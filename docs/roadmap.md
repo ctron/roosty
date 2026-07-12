@@ -19,7 +19,7 @@
 ## Short Term
 
 - Fill Mastodon client startup gaps found by Elk and browser logs.
-- Add cursor pagination for timelines and status collections.
-- Add basic replies and make `in_reply_to_account_id` accurate.
-- Persist and return status counts and last-status timestamps on accounts.
+- Add cursor pagination for account status collections.
+- Add a conversation endpoint for replies.
+- Add favourites, boosts, and bookmarks.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.

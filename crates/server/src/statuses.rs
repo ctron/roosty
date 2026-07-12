@@ -2,11 +2,11 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use roost_core::{RoostError, StatusId};
+use roost_core::{AccountId, RoostError, StatusId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -50,13 +50,22 @@ enum StatusInputError {
 }
 
 #[derive(Deserialize)]
-struct StatusParams {
-    limit: Option<u64>,
+struct StatusPath {
+    status_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineQuery {
+    limit: u64,
+    cursor: roost_db::TimelineCursor,
 }
 
 #[derive(Deserialize)]
-struct StatusPath {
-    status_id: Uuid,
+struct TimelineParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +128,13 @@ async fn create_status(
         Ok(status_id) => status_id,
         Err(error) => return bad_request(&error.to_string()),
     };
+    if let Some(parent_id) = in_reply_to_id {
+        match roost_db::find_local_status_by_id(&state.db, parent_id).await {
+            Ok(Some(parent)) if can_view_status(&parent, Some(account.id)) => {}
+            Ok(Some(_)) | Ok(None) => return bad_request("reply target status does not exist"),
+            Err(error) => return server_error(error),
+        }
+    }
 
     let new_status = roost_db::NewLocalStatus {
         account_id: account.id,
@@ -131,19 +147,32 @@ async fn create_status(
     };
 
     match roost_db::create_local_status(&state.db, new_status).await {
-        Ok(status) => {
-            let response = status_response(&state, status, account).await;
-            state.streaming_events.publish_update(&response);
-            (StatusCode::OK, Json(response)).into_response()
-        }
+        Ok(status) => match status_response(&state, status, account).await {
+            Ok(response) => {
+                state.streaming_events.publish_update(&response);
+                (StatusCode::OK, Json(response)).into_response()
+            }
+            Err(error) => server_error(error),
+        },
         Err(error) => server_error(error),
     }
 }
 
-async fn show_status(State(state): State<AppState>, Path(path): Path<StatusPath>) -> Response {
+async fn show_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    let viewer = match optional_account_from_headers(&state, &headers).await {
+        Ok(viewer) => viewer,
+        Err(response) => return response,
+    };
     match roost_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await {
-        Ok(Some(status)) => status_with_author_response(&state, status).await,
+        Ok(Some(status)) if can_view_status(&status, viewer.as_ref().map(|account| account.id)) => {
+            status_with_author_response(&state, status).await
+        }
         Ok(None) => not_found(),
+        Ok(Some(_)) => not_found(),
         Err(error) => server_error(error),
     }
 }
@@ -155,7 +184,10 @@ async fn delete_status(
 ) -> Response {
     match roost_db::delete_owned_local_status(&state.db, StatusId(path.status_id), account.id).await
     {
-        Ok(Some(status)) => Json(status_response(&state, status, account).await).into_response(),
+        Ok(Some(status)) => match status_response(&state, status, account).await {
+            Ok(status) => Json(status).into_response(),
+            Err(error) => server_error(error),
+        },
         Ok(None) => not_found(),
         Err(RoostError::InvalidInput(error)) => forbidden(&error),
         Err(error) => server_error(error),
@@ -165,22 +197,34 @@ async fn delete_status(
 async fn home_timeline(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-    Query(params): Query<StatusParams>,
+    Query(params): Query<TimelineParams>,
 ) -> Response {
-    let limit = timeline_limit(params.limit);
-    match roost_db::home_timeline_for_account(&state.db, account.id, limit).await {
-        Ok(statuses) => statuses_response(&state, statuses).await,
+    let query = match timeline_query(params) {
+        Ok(query) => query,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    match roost_db::home_timeline_for_account(&state.db, account.id, query.limit, query.cursor)
+        .await
+    {
+        Ok(statuses) => {
+            timeline_response(&state, statuses, query.limit, "/api/v1/timelines/home").await
+        }
         Err(error) => server_error(error),
     }
 }
 
 async fn public_timeline(
     State(state): State<AppState>,
-    Query(params): Query<StatusParams>,
+    Query(params): Query<TimelineParams>,
 ) -> Response {
-    let limit = timeline_limit(params.limit);
-    match roost_db::public_local_timeline(&state.db, limit).await {
-        Ok(statuses) => statuses_response(&state, statuses).await,
+    let query = match timeline_query(params) {
+        Ok(query) => query,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    match roost_db::public_local_timeline(&state.db, query.limit, query.cursor).await {
+        Ok(statuses) => {
+            timeline_response(&state, statuses, query.limit, "/api/v1/timelines/public").await
+        }
         Err(error) => server_error(error),
     }
 }
@@ -255,6 +299,20 @@ async fn statuses_response(state: &AppState, statuses: Vec<roost_db::LocalStatus
     Json(response).into_response()
 }
 
+async fn timeline_response(
+    state: &AppState,
+    statuses: Vec<roost_db::LocalStatus>,
+    limit: u64,
+    path: &str,
+) -> Response {
+    let link_header = timeline_link_header(&statuses, limit, path);
+    let mut response = statuses_response(state, statuses).await;
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
+}
+
 async fn status_with_author_response(state: &AppState, status: roost_db::LocalStatus) -> Response {
     match status_with_author(state, status).await {
         Ok(status) => Json(status).into_response(),
@@ -270,22 +328,29 @@ async fn status_with_author(
         .await?
         .ok_or_else(|| RoostError::InvalidInput("status author does not exist".to_owned()))?;
 
-    Ok(status_response(state, status, account).await)
+    status_response(state, status, account).await
 }
 
 async fn status_response(
     state: &AppState,
     status: roost_db::LocalStatus,
     account: roost_db::LocalAccount,
-) -> StatusResponse {
+) -> Result<StatusResponse, RoostError> {
     let status_path = format!("@{}/{}", account.username, status.id.0);
     let url = public_url(state, &status_path);
+    let in_reply_to_account_id = match status.in_reply_to_id {
+        Some(status_id) => roost_db::find_local_status_by_id(&state.db, status_id)
+            .await?
+            .map(|status| status.account_id.0.to_string()),
+        None => None,
+    };
+    let replies_count = roost_db::count_local_replies(&state.db, status.id).await?;
 
-    StatusResponse {
+    Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.created_at),
         in_reply_to_id: status.in_reply_to_id.map(|id| id.0.to_string()),
-        in_reply_to_account_id: None,
+        in_reply_to_account_id,
         sensitive: status.sensitive,
         spoiler_text: status.spoiler_text,
         visibility: status.visibility,
@@ -293,14 +358,14 @@ async fn status_response(
         uri: url.clone(),
         url,
         content: status_content_html(&status.content),
-        account: account_response(state, account),
+        account: account_response(state, account).await?,
         media_attachments: Vec::new(),
         mentions: Vec::new(),
         tags: Vec::new(),
         emojis: Vec::new(),
         reblogs_count: 0,
         favourites_count: 0,
-        replies_count: 0,
+        replies_count,
         favourited: false,
         reblogged: false,
         muted: false,
@@ -308,11 +373,64 @@ async fn status_response(
         pinned: false,
         reblog: None,
         application: None,
-    }
+    })
 }
 
 fn timeline_limit(limit: Option<u64>) -> u64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputError> {
+    Ok(TimelineQuery {
+        limit: timeline_limit(params.limit),
+        cursor: roost_db::TimelineCursor {
+            max_id: parse_optional_status_id(params.max_id.as_deref())?,
+            since_id: parse_optional_status_id(params.since_id.as_deref())?,
+            min_id: parse_optional_status_id(params.min_id.as_deref())?,
+        },
+    })
+}
+
+fn timeline_link_header(
+    statuses: &[roost_db::LocalStatus],
+    limit: u64,
+    path: &str,
+) -> Option<HeaderValue> {
+    if statuses.len() < limit as usize {
+        return None;
+    }
+    let first = statuses.first()?;
+    let last = statuses.last()?;
+    let value = format!(
+        r#"<{path}?min_id={}>; rel="prev", <{path}?max_id={}>; rel="next""#,
+        first.id.0, last.id.0,
+    );
+    HeaderValue::from_str(&value).ok()
+}
+
+fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) -> bool {
+    matches!(status.visibility.as_str(), "public" | "unlisted")
+        || viewer.is_some_and(|account_id| account_id == status.account_id)
+}
+
+async fn optional_account_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<roost_db::LocalAccount>, Response> {
+    let Some(bearer) = bearer_token(headers) else {
+        return Ok(None);
+    };
+
+    crate::auth::account_from_bearer_token(state, bearer)
+        .await
+        .map(Some)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
 }
 
 fn status_content_html(content: &str) -> String {
@@ -503,6 +621,166 @@ mod tests {
             )
             .await;
         assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    async fn replies_validate_parent_statuses_and_return_reply_metadata(
+        context: &mut StatusContext,
+    ) {
+        // Reply fields are part of the public Mastodon status shape, so parent
+        // validation and reply counts must agree with stored relationships.
+        let token = context.access_token().await;
+        let parent = context.create_status(&token, "parent", None, None).await;
+        let parent_id = parent["id"].as_str().unwrap();
+
+        let reply = context
+            .create_status(&token, "reply", None, Some(parent_id))
+            .await;
+        assert_eq!(reply["in_reply_to_id"], parent_id);
+        assert_eq!(
+            reply["in_reply_to_account_id"],
+            context.account_id.0.to_string()
+        );
+
+        let parent = context.get(&format!("/api/v1/statuses/{parent_id}")).await;
+        assert_eq!(json_body(parent).await["replies_count"], 1);
+
+        let missing_reply = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &token,
+                serde_json::json!({
+                    "status": "missing parent",
+                    "in_reply_to_id": uuid::Uuid::now_v7().to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(missing_reply.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    async fn visibility_controls_public_timeline_and_direct_status_reads(
+        context: &mut StatusContext,
+    ) {
+        // Until follow graph support exists, private and direct statuses are
+        // owner-only while public and unlisted statuses remain URL-readable.
+        let token = context.access_token().await;
+        context
+            .create_status(&token, "public", Some("public"), None)
+            .await;
+        let unlisted = context
+            .create_status(&token, "unlisted", Some("unlisted"), None)
+            .await;
+        let private = context
+            .create_status(&token, "private", Some("private"), None)
+            .await;
+        let direct = context
+            .create_status(&token, "direct", Some("direct"), None)
+            .await;
+
+        let public = json_body(context.get("/api/v1/timelines/public").await).await;
+        assert_eq!(public.as_array().unwrap().len(), 1);
+        assert_eq!(public[0]["visibility"], "public");
+
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home", &token)
+                .await,
+        )
+        .await;
+        assert_eq!(home.as_array().unwrap().len(), 4);
+
+        let unlisted_id = unlisted["id"].as_str().unwrap();
+        assert_eq!(
+            context
+                .get(&format!("/api/v1/statuses/{unlisted_id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        for status in [private, direct] {
+            let status_id = status["id"].as_str().unwrap();
+            assert_eq!(
+                context
+                    .get(&format!("/api/v1/statuses/{status_id}"))
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                context
+                    .authenticated_get(&format!("/api/v1/statuses/{status_id}"), &token)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    async fn timeline_cursors_page_through_local_statuses(context: &mut StatusContext) {
+        // Cursor support is what lets Mastodon clients incrementally load
+        // timeline pages without relying on offset pagination.
+        let token = context.access_token().await;
+        let first = context.create_status(&token, "first", None, None).await;
+        let second = context.create_status(&token, "second", None, None).await;
+        let third = context.create_status(&token, "third", None, None).await;
+
+        let page = context.get("/api/v1/timelines/public?limit=2").await;
+        assert!(page.headers().get(header::LINK).is_some());
+        let body = json_body(page).await;
+        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(body[0]["id"], third["id"]);
+        assert_eq!(body[1]["id"], second["id"]);
+
+        let second_id = second["id"].as_str().unwrap();
+        let older = json_body(
+            context
+                .get(&format!("/api/v1/timelines/public?max_id={second_id}"))
+                .await,
+        )
+        .await;
+        assert_eq!(older.as_array().unwrap().len(), 1);
+        assert_eq!(older[0]["id"], first["id"]);
+
+        let newer = json_body(
+            context
+                .get(&format!("/api/v1/timelines/public?since_id={second_id}"))
+                .await,
+        )
+        .await;
+        assert_eq!(newer.as_array().unwrap().len(), 1);
+        assert_eq!(newer[0]["id"], third["id"]);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    async fn account_responses_include_local_status_metadata(context: &mut StatusContext) {
+        // Status counts are client-visible account metadata and should ignore
+        // soft-deleted statuses.
+        let token = context.access_token().await;
+        context.create_status(&token, "kept", None, None).await;
+        let deleted = context.create_status(&token, "deleted", None, None).await;
+        let deleted_id = deleted["id"].as_str().unwrap();
+        assert_eq!(
+            context
+                .authenticated_empty("DELETE", &format!("/api/v1/statuses/{deleted_id}"), &token)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let credentials = context
+            .authenticated_get("/api/v1/accounts/verify_credentials", &token)
+            .await;
+        let body = json_body(credentials).await;
+        assert_eq!(body["statuses_count"], 1);
+        assert!(body["last_status_at"].as_str().is_some());
     }
 
     #[test]
@@ -713,6 +991,28 @@ mod tests {
             .await
             .unwrap()
             .token
+        }
+
+        async fn create_status(
+            &self,
+            token: &str,
+            status: &str,
+            visibility: Option<&str>,
+            in_reply_to_id: Option<&str>,
+        ) -> Value {
+            let mut body = serde_json::json!({ "status": status });
+            if let Some(visibility) = visibility {
+                body["visibility"] = serde_json::json!(visibility);
+            }
+            if let Some(in_reply_to_id) = in_reply_to_id {
+                body["in_reply_to_id"] = serde_json::json!(in_reply_to_id);
+            }
+
+            let response = self
+                .authenticated_json("POST", "/api/v1/statuses", token, body)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
         }
     }
 

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use askama::Template;
 use axum::{
     Form, Json, Router,
@@ -698,7 +700,10 @@ async fn verify_credentials(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    Json(account_response(&state, account)).into_response()
+    match account_response(&state, account).await {
+        Ok(account) => Json(account).into_response(),
+        Err(error) => server_error(error),
+    }
 }
 
 async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Response {
@@ -724,7 +729,10 @@ async fn update_credentials(
     };
 
     match roost_db::update_local_account_settings(&state.db, account.id, update).await {
-        Ok(account) => Json(account_response(&state, account)).into_response(),
+        Ok(account) => match account_response(&state, account).await {
+            Ok(account) => Json(account).into_response(),
+            Err(error) => server_error(error),
+        },
         Err(error) => server_error(error),
     }
 }
@@ -758,10 +766,10 @@ pub(crate) async fn account_from_bearer_token(
 }
 
 /// Build the Mastodon-compatible credential account response.
-pub(crate) fn account_response(
+pub(crate) async fn account_response(
     state: &AppState,
     account: roost_db::LocalAccount,
-) -> AccountResponse {
+) -> Result<AccountResponse, RoostError> {
     let account_url = match state
         .config
         .public_base_url
@@ -776,8 +784,12 @@ pub(crate) fn account_response(
     } else {
         account.display_name.clone()
     };
+    let statuses_count = roost_db::count_local_statuses_by_account(&state.db, account.id).await?;
+    let last_status_at = roost_db::last_local_status_at(&state.db, account.id)
+        .await?
+        .map(|timestamp| DateOnly(timestamp).to_string());
 
-    AccountResponse {
+    Ok(AccountResponse {
         id: account.id.0.to_string(),
         username: account.username.clone(),
         acct: account.username.clone(),
@@ -797,8 +809,8 @@ pub(crate) fn account_response(
         emojis: Vec::new(),
         followers_count: 0,
         following_count: 0,
-        statuses_count: 0,
-        last_status_at: None,
+        statuses_count,
+        last_status_at,
         source: AccountSource {
             note: account.note,
             fields: profile_fields,
@@ -815,12 +827,27 @@ pub(crate) fn account_response(
             permissions: "0".to_owned(),
             highlighted: account.is_admin,
         },
-    }
+    })
 }
 
 /// Convert stored profile fields to the array shape expected by account APIs.
 fn profile_fields_from_value(value: &Value) -> Vec<Value> {
     value.as_array().cloned().unwrap_or_default()
+}
+
+/// Date-only display wrapper used by Mastodon's `last_status_at` field.
+struct DateOnly(OffsetDateTime);
+
+impl fmt::Display for DateOnly {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:04}-{:02}-{:02}",
+            self.0.year(),
+            u8::from(self.0.month()),
+            self.0.day()
+        )
+    }
 }
 
 /// Convert parsed update input into a validated database update.

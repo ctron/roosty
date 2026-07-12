@@ -62,6 +62,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/accounts/verify_credentials` | Returns local credential account. |
 | 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics and posting defaults. |
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
+| 🟢 | Status metadata | Local `statuses_count` and `last_status_at` are populated. |
 | 🔴 | `GET /api/v1/accounts/:id` | Public account lookup is missing. |
 | 🔴 | Account statuses | `GET /api/v1/accounts/:id/statuses` is missing. |
 
@@ -72,7 +73,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `POST /api/v1/statuses` | Local text statuses only. |
 | 🟢 | `GET /api/v1/statuses/:id` | Local, non-deleted statuses. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
-| 🔴 | Replies | Reply id can be stored, but conversation behavior is not complete. |
+| 🟡 | Replies | Reply targets are validated and reply metadata is returned; no conversation endpoint yet. |
+| 🟡 | Visibility semantics | Public/unlisted URL reads work; private/direct are owner-only until follow graph support exists. |
 | 🔴 | Favourites | Favourite/unfavourite APIs are missing. |
 | 🔴 | Boosts | Reblog/unreblog APIs are missing. |
 | 🔴 | Bookmarks | Bookmark/unbookmark APIs are missing. |
@@ -84,7 +86,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own local statuses; no follow graph yet. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
 | 🔴 | `GET /api/v1/timelines/tag/:tag` | Hashtag timeline is missing. |
-| 🔴 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are missing. |
+| 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for local timelines. |
 
 ### Notifications and Markers
 
@@ -121,8 +123,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add WebFinger, actor documents, inbox, and outbox.
 - [ ] Add federation delivery and inbound activity processing.
 - [ ] Add follow graph and real home timeline membership.
-- [ ] Add timeline cursor pagination and `Link` headers.
-- [ ] Add replies, favourites, boosts, and bookmarks.
+- [ ] Add conversation endpoint support for replies.
+- [ ] Add favourites, boosts, and bookmarks.
 - [ ] Add persisted notifications and notification streaming.
 - [ ] Add media upload and attachment responses.
 - [ ] Add moderation APIs and domain policy.

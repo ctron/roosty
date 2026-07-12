@@ -7,7 +7,7 @@ use roost_core::{AccountId, JobId, Result, RoostError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, Database, DatabaseBackend,
     DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    QueryOrder, QuerySelect, Select, Set, Statement,
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -176,6 +176,17 @@ pub struct NewLocalStatus {
     pub in_reply_to_id: Option<StatusId>,
 }
 
+/// Cursor filters accepted by local timeline queries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimelineCursor {
+    /// Return statuses older than this id.
+    pub max_id: Option<StatusId>,
+    /// Return statuses newer than this id.
+    pub since_id: Option<StatusId>,
+    /// Return statuses immediately newer than this id.
+    pub min_id: Option<StatusId>,
+}
+
 /// OAuth client application metadata.
 #[derive(Clone, Debug)]
 pub struct OAuthApplication {
@@ -307,6 +318,42 @@ pub async fn find_local_status_by_id(
     Ok(status.map(local_status_from_model))
 }
 
+/// Count active statuses authored by a local account.
+pub async fn count_local_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<u64> {
+    Ok(local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .count(db)
+        .await?)
+}
+
+/// Return the latest active status timestamp for a local account.
+pub async fn last_local_status_at(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<Option<OffsetDateTime>> {
+    let status = local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .order_by_desc(local_status::Column::CreatedAt)
+        .one(db)
+        .await?;
+
+    Ok(status.map(|status| status.created_at))
+}
+
+/// Count active local replies to a status.
+pub async fn count_local_replies(db: &DbConnection, status_id: StatusId) -> Result<u64> {
+    Ok(local_status::Entity::find()
+        .filter(local_status::Column::InReplyToId.eq(status_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .count(db)
+        .await?)
+}
+
 /// Soft-delete a local status when the authenticated account owns it.
 pub async fn delete_owned_local_status(
     db: &DbConnection,
@@ -334,14 +381,21 @@ pub async fn delete_owned_local_status(
 }
 
 /// List public local statuses for the public timeline.
-pub async fn public_local_timeline(db: &DbConnection, limit: u64) -> Result<Vec<LocalStatus>> {
-    let statuses = local_status::Entity::find()
-        .filter(local_status::Column::Visibility.eq("public"))
-        .filter(local_status::Column::DeletedAt.is_null())
-        .order_by_desc(local_status::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await?;
+pub async fn public_local_timeline(
+    db: &DbConnection,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<Vec<LocalStatus>> {
+    let statuses = apply_timeline_cursor(
+        local_status::Entity::find()
+            .filter(local_status::Column::Visibility.eq("public"))
+            .filter(local_status::Column::DeletedAt.is_null()),
+        cursor,
+    )
+    .order_by_desc(local_status::Column::Id)
+    .limit(limit)
+    .all(db)
+    .await?;
 
     Ok(statuses.into_iter().map(local_status_from_model).collect())
 }
@@ -351,16 +405,37 @@ pub async fn home_timeline_for_account(
     db: &DbConnection,
     account_id: AccountId,
     limit: u64,
+    cursor: TimelineCursor,
 ) -> Result<Vec<LocalStatus>> {
-    let statuses = local_status::Entity::find()
-        .filter(local_status::Column::AccountId.eq(account_id.0))
-        .filter(local_status::Column::DeletedAt.is_null())
-        .order_by_desc(local_status::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await?;
+    let statuses = apply_timeline_cursor(
+        local_status::Entity::find()
+            .filter(local_status::Column::AccountId.eq(account_id.0))
+            .filter(local_status::Column::DeletedAt.is_null()),
+        cursor,
+    )
+    .order_by_desc(local_status::Column::Id)
+    .limit(limit)
+    .all(db)
+    .await?;
 
     Ok(statuses.into_iter().map(local_status_from_model).collect())
+}
+
+/// Apply Mastodon cursor parameters to a local status query.
+fn apply_timeline_cursor(
+    mut query: Select<local_status::Entity>,
+    cursor: TimelineCursor,
+) -> Select<local_status::Entity> {
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(local_status::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(local_status::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(local_status::Column::Id.gt(min_id.0));
+    }
+    query
 }
 
 /// Mark an active model field as changed only when an update value is present.
