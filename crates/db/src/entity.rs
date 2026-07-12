@@ -13,6 +13,7 @@ pub mod local_status_reblog;
 pub mod local_status_tag;
 pub mod local_tag;
 pub mod local_tag_follow;
+pub mod local_timeline_marker;
 pub mod oauth_access_token;
 pub mod oauth_application;
 pub mod oauth_authorization_code;

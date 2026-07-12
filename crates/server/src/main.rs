@@ -18,6 +18,7 @@ mod config;
 mod conversations;
 mod http;
 mod instance;
+mod markers;
 mod media;
 mod notifications;
 mod password;

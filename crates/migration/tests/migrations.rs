@@ -34,6 +34,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_tag").await);
     assert!(table_exists(database.connection(), "local_status_tag").await);
     assert!(table_exists(database.connection(), "local_tag_follow").await);
+    assert!(table_exists(database.connection(), "local_timeline_marker").await);
+    assert!(table_exists(database.connection(), "local_timeline_marker").await);
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
@@ -100,6 +102,15 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     );
     assert!(column_exists(database.connection(), "local_notification", "status_id").await);
     assert!(column_exists(database.connection(), "local_notification", "dismissed_at").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_timeline_marker",
+            "last_read_id"
+        )
+        .await
+    );
+    assert!(column_exists(database.connection(), "local_timeline_marker", "version").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "id").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "account_id").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "status_id").await);
@@ -180,6 +191,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_tag").await);
     assert!(!table_exists(database.connection(), "local_status_tag").await);
     assert!(!table_exists(database.connection(), "local_tag_follow").await);
+    assert!(!table_exists(database.connection(), "local_timeline_marker").await);
 }
 
 struct EmbeddedDatabase {

@@ -111,9 +111,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, and `follow` notifications with cursor pagination and basic filters. |
-| 🔴 | `GET /api/v1/markers` | Placeholder currently returns an empty object. |
+| 🟢 | `GET/POST /api/v1/markers` | Persists local home and notification read positions. |
 | 🟡 | Persisted notifications | Local notifications are stored and can be dismissed or cleared; remote, grouped, policy, and request flows are missing. |
-| 🔴 | Notification read state | Marker updates are missing. |
+| 🟡 | Notification read state | Local home and notification markers work; grouped and remote notification state is missing. |
 
 ### Tags, Push, and Media
 
@@ -147,7 +147,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add remote follow graph and full private-status home timeline semantics.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote ActivityPub `Announce` support.
-- [ ] Add followed tags and remote hashtag support.
-- [ ] Add notification markers, grouped notifications, push integration, and remote notification events.
+- [ ] Add remote hashtag support.
+- [ ] Add grouped notifications, push integration, and remote notification events.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.

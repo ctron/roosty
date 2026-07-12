@@ -11,7 +11,7 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use roost_core::AccountId;
@@ -26,7 +26,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/push/subscription", get(push_subscription))
         .route("/api/v1/followed_tags", get(followed_tags))
-        .route("/api/v1/markers", get(markers))
         .route("/api/v1/streaming", get(streaming))
         .route("/api/v1/streaming/direct", get(streaming_direct))
         .route("/api/v1/streaming/health", get(streaming_health))
@@ -64,10 +63,6 @@ async fn followed_tags(
         }
         Err(error) => server_error(error),
     }
-}
-
-async fn markers(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
-    Json(json!({})).into_response()
 }
 
 async fn streaming_health() -> &'static str {
@@ -309,6 +304,77 @@ mod tests {
 
     #[test_context(CompatContext)]
     #[tokio::test]
+    async fn markers_persist_requested_home_and_notification_positions(
+        context: &mut CompatContext,
+    ) {
+        // Given an authenticated account, when it saves both timeline positions,
+        // then Mastodon clients can retrieve the same complete marker objects.
+        let token = context.access_token().await;
+        let home_id = uuid::Uuid::now_v7();
+        let notification_id = uuid::Uuid::now_v7();
+        let body = format!(
+            "home%5Blast_read_id%5D={home_id}&notifications%5Blast_read_id%5D={notification_id}"
+        );
+
+        let created = json_body(
+            context
+                .authenticated_form_post("/api/v1/markers", &token, body)
+                .await,
+        )
+        .await;
+
+        assert_eq!(
+            created,
+            serde_json::json!({
+                "home": {
+                    "last_read_id": home_id.to_string(),
+                    "version": 1,
+                    "updated_at": created["home"]["updated_at"].clone(),
+                },
+                "notifications": {
+                    "last_read_id": notification_id.to_string(),
+                    "version": 1,
+                    "updated_at": created["notifications"]["updated_at"].clone(),
+                },
+            })
+        );
+
+        let fetched = json_body(
+            context
+                .authenticated_get(
+                    "/api/v1/markers?timeline[]=notifications&timeline[]=home",
+                    &token,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(fetched, created);
+
+        let next_home_id = uuid::Uuid::now_v7();
+        let updated = json_body(
+            context
+                .authenticated_form_post(
+                    "/api/v1/markers",
+                    &token,
+                    format!("home%5Blast_read_id%5D={next_home_id}"),
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(
+            updated,
+            serde_json::json!({
+                "home": {
+                    "last_read_id": next_home_id.to_string(),
+                    "version": 2,
+                    "updated_at": updated["home"]["updated_at"].clone(),
+                },
+            })
+        );
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
     async fn public_timeline_returns_an_empty_collection(context: &mut CompatContext) {
         let response = context
             .get("/api/v1/timelines/public?limit=30&local=true")
@@ -506,6 +572,28 @@ mod tests {
                     .uri(uri)
                     .header(AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        /// Submit a URL-encoded form as an authenticated Mastodon API client.
+        async fn authenticated_form_post(
+            &self,
+            uri: &str,
+            token: &str,
+            body: String,
+        ) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await

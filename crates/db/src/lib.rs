@@ -26,7 +26,7 @@ use entity::{
     local_account, local_conversation, local_conversation_account, local_follow,
     local_media_attachment, local_notification, local_status, local_status_bookmark,
     local_status_favourite, local_status_reblog, local_status_tag, local_tag, local_tag_follow,
-    oauth_access_token, oauth_application, oauth_authorization_code,
+    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -580,6 +580,36 @@ pub struct LocalNotification {
     pub dismissed_at: Option<OffsetDateTime>,
 }
 
+/// Timelines that support persisted Mastodon read markers.
+#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum LocalTimeline {
+    /// The authenticated account's home timeline.
+    Home,
+    /// The authenticated account's notification timeline.
+    Notifications,
+}
+
+impl LocalTimeline {
+    /// Return the Mastodon wire value for this timeline.
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// Persisted read position for one account timeline.
+#[derive(Clone, Debug)]
+pub struct LocalTimelineMarker {
+    /// Timeline whose read position this marker records.
+    pub timeline: LocalTimeline,
+    /// Opaque identifier of the last item the account read.
+    pub last_read_id: Uuid,
+    /// Monotonically increasing revision of this marker.
+    pub version: i64,
+    /// Time of the most recent marker update.
+    pub updated_at: OffsetDateTime,
+}
+
 /// Filters accepted by local notification collection queries.
 #[derive(Clone, Debug, Default)]
 pub struct NotificationFilter {
@@ -964,6 +994,71 @@ pub async fn clear_local_notifications(db: &DbConnection, account_id: AccountId)
         active.update(db).await?;
     }
     Ok(())
+}
+
+/// Return saved timeline markers for an account and a requested set of timelines.
+pub async fn local_timeline_markers_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    timelines: &[LocalTimeline],
+) -> Result<Vec<LocalTimelineMarker>> {
+    if timelines.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let markers = local_timeline_marker::Entity::find()
+        .filter(local_timeline_marker::Column::AccountId.eq(account_id.0))
+        .filter(
+            local_timeline_marker::Column::Timeline
+                .is_in(timelines.iter().map(|timeline| timeline.as_str())),
+        )
+        .all(db)
+        .await?;
+
+    markers
+        .into_iter()
+        .map(local_timeline_marker_from_model)
+        .collect()
+}
+
+/// Save a local account's read position for a Mastodon timeline.
+pub async fn save_local_timeline_marker(
+    db: &DbConnection,
+    account_id: AccountId,
+    timeline: LocalTimeline,
+    last_read_id: Uuid,
+) -> Result<LocalTimelineMarker> {
+    let now = OffsetDateTime::now_utc();
+    let marker =
+        local_timeline_marker::Entity::find_by_id((account_id.0, timeline.as_str().to_owned()))
+            .one(db)
+            .await?;
+
+    let marker = match marker {
+        Some(marker) => {
+            let version = marker.version.checked_add(1).ok_or_else(|| {
+                RoostError::InvalidInput("timeline marker version is exhausted".to_owned())
+            })?;
+            let mut active = marker.into_active_model();
+            active.last_read_id = Set(last_read_id);
+            active.version = Set(version);
+            active.updated_at = Set(now);
+            active.update(db).await?
+        }
+        None => {
+            local_timeline_marker::ActiveModel {
+                account_id: Set(account_id.0),
+                timeline: Set(timeline.as_str().to_owned()),
+                last_read_id: Set(last_read_id),
+                version: Set(1),
+                updated_at: Set(now),
+            }
+            .insert(db)
+            .await?
+        }
+    };
+
+    local_timeline_marker_from_model(marker)
 }
 
 /// List local accounts following this account with Mastodon cursor filters.
@@ -3165,6 +3260,20 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         created_at: notification.created_at,
         dismissed_at: notification.dismissed_at,
     }
+}
+
+/// Convert a SeaORM timeline marker row into its database API representation.
+fn local_timeline_marker_from_model(
+    marker: local_timeline_marker::Model,
+) -> Result<LocalTimelineMarker> {
+    Ok(LocalTimelineMarker {
+        timeline: LocalTimeline::from_str(&marker.timeline).map_err(|_| {
+            RoostError::InvalidInput("stored timeline marker type is invalid".to_owned())
+        })?,
+        last_read_id: marker.last_read_id,
+        version: marker.version,
+        updated_at: marker.updated_at,
+    })
 }
 
 fn local_media_attachment_from_model(media: local_media_attachment::Model) -> LocalMediaAttachment {
