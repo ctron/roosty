@@ -1,5 +1,9 @@
 # Repository Working Notes
 
+## Project Target
+
+- Roost targets compatibility with the ActivityPub specification and Mastodon-compatible client APIs.
+
 ## Verification
 
 After making Rust code or manifest changes, run:
