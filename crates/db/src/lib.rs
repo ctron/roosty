@@ -252,6 +252,28 @@ pub struct TimelineCursor {
     pub min_id: Option<StatusId>,
 }
 
+/// Cursor filters accepted by Mastodon collection queries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CollectionCursor {
+    /// Return collection rows older than this internal id.
+    pub max_id: Option<Uuid>,
+    /// Return collection rows newer than this internal id.
+    pub since_id: Option<Uuid>,
+    /// Return collection rows immediately newer than this internal id.
+    pub min_id: Option<Uuid>,
+}
+
+/// Page of Mastodon collection items and opaque cursor metadata.
+#[derive(Clone, Debug)]
+pub struct CollectionPage<T> {
+    /// Items returned to the API caller.
+    pub items: Vec<T>,
+    /// Cursor for the first row in the page.
+    pub first_cursor: Option<Uuid>,
+    /// Cursor for the last row in the page.
+    pub last_cursor: Option<Uuid>,
+}
+
 /// Stored local follow relationship between two accounts.
 #[derive(Clone, Debug)]
 pub struct LocalFollow {
@@ -431,6 +453,7 @@ pub async fn follow_local_account(
             }
             None => {
                 local_follow::ActiveModel {
+                    id: Set(Uuid::now_v7()),
                     follower_account_id: Set(follower_account_id.0),
                     followed_account_id: Set(followed_account_id.0),
                     show_reblogs: Set(show_reblogs),
@@ -463,42 +486,60 @@ pub async fn unfollow_local_account(
     Ok(())
 }
 
-/// List local accounts following this account, newest first.
+/// List local accounts following this account with Mastodon cursor filters.
 pub async fn local_followers_for_account(
     db: &DbConnection,
     account_id: AccountId,
     limit: u64,
-) -> Result<Vec<LocalAccount>> {
-    let account_ids = local_follow::Entity::find()
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalAccount>> {
+    let rows = local_follow::Entity::find()
         .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
-        .order_by_desc(local_follow::Column::CreatedAt)
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_follow::Column::Id)
         .limit(limit)
         .all(db)
-        .await?
+        .await?;
+    let first_cursor = rows.first().map(|follow| follow.id);
+    let last_cursor = rows.last().map(|follow| follow.id);
+    let account_ids = rows
         .into_iter()
         .map(|follow| AccountId(follow.follower_account_id))
         .collect::<Vec<_>>();
 
-    local_accounts_by_id(db, account_ids).await
+    Ok(CollectionPage {
+        items: local_accounts_by_id(db, account_ids).await?,
+        first_cursor,
+        last_cursor,
+    })
 }
 
-/// List local accounts followed by this account, newest first.
+/// List local accounts followed by this account with Mastodon cursor filters.
 pub async fn local_following_for_account(
     db: &DbConnection,
     account_id: AccountId,
     limit: u64,
-) -> Result<Vec<LocalAccount>> {
-    let account_ids = local_follow::Entity::find()
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalAccount>> {
+    let rows = local_follow::Entity::find()
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
-        .order_by_desc(local_follow::Column::CreatedAt)
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_follow::Column::Id)
         .limit(limit)
         .all(db)
-        .await?
+        .await?;
+    let first_cursor = rows.first().map(|follow| follow.id);
+    let last_cursor = rows.last().map(|follow| follow.id);
+    let account_ids = rows
         .into_iter()
         .map(|follow| AccountId(follow.followed_account_id))
         .collect::<Vec<_>>();
 
-    local_accounts_by_id(db, account_ids).await
+    Ok(CollectionPage {
+        items: local_accounts_by_id(db, account_ids).await?,
+        first_cursor,
+        last_cursor,
+    })
 }
 
 /// Update mutable local account settings and return the refreshed account.
@@ -634,6 +675,7 @@ pub async fn favourite_local_status(
         .is_none()
     {
         local_status_favourite::ActiveModel {
+            id: Set(Uuid::now_v7()),
             account_id: Set(account_id.0),
             status_id: Set(status_id.0),
             created_at: Set(OffsetDateTime::now_utc()),
@@ -688,18 +730,27 @@ pub async fn local_favourites_for_account(
     db: &DbConnection,
     account_id: AccountId,
     limit: u64,
-) -> Result<Vec<LocalStatus>> {
-    let status_ids = local_status_favourite::Entity::find()
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalStatus>> {
+    let rows = local_status_favourite::Entity::find()
         .filter(local_status_favourite::Column::AccountId.eq(account_id.0))
-        .order_by_desc(local_status_favourite::Column::CreatedAt)
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_status_favourite::Column::Id)
         .limit(limit)
         .all(db)
-        .await?
+        .await?;
+    let first_cursor = rows.first().map(|model| model.id);
+    let last_cursor = rows.last().map(|model| model.id);
+    let status_ids = rows
         .into_iter()
         .map(|model| StatusId(model.status_id))
         .collect::<Vec<_>>();
 
-    active_statuses_by_id(db, status_ids).await
+    Ok(CollectionPage {
+        items: active_statuses_by_id(db, status_ids).await?,
+        first_cursor,
+        last_cursor,
+    })
 }
 
 /// Mark a local status as bookmarked by an account.
@@ -714,6 +765,7 @@ pub async fn bookmark_local_status(
         .is_none()
     {
         local_status_bookmark::ActiveModel {
+            id: Set(Uuid::now_v7()),
             account_id: Set(account_id.0),
             status_id: Set(status_id.0),
             created_at: Set(OffsetDateTime::now_utc()),
@@ -760,18 +812,27 @@ pub async fn local_bookmarks_for_account(
     db: &DbConnection,
     account_id: AccountId,
     limit: u64,
-) -> Result<Vec<LocalStatus>> {
-    let status_ids = local_status_bookmark::Entity::find()
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalStatus>> {
+    let rows = local_status_bookmark::Entity::find()
         .filter(local_status_bookmark::Column::AccountId.eq(account_id.0))
-        .order_by_desc(local_status_bookmark::Column::CreatedAt)
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_status_bookmark::Column::Id)
         .limit(limit)
         .all(db)
-        .await?
+        .await?;
+    let first_cursor = rows.first().map(|model| model.id);
+    let last_cursor = rows.last().map(|model| model.id);
+    let status_ids = rows
         .into_iter()
         .map(|model| StatusId(model.status_id))
         .collect::<Vec<_>>();
 
-    active_statuses_by_id(db, status_ids).await
+    Ok(CollectionPage {
+        items: active_statuses_by_id(db, status_ids).await?,
+        first_cursor,
+        last_cursor,
+    })
 }
 
 /// Load active local statuses for ordered status identifiers.
@@ -927,6 +988,57 @@ fn apply_timeline_cursor(
         query = query.filter(local_status::Column::Id.gt(min_id.0));
     }
     query
+}
+
+/// Adds Mastodon cursor filters to SeaORM collection queries.
+trait ApplyCollectionCursor {
+    /// Apply `max_id`, `since_id`, and `min_id` filters to an ordered collection query.
+    fn apply_collection_cursor(self, cursor: CollectionCursor) -> Self;
+}
+
+impl ApplyCollectionCursor for Select<local_status_favourite::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_status_favourite::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_status_favourite::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_status_favourite::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_status_bookmark::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_status_bookmark::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_status_bookmark::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_status_bookmark::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_follow::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_follow::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_follow::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_follow::Column::Id.gt(min_id));
+        }
+        self
+    }
 }
 
 /// Mark an active model field as changed only when an update value is present.

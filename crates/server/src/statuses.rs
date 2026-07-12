@@ -92,6 +92,9 @@ struct TimelineParams {
 #[derive(Deserialize)]
 struct CollectionParams {
     limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -526,17 +529,39 @@ async fn status_collection_list(
     collection: StatusCollectionList,
 ) -> Response {
     let limit = timeline_limit(params.limit);
+    let cursor = match collection_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("collection cursor is invalid"),
+    };
     let result = match collection {
         StatusCollectionList::Favourites => {
-            roost_db::local_favourites_for_account(&state.db, account_id, limit).await
+            roost_db::local_favourites_for_account(&state.db, account_id, limit, cursor).await
         }
         StatusCollectionList::Bookmarks => {
-            roost_db::local_bookmarks_for_account(&state.db, account_id, limit).await
+            roost_db::local_bookmarks_for_account(&state.db, account_id, limit, cursor).await
         }
     };
 
     match result {
-        Ok(statuses) => statuses_response(state, statuses, Some(account_id)).await,
+        Ok(page) => {
+            let path = match collection {
+                StatusCollectionList::Favourites => "/api/v1/favourites",
+                StatusCollectionList::Bookmarks => "/api/v1/bookmarks",
+            };
+            let link_header = CollectionLink::new(
+                page.items.len(),
+                limit,
+                page.first_cursor,
+                page.last_cursor,
+                path,
+            )
+            .header_value();
+            let mut response = statuses_response(state, page.items, Some(account_id)).await;
+            if let Some(link_header) = link_header {
+                response.headers_mut().insert(header::LINK, link_header);
+            }
+            response
+        }
         Err(error) => server_error(error),
     }
 }
@@ -807,6 +832,15 @@ fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputEr
     })
 }
 
+/// Parse Mastodon cursor parameters from a local collection request.
+fn collection_cursor(params: &CollectionParams) -> Result<roost_db::CollectionCursor, ()> {
+    Ok(roost_db::CollectionCursor {
+        max_id: parse_optional_uuid(params.max_id.as_deref())?,
+        since_id: parse_optional_uuid(params.since_id.as_deref())?,
+        min_id: parse_optional_uuid(params.min_id.as_deref())?,
+    })
+}
+
 fn timeline_link_header(
     statuses: &[roost_db::LocalStatus],
     limit: u64,
@@ -822,6 +856,59 @@ fn timeline_link_header(
         first.id.0, last.id.0,
     );
     HeaderValue::from_str(&value).ok()
+}
+
+/// Data needed to build a Mastodon collection pagination Link header.
+pub(crate) struct CollectionLink<'a> {
+    /// Number of items returned in the response body.
+    item_count: usize,
+    /// Effective clamped request limit.
+    limit: u64,
+    /// Opaque cursor for the first collection row returned.
+    first_cursor: Option<Uuid>,
+    /// Opaque cursor for the last collection row returned.
+    last_cursor: Option<Uuid>,
+    /// API path used to construct relative pagination links.
+    path: &'a str,
+}
+
+impl<'a> CollectionLink<'a> {
+    /// Create collection pagination metadata from a completed page.
+    pub(crate) fn new(
+        item_count: usize,
+        limit: u64,
+        first_cursor: Option<Uuid>,
+        last_cursor: Option<Uuid>,
+        path: &'a str,
+    ) -> Self {
+        CollectionLink {
+            item_count,
+            limit,
+            first_cursor,
+            last_cursor,
+            path,
+        }
+    }
+
+    /// Render the pagination Link header when the page may have more rows.
+    pub(crate) fn header_value(&self) -> Option<HeaderValue> {
+        if self.item_count < self.limit as usize {
+            return None;
+        }
+        let first_cursor = self.first_cursor?;
+        let last_cursor = self.last_cursor?;
+        let path = self.path;
+        let limit = self.limit;
+        let value = format!(
+            r#"<{path}?limit={limit}&min_id={first_cursor}>; rel="prev", <{path}?limit={limit}&max_id={last_cursor}>; rel="next""#,
+        );
+        HeaderValue::from_str(&value).ok()
+    }
+}
+
+/// Parse an optional UUID cursor from Mastodon collection query parameters.
+fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
+    value.map(Uuid::parse_str).transpose().map_err(|_| ())
 }
 
 fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) -> bool {
@@ -1444,6 +1531,54 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Verifies favourites expose Mastodon cursor pagination through Link headers.
+    async fn favourites_collection_uses_cursor_pagination(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let first = context.create_status(&token, "first", None, None).await;
+        let second = context.create_status(&token, "second", None, None).await;
+        let third = context.create_status(&token, "third", None, None).await;
+        for status in [&first, &second, &third] {
+            let status_id = status["id"].as_str().unwrap();
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/favourite"),
+                    &token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let page = context
+            .authenticated_get("/api/v1/favourites?limit=2", &token)
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let body = json_body(page).await;
+        assert_eq!(
+            status_ids(&body),
+            [
+                third["id"].as_str().unwrap().to_owned(),
+                second["id"].as_str().unwrap().to_owned(),
+            ]
+        );
+
+        let next = context
+            .authenticated_get(
+                &format!("/api/v1/favourites?limit=2&max_id={next_cursor}"),
+                &token,
+            )
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let body = json_body(next).await;
+        assert_eq!(
+            status_ids(&body),
+            [first["id"].as_str().unwrap().to_owned()]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Verifies that public timelines preserve viewer-specific favourite state.
     async fn public_timeline_marks_statuses_favourited_by_the_viewer(context: &mut StatusContext) {
         let token = context.access_token().await;
@@ -1574,6 +1709,66 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Verifies bookmarks expose Mastodon cursor pagination through Link headers.
+    async fn bookmarks_collection_uses_cursor_pagination(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let first = context.create_status(&token, "first", None, None).await;
+        let second = context.create_status(&token, "second", None, None).await;
+        let third = context.create_status(&token, "third", None, None).await;
+        for status in [&first, &second, &third] {
+            let status_id = status["id"].as_str().unwrap();
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/bookmark"),
+                    &token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let page = context
+            .authenticated_get("/api/v1/bookmarks?limit=2", &token)
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let body = json_body(page).await;
+        assert_eq!(
+            status_ids(&body),
+            [
+                third["id"].as_str().unwrap().to_owned(),
+                second["id"].as_str().unwrap().to_owned(),
+            ]
+        );
+
+        let next = context
+            .authenticated_get(
+                &format!("/api/v1/bookmarks?limit=2&max_id={next_cursor}"),
+                &token,
+            )
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let body = json_body(next).await;
+        assert_eq!(
+            status_ids(&body),
+            [first["id"].as_str().unwrap().to_owned()]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies malformed collection cursors are rejected before database access.
+    async fn status_collections_reject_invalid_cursors(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let response = context
+            .authenticated_get("/api/v1/favourites?max_id=not-a-uuid", &token)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Verifies bookmark permissions use the same policy as status reads.
     async fn bookmarks_follow_status_visibility(context: &mut StatusContext) {
         let owner_token = context.access_token().await;
@@ -1616,6 +1811,35 @@ mod tests {
             mention_usernames("@alice test x@y @bo_b"),
             ["alice", "bo_b"]
         );
+    }
+
+    /// Extract status identifiers from a Mastodon status collection response.
+    fn status_ids(body: &Value) -> Vec<String> {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|status| status["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Extract a cursor query parameter from a Mastodon Link header.
+    fn link_cursor(response: &axum::http::Response<Body>, rel: &str, param: &str) -> String {
+        let link = response
+            .headers()
+            .get(header::LINK)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let segment = link
+            .split(',')
+            .find(|segment| segment.contains(&format!(r#"rel="{rel}""#)))
+            .unwrap();
+        let start = segment.find(&format!("{param}=")).unwrap() + param.len() + 1;
+        segment[start..]
+            .split(['&', '>'])
+            .next()
+            .unwrap()
+            .to_owned()
     }
 
     struct StatusContext {

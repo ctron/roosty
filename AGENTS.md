@@ -39,6 +39,8 @@ Keep this as the default verification command for changes in this repository.
 - Document non-obvious tests in a give, when, then style.
 - Update `docs/roadmap.md` and `docs/compatibility.md` when adding, removing, or materially changing ActivityPub or
   Mastodon-compatible behavior.
+- When adding Mastodon-compatible endpoints that accept `limit`, check the official API shape and implement the
+  required cursor or offset pagination parameters and `Link` headers at the same time.
 
 ## Git
 

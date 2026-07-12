@@ -55,6 +55,9 @@ struct AccountStatusesParams {
 #[derive(Deserialize)]
 struct AccountCollectionParams {
     limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -299,17 +302,43 @@ async fn account_collection(
         .limit
         .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
         .clamp(1, MAX_ACCOUNT_LIMIT);
+    let cursor = match collection_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("collection cursor is invalid"),
+    };
     let accounts = match collection {
         AccountCollection::Followers => {
-            roost_db::local_followers_for_account(&state.db, account_id, limit).await
+            roost_db::local_followers_for_account(&state.db, account_id, limit, cursor).await
         }
         AccountCollection::Following => {
-            roost_db::local_following_for_account(&state.db, account_id, limit).await
+            roost_db::local_following_for_account(&state.db, account_id, limit, cursor).await
         }
     };
     match accounts {
-        Ok(accounts) => match account_responses(state, accounts).await {
-            Ok(accounts) => Json(accounts).into_response(),
+        Ok(page) => match account_responses(state, page.items).await {
+            Ok(accounts) => {
+                let path = match collection {
+                    AccountCollection::Followers => {
+                        format!("/api/v1/accounts/{}/followers", account_id.0)
+                    }
+                    AccountCollection::Following => {
+                        format!("/api/v1/accounts/{}/following", account_id.0)
+                    }
+                };
+                let link_header = crate::statuses::CollectionLink::new(
+                    accounts.len(),
+                    limit,
+                    page.first_cursor,
+                    page.last_cursor,
+                    &path,
+                )
+                .header_value();
+                let mut response = Json(accounts).into_response();
+                if let Some(link_header) = link_header {
+                    response.headers_mut().insert(header::LINK, link_header);
+                }
+                response
+            }
             Err(error) => server_error(error),
         },
         Err(error) => server_error(error),
@@ -401,12 +430,30 @@ fn timeline_cursor(params: &AccountStatusesParams) -> Result<roost_db::TimelineC
     })
 }
 
+/// Parse Mastodon cursor parameters from an account collection request.
+fn collection_cursor(params: &AccountCollectionParams) -> Result<roost_db::CollectionCursor, ()> {
+    Ok(roost_db::CollectionCursor {
+        max_id: parse_optional_uuid(params.max_id.as_deref())?,
+        since_id: parse_optional_uuid(params.since_id.as_deref())?,
+        min_id: parse_optional_uuid(params.min_id.as_deref())?,
+    })
+}
+
 /// Parse an optional status UUID from Mastodon cursor query parameters.
 fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, ()> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.parse().map(StatusId).map_err(|_| ()))
+        .transpose()
+}
+
+/// Parse an optional UUID cursor from Mastodon collection query parameters.
+fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().map_err(|_| ()))
         .transpose()
 }
 
@@ -619,6 +666,105 @@ mod tests {
 
     #[test_context(AccountContext)]
     #[tokio::test]
+    /// Verifies follower collections expose Mastodon cursor pagination through Link headers.
+    async fn followers_collection_uses_cursor_pagination(context: &mut AccountContext) {
+        let (target_id, _target_token) =
+            context.create_account("target", "target@example.com").await;
+        let (_first_id, first_token) = context.create_account("first", "first@example.com").await;
+        let (_second_id, second_token) =
+            context.create_account("second", "second@example.com").await;
+        let (_third_id, third_token) = context.create_account("third", "third@example.com").await;
+        for token in [&first_token, &second_token, &third_token] {
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/accounts/{}/follow", target_id.0),
+                    token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let page = context
+            .get(&format!(
+                "/api/v1/accounts/{}/followers?limit=2",
+                target_id.0
+            ))
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let body = json_body(page).await;
+        assert_eq!(account_usernames(&body), ["third", "second"]);
+
+        let next = context
+            .get(&format!(
+                "/api/v1/accounts/{}/followers?limit=2&max_id={next_cursor}",
+                target_id.0
+            ))
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let body = json_body(next).await;
+        assert_eq!(account_usernames(&body), ["first"]);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Verifies following collections expose Mastodon cursor pagination through Link headers.
+    async fn following_collection_uses_cursor_pagination(context: &mut AccountContext) {
+        let (_first_id, first_token) = context.create_account("first", "first@example.com").await;
+        let (target_one, _token_one) = context.create_account("one", "one@example.com").await;
+        let (target_two, _token_two) = context.create_account("two", "two@example.com").await;
+        let (target_three, _token_three) =
+            context.create_account("three", "three@example.com").await;
+        for target in [target_one, target_two, target_three] {
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/accounts/{}/follow", target.0),
+                    &first_token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let first_account = context.get("/api/v1/accounts/lookup?acct=first").await;
+        let first_account = json_body(first_account).await;
+        let first_id = first_account["id"].as_str().unwrap();
+        let page = context
+            .get(&format!("/api/v1/accounts/{first_id}/following?limit=2"))
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let body = json_body(page).await;
+        assert_eq!(account_usernames(&body), ["three", "two"]);
+
+        let next = context
+            .get(&format!(
+                "/api/v1/accounts/{first_id}/following?limit=2&max_id={next_cursor}"
+            ))
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let body = json_body(next).await;
+        assert_eq!(account_usernames(&body), ["one"]);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Verifies malformed account collection cursors are rejected.
+    async fn account_collections_reject_invalid_cursors(context: &mut AccountContext) {
+        let (account_id, _token) = context.create_account("alice", "alice@example.com").await;
+        let response = context
+            .get(&format!(
+                "/api/v1/accounts/{}/followers?max_id=not-a-uuid",
+                account_id.0
+            ))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
     /// Verifies local follow edge cases use Mastodon-style status codes.
     async fn follow_rejects_self_and_missing_accounts(context: &mut AccountContext) {
         let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
@@ -640,6 +786,35 @@ mod tests {
 
         assert_eq!(self_follow.status(), StatusCode::BAD_REQUEST);
         assert_eq!(missing_follow.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Extract account usernames from a Mastodon account collection response.
+    fn account_usernames(body: &Value) -> Vec<&str> {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|account| account["username"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Extract a cursor query parameter from a Mastodon Link header.
+    fn link_cursor(response: &axum::http::Response<Body>, rel: &str, param: &str) -> String {
+        let link = response
+            .headers()
+            .get(header::LINK)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let segment = link
+            .split(',')
+            .find(|segment| segment.contains(&format!(r#"rel="{rel}""#)))
+            .unwrap();
+        let start = segment.find(&format!("{param}=")).unwrap() + param.len() + 1;
+        segment[start..]
+            .split(['&', '>'])
+            .next()
+            .unwrap()
+            .to_owned()
     }
 
     struct AccountContext {

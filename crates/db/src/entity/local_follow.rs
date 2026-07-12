@@ -5,6 +5,7 @@ use time::OffsetDateTime;
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "local_follow")]
 pub struct Model {
+    pub id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub follower_account_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]

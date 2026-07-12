@@ -68,7 +68,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses; media/tag/pin filters are empty until those features exist. |
-| 🟡 | Follow graph | Local follow/unfollow, relationships, followers, and following are implemented; remote follows are missing. |
+| 🟡 | Follow graph | Local follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote follows are missing. |
 
 ### Search
 
@@ -88,9 +88,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local `@username` mentions render as links and populate `mentions`; no notifications yet. |
 | 🟡 | Visibility semantics | Public/unlisted URL reads work; private/direct are owner-only until follow graph support exists. |
-| 🟡 | `GET /api/v1/favourites` | Returns authenticated user's local favourites; no cursor headers yet. |
+| 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local favourites with cursor pagination. |
 | 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
-| 🟡 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks; no cursor headers yet. |
+| 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
 | 🔴 | Boosts | Reblog/unreblog APIs are missing. |
 | 🟢 | Bookmarks | Bookmark/unbookmark APIs are implemented for local statuses. |
 
@@ -139,7 +139,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add federation delivery and inbound activity processing.
 - [ ] Add remote follow graph and full private-status home timeline semantics.
 - [ ] Add conversation endpoint support for replies.
-- [ ] Add collection pagination and boosts.
+- [ ] Add boosts.
 - [ ] Add persisted notifications and notification streaming.
 - [ ] Add media upload and attachment responses.
 - [ ] Add moderation APIs and domain policy.

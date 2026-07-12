@@ -10,6 +10,7 @@ mod m20260701_000005_create_local_status_table;
 mod m20260701_000006_create_local_status_favourite_table;
 mod m20260701_000007_create_local_status_bookmark_table;
 mod m20260701_000008_create_local_follow_table;
+mod m20260701_000009_add_collection_cursor_ids;
 
 pub struct Migrator;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000006_create_local_status_favourite_table::Migration),
             Box::new(m20260701_000007_create_local_status_bookmark_table::Migration),
             Box::new(m20260701_000008_create_local_follow_table::Migration),
+            Box::new(m20260701_000009_add_collection_cursor_ids::Migration),
         ]
     }
 }
