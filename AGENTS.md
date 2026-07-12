@@ -1,0 +1,20 @@
+# Repository Working Notes
+
+## Verification
+
+After making Rust code or manifest changes, run:
+
+```sh
+cargo fmt --all
+cargo clippy --all-targets
+```
+
+Keep this as the default verification command for changes in this repository.
+
+## Workspace Conventions
+
+- Keep dependency versions in the root `Cargo.toml` under `[workspace.dependencies]`.
+- Keep package metadata in the root `Cargo.toml` under `[workspace.package]`, including project version, Rust version, and license.
+- Current license: `Apache-2.0`.
+- Use SeaORM migrations as the canonical migration system from the start.
+- Keep SQLx available for explicit query paths where direct SQL is the clearer fit.

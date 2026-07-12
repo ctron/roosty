@@ -1,0 +1,29 @@
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+pub type Result<T, E = RoostError> = std::result::Result<T, E>;
+
+#[derive(Debug, Error)]
+pub enum RoostError {
+    #[error("configuration error: {0}")]
+    Configuration(String),
+
+    #[error("database error: {0}")]
+    Database(String),
+
+    #[error("operation is not implemented yet: {0}")]
+    NotImplemented(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct AccountId(pub Uuid);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct StatusId(pub Uuid);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct JobId(pub Uuid);

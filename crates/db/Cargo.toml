@@ -1,0 +1,13 @@
+[package]
+name = "roost-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+roost-core.workspace = true
+sea-orm.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
