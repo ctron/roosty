@@ -52,6 +52,12 @@ Create another local administrator:
 podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin create-user --username moderator --email moderator@example.com --admin
 ```
 
+Reset a local user's password and print a temporary replacement:
+
+```sh
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin reset-password --username alice
+```
+
 Elk is preset to use the local Roost instance. If it asks for an instance URL, use:
 
 ```text
@@ -78,7 +84,7 @@ Stop the stack:
 podman compose -f deploy/compose.yaml down
 ```
 
-Remove local volumes, including PostgreSQL data and Elk client settings:
+Remove local volumes, including PostgreSQL data, uploaded media, and Elk client settings:
 
 ```sh
 podman compose -f deploy/compose.yaml down -v

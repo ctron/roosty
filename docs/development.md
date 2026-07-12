@@ -38,6 +38,12 @@ Bootstrap the first administrator:
 podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin bootstrap --username admin --email admin@example.com
 ```
 
+Reset a local user's password and print a temporary replacement:
+
+```sh
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin reset-password --username admin
+```
+
 The local application listener is exposed through Caddy on `https://roost.localhost:4000`. When `ROOST_INFRA_LISTEN_ADDR` is set, infrastructure endpoints are served only from that listener:
 
 ```text
@@ -46,4 +52,4 @@ http://localhost:3001/readyz
 http://localhost:3001/metrics
 ```
 
-Elk stores local client settings in the `elk-data` compose volume. The backend does not serve, package, or embed Elk.
+Roost stores uploaded media in the `roost-media` compose volume. Elk stores local client settings in the `elk-data` compose volume. The backend does not serve, package, or embed Elk.

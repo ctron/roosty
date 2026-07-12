@@ -80,6 +80,14 @@ pub(crate) fn supported_image_mime_types() -> Vec<&'static str> {
         .collect()
 }
 
+/// Return whether a content type is one of the image types Roost accepts locally.
+pub(crate) fn supported_image_extension(content_type: &str) -> Option<&'static str> {
+    SUPPORTED_IMAGE_FORMATS
+        .iter()
+        .find(|format| format.content_type == content_type)
+        .map(|format| format.extension)
+}
+
 /// Build Mastodon-compatible media upload and serving routes.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -713,7 +721,7 @@ fn media_path(state: &AppState, relative_path: &str) -> PathBuf {
 }
 
 /// Build the public URL for a stored media file.
-fn media_url(state: &AppState, relative_path: &str) -> String {
+pub(crate) fn media_url(state: &AppState, relative_path: &str) -> String {
     state
         .config
         .public_base_url

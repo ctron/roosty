@@ -90,6 +90,12 @@ enum AdminCommand {
         #[arg(long)]
         admin: bool,
     },
+
+    /// Reset a local account password and print a temporary replacement.
+    ResetPassword {
+        #[arg(long)]
+        username: String,
+    },
 }
 
 #[tokio::main]
@@ -113,6 +119,7 @@ async fn main() -> Result<()> {
                 email,
                 admin,
             } => create_user(&username, &email, admin).await,
+            AdminCommand::ResetPassword { username } => reset_password(&username).await,
         },
     }
 }
@@ -175,6 +182,26 @@ async fn create_user(username: &str, email: &str, admin: bool) -> Result<()> {
     println!("Created local {role} account {account_id}");
     println!("Username: {username}");
     println!("Email: {email}");
+    println!("Temporary password: {temporary_password}");
+
+    Ok(())
+}
+
+/// Reset a local account password from an operator command.
+async fn reset_password(username: &str) -> Result<()> {
+    validate_username(username)?;
+
+    let database_url = database_url_from_env()?;
+    let db = roost_db::connect(&database_url).await?;
+    let temporary_password = password::generate_temporary_password();
+    let password_hash = password::hash_password(&temporary_password)?;
+
+    let account = roost_db::update_local_account_password_hash(&db, username, &password_hash)
+        .await?
+        .ok_or_else(|| RoostError::InvalidInput("local account does not exist".to_owned()))?;
+
+    println!("Reset password for local account {}", account.id.0);
+    println!("Username: {}", account.username);
     println!("Temporary password: {temporary_password}");
 
     Ok(())
@@ -376,6 +403,21 @@ mod tests {
         );
     }
 
+    /// Keeps the operator-facing password reset CLI shape stable.
+    #[test]
+    fn parses_reset_password_command() {
+        let cli = Cli::parse_from(["roost", "admin", "reset-password", "--username", "alice"]);
+
+        let parsed = match cli.command {
+            Command::Admin {
+                command: AdminCommand::ResetPassword { username },
+            } => Some(username),
+            _ => None,
+        };
+
+        assert_eq!(parsed, Some("alice".to_owned()));
+    }
+
     /// Verifies that operator-created users can be added after bootstrap with role metadata.
     #[tokio::test]
     async fn creates_additional_local_users_with_roles() {
@@ -423,6 +465,34 @@ mod tests {
             duplicate_email,
             Err(RoostError::InvalidInput(message)) if message == "email is already in use"
         ));
+
+        db.close().await.unwrap();
+        postgresql.drop_database(&database_name).await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given an existing account, replacing its hash makes only the new password valid.
+    #[tokio::test]
+    async fn resets_local_account_password_hash() {
+        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let old_hash = password::hash_password("old-password").unwrap();
+        roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &old_hash)
+            .await
+            .unwrap();
+        let new_hash = password::hash_password("new-password").unwrap();
+
+        let account = roost_db::update_local_account_password_hash(&db, "admin", &new_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let missing = roost_db::update_local_account_password_hash(&db, "missing", &new_hash)
+            .await
+            .unwrap();
+
+        assert_eq!(account.username, "admin");
+        assert!(password::verify_password("new-password", &account.password_hash).unwrap());
+        assert!(!password::verify_password("old-password", &account.password_hash).unwrap());
+        assert!(missing.is_none());
 
         db.close().await.unwrap();
         postgresql.drop_database(&database_name).await.unwrap();

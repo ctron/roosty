@@ -19,6 +19,8 @@ services:
       ROOST_FEDERATION_ENABLED: "false"
     ports:
       - "3001:3001"
+    volumes:
+      - roost-media:/var/lib/roost/media
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,3 +75,4 @@ volumes:
   caddy-data:
   elk-data:
   postgres-data:
+  roost-media:

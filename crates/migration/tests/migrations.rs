@@ -32,6 +32,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
     assert!(column_exists(database.connection(), "local_account", "default_visibility").await);
     assert!(column_exists(database.connection(), "local_account", "profile_fields").await);
+    assert!(column_exists(database.connection(), "local_account", "avatar_file_path").await);
+    assert!(column_exists(database.connection(), "local_account", "header_file_path").await);
     assert!(column_exists(database.connection(), "local_status", "deleted_at").await);
     assert!(column_exists(database.connection(), "local_status_favourite", "id").await);
     assert!(column_exists(database.connection(), "local_status_bookmark", "id").await);

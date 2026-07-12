@@ -60,7 +60,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟢 | `GET /api/v1/accounts/verify_credentials` | Returns local credential account. |
-| 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics and posting defaults. |
+| 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics, avatar/header images, and posting defaults. |
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
 | 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
 | 🟡 | `GET /api/v1/accounts/lookup` | Local username/address lookup only; no WebFinger resolution. |
@@ -84,6 +84,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `POST /api/v1/statuses` | Local text statuses only. |
 | 🟢 | `GET /api/v1/statuses/:id` | Local, non-deleted statuses. |
 | 🟡 | `GET /api/v1/statuses/:id/context` | Local ancestors and descendants only. |
+| 🟡 | `PUT /api/v1/statuses/:id` | Owner-only local text, sensitivity, spoiler, language, media IDs, and media alt/focus edits; polls and edit history are missing. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local `@username` mentions render as links and populate `mentions`; no notifications yet. |

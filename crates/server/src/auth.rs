@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::Path};
 
 use askama::Template;
 use axum::{
@@ -9,15 +9,19 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, patch, post},
 };
-use axum_params::Params;
+use axum_params::{Params, UploadFile};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use roost_core::{AccountId, RoostError};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeOwned, MapAccess, Visitor},
+};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
+use uuid::Uuid;
 
 use crate::{http::AppState, password};
 
@@ -671,6 +675,16 @@ struct UpdateCredentialsInput {
     default_language: Option<Option<String>>,
     default_quote_policy: Option<String>,
     profile_fields: Option<Value>,
+    avatar: Option<ProfileImageUpload>,
+    header: Option<ProfileImageUpload>,
+    avatar_file_path: Option<String>,
+    header_file_path: Option<String>,
+}
+
+/// Profile image upload bytes kept after axum-params temp files are dropped.
+struct ProfileImageUpload {
+    content_type: String,
+    bytes: Vec<u8>,
 }
 
 /// Account settings payload accepted by Mastodon's update credentials endpoint.
@@ -691,6 +705,74 @@ struct UpdateCredentialsParams {
     #[serde(rename = "source[quote_policy]")]
     source_quote_policy: Option<String>,
     fields_attributes: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_upload_file")]
+    avatar: Option<UploadFile>,
+    #[serde(default, deserialize_with = "deserialize_optional_upload_file")]
+    header: Option<UploadFile>,
+}
+
+/// Deserialize optional profile upload fields while accepting null-like text sentinels.
+fn deserialize_optional_upload_file<'de, D>(deserializer: D) -> Result<Option<UploadFile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_any(OptionalUploadFileVisitor)
+}
+
+struct OptionalUploadFileVisitor;
+
+impl<'de> Visitor<'de> for OptionalUploadFileVisitor {
+    type Value = Option<UploadFile>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a multipart upload file or a null-like text field")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_optional_upload_file(deserializer)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if matches!(value.trim(), "" | "null" | "undefined") {
+            Ok(None)
+        } else {
+            Err(E::custom("expected upload file"))
+        }
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value.as_str())
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        UploadFile::deserialize(de::value::MapAccessDeserializer::new(map)).map(Some)
+    }
 }
 
 /// Nested default posting settings from Mastodon profile update requests.
@@ -713,6 +795,8 @@ enum UpdateCredentialsError {
     QuotePolicy,
     #[error("source[language] is invalid")]
     Language,
+    #[error("profile image is invalid")]
+    ProfileImage,
 }
 
 impl<S> FromRequest<S> for UpdateCredentialsInput
@@ -728,6 +812,7 @@ where
                 .map_err(|error| bad_request(&format!("invalid request body: {error:?}")))?;
 
         update_credentials_input_from_params(params)
+            .await
             .map_err(|error| bad_request(&error.to_string()))
     }
 }
@@ -757,8 +842,20 @@ async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Res
 async fn update_credentials(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-    input: UpdateCredentialsInput,
+    mut input: UpdateCredentialsInput,
 ) -> Response {
+    if let Some(avatar) = input.avatar.take() {
+        match store_profile_image(&state, account.id, "avatar", avatar).await {
+            Ok(path) => input.avatar_file_path = Some(path),
+            Err(error) => return server_error(error),
+        }
+    }
+    if let Some(header) = input.header.take() {
+        match store_profile_image(&state, account.id, "header", header).await {
+            Ok(path) => input.header_file_path = Some(path),
+            Err(error) => return server_error(error),
+        }
+    }
     let update = match settings_update_from_input(input) {
         Ok(update) => update,
         Err(error) => return bad_request(&error.to_string()),
@@ -838,6 +935,16 @@ pub(crate) async fn account_response(
     let last_status_at = roost_db::last_local_status_at(&state.db, account.id)
         .await?
         .map(|timestamp| DateOnly(timestamp).to_string());
+    let avatar = account
+        .avatar_file_path
+        .as_deref()
+        .map(|path| crate::media::media_url(state, path))
+        .unwrap_or_default();
+    let header = account
+        .header_file_path
+        .as_deref()
+        .map(|path| crate::media::media_url(state, path))
+        .unwrap_or_default();
 
     Ok(AccountResponse {
         id: account.id.0.to_string(),
@@ -851,10 +958,10 @@ pub(crate) async fn account_response(
         created_at: "1970-01-01T00:00:00.000Z".to_owned(),
         note: account.note.clone(),
         url: account_url,
-        avatar: String::new(),
-        avatar_static: String::new(),
-        header: String::new(),
-        header_static: String::new(),
+        avatar: avatar.clone(),
+        avatar_static: avatar,
+        header: header.clone(),
+        header_static: header,
         fields: profile_fields.clone(),
         emojis: Vec::new(),
         followers_count,
@@ -925,14 +1032,22 @@ fn settings_update_from_input(
         default_language: input.default_language,
         default_quote_policy: input.default_quote_policy,
         profile_fields: input.profile_fields,
+        avatar_file_path: input.avatar_file_path,
+        header_file_path: input.header_file_path,
     })
 }
 
 /// Convert extracted account update parameters into an internal update request.
-fn update_credentials_input_from_params(
+async fn update_credentials_input_from_params(
     params: UpdateCredentialsParams,
 ) -> Result<UpdateCredentialsInput, UpdateCredentialsError> {
     let source = params.source.unwrap_or_default();
+    let avatar = profile_image_upload(params.avatar)
+        .await
+        .map_err(|_| UpdateCredentialsError::ProfileImage)?;
+    let header = profile_image_upload(params.header)
+        .await
+        .map_err(|_| UpdateCredentialsError::ProfileImage)?;
 
     Ok(UpdateCredentialsInput {
         display_name: params.display_name,
@@ -949,7 +1064,55 @@ fn update_credentials_input_from_params(
             .or_else(|| json_language(params.source_language.as_ref())),
         default_quote_policy: source.quote_policy.or(params.source_quote_policy),
         profile_fields: json_profile_fields(params.fields_attributes.as_ref()),
+        avatar,
+        header,
+        avatar_file_path: None,
+        header_file_path: None,
     })
+}
+
+/// Read an optional profile image upload before its temporary file is removed.
+async fn profile_image_upload(
+    upload: Option<UploadFile>,
+) -> Result<Option<ProfileImageUpload>, std::io::Error> {
+    let Some(upload) = upload else {
+        return Ok(None);
+    };
+    let mut file = upload.open().await?;
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+    Ok(Some(ProfileImageUpload {
+        content_type: upload.content_type,
+        bytes,
+    }))
+}
+
+/// Store a validated profile image under the local media root.
+async fn store_profile_image(
+    state: &AppState,
+    account_id: AccountId,
+    kind: &str,
+    upload: ProfileImageUpload,
+) -> Result<String, RoostError> {
+    let extension = crate::media::supported_image_extension(&upload.content_type)
+        .ok_or_else(|| RoostError::InvalidInput("profile image type is invalid".to_owned()))?;
+    image::load_from_memory(&upload.bytes)
+        .map_err(|error| RoostError::InvalidInput(format!("profile image is invalid: {error}")))?;
+
+    let relative_path = format!(
+        "accounts/{}/{}-{}.{}",
+        account_id.0.simple(),
+        kind,
+        Uuid::now_v7().simple(),
+        extension
+    );
+    let full_path = Path::new(&state.config.media_root).join(&relative_path);
+    if let Some(parent) = full_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(full_path, upload.bytes).await?;
+
+    Ok(relative_path)
 }
 
 /// Validate default status visibility values accepted by Mastodon clients.
@@ -1231,6 +1394,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Cursor,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1243,6 +1407,7 @@ mod tests {
             header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         },
     };
+    use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
     use roost_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
@@ -1767,6 +1932,84 @@ mod tests {
 
     #[test_context(EndpointContext)]
     #[tokio::test]
+    /// Given multipart profile images, stores avatar and header paths for account responses.
+    async fn update_credentials_persists_profile_images(context: &mut EndpointContext) {
+        let token = context.authenticated_token().await;
+        let boundary = "geckoformboundaryimages";
+        let avatar = encoded_test_image();
+        let header = encoded_test_image();
+        let mut body = Vec::new();
+        append_multipart_file(
+            &mut body,
+            boundary,
+            "avatar",
+            "avatar.png",
+            "image/png",
+            &avatar,
+        );
+        append_multipart_file(
+            &mut body,
+            boundary,
+            "header",
+            "header.png",
+            "image/png",
+            &header,
+        );
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let update_response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_body = json_body(update_response).await;
+        let avatar_url = update_body["avatar"].as_str().unwrap();
+        let header_url = update_body["header"].as_str().unwrap();
+        assert!(avatar_url.contains("/media_attachments/files/accounts/"));
+        assert!(header_url.contains("/media_attachments/files/accounts/"));
+        assert_eq!(update_body["avatar_static"], avatar_url);
+        assert_eq!(update_body["header_static"], header_url);
+
+        let credentials_response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let credentials_body = json_body(credentials_response).await;
+        assert_eq!(credentials_body["avatar"], avatar_url);
+        assert_eq!(credentials_body["header"], header_url);
+
+        let avatar_path = avatar_url.strip_prefix("https://localhost:4000").unwrap();
+        let served = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri(avatar_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(served.status(), StatusCode::OK);
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
     /// Given JSON profile metadata arrays, stores fields for later credential reads.
     async fn update_credentials_persists_json_profile_fields(context: &mut EndpointContext) {
         let token = context.authenticated_token().await;
@@ -1882,6 +2125,39 @@ mod tests {
         )
     }
 
+    /// Build a tiny valid PNG fixture for profile image uploads.
+    fn encoded_test_image() -> Vec<u8> {
+        let image = ImageBuffer::from_fn(2, 2, |x, y| {
+            if (x + y) % 2 == 0 {
+                Rgba([220_u8, 20, 60, 255])
+            } else {
+                Rgba([20_u8, 80, 220, 255])
+            }
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    /// Append one multipart file part to a test request body.
+    fn append_multipart_file(
+        body: &mut Vec<u8>,
+        boundary: &str,
+        name: &str,
+        filename: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+
     struct EndpointContext {
         postgresql: PostgreSQL,
         db: roost_db::DbConnection,
@@ -1931,7 +2207,7 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 object_storage_backend: "local".to_owned(),
-                media_root: "./media".to_owned(),
+                media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
                 registration_mode: "closed".to_owned(),
                 federation_enabled: false,
                 instance_name: "Roost Test".to_owned(),

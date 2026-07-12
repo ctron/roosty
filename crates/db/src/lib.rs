@@ -170,6 +170,10 @@ pub struct LocalAccount {
     pub default_quote_policy: String,
     /// Profile metadata fields.
     pub profile_fields: JsonValue,
+    /// Optional local avatar path relative to the media root.
+    pub avatar_file_path: Option<String>,
+    /// Optional local header image path relative to the media root.
+    pub header_file_path: Option<String>,
 }
 
 /// Mutable local account settings accepted from account update APIs.
@@ -195,6 +199,10 @@ pub struct LocalAccountSettingsUpdate {
     pub default_quote_policy: Option<String>,
     /// Profile metadata fields.
     pub profile_fields: Option<JsonValue>,
+    /// Optional replacement avatar path relative to the media root.
+    pub avatar_file_path: Option<String>,
+    /// Optional replacement header path relative to the media root.
+    pub header_file_path: Option<String>,
 }
 
 /// Local status data returned by status and timeline queries.
@@ -218,6 +226,8 @@ pub struct LocalStatus {
     pub in_reply_to_id: Option<StatusId>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
+    /// Last update timestamp.
+    pub updated_at: OffsetDateTime,
     /// Soft-delete timestamp.
     pub deleted_at: Option<OffsetDateTime>,
 }
@@ -239,6 +249,19 @@ pub struct NewLocalStatus {
     pub language: Option<String>,
     /// Optional local status this status replies to.
     pub in_reply_to_id: Option<StatusId>,
+}
+
+/// Mutable local status fields accepted by Mastodon status edit APIs.
+#[derive(Clone, Debug, Default)]
+pub struct LocalStatusUpdate {
+    /// Optional replacement plain text content.
+    pub content: Option<String>,
+    /// Optional replacement sensitivity flag.
+    pub sensitive: Option<bool>,
+    /// Optional replacement content warning text.
+    pub spoiler_text: Option<String>,
+    /// Optional replacement language tag.
+    pub language: Option<Option<String>>,
 }
 
 /// Stored local media attachment metadata.
@@ -335,6 +358,17 @@ pub struct LocalMediaPreviewUpdate {
     pub preview_height: i32,
     /// Blurhash generated from the preview image.
     pub blurhash: String,
+}
+
+/// Mutable media metadata accepted while editing an owned local status.
+#[derive(Clone, Debug)]
+pub struct LocalStatusMediaAttributeUpdate {
+    /// Media attachment identifier.
+    pub media_id: Uuid,
+    /// Optional replacement accessible media description.
+    pub description: Option<Option<String>>,
+    /// Optional replacement focal point.
+    pub focus: Option<(f64, f64)>,
 }
 
 /// Cursor filters accepted by local timeline queries.
@@ -663,9 +697,35 @@ pub async fn update_local_account_settings(
         update.default_quote_policy,
     );
     set_if_some(&mut active.profile_fields, update.profile_fields);
+    if let Some(path) = update.avatar_file_path {
+        active.avatar_file_path = Set(Some(path));
+    }
+    if let Some(path) = update.header_file_path {
+        active.header_file_path = Set(Some(path));
+    }
     active.updated_at = Set(OffsetDateTime::now_utc());
 
     Ok(local_account_from_model(active.update(db).await?))
+}
+
+/// Replace a local account password hash by username for operator password resets.
+pub async fn update_local_account_password_hash(
+    db: &DbConnection,
+    username: &str,
+    password_hash: &str,
+) -> Result<Option<LocalAccount>> {
+    let Some(account) = local_account::Entity::find()
+        .filter(local_account::Column::Username.eq(username))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active = account.into_active_model();
+    active.password_hash = Set(password_hash.to_owned());
+    active.updated_at = Set(OffsetDateTime::now_utc());
+
+    Ok(Some(local_account_from_model(active.update(db).await?)))
 }
 
 /// Create a local status authored by an account on this instance.
@@ -760,6 +820,112 @@ pub async fn create_local_status_with_media(
 
     txn.commit().await?;
     Ok(local_status_from_model(status))
+}
+
+/// Update an owned local status and its attached media metadata.
+pub async fn update_owned_local_status(
+    db: &DbConnection,
+    status_id: StatusId,
+    account_id: AccountId,
+    update: LocalStatusUpdate,
+    media_ids: Option<&[Uuid]>,
+    media_attributes: &[LocalStatusMediaAttributeUpdate],
+) -> Result<Option<LocalStatus>> {
+    let txn = db.begin().await?;
+    let Some(status) = local_status::Entity::find_by_id(status_id.0)
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .one(&txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(media_ids) = media_ids {
+        for media_id in media_ids {
+            let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
+                .one(&txn)
+                .await?
+            else {
+                return Err(RoostError::InvalidInput(
+                    "media attachment not found".to_owned(),
+                ));
+            };
+            let available = media
+                .status_id
+                .is_none_or(|existing| existing == status_id.0);
+            if media.account_id != account_id.0 || !available {
+                return Err(RoostError::InvalidInput(
+                    "media attachment is not available".to_owned(),
+                ));
+            }
+        }
+
+        let keep = media_ids.to_vec();
+        let current = local_media_attachment::Entity::find()
+            .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
+            .all(&txn)
+            .await?;
+        for media in current {
+            if !keep.contains(&media.id) {
+                let mut active = media.into_active_model();
+                active.status_id = Set(None);
+                active.status_order = Set(0);
+                active.updated_at = Set(OffsetDateTime::now_utc());
+                active.update(&txn).await?;
+            }
+        }
+
+        for (index, media_id) in media_ids.iter().enumerate() {
+            let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
+                .one(&txn)
+                .await?
+            else {
+                return Err(RoostError::InvalidInput(
+                    "media attachment not found".to_owned(),
+                ));
+            };
+            let mut active = media.into_active_model();
+            active.status_id = Set(Some(status_id.0));
+            active.status_order = Set(index as i32);
+            active.updated_at = Set(OffsetDateTime::now_utc());
+            active.update(&txn).await?;
+        }
+    }
+
+    for attribute in media_attributes {
+        let Some(media) = local_media_attachment::Entity::find_by_id(attribute.media_id)
+            .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+            .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
+            .one(&txn)
+            .await?
+        else {
+            return Err(RoostError::InvalidInput(
+                "media attachment is not available".to_owned(),
+            ));
+        };
+        let mut active = media.into_active_model();
+        if let Some(description) = &attribute.description {
+            active.description = Set(description.clone());
+        }
+        if let Some((focus_x, focus_y)) = attribute.focus {
+            active.focus_x = Set(Some(focus_x));
+            active.focus_y = Set(Some(focus_y));
+        }
+        active.updated_at = Set(OffsetDateTime::now_utc());
+        active.update(&txn).await?;
+    }
+
+    let mut active = status.into_active_model();
+    set_if_some(&mut active.content, update.content);
+    set_if_some(&mut active.sensitive, update.sensitive);
+    set_if_some(&mut active.spoiler_text, update.spoiler_text);
+    set_if_some(&mut active.language, update.language);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    let status = active.update(&txn).await?;
+
+    txn.commit().await?;
+    Ok(Some(local_status_from_model(status)))
 }
 
 /// Create local media metadata after the uploaded file has been stored.
@@ -1606,6 +1772,8 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         default_language: account.default_language,
         default_quote_policy: account.default_quote_policy,
         profile_fields: account.profile_fields,
+        avatar_file_path: account.avatar_file_path,
+        header_file_path: account.header_file_path,
     }
 }
 
@@ -1630,6 +1798,7 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         language: status.language,
         in_reply_to_id: status.in_reply_to_id.map(StatusId),
         created_at: status.created_at,
+        updated_at: status.updated_at,
         deleted_at: status.deleted_at,
     }
 }

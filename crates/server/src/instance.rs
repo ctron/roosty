@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use crate::{config::Config, http::AppState, media};
 
 const NODEINFO_REL_2_1: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
+const IMAGE_MATRIX_LIMIT: u64 = 4096 * 4096;
 
 /// Build public instance discovery and metadata routes.
 pub fn router() -> Router<AppState> {
@@ -179,7 +180,7 @@ fn configuration(config: &Config) -> Value {
         "media_attachments": {
             "supported_mime_types": media::supported_image_mime_types(),
             "image_size_limit": 10485760,
-            "image_matrix_limit": 0,
+            "image_matrix_limit": IMAGE_MATRIX_LIMIT,
             "video_size_limit": 0,
             "video_frame_rate_limit": 0,
             "video_matrix_limit": 0,
@@ -286,6 +287,10 @@ mod tests {
         assert_eq!(
             body["configuration"]["urls"]["streaming"],
             "wss://roost.localhost:4000/api/v1/streaming"
+        );
+        assert_eq!(
+            body["configuration"]["media_attachments"]["image_matrix_limit"],
+            IMAGE_MATRIX_LIMIT
         );
     }
 

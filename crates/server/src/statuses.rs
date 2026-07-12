@@ -30,7 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/statuses", post(create_status))
         .route(
             "/api/v1/statuses/{status_id}",
-            get(show_status).delete(delete_status),
+            get(show_status).put(update_status).delete(delete_status),
         )
         .route("/api/v1/statuses/{status_id}/context", get(status_context))
         .route(
@@ -73,6 +73,8 @@ enum StatusInputError {
     MediaId,
     #[error("too many media attachments")]
     TooManyMedia,
+    #[error("media attribute is invalid")]
+    MediaAttribute,
 }
 
 #[derive(Deserialize)]
@@ -107,17 +109,29 @@ struct StatusInput {
     status: Option<String>,
     visibility: Option<String>,
     sensitive: Option<bool>,
+    #[serde(alias = "spoilerText")]
     spoiler_text: Option<String>,
     language: Option<String>,
+    #[serde(alias = "inReplyToId")]
     in_reply_to_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "mediaIds")]
     media_ids: Vec<String>,
+    #[serde(default, alias = "mediaAttributes")]
+    media_attributes: Vec<MediaAttributeInput>,
+}
+
+#[derive(Deserialize)]
+struct MediaAttributeInput {
+    id: String,
+    description: Option<String>,
+    focus: Option<String>,
 }
 
 #[derive(Serialize)]
 struct StatusResponse {
     id: String,
     created_at: String,
+    edited_at: Option<String>,
     in_reply_to_id: Option<String>,
     in_reply_to_account_id: Option<String>,
     sensitive: bool,
@@ -208,6 +222,12 @@ async fn create_status(
         Ok(media_ids) => media_ids,
         Err(error) => return bad_request(&error.to_string()),
     };
+    if let Err(error) = validate_status_text(
+        input.status.as_deref().unwrap_or_default(),
+        !media_ids.is_empty(),
+    ) {
+        return bad_request(&error.to_string());
+    }
 
     let visibility = input
         .visibility
@@ -266,6 +286,70 @@ async fn show_status(
         }
         Ok(None) => not_found(),
         Ok(Some(_)) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn update_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+    request: axum::extract::Request,
+) -> Response {
+    let status_id = StatusId(path.status_id);
+    match roost_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) if status.account_id == account.id && status.deleted_at.is_none() => {}
+        Ok(Some(_)) | Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+    let input = match parse_status_input(request).await {
+        Ok(input) => input,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let media_ids = match parse_media_ids(&input.media_ids) {
+        Ok(media_ids) => media_ids,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let media_ids = (!input.media_ids.is_empty()).then_some(media_ids);
+    let media_attributes = match parse_media_attributes(&input.media_attributes) {
+        Ok(attributes) => attributes,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let has_media = match media_ids.as_ref() {
+        Some(media_ids) => !media_ids.is_empty(),
+        None => match roost_db::local_status_has_media(&state.db, status_id).await {
+            Ok(has_media) => has_media,
+            Err(error) => return server_error(error),
+        },
+    };
+    if let Some(status) = input.status.as_deref()
+        && let Err(error) = validate_status_text(status, has_media)
+    {
+        return bad_request(&error.to_string());
+    }
+
+    let update = roost_db::LocalStatusUpdate {
+        content: input.status.map(|status| status.trim().to_owned()),
+        sensitive: input.sensitive,
+        spoiler_text: input.spoiler_text,
+        language: input.language.map(Some),
+    };
+    match roost_db::update_owned_local_status(
+        &state.db,
+        status_id,
+        account.id,
+        update,
+        media_ids.as_deref(),
+        &media_attributes,
+    )
+    .await
+    {
+        Ok(Some(status)) => match status_response(&state, status, account).await {
+            Ok(status) => Json(status).into_response(),
+            Err(error) => server_error(error),
+        },
+        Ok(None) => not_found(),
+        Err(RoostError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
 }
@@ -453,10 +537,6 @@ async fn parse_status_input(
             .map_err(|error| StatusInputError::Form(error.to_string()))?
     };
 
-    validate_status_text(
-        input.status.as_deref().unwrap_or_default(),
-        !input.media_ids.is_empty(),
-    )?;
     Ok(input)
 }
 
@@ -490,6 +570,69 @@ fn parse_media_ids(values: &[String]) -> Result<Vec<Uuid>, StatusInputError> {
         media_ids.push(media_id);
     }
     Ok(media_ids)
+}
+
+/// Parse media metadata updates accepted by Mastodon status edit requests.
+fn parse_media_attributes(
+    values: &[MediaAttributeInput],
+) -> Result<Vec<roost_db::LocalStatusMediaAttributeUpdate>, StatusInputError> {
+    let mut seen = HashSet::new();
+    let mut attributes = Vec::with_capacity(values.len());
+    for value in values {
+        let media_id = value
+            .id
+            .trim()
+            .parse::<Uuid>()
+            .map_err(|_| StatusInputError::MediaAttribute)?;
+        if !seen.insert(media_id) {
+            return Err(StatusInputError::MediaAttribute);
+        }
+        let description = match &value.description {
+            Some(description) => Some(
+                normalize_media_description(Some(description.clone()))
+                    .map_err(|_| StatusInputError::MediaAttribute)?,
+            ),
+            None => None,
+        };
+        let focus = parse_media_focus(value.focus.as_deref())
+            .map_err(|_| StatusInputError::MediaAttribute)?;
+        attributes.push(roost_db::LocalStatusMediaAttributeUpdate {
+            media_id,
+            description,
+            focus,
+        });
+    }
+
+    Ok(attributes)
+}
+
+/// Normalize media alt text sent through status edit media attributes.
+fn normalize_media_description(value: Option<String>) -> Result<Option<String>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.chars().count() > 1500 {
+        return Err(());
+    }
+    let value = value.trim().to_owned();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+/// Parse Mastodon's media focus field from status edit media attributes.
+fn parse_media_focus(value: Option<&str>) -> Result<Option<(f64, f64)>, ()> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((x, y)) = value.split_once(',') else {
+        return Err(());
+    };
+    let x = x.trim().parse::<f64>().map_err(|_| ())?;
+    let y = y.trim().parse::<f64>().map_err(|_| ())?;
+    if (-1.0..=1.0).contains(&x) && (-1.0..=1.0).contains(&y) {
+        Ok(Some((x, y)))
+    } else {
+        Err(())
+    }
 }
 
 /// Validate Mastodon visibility values accepted for local statuses.
@@ -702,6 +845,8 @@ async fn status_response_for_viewer(
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.created_at),
+        edited_at: (status.updated_at != status.created_at)
+            .then(|| format_timestamp(status.updated_at)),
         in_reply_to_id: status.in_reply_to_id.map(|id| id.0.to_string()),
         in_reply_to_account_id,
         sensitive: status.sensitive,
@@ -1690,6 +1835,146 @@ mod tests {
         assert_eq!(update["meta"]["original"]["size"], "3x2");
         assert_eq!(update["meta"]["small"]["size"], "2x4");
         assert_ne!(upload["blurhash"], update["blurhash"]);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given unattached media, updating description persists alt text into status responses.
+    async fn media_update_persists_description(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Png);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "avatar.png",
+                    "image/png",
+                    &image,
+                )],
+            )
+            .await;
+        let upload = json_body(upload).await;
+        let media_id = upload["id"].as_str().unwrap();
+
+        let update = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/media/{media_id}"),
+                &token,
+                serde_json::json!({ "description": "Alt test" }),
+            )
+            .await;
+
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(json_body(update).await["description"], "Alt test");
+
+        let status = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &token,
+                serde_json::json!({
+                    "status": "",
+                    "media_ids": [media_id]
+                }),
+            )
+            .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(status).await["media_attachments"][0]["description"],
+            "Alt test"
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an owned status, the Mastodon edit endpoint updates text and edit metadata.
+    async fn status_update_persists_text_changes(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "original text", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let update = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &token,
+                serde_json::json!({
+                    "status": "edited text",
+                    "sensitive": true,
+                    "spoiler_text": "warning",
+                    "language": "en"
+                }),
+            )
+            .await;
+
+        assert_eq!(update.status(), StatusCode::OK);
+        let update = json_body(update).await;
+        assert_eq!(update["content"], "<p>edited text</p>");
+        assert_eq!(update["sensitive"], true);
+        assert_eq!(update["spoiler_text"], "warning");
+        assert_eq!(update["language"], "en");
+        assert!(update["edited_at"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an owned status with media, status edit media attributes persist alt text.
+    async fn status_update_persists_media_attributes(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Png);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "avatar.png",
+                    "image/png",
+                    &image,
+                )],
+            )
+            .await;
+        let upload = json_body(upload).await;
+        let media_id = upload["id"].as_str().unwrap();
+        let status = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &token,
+                serde_json::json!({
+                    "status": "",
+                    "media_ids": [media_id]
+                }),
+            )
+            .await;
+        let status = json_body(status).await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let update = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &token,
+                serde_json::json!({
+                    "media_attributes": [{
+                        "id": media_id,
+                        "description": "Alt test",
+                        "focus": "0.1,-0.2"
+                    }]
+                }),
+            )
+            .await;
+
+        assert_eq!(update.status(), StatusCode::OK);
+        let update = json_body(update).await;
+        assert_eq!(update["media_attachments"][0]["description"], "Alt test");
+        assert_eq!(update["media_attachments"][0]["meta"]["focus"]["x"], 0.1);
+        assert_eq!(update["media_attachments"][0]["meta"]["focus"]["y"], -0.2);
     }
 
     #[test_context(StatusContext)]

@@ -21,6 +21,8 @@ pub struct Model {
     pub default_language: Option<String>,
     pub default_quote_policy: String,
     pub profile_fields: Json,
+    pub avatar_file_path: Option<String>,
+    pub header_file_path: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
