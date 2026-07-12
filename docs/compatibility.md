@@ -62,9 +62,18 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/accounts/verify_credentials` | Returns local credential account. |
 | 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics and posting defaults. |
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
+| 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
 | 🟢 | Status metadata | Local `statuses_count` and `last_status_at` are populated. |
+| 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🔴 | `GET /api/v1/accounts/:id` | Public account lookup is missing. |
 | 🔴 | Account statuses | `GET /api/v1/accounts/:id/statuses` is missing. |
+
+### Search
+
+| Support | Area | Details |
+| --- | --- | --- |
+| 🟡 | `GET /api/v2/search` | Local account results for `type=accounts`; statuses and hashtags are empty. |
+| 🔴 | Remote account resolution | `resolve=true` does not fetch remote accounts until WebFinger exists. |
 
 ### Statuses
 
@@ -75,6 +84,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/statuses/:id/context` | Local ancestors and descendants only. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
+| 🟡 | Mentions | Local `@username` mentions render as links and populate `mentions`; no notifications yet. |
 | 🟡 | Visibility semantics | Public/unlisted URL reads work; private/direct are owner-only until follow graph support exists. |
 | 🟡 | `GET /api/v1/favourites` | Returns authenticated user's local favourites; no cursor headers yet. |
 | 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
@@ -116,7 +126,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/streaming` | WebSocket auth works; in-process only. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
-| 🟢 | `update` events | Sent after local status creation with `stream`, `event`, and JSON-string `payload`. |
+| 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
 | 🔴 | `notification` and `delete` events | Not emitted yet. |
 | 🔴 | Multi-process fan-out | No Redis/Postgres pub-sub backend yet. |

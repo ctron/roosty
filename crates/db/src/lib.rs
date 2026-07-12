@@ -58,19 +58,7 @@ pub async fn create_bootstrap_admin(
         ));
     }
 
-    let account_id = Uuid::now_v7();
-    local_account::ActiveModel {
-        id: Set(account_id),
-        username: Set(username.to_owned()),
-        email: Set(email.to_owned()),
-        password_hash: Set(password_hash.to_owned()),
-        is_admin: Set(true),
-        ..Default::default()
-    }
-    .insert(db)
-    .await?;
-
-    Ok(account_id)
+    insert_local_account(db, username, email, password_hash, true).await
 }
 
 /// Create a non-admin local account.
@@ -80,19 +68,73 @@ pub async fn create_local_account(
     email: &str,
     password_hash: &str,
 ) -> Result<Uuid> {
+    insert_local_account(db, username, email, password_hash, false).await
+}
+
+/// Create an administrator local account after bootstrap.
+pub async fn create_admin_account(
+    db: &DbConnection,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+) -> Result<Uuid> {
+    insert_local_account(db, username, email, password_hash, true).await
+}
+
+/// Insert a local account after checking user-facing unique account fields.
+async fn insert_local_account(
+    db: &DbConnection,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    is_admin: bool,
+) -> Result<Uuid> {
+    ensure_local_account_available(db, username, email).await?;
+
     let account_id = Uuid::now_v7();
     local_account::ActiveModel {
         id: Set(account_id),
         username: Set(username.to_owned()),
         email: Set(email.to_owned()),
         password_hash: Set(password_hash.to_owned()),
-        is_admin: Set(false),
+        is_admin: Set(is_admin),
         ..Default::default()
     }
     .insert(db)
     .await?;
 
     Ok(account_id)
+}
+
+/// Reject account creation when the requested username or email is already in use.
+async fn ensure_local_account_available(
+    db: &DbConnection,
+    username: &str,
+    email: &str,
+) -> Result<()> {
+    if local_account::Entity::find()
+        .filter(local_account::Column::Username.eq(username))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(RoostError::InvalidInput(
+            "username is already in use".to_owned(),
+        ));
+    }
+
+    if local_account::Entity::find()
+        .filter(local_account::Column::Email.eq(email))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(RoostError::InvalidInput(
+            "email is already in use".to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Local account data used by authentication and account API responses.
@@ -269,6 +311,45 @@ pub async fn find_local_account_by_id(
         .await?;
 
     Ok(account.map(local_account_from_model))
+}
+
+/// Find a local account by its exact local username.
+pub async fn find_local_account_by_username(
+    db: &DbConnection,
+    username: &str,
+) -> Result<Option<LocalAccount>> {
+    let account = local_account::Entity::find()
+        .filter(local_account::Column::Username.eq(username))
+        .one(db)
+        .await?;
+
+    Ok(account.map(local_account_from_model))
+}
+
+/// Search local accounts by username or display name for Mastodon autocomplete.
+pub async fn search_local_accounts(
+    db: &DbConnection,
+    query: &str,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<LocalAccount>> {
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let accounts = local_account::Entity::find()
+        .filter(
+            local_account::Column::Username
+                .contains(query)
+                .or(local_account::Column::DisplayName.contains(query)),
+        )
+        .order_by_asc(local_account::Column::Username)
+        .limit(limit)
+        .offset(offset)
+        .all(db)
+        .await?;
+
+    Ok(accounts.into_iter().map(local_account_from_model).collect())
 }
 
 /// Update mutable local account settings and return the refreshed account.

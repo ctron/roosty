@@ -40,6 +40,18 @@ Bootstrap the first administrator:
 podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin bootstrap --username admin --email admin@example.com
 ```
 
+Create another local user:
+
+```sh
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin create-user --username alice --email alice@example.com
+```
+
+Create another local administrator:
+
+```sh
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin create-user --username moderator --email moderator@example.com --admin
+```
+
 Elk is preset to use the local Roost instance. If it asks for an instance URL, use:
 
 ```text

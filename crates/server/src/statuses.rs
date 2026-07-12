@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use axum::{
     Json, Router,
@@ -223,10 +223,15 @@ async fn create_status(
         in_reply_to_id,
     };
 
+    let author_id = account.id;
     match roost_db::create_local_status(&state.db, new_status).await {
         Ok(status) => match status_response(&state, status, account).await {
             Ok(response) => {
-                state.streaming_events.publish_update(&response);
+                state.streaming_events.publish_status_update(
+                    &response,
+                    author_id,
+                    &response.visibility,
+                );
                 (StatusCode::OK, Json(response)).into_response()
             }
             Err(error) => server_error(error),
@@ -607,10 +612,8 @@ async fn status_response_for_viewer(
     let in_reply_to_account_id = reply_target
         .as_ref()
         .map(|target| target.account_id.0.to_string());
-    let mentions = reply_target
-        .as_ref()
-        .map(|target| vec![MentionResponse::new(state, &target.account)])
-        .unwrap_or_default();
+    let text_mentions = local_text_mentions(state, &status.content).await?;
+    let mentions = status_mentions(state, reply_target.as_ref(), &text_mentions);
     let replies_count = roost_db::count_local_replies(&state.db, status.id).await?;
     let favourites_count = roost_db::count_local_favourites(&state.db, status.id).await?;
     let favourited = match viewer {
@@ -637,7 +640,7 @@ async fn status_response_for_viewer(
         language: status.language,
         uri: url.clone(),
         url,
-        content: status_content_html(&status.content),
+        content: status_content_html_with_mentions(state, &status.content, &text_mentions),
         account: account_response(state, account).await?,
         media_attachments: Vec::new(),
         mentions,
@@ -654,6 +657,51 @@ async fn status_response_for_viewer(
         reblog: None,
         application: None,
     })
+}
+
+/// Resolve local `@username` references present in status text.
+async fn local_text_mentions(
+    state: &AppState,
+    content: &str,
+) -> Result<Vec<roost_db::LocalAccount>, RoostError> {
+    let mut accounts = Vec::new();
+    let mut seen = HashSet::new();
+
+    for username in mention_usernames(content) {
+        if !seen.insert(username.clone()) {
+            continue;
+        }
+        if let Some(account) =
+            roost_db::find_local_account_by_username(&state.db, &username).await?
+        {
+            accounts.push(account);
+        }
+    }
+
+    Ok(accounts)
+}
+
+/// Build the combined Mastodon mentions array without duplicate accounts.
+fn status_mentions(
+    state: &AppState,
+    reply_target: Option<&ReplyTarget>,
+    text_mentions: &[roost_db::LocalAccount],
+) -> Vec<MentionResponse> {
+    let mut mentions = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(target) = reply_target {
+        seen.insert(target.account_id);
+        mentions.push(MentionResponse::new(state, &target.account));
+    }
+
+    for account in text_mentions {
+        if seen.insert(account.id) {
+            mentions.push(MentionResponse::new(state, account));
+        }
+    }
+
+    mentions
 }
 
 /// Load the account targeted by a local reply, if the status is a reply.
@@ -779,9 +827,119 @@ fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) ->
         || viewer.is_some_and(|account_id| account_id == status.account_id)
 }
 
+#[cfg(test)]
 fn status_content_html(content: &str) -> String {
-    let escaped = escape_html(content).replace('\n', "<br />");
+    let mut escaped = String::new();
+    push_escaped_html_with_breaks(&mut escaped, content);
     format!("<p>{escaped}</p>")
+}
+
+fn status_content_html_with_mentions(
+    state: &AppState,
+    content: &str,
+    mentions: &[roost_db::LocalAccount],
+) -> String {
+    let mention_urls = mentions
+        .iter()
+        .map(|account| {
+            (
+                account.username.as_str(),
+                public_url(state, &format!("@{}", account.username)),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let matches = local_mention_matches(content);
+    let mut html = String::new();
+    let mut last = 0;
+
+    for mention in matches {
+        push_escaped_html_with_breaks(&mut html, &content[last..mention.start]);
+        if let Some(url) = mention_urls.get(mention.username.as_str()) {
+            html.push_str(r#"<a href=""#);
+            html.push_str(&escape_html(url));
+            html.push_str(r#"" class="u-url mention">@"#);
+            html.push_str(&escape_html(&mention.username));
+            html.push_str("</a>");
+        } else {
+            push_escaped_html_with_breaks(&mut html, &content[mention.start..mention.end]);
+        }
+        last = mention.end;
+    }
+
+    push_escaped_html_with_breaks(&mut html, &content[last..]);
+    format!("<p>{html}</p>")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MentionMatch {
+    start: usize,
+    end: usize,
+    username: String,
+}
+
+/// Return local mention usernames in first-seen order.
+fn mention_usernames(content: &str) -> Vec<String> {
+    local_mention_matches(content)
+        .into_iter()
+        .map(|mention| mention.username)
+        .collect()
+}
+
+/// Locate syntactic local `@username` mentions in a plain-text status.
+fn local_mention_matches(content: &str) -> Vec<MentionMatch> {
+    let mut matches = Vec::new();
+    let mut previous = None;
+    let mut iter = content.char_indices().peekable();
+
+    while let Some((start, character)) = iter.next() {
+        if character != '@' || !valid_mention_prefix(previous) {
+            previous = Some(character);
+            continue;
+        }
+
+        let mut end = start + character.len_utf8();
+        let mut username = String::new();
+        while let Some((index, next)) = iter.peek().copied() {
+            if !valid_mention_name_character(next) {
+                break;
+            }
+            iter.next();
+            end = index + next.len_utf8();
+            username.push(next);
+        }
+
+        if (2..=30).contains(&username.len()) {
+            matches.push(MentionMatch {
+                start,
+                end,
+                username,
+            });
+        }
+        previous = content[start..end].chars().last();
+    }
+
+    matches
+}
+
+fn valid_mention_prefix(previous: Option<char>) -> bool {
+    previous.is_none_or(|character| {
+        !(character.is_ascii_alphanumeric() || character == '_' || character == '@')
+    })
+}
+
+fn valid_mention_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+fn push_escaped_html_with_breaks(output: &mut String, value: &str) {
+    for segment in value.split_inclusive('\n') {
+        if let Some(stripped) = segment.strip_suffix('\n') {
+            output.push_str(&escape_html(stripped));
+            output.push_str("<br />");
+        } else {
+            output.push_str(&escape_html(segment));
+        }
+    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -873,7 +1031,7 @@ mod tests {
     use test_context::{AsyncTestContext, test_context};
     use tower::ServiceExt;
 
-    use super::{escape_html, status_content_html, timeline_limit};
+    use super::{escape_html, mention_usernames, status_content_html, timeline_limit};
     use crate::{config::Config, http::AppState, password};
 
     #[test_context(StatusContext)]
@@ -909,6 +1067,50 @@ mod tests {
         let public = context.get("/api/v1/timelines/public?limit=30").await;
         assert_eq!(public.status(), StatusCode::OK);
         assert_eq!(json_body(public).await.as_array().unwrap().len(), 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies that home timelines do not include unrelated local accounts.
+    async fn home_timeline_is_scoped_to_authenticated_account(context: &mut StatusContext) {
+        let first_token = context.access_token().await;
+        let second_token = context.access_token_for("other", "other@example.com").await;
+
+        let first_status = context
+            .create_status(&first_token, "first user", None, None)
+            .await;
+        context
+            .create_status(&second_token, "second user", None, None)
+            .await;
+
+        let first_home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home?limit=30", &first_token)
+                .await,
+        )
+        .await;
+
+        assert_eq!(first_home.as_array().unwrap().len(), 1);
+        assert_eq!(first_home[0]["id"], first_status["id"]);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies that local text mentions populate Mastodon mention metadata.
+    async fn local_mentions_are_linked_and_returned(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        context.access_token_for("alice", "alice@example.com").await;
+
+        let status = context
+            .create_status(&token, "hello @alice and @missing", None, None)
+            .await;
+
+        assert_eq!(status["mentions"].as_array().unwrap().len(), 1);
+        assert_eq!(status["mentions"][0]["username"], "alice");
+        assert!(status["content"].as_str().unwrap().contains(
+            r#"<a href="https://localhost:4000/@alice" class="u-url mention">@alice</a>"#
+        ));
+        assert!(status["content"].as_str().unwrap().contains("@missing"));
     }
 
     #[test_context(StatusContext)]
@@ -1408,6 +1610,10 @@ mod tests {
         assert_eq!(timeline_limit(Some(100)), 40);
         assert_eq!(escape_html("<&>'\""), "&lt;&amp;&gt;&#39;&quot;");
         assert_eq!(status_content_html("a\nb"), "<p>a<br />b</p>");
+        assert_eq!(
+            mention_usernames("@alice test x@y @bo_b"),
+            ["alice", "bo_b"]
+        );
     }
 
     struct StatusContext {

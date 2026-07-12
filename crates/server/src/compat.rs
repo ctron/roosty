@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use roost_core::AccountId;
+
 use crate::{
     auth::{self, AuthenticatedAccount},
     http::AppState,
@@ -70,20 +72,22 @@ async fn streaming(
     let Some(token) = streaming_token(&headers, &query) else {
         return unauthorized().into_response();
     };
-    if let Err(response) = auth::account_from_bearer_token(&state, &token).await {
-        return response;
-    }
+    let account = match auth::account_from_bearer_token(&state, &token).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
 
     let stream = query.get("stream").cloned();
     let events = state.streaming_events.clone();
     websocket
-        .on_upgrade(move |socket| handle_streaming_socket(socket, stream, events))
+        .on_upgrade(move |socket| handle_streaming_socket(socket, account.id, stream, events))
         .into_response()
 }
 
 /// Keep a validated streaming socket open until the client closes it.
 async fn handle_streaming_socket(
     mut socket: WebSocket,
+    account_id: AccountId,
     initial_stream: Option<String>,
     events: crate::streaming::StreamingEvents,
 ) {
@@ -115,8 +119,9 @@ async fn handle_streaming_socket(
             event = receiver.recv() => {
                 match event {
                     Ok(event) => {
-                        let message = match event.to_socket_message(&streams) {
-                            Ok(message) => message,
+                        let message = match event.to_socket_message(account_id, &streams) {
+                            Ok(Some(message)) => message,
+                            Ok(None) => continue,
                             Err(error) => {
                                 warn!(%error, "failed to serialize streaming socket message");
                                 continue;

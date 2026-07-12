@@ -43,6 +43,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::auth::router())
         .merge(crate::compat::router())
         .merge(crate::instance::router())
+        .merge(crate::search::router())
         .merge(crate::statuses::router())
         .fallback(public_fallback)
         .layer(

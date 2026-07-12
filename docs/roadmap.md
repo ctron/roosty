@@ -19,6 +19,8 @@
 ## Short Term
 
 - Fill Mastodon client startup gaps found by Elk and browser logs.
+- Improve local account administration now that multiple local users can be operator-created.
+- Expand local account search into remote discovery when WebFinger support lands.
 - Add cursor pagination for account status collections.
 - Add a conversation endpoint for replies.
 - Add boosts.
