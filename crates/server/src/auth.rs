@@ -9,6 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, patch, post},
 };
+use axum_params::Params;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use roost_core::{AccountId, RoostError};
@@ -672,10 +673,38 @@ struct UpdateCredentialsInput {
     profile_fields: Option<Value>,
 }
 
+/// Account settings payload accepted by Mastodon's update credentials endpoint.
+#[derive(Default, Deserialize)]
+struct UpdateCredentialsParams {
+    display_name: Option<String>,
+    note: Option<String>,
+    locked: Option<Value>,
+    bot: Option<Value>,
+    discoverable: Option<Value>,
+    source: Option<UpdateCredentialsSourceParams>,
+    #[serde(rename = "source[privacy]")]
+    source_privacy: Option<String>,
+    #[serde(rename = "source[sensitive]")]
+    source_sensitive: Option<Value>,
+    #[serde(rename = "source[language]")]
+    source_language: Option<Value>,
+    #[serde(rename = "source[quote_policy]")]
+    source_quote_policy: Option<String>,
+    fields_attributes: Option<Value>,
+}
+
+/// Nested default posting settings from Mastodon profile update requests.
+#[derive(Default, Deserialize)]
+struct UpdateCredentialsSourceParams {
+    privacy: Option<String>,
+    sensitive: Option<Value>,
+    language: Option<Value>,
+    quote_policy: Option<String>,
+}
+
+/// Validation errors for Mastodon account settings updates.
 #[derive(Debug, thiserror::Error)]
 enum UpdateCredentialsError {
-    #[error("invalid JSON: {0}")]
-    Json(serde_json::Error),
     #[error("boolean value is invalid")]
     Boolean,
     #[error("source[privacy] is invalid")]
@@ -692,25 +721,14 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let content_type = request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        let body = to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| bad_request(&format!("invalid request body: {error}")))?;
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Params(params, _temp_files) =
+            Params::<UpdateCredentialsParams>::from_request(request, state)
+                .await
+                .map_err(|error| bad_request(&format!("invalid request body: {error:?}")))?;
 
-        let input = if content_type.contains("application/json") {
-            parse_update_credentials_json(&body)
-        } else {
-            parse_update_credentials_form(&body)
-        }
-        .map_err(|error| bad_request(&error.to_string()))?;
-
-        Ok(input)
+        update_credentials_input_from_params(params)
+            .map_err(|error| bad_request(&error.to_string()))
     }
 }
 
@@ -910,65 +928,27 @@ fn settings_update_from_input(
     })
 }
 
-/// Parse a JSON account update request.
-fn parse_update_credentials_json(
-    body: &[u8],
+/// Convert extracted account update parameters into an internal update request.
+fn update_credentials_input_from_params(
+    params: UpdateCredentialsParams,
 ) -> Result<UpdateCredentialsInput, UpdateCredentialsError> {
-    let value: Value = serde_json::from_slice(body).map_err(UpdateCredentialsError::Json)?;
-    let source = value.get("source");
+    let source = params.source.unwrap_or_default();
 
     Ok(UpdateCredentialsInput {
-        display_name: optional_string(value.get("display_name")),
-        note: optional_string(value.get("note")),
-        locked: optional_bool(value.get("locked"))?,
-        bot: optional_bool(value.get("bot"))?,
-        discoverable: optional_bool(value.get("discoverable"))?,
-        default_visibility: source
-            .and_then(|source| optional_string(source.get("privacy")))
-            .or_else(|| optional_string(value.get("source[privacy]"))),
-        default_sensitive: match source
-            .and_then(|source| optional_bool(source.get("sensitive")).transpose())
-        {
-            Some(result) => Some(result?),
-            None => optional_bool(value.get("source[sensitive]"))?,
+        display_name: params.display_name,
+        note: params.note,
+        locked: optional_bool(params.locked.as_ref())?,
+        bot: optional_bool(params.bot.as_ref())?,
+        discoverable: optional_bool(params.discoverable.as_ref())?,
+        default_visibility: source.privacy.or(params.source_privacy),
+        default_sensitive: match optional_bool(source.sensitive.as_ref())? {
+            Some(value) => Some(value),
+            None => optional_bool(params.source_sensitive.as_ref())?,
         },
-        default_language: json_language(source.and_then(|source| source.get("language")))
-            .or_else(|| json_language(value.get("source[language]"))),
-        default_quote_policy: source
-            .and_then(|source| optional_string(source.get("quote_policy")))
-            .or_else(|| optional_string(value.get("source[quote_policy]"))),
-        profile_fields: json_profile_fields(value.get("fields_attributes")),
-    })
-}
-
-/// Parse a form-encoded account update request.
-fn parse_update_credentials_form(
-    body: &[u8],
-) -> Result<UpdateCredentialsInput, UpdateCredentialsError> {
-    let pairs = form_urlencoded::parse(body).collect::<Vec<_>>();
-    let field = |name: &str| {
-        pairs
-            .iter()
-            .find_map(|(key, value)| (key == name).then(|| value.to_string()))
-    };
-
-    Ok(UpdateCredentialsInput {
-        display_name: field("display_name"),
-        note: field("note"),
-        locked: field("locked")
-            .map(|value| parse_bool(&value))
-            .transpose()?,
-        bot: field("bot").map(|value| parse_bool(&value)).transpose()?,
-        discoverable: field("discoverable")
-            .map(|value| parse_bool(&value))
-            .transpose()?,
-        default_visibility: field("source[privacy]"),
-        default_sensitive: field("source[sensitive]")
-            .map(|value| parse_bool(&value))
-            .transpose()?,
-        default_language: field("source[language]").map(normalize_language),
-        default_quote_policy: field("source[quote_policy]"),
-        profile_fields: form_profile_fields(&pairs),
+        default_language: json_language(source.language.as_ref())
+            .or_else(|| json_language(params.source_language.as_ref())),
+        default_quote_policy: source.quote_policy.or(params.source_quote_policy),
+        profile_fields: json_profile_fields(params.fields_attributes.as_ref()),
     })
 }
 
@@ -1001,15 +981,13 @@ fn validate_language(value: &str) -> Result<(), UpdateCredentialsError> {
     }
 }
 
-fn optional_string(value: Option<&Value>) -> Option<String> {
-    value.and_then(Value::as_str).map(str::to_owned)
-}
-
-/// Parse an optional JSON boolean or string boolean field.
+/// Parse an optional extracted boolean field.
 fn optional_bool(value: Option<&Value>) -> Result<Option<bool>, UpdateCredentialsError> {
     value
         .map(|value| match value {
             Value::Bool(value) => Ok(*value),
+            Value::Number(value) if value.as_u64() == Some(1) => Ok(true),
+            Value::Number(value) if value.as_u64() == Some(0) => Ok(false),
             Value::String(value) => parse_bool(value),
             _ => Err(UpdateCredentialsError::Boolean),
         })
@@ -1046,47 +1024,22 @@ fn parse_bool(value: &str) -> Result<bool, UpdateCredentialsError> {
 
 /// Convert JSON `fields_attributes` into the stored profile field array.
 fn json_profile_fields(value: Option<&Value>) -> Option<Value> {
-    let fields = value?.as_object()?;
-    let mut keys = fields.keys().collect::<Vec<_>>();
-    keys.sort();
-    let values = keys
-        .into_iter()
-        .filter_map(|key| profile_field_from_value(fields.get(key)?))
-        .collect::<Vec<_>>();
-    Some(Value::Array(values))
-}
-
-/// Convert form-encoded `fields_attributes[index][name|value]` pairs.
-fn form_profile_fields(
-    pairs: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
-) -> Option<Value> {
-    let mut fields = std::collections::BTreeMap::<String, (Option<String>, Option<String>)>::new();
-    for (key, value) in pairs {
-        let Some(rest) = key.strip_prefix("fields_attributes[") else {
-            continue;
-        };
-        let Some((index, field_name)) = rest.split_once("][") else {
-            continue;
-        };
-        let Some(field_name) = field_name.strip_suffix(']') else {
-            continue;
-        };
-        let entry = fields.entry(index.to_owned()).or_default();
-        match field_name {
-            "name" => entry.0 = Some(value.to_string()),
-            "value" => entry.1 = Some(value.to_string()),
-            _ => {}
+    let value = value?;
+    let values = match value {
+        Value::Array(fields) => fields
+            .iter()
+            .filter_map(profile_field_from_value)
+            .collect::<Vec<_>>(),
+        Value::Object(fields) => {
+            let mut keys = fields.keys().collect::<Vec<_>>();
+            keys.sort();
+            keys.into_iter()
+                .filter_map(|key| profile_field_from_value(fields.get(key)?))
+                .collect::<Vec<_>>()
         }
-    }
-    if fields.is_empty() {
-        return None;
-    }
-    Some(Value::Array(
-        fields
-            .into_values()
-            .filter_map(|(name, value)| profile_field(name?, value?))
-            .collect(),
-    ))
+        _ => return None,
+    };
+    Some(Value::Array(values))
 }
 
 /// Convert one JSON profile field object into the stored field shape.
@@ -1293,7 +1246,7 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roost_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_context::{AsyncTestContext, test_context};
     use tower::ServiceExt;
@@ -1656,6 +1609,7 @@ mod tests {
 
     #[test_context(EndpointContext)]
     #[tokio::test]
+    /// Given URL-encoded profile and source settings, persists account metadata and preferences.
     async fn update_credentials_persists_profile_and_preferences(context: &mut EndpointContext) {
         // Mastodon clients update both profile settings and composer defaults
         // through update_credentials; preferences should reflect those writes.
@@ -1689,16 +1643,39 @@ mod tests {
 
         assert_eq!(update_response.status(), StatusCode::OK);
         let body = json_body(update_response).await;
-        assert_eq!(body["display_name"], "Admin Person");
-        assert_eq!(body["note"], "A local administrator");
-        assert_eq!(body["locked"], true);
-        assert_eq!(body["bot"], false);
-        assert_eq!(body["discoverable"], false);
-        assert_eq!(body["source"]["privacy"], "unlisted");
-        assert_eq!(body["source"]["sensitive"], true);
-        assert_eq!(body["source"]["language"], "de");
-        assert_eq!(body["source"]["quote_policy"], "nobody");
-        assert_eq!(body["fields"][0]["name"], "Website");
+        assert_eq!(
+            account_settings_snapshot(&body),
+            json!({
+                "display_name": "Admin Person",
+                "note": "A local administrator",
+                "locked": true,
+                "bot": false,
+                "discoverable": false,
+                "source": {
+                    "privacy": "unlisted",
+                    "sensitive": true,
+                    "language": "de",
+                    "quote_policy": "nobody"
+                },
+                "fields": profile_fields_json(&[("Website", "https://example.com")])
+            })
+        );
+
+        let credentials_response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let body = json_body(credentials_response).await;
+        assert_eq!(
+            body["fields"],
+            profile_fields_json(&[("Website", "https://example.com")])
+        );
 
         let preferences_response = context
             .request(
@@ -1712,10 +1689,125 @@ mod tests {
             .await;
         assert_eq!(preferences_response.status(), StatusCode::OK);
         let body = json_body(preferences_response).await;
-        assert_eq!(body["posting:default:visibility"], "unlisted");
-        assert_eq!(body["posting:default:sensitive"], true);
-        assert_eq!(body["posting:default:language"], "de");
-        assert_eq!(body["posting:default:quote_policy"], "nobody");
+        assert_eq!(
+            preferences_snapshot(&body),
+            json!({
+                "posting:default:visibility": "unlisted",
+                "posting:default:sensitive": true,
+                "posting:default:language": "de",
+                "posting:default:quote_policy": "nobody"
+            })
+        );
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given multipart profile metadata, stores fields for later credential reads.
+    async fn update_credentials_persists_multipart_profile_fields(context: &mut EndpointContext) {
+        let token = context.authenticated_token().await;
+        let boundary = "geckoformboundarytest";
+        let body = [
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"display_name\"\r\n\r\nJust me\r\n"
+            ),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"fields_attributes[][name]\"\r\n\r\nWebsite\r\n"
+            ),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"fields_attributes[][value]\"\r\n\r\nhttps://example.com\r\n"
+            ),
+            format!("--{boundary}--\r\n"),
+        ]
+        .concat();
+
+        let update_response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_body = json_body(update_response).await;
+        assert_eq!(
+            profile_snapshot(&update_body),
+            json!({
+                "display_name": "Just me",
+                "fields": profile_fields_json(&[("Website", "https://example.com")])
+            })
+        );
+
+        let credentials_response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let credentials_body = json_body(credentials_response).await;
+        assert_eq!(
+            profile_snapshot(&credentials_body),
+            json!({
+                "display_name": "Just me",
+                "fields": profile_fields_json(&[("Website", "https://example.com")])
+            })
+        );
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given JSON profile metadata arrays, stores fields for later credential reads.
+    async fn update_credentials_persists_json_profile_fields(context: &mut EndpointContext) {
+        let token = context.authenticated_token().await;
+        let update_response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "fields_attributes": [
+                                { "name": "Website", "value": "https://example.com" },
+                                { "name": "Location", "value": "Berlin" }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_body = json_body(update_response).await;
+        let fields =
+            profile_fields_json(&[("Website", "https://example.com"), ("Location", "Berlin")]);
+        assert_eq!(update_body["fields"], fields);
+
+        let credentials_response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let credentials_body = json_body(credentials_response).await;
+        assert_eq!(credentials_body["fields"], fields);
     }
 
     #[test_context(EndpointContext)]
@@ -1742,6 +1834,52 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = json_body(response).await;
         assert_eq!(body["error"], "invalid_request");
+    }
+
+    /// Select profile fields that should round-trip through account responses.
+    fn profile_snapshot(body: &Value) -> Value {
+        json!({
+            "display_name": body["display_name"],
+            "fields": body["fields"]
+        })
+    }
+
+    /// Select profile and preference fields persisted by update credentials.
+    fn account_settings_snapshot(body: &Value) -> Value {
+        json!({
+            "display_name": body["display_name"],
+            "note": body["note"],
+            "locked": body["locked"],
+            "bot": body["bot"],
+            "discoverable": body["discoverable"],
+            "source": {
+                "privacy": body["source"]["privacy"],
+                "sensitive": body["source"]["sensitive"],
+                "language": body["source"]["language"],
+                "quote_policy": body["source"]["quote_policy"]
+            },
+            "fields": body["fields"]
+        })
+    }
+
+    /// Select Mastodon preference keys that mirror update credentials settings.
+    fn preferences_snapshot(body: &Value) -> Value {
+        json!({
+            "posting:default:visibility": body["posting:default:visibility"],
+            "posting:default:sensitive": body["posting:default:sensitive"],
+            "posting:default:language": body["posting:default:language"],
+            "posting:default:quote_policy": body["posting:default:quote_policy"]
+        })
+    }
+
+    /// Build expected Mastodon profile metadata field arrays.
+    fn profile_fields_json(fields: &[(&str, &str)]) -> Value {
+        Value::Array(
+            fields
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value, "verified_at": null }))
+                .collect(),
+        )
     }
 
     struct EndpointContext {

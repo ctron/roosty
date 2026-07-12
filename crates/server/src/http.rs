@@ -9,7 +9,7 @@ use axum::{
 };
 use tower_http::{
     cors::{Any, CorsLayer},
-    trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
+    trace::{DefaultMakeSpan, DefaultOnResponse, HttpMakeClassifier, TraceLayer},
 };
 use tracing::Level;
 
@@ -47,12 +47,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::search::router())
         .merge(crate::statuses::router())
         .fallback(public_fallback)
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_request(DefaultOnRequest::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        )
+        .layer(request_trace_layer())
         .layer(public_cors_layer());
     let router = if include_infra_routes {
         public_router.merge(infra_routes())
@@ -74,12 +69,19 @@ fn infra_routes() -> Router<AppState> {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_request(DefaultOnRequest::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        )
+        .layer(request_trace_layer())
+}
+
+/// Build request tracing that emits one completion event per HTTP request.
+fn request_trace_layer()
+-> TraceLayer<HttpMakeClassifier, DefaultMakeSpan, (), DefaultOnResponse, (), (), ()> {
+    TraceLayer::new_for_http()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_request(())
+        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_body_chunk(())
+        .on_eos(())
+        .on_failure(())
 }
 
 /// Build the public CORS policy used by browser-based Mastodon clients.
