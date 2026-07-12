@@ -8,7 +8,7 @@ use axum::{
 };
 use roost_core::{AccountId, RoostError, StatusId};
 use roost_db::LocalNotificationType;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -32,8 +32,14 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/accounts/{account_id}/follow", post(follow))
         .route("/api/v1/accounts/{account_id}/unfollow", post(unfollow))
+        .route("/api/v1/accounts/{account_id}/block", post(block))
+        .route("/api/v1/accounts/{account_id}/unblock", post(unblock))
+        .route("/api/v1/accounts/{account_id}/mute", post(mute))
+        .route("/api/v1/accounts/{account_id}/unmute", post(unmute))
         .route("/api/v1/accounts/{account_id}/followers", get(followers))
         .route("/api/v1/accounts/{account_id}/following", get(following))
+        .route("/api/v1/blocks", get(blocked_accounts))
+        .route("/api/v1/mutes", get(muted_accounts))
 }
 
 #[derive(Deserialize)]
@@ -67,10 +73,17 @@ struct LookupParams {
     acct: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct FollowInput {
     reblogs: Option<bool>,
     notify: Option<bool>,
+}
+
+/// Mute settings accepted by Mastodon's account mute endpoint.
+#[derive(Default, Deserialize)]
+struct MuteInput {
+    notifications: Option<bool>,
+    duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +95,10 @@ struct RelationshipsParams {
 enum AccountCollection {
     Followers,
     Following,
+    /// Accounts blocked by the authenticated account.
+    Blocks,
+    /// Accounts muted by the authenticated account.
+    Mutes,
 }
 
 #[derive(Serialize)]
@@ -230,7 +247,85 @@ async fn follow(
         Err(RoostError::InvalidInput(error)) if error == "followed account does not exist" => {
             not_found()
         }
+        Err(RoostError::InvalidInput(error))
+            if error == "follow is blocked by an account relationship" =>
+        {
+            forbidden(&error)
+        }
         Err(RoostError::InvalidInput(error)) => bad_request(&error),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Block a local account and return the resulting relationship.
+async fn block(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+) -> Response {
+    let target_id = AccountId(path.account_id);
+    match roost_db::block_local_account(&state.db, account.id, target_id).await {
+        Ok(()) => relationship_response(&state, account.id, target_id).await,
+        Err(RoostError::InvalidInput(error)) if error == "target account does not exist" => {
+            not_found()
+        }
+        Err(RoostError::InvalidInput(error)) => bad_request(&error),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Remove a local block and return the resulting relationship.
+async fn unblock(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+) -> Response {
+    let target_id = AccountId(path.account_id);
+    match roost_db::unblock_local_account(&state.db, account.id, target_id).await {
+        Ok(()) => relationship_response(&state, account.id, target_id).await,
+        Err(error) => server_error(error),
+    }
+}
+
+/// Mute a local account and return the resulting relationship.
+async fn mute(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+    request: Request,
+) -> Response {
+    let input = match mute_input(request).await {
+        Ok(input) => input,
+        Err(error) => return bad_request(&error),
+    };
+    let target_id = AccountId(path.account_id);
+    match roost_db::mute_local_account(
+        &state.db,
+        account.id,
+        target_id,
+        input.notifications.unwrap_or(true),
+        input.duration.unwrap_or(0),
+    )
+    .await
+    {
+        Ok(_) => relationship_response(&state, account.id, target_id).await,
+        Err(RoostError::InvalidInput(error)) if error == "target account does not exist" => {
+            not_found()
+        }
+        Err(RoostError::InvalidInput(error)) => bad_request(&error),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Remove a local mute and return the resulting relationship.
+async fn unmute(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+) -> Response {
+    let target_id = AccountId(path.account_id);
+    match roost_db::unmute_local_account(&state.db, account.id, target_id).await {
+        Ok(()) => relationship_response(&state, account.id, target_id).await,
         Err(error) => server_error(error),
     }
 }
@@ -299,6 +394,24 @@ async fn following(
     .await
 }
 
+/// Return local accounts blocked by the authenticated account.
+async fn blocked_accounts(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Query(params): Query<AccountCollectionParams>,
+) -> Response {
+    account_collection(&state, account.id, params, AccountCollection::Blocks).await
+}
+
+/// Return local accounts muted by the authenticated account.
+async fn muted_accounts(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Query(params): Query<AccountCollectionParams>,
+) -> Response {
+    account_collection(&state, account.id, params, AccountCollection::Mutes).await
+}
+
 /// Return a local follower/following account collection.
 async fn account_collection(
     state: &AppState,
@@ -306,10 +419,15 @@ async fn account_collection(
     params: AccountCollectionParams,
     collection: AccountCollection,
 ) -> Response {
-    match roost_db::find_local_account_by_id(&state.db, account_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
+    if !matches!(
+        collection,
+        AccountCollection::Blocks | AccountCollection::Mutes
+    ) {
+        match roost_db::find_local_account_by_id(&state.db, account_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return not_found(),
+            Err(error) => return server_error(error),
+        }
     }
 
     let limit = params
@@ -327,6 +445,12 @@ async fn account_collection(
         AccountCollection::Following => {
             roost_db::local_following_for_account(&state.db, account_id, limit, cursor).await
         }
+        AccountCollection::Blocks => {
+            roost_db::blocked_local_accounts_for_account(&state.db, account_id, limit, cursor).await
+        }
+        AccountCollection::Mutes => {
+            roost_db::muted_local_accounts_for_account(&state.db, account_id, limit, cursor).await
+        }
     };
     match accounts {
         Ok(page) => match account_responses(state, page.items).await {
@@ -338,6 +462,8 @@ async fn account_collection(
                     AccountCollection::Following => {
                         format!("/api/v1/accounts/{}/following", account_id.0)
                     }
+                    AccountCollection::Blocks => "/api/v1/blocks".to_owned(),
+                    AccountCollection::Mutes => "/api/v1/mutes".to_owned(),
                 };
                 let link_header = crate::statuses::CollectionLink::new(
                     limit,
@@ -391,6 +517,9 @@ async fn relationship_model(
 ) -> roost_core::Result<RelationshipResponse> {
     let following = roost_db::local_follow_relationship(&state.db, source_id, target_id).await?;
     let followed_by = roost_db::local_follow_relationship(&state.db, target_id, source_id).await?;
+    let blocking = roost_db::local_account_blocks(&state.db, source_id, target_id).await?;
+    let blocked_by = roost_db::local_account_blocks(&state.db, target_id, source_id).await?;
+    let mute = roost_db::active_local_account_mute(&state.db, source_id, target_id).await?;
 
     Ok(RelationshipResponse {
         id: target_id.0.to_string(),
@@ -398,11 +527,13 @@ async fn relationship_model(
         showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs),
         notifying: following.as_ref().is_some_and(|follow| follow.notify),
         followed_by: followed_by.is_some(),
-        blocking: false,
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        muting_expires_at: None,
+        blocking,
+        blocked_by,
+        muting: mute.is_some(),
+        muting_notifications: mute.as_ref().is_some_and(|mute| mute.notifications),
+        muting_expires_at: mute
+            .and_then(|mute| mute.expires_at)
+            .map(crate::statuses::format_timestamp),
         requested: false,
         domain_blocking: false,
         endorsed: false,
@@ -411,6 +542,19 @@ async fn relationship_model(
 
 /// Parse optional follow settings from JSON, form, or empty request bodies.
 async fn follow_input(request: Request) -> Result<FollowInput, String> {
+    parse_account_action_input(request).await
+}
+
+/// Parse optional mute settings from JSON, form, or empty request bodies.
+async fn mute_input(request: Request) -> Result<MuteInput, String> {
+    parse_account_action_input(request).await
+}
+
+/// Parse a small Mastodon account action payload from JSON or URL-encoded form data.
+async fn parse_account_action_input<T>(request: Request) -> Result<T, String>
+where
+    T: Default + DeserializeOwned,
+{
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -421,10 +565,7 @@ async fn follow_input(request: Request) -> Result<FollowInput, String> {
         .await
         .map_err(|error| format!("invalid request body: {error}"))?;
     if body.is_empty() {
-        return Ok(FollowInput {
-            reblogs: None,
-            notify: None,
-        });
+        return Ok(T::default());
     }
 
     if content_type.contains("application/json") {
@@ -512,6 +653,17 @@ fn non_empty(value: &str) -> Option<String> {
 fn bad_request(description: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: description.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+/// Return a Mastodon-style forbidden response.
+fn forbidden(description: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
         Json(ErrorResponse {
             error: description.to_owned(),
         }),
@@ -865,6 +1017,179 @@ mod tests {
 
         assert_eq!(self_follow.status(), StatusCode::BAD_REQUEST);
         assert_eq!(missing_follow.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Given local follow relationships, when one account blocks the other, then follows are severed and discovery excludes the blocked account.
+    async fn blocks_sever_follows_and_filter_personalized_results(context: &mut AccountContext) {
+        let (_alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        let (bob_id, bob_token) = context.create_account("bob", "bob@example.com").await;
+        context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+
+        let block = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/block", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(block.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(block).await,
+            serde_json::json!({
+                "id": bob_id.0.to_string(),
+                "following": false,
+                "showing_reblogs": false,
+                "notifying": false,
+                "followed_by": false,
+                "blocking": true,
+                "blocked_by": false,
+                "muting": false,
+                "muting_notifications": false,
+                "muting_expires_at": null,
+                "requested": false,
+                "domain_blocking": false,
+                "endorsed": false,
+            })
+        );
+
+        let blocked = context
+            .authenticated_get("/api/v1/blocks", &alice_token)
+            .await;
+        assert_eq!(blocked.status(), StatusCode::OK);
+        assert_eq!(account_usernames(&json_body(blocked).await), ["bob"]);
+
+        let follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(follow.status(), StatusCode::FORBIDDEN);
+
+        let search = context
+            .authenticated_get("/api/v2/search?type=accounts&q=bob", &alice_token)
+            .await;
+        assert_eq!(json_body(search).await["accounts"], serde_json::json!([]));
+        assert_ne!(bob_token, alice_token);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Given a followed author, when the follower mutes them, then the home timeline and notifications honor the mute settings.
+    async fn mutes_filter_home_timeline_and_optionally_notifications(context: &mut AccountContext) {
+        let (_alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        let (bob_id, bob_token) = context.create_account("bob", "bob@example.com").await;
+        context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        context
+            .create_status(&bob_token, "before mute", Some("public"))
+            .await;
+
+        let mute = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/mute", bob_id.0),
+                &alice_token,
+                serde_json::json!({ "notifications": true, "duration": 0 }),
+            )
+            .await;
+        assert_eq!(mute.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(mute).await,
+            serde_json::json!({
+                "id": bob_id.0.to_string(),
+                "following": true,
+                "showing_reblogs": true,
+                "notifying": false,
+                "followed_by": false,
+                "blocking": false,
+                "blocked_by": false,
+                "muting": true,
+                "muting_notifications": true,
+                "muting_expires_at": null,
+                "requested": false,
+                "domain_blocking": false,
+                "endorsed": false,
+            })
+        );
+
+        let muted = context
+            .authenticated_get("/api/v1/mutes", &alice_token)
+            .await;
+        assert_eq!(muted.status(), StatusCode::OK);
+        assert_eq!(account_usernames(&json_body(muted).await), ["bob"]);
+        let home = context
+            .authenticated_get("/api/v1/timelines/home?limit=30", &alice_token)
+            .await;
+        assert_eq!(json_body(home).await, serde_json::json!([]));
+
+        context
+            .create_status(&bob_token, "hello @alice", Some("public"))
+            .await;
+        let notifications = context
+            .authenticated_get("/api/v1/notifications?limit=30", &alice_token)
+            .await;
+        assert_eq!(json_body(notifications).await, serde_json::json!([]));
+
+        let unmute = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/unmute", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(json_body(unmute).await["muting"], false);
+
+        let temporary_mute = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/mute", bob_id.0),
+                &alice_token,
+                serde_json::json!({ "notifications": false, "duration": 60 }),
+            )
+            .await;
+        let temporary_mute = json_body(temporary_mute).await;
+        assert_eq!(
+            temporary_mute,
+            serde_json::json!({
+                "id": bob_id.0.to_string(),
+                "following": true,
+                "showing_reblogs": true,
+                "notifying": false,
+                "followed_by": false,
+                "blocking": false,
+                "blocked_by": false,
+                "muting": true,
+                "muting_notifications": false,
+                "muting_expires_at": temporary_mute["muting_expires_at"].clone(),
+                "requested": false,
+                "domain_blocking": false,
+                "endorsed": false,
+            })
+        );
+        assert!(temporary_mute["muting_expires_at"].is_string());
+
+        context
+            .create_status(&bob_token, "notification allowed @alice", Some("public"))
+            .await;
+        let notifications = context
+            .authenticated_get("/api/v1/notifications?limit=30", &alice_token)
+            .await;
+        assert_eq!(json_body(notifications).await[0]["type"], "mention");
     }
 
     /// Extract account usernames from a Mastodon account collection response.

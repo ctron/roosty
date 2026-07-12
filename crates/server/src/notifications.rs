@@ -162,6 +162,10 @@ pub(crate) async fn create_and_stream_notification(
     if account_id == actor_account_id {
         return Ok(());
     }
+    if !roost_db::local_account_allows_notification(&state.db, account_id, actor_account_id).await?
+    {
+        return Ok(());
+    }
     let notification = roost_db::notify_local_account(
         &state.db,
         account_id,

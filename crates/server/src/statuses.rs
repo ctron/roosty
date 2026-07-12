@@ -1182,7 +1182,7 @@ async fn status_stream_recipients(
         return Vec::new();
     }
     match roost_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
-        Ok(recipients) => recipients,
+        Ok(recipients) => filter_stream_recipients(state, status.account_id, recipients).await,
         Err(error) => {
             warn!(%error, "failed to resolve status stream recipients");
             Vec::new()
@@ -1193,12 +1193,30 @@ async fn status_stream_recipients(
 /// Return followers that should receive this account's boost in their home stream.
 async fn reblog_stream_recipients(state: &AppState, account_id: AccountId) -> Vec<AccountId> {
     match roost_db::local_follower_ids_for_account(&state.db, account_id, false).await {
-        Ok(recipients) => recipients,
+        Ok(recipients) => filter_stream_recipients(state, account_id, recipients).await,
         Err(error) => {
             warn!(%error, "failed to resolve reblog stream recipients");
             Vec::new()
         }
     }
+}
+
+/// Remove followers who have muted or blocked the account producing a stream event.
+async fn filter_stream_recipients(
+    state: &AppState,
+    author_id: AccountId,
+    recipients: Vec<AccountId>,
+) -> Vec<AccountId> {
+    let mut visible = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        match roost_db::local_account_is_hidden_for_viewer(&state.db, recipient, author_id).await {
+            Ok(false) => visible.push(recipient),
+            Ok(true) => {}
+            Err(error) => warn!(%error, "failed to filter muted or blocked stream recipient"),
+        }
+    }
+
+    visible
 }
 
 /// Return a Mastodon account collection with cursor pagination headers.
@@ -1418,6 +1436,12 @@ async fn reblog_response(
     );
 
     let reblogged_by_viewer = viewer.is_some_and(|viewer| viewer == reblog.account_id);
+    let muted = match viewer {
+        Some(viewer) => roost_db::active_local_account_mute(&state.db, viewer, reblog.account_id)
+            .await?
+            .is_some(),
+        None => false,
+    };
 
     Ok(Some(StatusResponse {
         id: reblog.id.to_string(),
@@ -1442,7 +1466,7 @@ async fn reblog_response(
         replies_count: 0,
         favourited: false,
         reblogged: reblogged_by_viewer,
-        muted: false,
+        muted,
         bookmarked: false,
         pinned: false,
         reblog: Some(original),
@@ -1486,6 +1510,12 @@ async fn status_response_for_viewer(
         }
         None => false,
     };
+    let muted = match viewer {
+        Some(viewer) => roost_db::active_local_account_mute(&state.db, viewer, status.account_id)
+            .await?
+            .is_some(),
+        None => false,
+    };
     let media_attachments = roost_db::local_media_attachments_for_status(&state.db, status.id)
         .await?
         .iter()
@@ -1521,7 +1551,7 @@ async fn status_response_for_viewer(
         replies_count,
         favourited,
         reblogged,
-        muted: false,
+        muted,
         bookmarked,
         pinned: false,
         reblog: None,
@@ -1625,7 +1655,12 @@ async fn visible_status_for_account(
     account_id: AccountId,
 ) -> Result<Option<roost_db::LocalStatus>, RoostError> {
     let status = roost_db::find_local_status_by_id(&state.db, status_id).await?;
-    Ok(status.filter(|status| can_view_status(status, Some(account_id))))
+    match status {
+        Some(status) if status_visible_to_viewer(state, &status, Some(account_id)).await? => {
+            Ok(Some(status))
+        }
+        Some(_) | None => Ok(None),
+    }
 }
 
 /// Walk visible local parent statuses from root ancestor to direct parent.
@@ -1807,12 +1842,17 @@ pub(crate) async fn status_visible_to_viewer(
     status: &roost_db::LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<bool, RoostError> {
-    if can_view_status(status, viewer) {
+    let Some(viewer) = viewer else {
+        return Ok(can_view_status(status, viewer));
+    };
+    if viewer != status.account_id
+        && roost_db::local_accounts_are_blocked(&state.db, viewer, status.account_id).await?
+    {
+        return Ok(false);
+    }
+    if can_view_status(status, Some(viewer)) {
         return Ok(true);
     }
-    let Some(viewer) = viewer else {
-        return Ok(false);
-    };
 
     roost_db::local_status_visible_to_account(&state.db, status, viewer).await
 }

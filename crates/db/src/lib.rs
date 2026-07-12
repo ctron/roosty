@@ -23,10 +23,11 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_conversation, local_conversation_account, local_follow,
-    local_media_attachment, local_notification, local_status, local_status_bookmark,
-    local_status_favourite, local_status_reblog, local_status_tag, local_tag, local_tag_follow,
-    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
+    local_account, local_account_block, local_account_mute, local_conversation,
+    local_conversation_account, local_follow, local_media_attachment, local_notification,
+    local_status, local_status_bookmark, local_status_favourite, local_status_reblog,
+    local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
+    oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -634,6 +635,19 @@ pub struct LocalFollow {
     pub notify: bool,
 }
 
+/// Stored local account mute relationship.
+#[derive(Clone, Debug)]
+pub struct LocalAccountMute {
+    /// Account that muted another local account.
+    pub account_id: AccountId,
+    /// Account that is muted.
+    pub target_account_id: AccountId,
+    /// Whether the mute suppresses notifications as well as statuses.
+    pub notifications: bool,
+    /// Optional timestamp when the mute stops applying.
+    pub expires_at: Option<OffsetDateTime>,
+}
+
 /// OAuth client application metadata.
 #[derive(Clone, Debug)]
 pub struct OAuthApplication {
@@ -711,6 +725,7 @@ pub async fn find_local_account_by_username(
 /// Search local accounts by username or display name for Mastodon autocomplete.
 pub async fn search_local_accounts(
     db: &DbConnection,
+    viewer_account_id: AccountId,
     query: &str,
     limit: u64,
     offset: u64,
@@ -719,12 +734,18 @@ pub async fn search_local_accounts(
         return Ok(Vec::new());
     }
 
-    let accounts = local_account::Entity::find()
-        .filter(
-            local_account::Column::Username
-                .contains(query)
-                .or(local_account::Column::DisplayName.contains(query)),
-        )
+    let hidden_account_ids = blocked_local_account_ids_for_account(db, viewer_account_id).await?;
+    let mut accounts = local_account::Entity::find().filter(
+        local_account::Column::Username
+            .contains(query)
+            .or(local_account::Column::DisplayName.contains(query)),
+    );
+    if !hidden_account_ids.is_empty() {
+        accounts = accounts.filter(
+            local_account::Column::Id.is_not_in(hidden_account_ids.into_iter().map(|id| id.0)),
+        );
+    }
+    let accounts = accounts
         .order_by_asc(local_account::Column::Username)
         .limit(limit)
         .offset(offset)
@@ -803,6 +824,11 @@ pub async fn follow_local_account(
             "followed account does not exist".to_owned(),
         ));
     }
+    if local_accounts_are_blocked(db, follower_account_id, followed_account_id).await? {
+        return Err(RoostError::InvalidInput(
+            "follow is blocked by an account relationship".to_owned(),
+        ));
+    }
 
     let now = OffsetDateTime::now_utc();
     let follow =
@@ -847,6 +873,349 @@ pub async fn unfollow_local_account(
             .await?
     {
         model.into_active_model().delete(db).await?;
+    }
+
+    Ok(())
+}
+
+/// Block a local account and sever any follow relationships between the accounts.
+pub async fn block_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<()> {
+    ensure_local_relation_target(db, account_id, target_account_id).await?;
+
+    if local_account_block::Entity::find_by_id((account_id.0, target_account_id.0))
+        .one(db)
+        .await?
+        .is_none()
+    {
+        let now = OffsetDateTime::now_utc();
+        local_account_block::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            account_id: Set(account_id.0),
+            target_account_id: Set(target_account_id.0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await?;
+    }
+
+    unfollow_local_account(db, account_id, target_account_id).await?;
+    unfollow_local_account(db, target_account_id, account_id).await
+}
+
+/// Remove a local account block when it exists.
+pub async fn unblock_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<()> {
+    if let Some(model) =
+        local_account_block::Entity::find_by_id((account_id.0, target_account_id.0))
+            .one(db)
+            .await?
+    {
+        model.into_active_model().delete(db).await?;
+    }
+
+    Ok(())
+}
+
+/// Mute a local account, replacing notification and duration settings when it already exists.
+pub async fn mute_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+    notifications: bool,
+    duration_seconds: u64,
+) -> Result<LocalAccountMute> {
+    ensure_local_relation_target(db, account_id, target_account_id).await?;
+    let now = OffsetDateTime::now_utc();
+    let expires_at = if duration_seconds == 0 {
+        None
+    } else {
+        let seconds = i64::try_from(duration_seconds)
+            .map_err(|_| RoostError::InvalidInput("mute duration is too large".to_owned()))?;
+        Some(now + Duration::seconds(seconds))
+    };
+    let mute = match local_account_mute::Entity::find_by_id((account_id.0, target_account_id.0))
+        .one(db)
+        .await?
+    {
+        Some(model) => {
+            let mut active = model.into_active_model();
+            active.notifications = Set(notifications);
+            active.expires_at = Set(expires_at);
+            active.updated_at = Set(now);
+            active.update(db).await?
+        }
+        None => {
+            local_account_mute::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                account_id: Set(account_id.0),
+                target_account_id: Set(target_account_id.0),
+                notifications: Set(notifications),
+                expires_at: Set(expires_at),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(db)
+            .await?
+        }
+    };
+
+    Ok(local_account_mute_from_model(mute))
+}
+
+/// Remove a local account mute when it exists.
+pub async fn unmute_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<()> {
+    if let Some(model) = local_account_mute::Entity::find_by_id((account_id.0, target_account_id.0))
+        .one(db)
+        .await?
+    {
+        model.into_active_model().delete(db).await?;
+    }
+
+    Ok(())
+}
+
+/// Return whether either of two local accounts blocks the other.
+pub async fn local_accounts_are_blocked(
+    db: &DbConnection,
+    first_account_id: AccountId,
+    second_account_id: AccountId,
+) -> Result<bool> {
+    if first_account_id == second_account_id {
+        return Ok(false);
+    }
+
+    Ok(local_account_block::Entity::find()
+        .filter(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(local_account_block::Column::AccountId.eq(first_account_id.0))
+                        .add(local_account_block::Column::TargetAccountId.eq(second_account_id.0)),
+                )
+                .add(
+                    Condition::all()
+                        .add(local_account_block::Column::AccountId.eq(second_account_id.0))
+                        .add(local_account_block::Column::TargetAccountId.eq(first_account_id.0)),
+                ),
+        )
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Return whether one local account directly blocks another.
+pub async fn local_account_blocks(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<bool> {
+    Ok(
+        local_account_block::Entity::find_by_id((account_id.0, target_account_id.0))
+            .one(db)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Return an active local mute relationship, ignoring rows whose duration has elapsed.
+pub async fn active_local_account_mute(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<Option<LocalAccountMute>> {
+    let now = OffsetDateTime::now_utc();
+    let mute = local_account_mute::Entity::find_by_id((account_id.0, target_account_id.0))
+        .filter(
+            Condition::any()
+                .add(local_account_mute::Column::ExpiresAt.is_null())
+                .add(local_account_mute::Column::ExpiresAt.gt(now)),
+        )
+        .one(db)
+        .await?;
+
+    Ok(mute.map(local_account_mute_from_model))
+}
+
+/// Return whether a viewer should hide a local account from personalized timelines.
+pub async fn local_account_is_hidden_for_viewer(
+    db: &DbConnection,
+    viewer_account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<bool> {
+    Ok(
+        local_accounts_are_blocked(db, viewer_account_id, target_account_id).await?
+            || active_local_account_mute(db, viewer_account_id, target_account_id)
+                .await?
+                .is_some(),
+    )
+}
+
+/// Return whether a local interaction may create a notification for its recipient.
+pub async fn local_account_allows_notification(
+    db: &DbConnection,
+    recipient_account_id: AccountId,
+    actor_account_id: AccountId,
+) -> Result<bool> {
+    if local_accounts_are_blocked(db, recipient_account_id, actor_account_id).await? {
+        return Ok(false);
+    }
+
+    Ok(
+        !active_local_account_mute(db, recipient_account_id, actor_account_id)
+            .await?
+            .is_some_and(|mute| mute.notifications),
+    )
+}
+
+/// Return block targets for an account in either relationship direction.
+pub async fn blocked_local_account_ids_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    let rows = local_account_block::Entity::find()
+        .filter(
+            local_account_block::Column::AccountId
+                .eq(account_id.0)
+                .or(local_account_block::Column::TargetAccountId.eq(account_id.0)),
+        )
+        .all(db)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            if row.account_id == account_id.0 {
+                AccountId(row.target_account_id)
+            } else {
+                AccountId(row.account_id)
+            }
+        })
+        .collect())
+}
+
+/// Return local accounts hidden from one account's personalized timelines.
+pub async fn hidden_local_account_ids_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    let mut account_ids = blocked_local_account_ids_for_account(db, account_id).await?;
+    let now = OffsetDateTime::now_utc();
+    let mutes = local_account_mute::Entity::find()
+        .filter(local_account_mute::Column::AccountId.eq(account_id.0))
+        .filter(
+            Condition::any()
+                .add(local_account_mute::Column::ExpiresAt.is_null())
+                .add(local_account_mute::Column::ExpiresAt.gt(now)),
+        )
+        .all(db)
+        .await?;
+    account_ids.extend(
+        mutes
+            .into_iter()
+            .map(|mute| AccountId(mute.target_account_id)),
+    );
+    account_ids.sort_unstable_by_key(|account_id| account_id.0);
+    account_ids.dedup();
+
+    Ok(account_ids)
+}
+
+/// List active locally muted accounts with Mastodon cursor pagination.
+pub async fn muted_local_accounts_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalAccount>> {
+    let now = OffsetDateTime::now_utc();
+    let rows = local_account_mute::Entity::find()
+        .filter(local_account_mute::Column::AccountId.eq(account_id.0))
+        .filter(
+            Condition::any()
+                .add(local_account_mute::Column::ExpiresAt.is_null())
+                .add(local_account_mute::Column::ExpiresAt.gt(now)),
+        )
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_account_mute::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let first_cursor = rows.first().map(|row| row.id);
+    let last_cursor = rows.last().map(|row| row.id);
+    let account_ids = rows
+        .into_iter()
+        .map(|row| AccountId(row.target_account_id))
+        .collect();
+
+    Ok(CollectionPage {
+        items: local_accounts_by_id(db, account_ids).await?,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// List locally blocked accounts with Mastodon cursor pagination.
+pub async fn blocked_local_accounts_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalAccount>> {
+    let rows = local_account_block::Entity::find()
+        .filter(local_account_block::Column::AccountId.eq(account_id.0))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_account_block::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let first_cursor = rows.first().map(|row| row.id);
+    let last_cursor = rows.last().map(|row| row.id);
+    let account_ids = rows
+        .into_iter()
+        .map(|row| AccountId(row.target_account_id))
+        .collect();
+
+    Ok(CollectionPage {
+        items: local_accounts_by_id(db, account_ids).await?,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// Validate that a local relation has an existing, distinct target account.
+async fn ensure_local_relation_target(
+    db: &DbConnection,
+    account_id: AccountId,
+    target_account_id: AccountId,
+) -> Result<()> {
+    if account_id == target_account_id {
+        return Err(RoostError::InvalidInput(
+            "accounts cannot moderate themselves".to_owned(),
+        ));
+    }
+    if find_local_account_by_id(db, target_account_id)
+        .await?
+        .is_none()
+    {
+        return Err(RoostError::InvalidInput(
+            "target account does not exist".to_owned(),
+        ));
     }
 
     Ok(())
@@ -2686,6 +3055,11 @@ pub async fn home_timeline_for_account(
     limit: u64,
     cursor: TimelineCursor,
 ) -> Result<TimelinePage<HomeTimelineItem>> {
+    let hidden_account_ids = hidden_local_account_ids_for_account(db, account_id)
+        .await?
+        .into_iter()
+        .map(|account_id| account_id.0)
+        .collect::<Vec<_>>();
     let follows = local_follow::Entity::find()
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .all(db)
@@ -2721,28 +3095,38 @@ pub async fn home_timeline_for_account(
                 .add(local_status::Column::Id.in_subquery(status_tags_subquery(followed_tag_ids))),
         );
     }
-    let statuses = apply_timeline_cursor(
+    let mut status_query = apply_timeline_cursor(
         local_status::Entity::find()
             .filter(status_condition)
             .filter(local_status::Column::DeletedAt.is_null()),
         cursor,
-    )
-    .order_by_desc(local_status::Column::Id)
-    .limit(page_query_limit(limit))
-    .all(db)
-    .await?;
+    );
+    if !hidden_account_ids.is_empty() {
+        status_query = status_query
+            .filter(local_status::Column::AccountId.is_not_in(hidden_account_ids.clone()));
+    }
+    let statuses = status_query
+        .order_by_desc(local_status::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
     let reblog_account_ids = std::iter::once(account_id.0)
         .chain(reblog_followed_ids.iter().copied())
         .collect::<Vec<_>>();
-    let reblogs = apply_reblog_timeline_cursor(
+    let mut reblog_query = apply_reblog_timeline_cursor(
         local_status_reblog::Entity::find()
             .filter(local_status_reblog::Column::AccountId.is_in(reblog_account_ids)),
         cursor,
-    )
-    .order_by_desc(local_status_reblog::Column::Id)
-    .limit(page_query_limit(limit))
-    .all(db)
-    .await?;
+    );
+    if !hidden_account_ids.is_empty() {
+        reblog_query = reblog_query
+            .filter(local_status_reblog::Column::AccountId.is_not_in(hidden_account_ids));
+    }
+    let reblogs = reblog_query
+        .order_by_desc(local_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
     let mut items = statuses
         .into_iter()
         .map(local_status_from_model)
@@ -2882,6 +3266,36 @@ impl ApplyCollectionCursor for Select<local_follow::Entity> {
         }
         if let Some(min_id) = cursor.min_id {
             self = self.filter(local_follow::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_account_block::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_account_block::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_account_block::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_account_block::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_account_mute::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_account_mute::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_account_mute::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_account_mute::Column::Id.gt(min_id));
         }
         self
     }
@@ -3187,6 +3601,16 @@ fn local_follow_from_model(follow: local_follow::Model) -> LocalFollow {
         followed_account_id: AccountId(follow.followed_account_id),
         show_reblogs: follow.show_reblogs,
         notify: follow.notify,
+    }
+}
+
+/// Convert a SeaORM mute row into its database API representation.
+fn local_account_mute_from_model(mute: local_account_mute::Model) -> LocalAccountMute {
+    LocalAccountMute {
+        account_id: AccountId(mute.account_id),
+        target_account_id: AccountId(mute.target_account_id),
+        notifications: mute.notifications,
+        expires_at: mute.expires_at,
     }
 }
 

@@ -69,6 +69,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses with media and hashtag filters; pinned statuses are missing. |
 | 🟡 | Follow graph | Local follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote follows are missing. |
+| 🟡 | Mutes and blocks | Local mute/unmute, block/unblock, relationship state, mute duration, and paginated collections work; remote and domain policy are missing. |
 
 ### Search
 
@@ -144,7 +145,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 - [ ] Add WebFinger, actor documents, inbox, and outbox.
 - [ ] Add federation delivery and inbound activity processing.
-- [ ] Add remote follow graph and full private-status home timeline semantics.
+- [ ] Add remote follow graph, remote mutes/blocks, and full private-status home timeline semantics.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote ActivityPub `Announce` support.
 - [ ] Add remote hashtag support.

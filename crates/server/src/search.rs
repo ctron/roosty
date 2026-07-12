@@ -49,11 +49,11 @@ struct ErrorResponse {
 
 async fn search(
     State(state): State<AppState>,
-    AuthenticatedAccount(_account): AuthenticatedAccount,
+    AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<SearchParams>,
 ) -> Response {
     let accounts = if matches!(params.search_type.as_deref(), None | Some("accounts")) {
-        search_accounts(&state, &params, MAX_SEARCH_LIMIT).await
+        search_accounts(&state, account.id, &params, MAX_SEARCH_LIMIT).await
     } else {
         Ok(Vec::new())
     };
@@ -76,10 +76,10 @@ async fn search(
 
 async fn account_search(
     State(state): State<AppState>,
-    AuthenticatedAccount(_account): AuthenticatedAccount,
+    AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<SearchParams>,
 ) -> Response {
-    match search_accounts(&state, &params, MAX_ACCOUNT_SEARCH_LIMIT).await {
+    match search_accounts(&state, account.id, &params, MAX_ACCOUNT_SEARCH_LIMIT).await {
         Ok(accounts) => Json(accounts).into_response(),
         Err(error) => server_error(error),
     }
@@ -88,6 +88,7 @@ async fn account_search(
 /// Search local accounts and convert them to Mastodon account responses.
 async fn search_accounts(
     state: &AppState,
+    account_id: roost_core::AccountId,
     params: &SearchParams,
     max_limit: u64,
 ) -> roost_core::Result<Vec<crate::auth::AccountResponse>> {
@@ -101,7 +102,8 @@ async fn search_accounts(
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, max_limit);
     let offset = params.offset.unwrap_or(0);
-    let accounts = roost_db::search_local_accounts(&state.db, &query, limit, offset).await?;
+    let accounts =
+        roost_db::search_local_accounts(&state.db, account_id, &query, limit, offset).await?;
     let mut responses = Vec::with_capacity(accounts.len());
 
     for account in accounts {

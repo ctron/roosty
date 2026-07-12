@@ -10,7 +10,7 @@
 
 ## Medium Term
 
-- Social graph APIs beyond local follows: remote follow delivery, follow requests, mute, unmute, block, and unblock.
+- Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
 - Notifications: grouped notifications, push integration, and remote notification events.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
