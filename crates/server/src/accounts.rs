@@ -560,6 +560,7 @@ mod tests {
     use serde_json::Value;
     use tempfile::TempDir;
     use test_context::{AsyncTestContext, test_context};
+    use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
     use crate::{config::Config, http::AppState, password};
@@ -676,6 +677,68 @@ mod tests {
         )
         .await;
         assert_eq!(home, serde_json::json!([]));
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Given a local follow, when the target has user streams open, then a status-less follow notification is emitted.
+    async fn follow_emits_streaming_notification(context: &mut AccountContext) {
+        let (alice_id, alice_token) = context
+            .create_account("alice", "alice-stream@example.com")
+            .await;
+        let (bob_id, _bob_token) = context
+            .create_account("bob", "bob-stream@example.com")
+            .await;
+        let mut receiver = context.state.streaming_events.subscribe();
+
+        let follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let user_message = event
+            .to_socket_message(bob_id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let notification_message = event
+            .to_socket_message(bob_id, &["user:notification".to_owned()])
+            .unwrap()
+            .unwrap();
+        let other_user_message = event
+            .to_socket_message(alice_id, &["user:notification".to_owned()])
+            .unwrap();
+        let user_value: Value = serde_json::from_str(&user_message).unwrap();
+        let notification_value: Value = serde_json::from_str(&notification_message).unwrap();
+        let payload: Value = serde_json::from_str(user_value["payload"].as_str().unwrap()).unwrap();
+
+        assert_eq!(other_user_message, None);
+        assert_eq!(
+            user_value,
+            serde_json::json!({
+                "stream": ["user"],
+                "event": "notification",
+                "payload": user_value["payload"],
+            })
+        );
+        assert_eq!(
+            notification_value,
+            serde_json::json!({
+                "stream": ["user:notification"],
+                "event": "notification",
+                "payload": user_value["payload"],
+            })
+        );
+        assert_eq!(payload["type"], "follow");
+        assert_eq!(payload["account"]["id"], alice_id.0.to_string());
+        assert!(payload.get("status").is_none());
     }
 
     #[test_context(AccountContext)]
@@ -838,6 +901,7 @@ mod tests {
         db: roost_db::DbConnection,
         database_name: String,
         config: Config,
+        state: AppState,
         application_id: uuid::Uuid,
         _temp_dir: TempDir,
     }
@@ -898,6 +962,7 @@ mod tests {
 
             Self {
                 postgresql,
+                state: AppState::new(config.clone(), db.clone()),
                 db,
                 database_name,
                 config,
@@ -907,19 +972,26 @@ mod tests {
         }
 
         async fn teardown(self) {
-            self.db.close().await.unwrap();
-            self.postgresql
-                .drop_database(&self.database_name)
-                .await
-                .unwrap();
-            self.postgresql.stop().await.unwrap();
+            let AccountContext {
+                postgresql,
+                db,
+                database_name,
+                state,
+                ..
+            } = self;
+            let AppState { db: state_db, .. } = state;
+
+            state_db.close().await.unwrap();
+            db.close().await.unwrap();
+            postgresql.drop_database(&database_name).await.unwrap();
+            postgresql.stop().await.unwrap();
         }
     }
 
     impl AccountContext {
         /// Build an app router backed by this test database.
         fn app(&self) -> Router {
-            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+            crate::http::app_router(self.state.clone(), false)
         }
 
         /// Send a raw request through the test router.

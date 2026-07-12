@@ -26,4 +26,3 @@
 - Add remote ActivityPub `Announce` support for boosts.
 - Extend media support with video/audio validation, async processing, and object storage.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.
-- Fix an issue with follows not being announced on the stream
