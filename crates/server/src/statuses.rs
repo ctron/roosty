@@ -554,7 +554,8 @@ async fn status_models(
     Ok(response)
 }
 
-async fn timeline_response(
+/// Build a Mastodon timeline response from local statuses and optional viewer state.
+pub(crate) async fn timeline_response(
     state: &AppState,
     statuses: Vec<roost_db::LocalStatus>,
     limit: u64,
@@ -790,7 +791,8 @@ async fn status_descendants(
     Ok(descendants)
 }
 
-fn timeline_limit(limit: Option<u64>) -> u64 {
+/// Clamp a Mastodon timeline limit to the local supported range.
+pub(crate) fn timeline_limit(limit: Option<u64>) -> u64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 

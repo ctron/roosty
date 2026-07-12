@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-sea-orm.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-time.workspace = true
-uuid.workspace = true
+sea-orm = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }

@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod accounts;
 mod auth;
 mod compat;
 mod config;

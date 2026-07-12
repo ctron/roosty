@@ -65,8 +65,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
 | 🟢 | Status metadata | Local `statuses_count` and `last_status_at` are populated. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
-| 🔴 | `GET /api/v1/accounts/:id` | Public account lookup is missing. |
-| 🔴 | Account statuses | `GET /api/v1/accounts/:id/statuses` is missing. |
+| 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
+| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses; media/tag/pin filters are empty until those features exist. |
+| 🟡 | Follow graph | Local follow/unfollow, relationships, followers, and following are implemented; remote follows are missing. |
 
 ### Search
 
@@ -96,7 +97,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own local statuses; no follow graph yet. |
+| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses and followed local public/unlisted statuses. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
 | 🔴 | `GET /api/v1/timelines/tag/:tag` | Hashtag timeline is missing. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for local timelines. |
@@ -135,7 +136,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 - [ ] Add WebFinger, actor documents, inbox, and outbox.
 - [ ] Add federation delivery and inbound activity processing.
-- [ ] Add follow graph and real home timeline membership.
+- [ ] Add remote follow graph and full private-status home timeline semantics.
 - [ ] Add conversation endpoint support for replies.
 - [ ] Add collection pagination and boosts.
 - [ ] Add persisted notifications and notification streaming.

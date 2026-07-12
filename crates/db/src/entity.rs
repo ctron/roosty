@@ -1,6 +1,7 @@
 //! SeaORM entity modules for Roost database tables.
 
 pub mod local_account;
+pub mod local_follow;
 pub mod local_status;
 pub mod local_status_bookmark;
 pub mod local_status_favourite;

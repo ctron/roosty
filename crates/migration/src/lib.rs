@@ -9,6 +9,7 @@ mod m20260701_000004_add_local_account_settings;
 mod m20260701_000005_create_local_status_table;
 mod m20260701_000006_create_local_status_favourite_table;
 mod m20260701_000007_create_local_status_bookmark_table;
+mod m20260701_000008_create_local_follow_table;
 
 pub struct Migrator;
 
@@ -23,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000005_create_local_status_table::Migration),
             Box::new(m20260701_000006_create_local_status_favourite_table::Migration),
             Box::new(m20260701_000007_create_local_status_bookmark_table::Migration),
+            Box::new(m20260701_000008_create_local_follow_table::Migration),
         ]
     }
 }

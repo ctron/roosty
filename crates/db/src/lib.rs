@@ -5,9 +5,9 @@ use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use roost_core::{AccountId, JobId, Result, RoostError, StatusId};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, Database, DatabaseBackend,
-    DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Select, Set, Statement,
+    ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
+    DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -19,8 +19,8 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_status, local_status_bookmark, local_status_favourite, oauth_access_token,
-    oauth_application, oauth_authorization_code,
+    local_account, local_follow, local_status, local_status_bookmark, local_status_favourite,
+    oauth_access_token, oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -252,6 +252,19 @@ pub struct TimelineCursor {
     pub min_id: Option<StatusId>,
 }
 
+/// Stored local follow relationship between two accounts.
+#[derive(Clone, Debug)]
+pub struct LocalFollow {
+    /// Account that follows another account.
+    pub follower_account_id: AccountId,
+    /// Account being followed.
+    pub followed_account_id: AccountId,
+    /// Whether boosts should appear in the follower's home timeline.
+    pub show_reblogs: bool,
+    /// Whether the follower wants notifications for new posts.
+    pub notify: bool,
+}
+
 /// OAuth client application metadata.
 #[derive(Clone, Debug)]
 pub struct OAuthApplication {
@@ -350,6 +363,142 @@ pub async fn search_local_accounts(
         .await?;
 
     Ok(accounts.into_iter().map(local_account_from_model).collect())
+}
+
+/// Count local accounts following this account.
+pub async fn count_local_followers(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+    Ok(local_follow::Entity::find()
+        .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
+        .count(db)
+        .await?)
+}
+
+/// Count local accounts this account follows.
+pub async fn count_local_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+    Ok(local_follow::Entity::find()
+        .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
+        .count(db)
+        .await?)
+}
+
+/// Return whether one local account follows another.
+pub async fn local_follow_relationship(
+    db: &DbConnection,
+    follower_account_id: AccountId,
+    followed_account_id: AccountId,
+) -> Result<Option<LocalFollow>> {
+    let follow = local_follow::Entity::find_by_id((follower_account_id.0, followed_account_id.0))
+        .one(db)
+        .await?;
+
+    Ok(follow.map(local_follow_from_model))
+}
+
+/// Follow a local account, updating follow options when it already exists.
+pub async fn follow_local_account(
+    db: &DbConnection,
+    follower_account_id: AccountId,
+    followed_account_id: AccountId,
+    show_reblogs: bool,
+    notify: bool,
+) -> Result<LocalFollow> {
+    if follower_account_id == followed_account_id {
+        return Err(RoostError::InvalidInput(
+            "accounts cannot follow themselves".to_owned(),
+        ));
+    }
+    if find_local_account_by_id(db, followed_account_id)
+        .await?
+        .is_none()
+    {
+        return Err(RoostError::InvalidInput(
+            "followed account does not exist".to_owned(),
+        ));
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let follow =
+        match local_follow::Entity::find_by_id((follower_account_id.0, followed_account_id.0))
+            .one(db)
+            .await?
+        {
+            Some(model) => {
+                let mut active = model.into_active_model();
+                active.show_reblogs = Set(show_reblogs);
+                active.notify = Set(notify);
+                active.updated_at = Set(now);
+                active.update(db).await?
+            }
+            None => {
+                local_follow::ActiveModel {
+                    follower_account_id: Set(follower_account_id.0),
+                    followed_account_id: Set(followed_account_id.0),
+                    show_reblogs: Set(show_reblogs),
+                    notify: Set(notify),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(db)
+                .await?
+            }
+        };
+
+    Ok(local_follow_from_model(follow))
+}
+
+/// Remove a local follow relationship when it exists.
+pub async fn unfollow_local_account(
+    db: &DbConnection,
+    follower_account_id: AccountId,
+    followed_account_id: AccountId,
+) -> Result<()> {
+    if let Some(model) =
+        local_follow::Entity::find_by_id((follower_account_id.0, followed_account_id.0))
+            .one(db)
+            .await?
+    {
+        model.into_active_model().delete(db).await?;
+    }
+
+    Ok(())
+}
+
+/// List local accounts following this account, newest first.
+pub async fn local_followers_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<Vec<LocalAccount>> {
+    let account_ids = local_follow::Entity::find()
+        .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
+        .order_by_desc(local_follow::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|follow| AccountId(follow.follower_account_id))
+        .collect::<Vec<_>>();
+
+    local_accounts_by_id(db, account_ids).await
+}
+
+/// List local accounts followed by this account, newest first.
+pub async fn local_following_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<Vec<LocalAccount>> {
+    let account_ids = local_follow::Entity::find()
+        .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
+        .order_by_desc(local_follow::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|follow| AccountId(follow.followed_account_id))
+        .collect::<Vec<_>>();
+
+    local_accounts_by_id(db, account_ids).await
 }
 
 /// Update mutable local account settings and return the refreshed account.
@@ -640,6 +789,21 @@ async fn active_statuses_by_id(
     Ok(statuses)
 }
 
+/// Return local accounts in the same order as the provided ids.
+async fn local_accounts_by_id(
+    db: &DbConnection,
+    account_ids: Vec<AccountId>,
+) -> Result<Vec<LocalAccount>> {
+    let mut accounts = Vec::with_capacity(account_ids.len());
+    for account_id in account_ids {
+        if let Some(account) = find_local_account_by_id(db, account_id).await? {
+            accounts.push(account);
+        }
+    }
+
+    Ok(accounts)
+}
+
 /// Soft-delete a local status when the authenticated account owns it.
 pub async fn delete_owned_local_status(
     db: &DbConnection,
@@ -686,16 +850,57 @@ pub async fn public_local_timeline(
     Ok(statuses.into_iter().map(local_status_from_model).collect())
 }
 
-/// List statuses authored by one account for the initial home timeline.
+/// List statuses visible on an account's profile timeline.
+pub async fn local_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    viewer: Option<AccountId>,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<Vec<LocalStatus>> {
+    let owner = viewer.is_some_and(|viewer| viewer == account_id);
+    let mut query = local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null());
+    if !owner {
+        query = query.filter(local_status::Column::Visibility.is_in(["public", "unlisted"]));
+    }
+
+    let statuses = apply_timeline_cursor(query, cursor)
+        .order_by_desc(local_status::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await?;
+
+    Ok(statuses.into_iter().map(local_status_from_model).collect())
+}
+
+/// List statuses authored by the account and followed local accounts.
 pub async fn home_timeline_for_account(
     db: &DbConnection,
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
 ) -> Result<Vec<LocalStatus>> {
+    let followed_ids = local_follow::Entity::find()
+        .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|follow| follow.followed_account_id)
+        .collect::<Vec<_>>();
+
     let statuses = apply_timeline_cursor(
         local_status::Entity::find()
-            .filter(local_status::Column::AccountId.eq(account_id.0))
+            .filter(
+                Condition::any()
+                    .add(local_status::Column::AccountId.eq(account_id.0))
+                    .add(
+                        Condition::all()
+                            .add(local_status::Column::AccountId.is_in(followed_ids))
+                            .add(local_status::Column::Visibility.is_in(["public", "unlisted"])),
+                    ),
+            )
             .filter(local_status::Column::DeletedAt.is_null()),
         cursor,
     )
@@ -982,6 +1187,16 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         default_language: account.default_language,
         default_quote_policy: account.default_quote_policy,
         profile_fields: account.profile_fields,
+    }
+}
+
+/// Convert a SeaORM local follow model into the public DB value type.
+fn local_follow_from_model(follow: local_follow::Model) -> LocalFollow {
+    LocalFollow {
+        follower_account_id: AccountId(follow.follower_account_id),
+        followed_account_id: AccountId(follow.followed_account_id),
+        show_reblogs: follow.show_reblogs,
+        notify: follow.notify,
     }
 }
 

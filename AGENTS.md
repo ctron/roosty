@@ -18,6 +18,7 @@ Keep this as the default verification command for changes in this repository.
 ## Workspace Conventions
 
 - Keep dependency versions in the root `Cargo.toml` under `[workspace.dependencies]`.
+- Reference workspace dependencies in crate manifests as `dependency = { workspace = true }`.
 - Keep package metadata in the root `Cargo.toml` under `[workspace.package]`, including project version, Rust version, and license.
 - Current license: `Apache-2.0`.
 - Use SeaORM migrations as the canonical migration system from the start.

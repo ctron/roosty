@@ -815,6 +815,8 @@ pub(crate) async fn account_response(
         account.display_name.clone()
     };
     let statuses_count = roost_db::count_local_statuses_by_account(&state.db, account.id).await?;
+    let followers_count = roost_db::count_local_followers(&state.db, account.id).await?;
+    let following_count = roost_db::count_local_following(&state.db, account.id).await?;
     let last_status_at = roost_db::last_local_status_at(&state.db, account.id)
         .await?
         .map(|timestamp| DateOnly(timestamp).to_string());
@@ -837,8 +839,8 @@ pub(crate) async fn account_response(
         header_static: String::new(),
         fields: profile_fields.clone(),
         emojis: Vec::new(),
-        followers_count: 0,
-        following_count: 0,
+        followers_count,
+        following_count,
         statuses_count,
         last_status_at,
         source: AccountSource {

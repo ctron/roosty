@@ -1,0 +1,791 @@
+use axum::{
+    Json, Router,
+    body::to_bytes,
+    extract::{Path, Query, RawQuery, Request, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use roost_core::{AccountId, RoostError, StatusId};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+    auth::{AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    http::AppState,
+};
+
+const DEFAULT_ACCOUNT_LIMIT: u64 = 40;
+const MAX_ACCOUNT_LIMIT: u64 = 80;
+
+/// Build routes for Mastodon-compatible account lookup and local follows.
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/accounts/relationships", get(relationships))
+        .route("/api/v1/accounts/{account_id}", get(show_account))
+        .route(
+            "/api/v1/accounts/{account_id}/statuses",
+            get(account_statuses),
+        )
+        .route("/api/v1/accounts/{account_id}/follow", post(follow))
+        .route("/api/v1/accounts/{account_id}/unfollow", post(unfollow))
+        .route("/api/v1/accounts/{account_id}/followers", get(followers))
+        .route("/api/v1/accounts/{account_id}/following", get(following))
+}
+
+#[derive(Deserialize)]
+struct AccountPath {
+    account_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct AccountStatusesParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
+    exclude_replies: Option<bool>,
+    exclude_reblogs: Option<bool>,
+    only_media: Option<bool>,
+    pinned: Option<bool>,
+    tagged: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccountCollectionParams {
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct FollowInput {
+    reblogs: Option<bool>,
+    notify: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RelationshipsParams {
+    id: Vec<Uuid>,
+}
+
+#[derive(Clone, Copy)]
+enum AccountCollection {
+    Followers,
+    Following,
+}
+
+#[derive(Serialize)]
+struct RelationshipResponse {
+    id: String,
+    following: bool,
+    showing_reblogs: bool,
+    notifying: bool,
+    followed_by: bool,
+    blocking: bool,
+    blocked_by: bool,
+    muting: bool,
+    muting_notifications: bool,
+    muting_expires_at: Option<String>,
+    requested: bool,
+    domain_blocking: bool,
+    endorsed: bool,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+/// Return a public local account profile by account id.
+async fn show_account(State(state): State<AppState>, Path(path): Path<AccountPath>) -> Response {
+    match roost_db::find_local_account_by_id(&state.db, AccountId(path.account_id)).await {
+        Ok(Some(account)) => match account_response(&state, account).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => server_error(error),
+        },
+        Ok(None) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Return statuses authored by one local account.
+async fn account_statuses(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+    Query(params): Query<AccountStatusesParams>,
+) -> Response {
+    let account_id = AccountId(path.account_id);
+    if params.only_media.unwrap_or(false)
+        || params.pinned.unwrap_or(false)
+        || params.tagged.as_deref().is_some_and(|tag| !tag.is_empty())
+    {
+        return Json(Vec::<serde_json::Value>::new()).into_response();
+    }
+
+    let cursor = match timeline_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("status id is invalid"),
+    };
+    let limit = crate::statuses::timeline_limit(params.limit);
+    match roost_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+
+    match roost_db::local_statuses_by_account(
+        &state.db,
+        account_id,
+        viewer.as_ref().map(|account| account.id),
+        limit,
+        cursor,
+    )
+    .await
+    {
+        Ok(mut statuses) => {
+            if params.exclude_replies.unwrap_or(false) {
+                statuses.retain(|status| status.in_reply_to_id.is_none());
+            }
+            if params.exclude_reblogs.unwrap_or(false) {
+                // Boosts are not implemented yet, so every local status already matches.
+            }
+            crate::statuses::timeline_response(
+                &state,
+                statuses,
+                limit,
+                &format!("/api/v1/accounts/{}/statuses", account_id.0),
+                viewer.as_ref().map(|account| account.id),
+            )
+            .await
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+/// Follow a local account and return the resulting relationship.
+async fn follow(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+    request: Request,
+) -> Response {
+    let input = match follow_input(request).await {
+        Ok(input) => input,
+        Err(error) => return bad_request(&error),
+    };
+    let target_id = AccountId(path.account_id);
+
+    match roost_db::follow_local_account(
+        &state.db,
+        account.id,
+        target_id,
+        input.reblogs.unwrap_or(true),
+        input.notify.unwrap_or(false),
+    )
+    .await
+    {
+        Ok(_) => relationship_response(&state, account.id, target_id).await,
+        Err(RoostError::InvalidInput(error)) if error == "followed account does not exist" => {
+            not_found()
+        }
+        Err(RoostError::InvalidInput(error)) => bad_request(&error),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Unfollow a local account and return the resulting relationship.
+async fn unfollow(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<AccountPath>,
+) -> Response {
+    let target_id = AccountId(path.account_id);
+    match roost_db::unfollow_local_account(&state.db, account.id, target_id).await {
+        Ok(()) => relationship_response(&state, account.id, target_id).await,
+        Err(error) => server_error(error),
+    }
+}
+
+/// Return Mastodon relationship objects for requested account ids.
+async fn relationships(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ids = match relationship_ids(query.as_deref()) {
+        Ok(ids) => ids,
+        Err(()) => return bad_request("account id is invalid"),
+    };
+    let mut relationships = Vec::with_capacity(ids.len());
+    for id in ids {
+        match relationship_model(&state, account.id, AccountId(id)).await {
+            Ok(relationship) => relationships.push(relationship),
+            Err(error) => return server_error(error),
+        }
+    }
+
+    Json(relationships).into_response()
+}
+
+/// Return local followers for a local account.
+async fn followers(
+    State(state): State<AppState>,
+    Path(path): Path<AccountPath>,
+    Query(params): Query<AccountCollectionParams>,
+) -> Response {
+    account_collection(
+        &state,
+        AccountId(path.account_id),
+        params,
+        AccountCollection::Followers,
+    )
+    .await
+}
+
+/// Return local accounts followed by a local account.
+async fn following(
+    State(state): State<AppState>,
+    Path(path): Path<AccountPath>,
+    Query(params): Query<AccountCollectionParams>,
+) -> Response {
+    account_collection(
+        &state,
+        AccountId(path.account_id),
+        params,
+        AccountCollection::Following,
+    )
+    .await
+}
+
+/// Return a local follower/following account collection.
+async fn account_collection(
+    state: &AppState,
+    account_id: AccountId,
+    params: AccountCollectionParams,
+    collection: AccountCollection,
+) -> Response {
+    match roost_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
+        .clamp(1, MAX_ACCOUNT_LIMIT);
+    let accounts = match collection {
+        AccountCollection::Followers => {
+            roost_db::local_followers_for_account(&state.db, account_id, limit).await
+        }
+        AccountCollection::Following => {
+            roost_db::local_following_for_account(&state.db, account_id, limit).await
+        }
+    };
+    match accounts {
+        Ok(accounts) => match account_responses(state, accounts).await {
+            Ok(accounts) => Json(accounts).into_response(),
+            Err(error) => server_error(error),
+        },
+        Err(error) => server_error(error),
+    }
+}
+
+/// Convert local account records into Mastodon account responses.
+async fn account_responses(
+    state: &AppState,
+    accounts: Vec<roost_db::LocalAccount>,
+) -> roost_core::Result<Vec<crate::auth::AccountResponse>> {
+    let mut responses = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        responses.push(account_response(state, account).await?);
+    }
+
+    Ok(responses)
+}
+
+async fn relationship_response(
+    state: &AppState,
+    source_id: AccountId,
+    target_id: AccountId,
+) -> Response {
+    match relationship_model(state, source_id, target_id).await {
+        Ok(relationship) => Json(relationship).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Build the local Mastodon relationship shape for two accounts.
+async fn relationship_model(
+    state: &AppState,
+    source_id: AccountId,
+    target_id: AccountId,
+) -> roost_core::Result<RelationshipResponse> {
+    let following = roost_db::local_follow_relationship(&state.db, source_id, target_id).await?;
+    let followed_by = roost_db::local_follow_relationship(&state.db, target_id, source_id).await?;
+
+    Ok(RelationshipResponse {
+        id: target_id.0.to_string(),
+        following: following.is_some(),
+        showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs),
+        notifying: following.as_ref().is_some_and(|follow| follow.notify),
+        followed_by: followed_by.is_some(),
+        blocking: false,
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        muting_expires_at: None,
+        requested: false,
+        domain_blocking: false,
+        endorsed: false,
+    })
+}
+
+/// Parse optional follow settings from JSON, form, or empty request bodies.
+async fn follow_input(request: Request) -> Result<FollowInput, String> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|error| format!("invalid request body: {error}"))?;
+    if body.is_empty() {
+        return Ok(FollowInput {
+            reblogs: None,
+            notify: None,
+        });
+    }
+
+    if content_type.contains("application/json") {
+        serde_json::from_slice(&body).map_err(|error| format!("invalid request body: {error}"))
+    } else {
+        serde_urlencoded::from_bytes(&body)
+            .map_err(|error| format!("invalid request body: {error}"))
+    }
+}
+
+/// Parse Mastodon status cursor parameters from an account statuses request.
+fn timeline_cursor(params: &AccountStatusesParams) -> Result<roost_db::TimelineCursor, ()> {
+    Ok(roost_db::TimelineCursor {
+        max_id: parse_optional_status_id(params.max_id.as_deref())?,
+        since_id: parse_optional_status_id(params.since_id.as_deref())?,
+        min_id: parse_optional_status_id(params.min_id.as_deref())?,
+    })
+}
+
+/// Parse an optional status UUID from Mastodon cursor query parameters.
+fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, ()> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().map(StatusId).map_err(|_| ()))
+        .transpose()
+}
+
+/// Parse repeated relationship id query parameters.
+fn relationship_ids(query: Option<&str>) -> Result<Vec<Uuid>, ()> {
+    let Some(query) = query else {
+        return Ok(Vec::new());
+    };
+
+    serde_qs::Config::new()
+        .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+        .use_form_encoding(true)
+        .deserialize_str::<RelationshipsParams>(query)
+        .map(|params| params.id)
+        .map_err(|_| ())
+}
+
+/// Return a Mastodon-style bad request response with a compact error string.
+fn bad_request(description: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: description.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+/// Return a Mastodon-style not found response.
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "Record not found".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+/// Return a Mastodon-style internal error response.
+fn server_error(error: RoostError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use postgresql_embedded::PostgreSQL;
+    use roost_core::AccountId;
+    use roost_migration::Migrator;
+    use sea_orm_migration::MigratorTrait;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use test_context::{AsyncTestContext, test_context};
+    use tower::ServiceExt;
+
+    use crate::{config::Config, http::AppState, password};
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Verifies account pages expose profile data and public status collections.
+    async fn account_lookup_and_statuses_return_local_profile(context: &mut AccountContext) {
+        let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        context
+            .create_status(&alice_token, "public", Some("public"))
+            .await;
+        context
+            .create_status(&alice_token, "private", Some("private"))
+            .await;
+
+        let account = context
+            .get(&format!("/api/v1/accounts/{}", alice_id.0))
+            .await;
+        let statuses = context
+            .get(&format!("/api/v1/accounts/{}/statuses", alice_id.0))
+            .await;
+
+        assert_eq!(account.status(), StatusCode::OK);
+        assert_eq!(json_body(account).await["username"], "alice");
+        let statuses = json_body(statuses).await;
+        assert_eq!(statuses.as_array().unwrap().len(), 1);
+        assert_eq!(statuses[0]["content"], "<p>public</p>");
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Verifies local follows update relationships, counts, and the home timeline.
+    async fn follow_unfollow_updates_relationships_and_home_timeline(context: &mut AccountContext) {
+        let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        let (bob_id, bob_token) = context.create_account("bob", "bob@example.com").await;
+        let bob_status = context
+            .create_status(&bob_token, "bob public", Some("public"))
+            .await;
+
+        let follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+        let follow = json_body(follow).await;
+        assert_eq!(follow["id"], bob_id.0.to_string());
+        assert_eq!(follow["following"], true);
+
+        let relationships = context
+            .authenticated_get(
+                &format!("/api/v1/accounts/relationships?id%5B%5D={}", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(relationships.status(), StatusCode::OK);
+        assert_eq!(json_body(relationships).await[0]["following"], true);
+
+        let bob_account =
+            json_body(context.get(&format!("/api/v1/accounts/{}", bob_id.0)).await).await;
+        let alice_account = json_body(
+            context
+                .get(&format!("/api/v1/accounts/{}", alice_id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(bob_account["followers_count"], 1);
+        assert_eq!(alice_account["following_count"], 1);
+
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home?limit=30", &alice_token)
+                .await,
+        )
+        .await;
+        assert_eq!(home.as_array().unwrap().len(), 1);
+        assert_eq!(home[0]["id"], bob_status["id"]);
+
+        let unfollow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/unfollow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(json_body(unfollow).await["following"], false);
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home?limit=30", &alice_token)
+                .await,
+        )
+        .await;
+        assert_eq!(home, serde_json::json!([]));
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Verifies local follow edge cases use Mastodon-style status codes.
+    async fn follow_rejects_self_and_missing_accounts(context: &mut AccountContext) {
+        let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+
+        let self_follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", alice_id.0),
+                &alice_token,
+            )
+            .await;
+        let missing_follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", uuid::Uuid::now_v7()),
+                &alice_token,
+            )
+            .await;
+
+        assert_eq!(self_follow.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(missing_follow.status(), StatusCode::NOT_FOUND);
+    }
+
+    struct AccountContext {
+        postgresql: PostgreSQL,
+        db: roost_db::DbConnection,
+        database_name: String,
+        config: Config,
+        application_id: uuid::Uuid,
+        _temp_dir: TempDir,
+    }
+
+    impl AsyncTestContext for AccountContext {
+        async fn setup() -> Self {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("roost-accounts-")
+                .tempdir()
+                .unwrap();
+            let database_name = unique_name();
+            let data_dir = temp_dir.path().join("data").join(&database_name);
+            let password_file = temp_dir
+                .path()
+                .join("passwords")
+                .join(format!("{database_name}.pgpass"));
+
+            if let Some(parent) = password_file.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+
+            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let mut postgresql = PostgreSQL::new(settings);
+
+            postgresql.setup().await.unwrap();
+            postgresql.start().await.unwrap();
+            postgresql.create_database(&database_name).await.unwrap();
+
+            let database_url = postgresql.settings().url(&database_name);
+            let db = roost_db::connect(&database_url).await.unwrap();
+            Migrator::up(&db, None).await.unwrap();
+
+            let (application, _secret) = roost_db::create_oauth_application(
+                &db,
+                "Elk",
+                "https://localhost:4001/oauth",
+                "read write follow push",
+                Some("https://localhost:4001"),
+                "test-token-pepper-change-me-0000",
+            )
+            .await
+            .unwrap();
+
+            let config = Config {
+                database_url,
+                public_base_url: "https://localhost:4000".parse().unwrap(),
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000),
+                infra_listen_addr: None,
+                session_secret: "test-session-secret-change-me-000".to_owned(),
+                token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+                object_storage_backend: "local".to_owned(),
+                media_root: "./media".to_owned(),
+                registration_mode: "closed".to_owned(),
+                federation_enabled: false,
+                instance_name: "Roost Test".to_owned(),
+                instance_description: Some("Endpoint test instance".to_owned()),
+            };
+
+            Self {
+                postgresql,
+                db,
+                database_name,
+                config,
+                application_id: application.id,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        async fn teardown(self) {
+            self.db.close().await.unwrap();
+            self.postgresql
+                .drop_database(&self.database_name)
+                .await
+                .unwrap();
+            self.postgresql.stop().await.unwrap();
+        }
+    }
+
+    impl AccountContext {
+        /// Build an app router backed by this test database.
+        fn app(&self) -> Router {
+            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+        }
+
+        /// Send a raw request through the test router.
+        async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
+            self.app().oneshot(request).await.unwrap()
+        }
+
+        /// Send an anonymous GET request.
+        async fn get(&self, uri: &str) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        /// Send an authenticated GET request.
+        async fn authenticated_get(&self, uri: &str, token: &str) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        /// Send an authenticated request without a body.
+        async fn authenticated_empty(
+            &self,
+            method: &str,
+            uri: &str,
+            token: &str,
+        ) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        /// Send an authenticated JSON request.
+        async fn authenticated_json(
+            &self,
+            method: &str,
+            uri: &str,
+            token: &str,
+            body: serde_json::Value,
+        ) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+        }
+
+        /// Create a local account with an access token for endpoint tests.
+        async fn create_account(&self, username: &str, email: &str) -> (AccountId, String) {
+            let password_hash = password::hash_password("password").unwrap();
+            let account_id = AccountId(
+                roost_db::create_local_account(&self.db, username, email, &password_hash)
+                    .await
+                    .unwrap(),
+            );
+            let token = roost_db::create_access_token(
+                &self.db,
+                &self.config.token_pepper,
+                account_id,
+                self.application_id,
+                "read write follow push",
+            )
+            .await
+            .unwrap()
+            .token;
+
+            (account_id, token)
+        }
+
+        /// Create a local status through the HTTP API and return its JSON response.
+        async fn create_status(
+            &self,
+            token: &str,
+            status: &str,
+            visibility: Option<&str>,
+        ) -> Value {
+            let mut body = serde_json::json!({ "status": status });
+            if let Some(visibility) = visibility {
+                body["visibility"] = serde_json::json!(visibility);
+            }
+
+            json_body(
+                self.authenticated_json("POST", "/api/v1/statuses", token, body)
+                    .await,
+            )
+            .await
+        }
+    }
+
+    /// Decode a JSON response body.
+    async fn json_body(response: axum::http::Response<Body>) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Build a unique database name for parallel embedded PostgreSQL tests.
+    fn unique_name() -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        format!("roost_accounts_{}_{}", std::process::id(), timestamp)
+    }
+}
