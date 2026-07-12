@@ -26,8 +26,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/followed_tags", get(followed_tags))
         .route("/api/v1/markers", get(markers))
         .route("/api/v1/notifications", get(notifications))
-        .route("/api/v1/timelines/home", get(home_timeline))
-        .route("/api/v1/timelines/public", get(public_timeline))
         .route("/api/v1/streaming", get(streaming))
         .route("/api/v1/streaming/health", get(streaming_health))
 }
@@ -55,16 +53,8 @@ async fn markers(AuthenticatedAccount(_account): AuthenticatedAccount) -> Respon
     Json(json!({})).into_response()
 }
 
-async fn home_timeline(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
-    Json(Vec::<Value>::new()).into_response()
-}
-
 async fn notifications(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
     Json(Vec::<Value>::new()).into_response()
-}
-
-async fn public_timeline() -> Json<Vec<Value>> {
-    Json(Vec::new())
 }
 
 async fn streaming_health() -> &'static str {
@@ -85,44 +75,102 @@ async fn streaming(
     }
 
     let stream = query.get("stream").cloned();
+    let events = state.streaming_events.clone();
     websocket
-        .on_upgrade(move |socket| handle_streaming_socket(socket, stream))
+        .on_upgrade(move |socket| handle_streaming_socket(socket, stream, events))
         .into_response()
 }
 
 /// Keep a validated streaming socket open until the client closes it.
-async fn handle_streaming_socket(mut socket: WebSocket, initial_stream: Option<String>) {
-    if let Some(stream) = initial_stream {
-        debug!(stream, "streaming client subscribed");
-    }
+async fn handle_streaming_socket(
+    mut socket: WebSocket,
+    initial_stream: Option<String>,
+    events: crate::streaming::StreamingEvents,
+) {
+    let mut streams = initial_stream.map_or_else(|| vec!["user".to_owned()], |stream| vec![stream]);
+    debug!(?streams, "streaming client subscribed");
 
-    while let Some(message) = socket.recv().await {
-        match message {
-            Ok(Message::Text(text)) => handle_streaming_text(&text),
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(payload)) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
+    let mut receiver = events.subscribe();
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                let Some(message) = message else {
                     break;
+                };
+                match message {
+                    Ok(Message::Text(text)) => handle_streaming_text(&text, &mut streams),
+                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Ping(payload)) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(%error, "streaming websocket error");
+                        break;
+                    }
                 }
             }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(%error, "streaming websocket error");
-                break;
+            event = receiver.recv() => {
+                match event {
+                    Ok(event) => {
+                        let message = match event.to_socket_message(&streams) {
+                            Ok(message) => message,
+                            Err(error) => {
+                                warn!(%error, "failed to serialize streaming socket message");
+                                continue;
+                            }
+                        };
+                        if socket.send(Message::Text(message.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "streaming websocket receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
 /// Log subscribe and unsubscribe messages until real event fan-out exists.
-fn handle_streaming_text(text: &str) {
+fn handle_streaming_text(text: &str, streams: &mut Vec<String>) {
     match serde_json::from_str::<Value>(text) {
         Ok(value) => {
             let message_type = value.get("type").and_then(Value::as_str);
             let stream = value.get("stream").and_then(Value::as_str);
+            update_stream_subscription(message_type, stream, streams);
             debug!(?message_type, ?stream, "streaming control message");
         }
         Err(error) => debug!(%error, "ignored non-json streaming message"),
+    }
+}
+
+/// Apply browser WebSocket subscribe and unsubscribe control messages.
+fn update_stream_subscription(
+    message_type: Option<&str>,
+    stream: Option<&str>,
+    streams: &mut Vec<String>,
+) {
+    let Some(stream) = stream.map(str::trim).filter(|stream| !stream.is_empty()) else {
+        return;
+    };
+    match message_type {
+        Some("subscribe") if !streams.iter().any(|current| current == stream) => {
+            streams.push(stream.to_owned());
+        }
+        Some("unsubscribe") => {
+            streams.retain(|current| current != stream);
+        }
+        _ => {}
+    }
+    if streams.is_empty() {
+        streams.push("user".to_owned());
     }
 }
 
@@ -184,7 +232,7 @@ mod tests {
     use test_context::{AsyncTestContext, test_context};
     use tower::ServiceExt;
 
-    use super::streaming_token;
+    use super::{streaming_token, update_stream_subscription};
     use crate::{config::Config, http::AppState, password};
 
     #[test_context(CompatContext)]
@@ -277,6 +325,22 @@ mod tests {
             streaming_token(&headers, &query),
             Some("protocol-token".to_owned())
         );
+    }
+
+    #[test]
+    fn streaming_subscription_updates_keep_a_default_stream() {
+        // Some browser clients open the socket first and subscribe through
+        // control messages; outgoing events still need a defined stream array.
+        let mut streams = vec!["user".to_owned()];
+
+        update_stream_subscription(Some("subscribe"), Some("public"), &mut streams);
+        assert_eq!(streams, vec!["user".to_owned(), "public".to_owned()]);
+
+        update_stream_subscription(Some("unsubscribe"), Some("user"), &mut streams);
+        assert_eq!(streams, vec!["public".to_owned()]);
+
+        update_stream_subscription(Some("unsubscribe"), Some("public"), &mut streams);
+        assert_eq!(streams, vec!["user".to_owned()]);
     }
 
     struct CompatContext {

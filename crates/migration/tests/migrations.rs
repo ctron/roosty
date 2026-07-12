@@ -20,11 +20,13 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "oauth_authorization_code").await);
     assert!(table_exists(database.connection(), "oauth_access_token").await);
     assert!(table_exists(database.connection(), "oauth_refresh_token").await);
+    assert!(table_exists(database.connection(), "local_status").await);
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
     assert!(column_exists(database.connection(), "local_account", "default_visibility").await);
     assert!(column_exists(database.connection(), "local_account", "profile_fields").await);
+    assert!(column_exists(database.connection(), "local_status", "deleted_at").await);
 }
 
 #[test_context(EmbeddedDatabase)]
@@ -36,11 +38,13 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "job").await);
     assert!(table_exists(database.connection(), "local_account").await);
     assert!(table_exists(database.connection(), "oauth_application").await);
+    assert!(table_exists(database.connection(), "local_status").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
     assert!(!table_exists(database.connection(), "local_account").await);
     assert!(!table_exists(database.connection(), "oauth_application").await);
+    assert!(!table_exists(database.connection(), "local_status").await);
 }
 
 struct EmbeddedDatabase {

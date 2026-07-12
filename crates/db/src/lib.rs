@@ -3,11 +3,11 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
-use roost_core::{AccountId, JobId, Result, RoostError};
+use roost_core::{AccountId, JobId, Result, RoostError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, Database, DatabaseBackend,
-    DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, Set,
-    Statement,
+    DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement,
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -18,7 +18,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 mod entity;
 
-use entity::{local_account, oauth_access_token, oauth_application, oauth_authorization_code};
+use entity::{
+    local_account, local_status, oauth_access_token, oauth_application, oauth_authorization_code,
+};
 
 /// Shared database connection type used across Roost crates.
 pub type DbConnection = DatabaseConnection;
@@ -130,6 +132,50 @@ pub struct LocalAccountSettingsUpdate {
     pub profile_fields: Option<JsonValue>,
 }
 
+/// Local status data returned by status and timeline queries.
+#[derive(Clone, Debug)]
+pub struct LocalStatus {
+    /// Internal status identifier.
+    pub id: StatusId,
+    /// Authoring local account identifier.
+    pub account_id: AccountId,
+    /// Plain text status content.
+    pub content: String,
+    /// Mastodon status visibility value.
+    pub visibility: String,
+    /// Whether the status is marked sensitive.
+    pub sensitive: bool,
+    /// Optional content warning text.
+    pub spoiler_text: String,
+    /// Optional BCP-47 language tag.
+    pub language: Option<String>,
+    /// Optional local status this status replies to.
+    pub in_reply_to_id: Option<StatusId>,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Soft-delete timestamp.
+    pub deleted_at: Option<OffsetDateTime>,
+}
+
+/// Data accepted when creating a local status.
+#[derive(Clone, Debug)]
+pub struct NewLocalStatus {
+    /// Authoring local account identifier.
+    pub account_id: AccountId,
+    /// Plain text status content.
+    pub content: String,
+    /// Mastodon status visibility value.
+    pub visibility: String,
+    /// Whether the status is marked sensitive.
+    pub sensitive: bool,
+    /// Optional content warning text.
+    pub spoiler_text: String,
+    /// Optional BCP-47 language tag.
+    pub language: Option<String>,
+    /// Optional local status this status replies to.
+    pub in_reply_to_id: Option<StatusId>,
+}
+
 /// OAuth client application metadata.
 #[derive(Clone, Debug)]
 pub struct OAuthApplication {
@@ -219,6 +265,102 @@ pub async fn update_local_account_settings(
     active.updated_at = Set(OffsetDateTime::now_utc());
 
     Ok(local_account_from_model(active.update(db).await?))
+}
+
+/// Create a local status authored by an account on this instance.
+pub async fn create_local_status(
+    db: &DbConnection,
+    new_status: NewLocalStatus,
+) -> Result<LocalStatus> {
+    let status_id = Uuid::now_v7();
+    let created_at = OffsetDateTime::now_utc();
+
+    let status = local_status::ActiveModel {
+        id: Set(status_id),
+        account_id: Set(new_status.account_id.0),
+        content: Set(new_status.content),
+        visibility: Set(new_status.visibility),
+        sensitive: Set(new_status.sensitive),
+        spoiler_text: Set(new_status.spoiler_text),
+        language: Set(new_status.language),
+        in_reply_to_id: Set(new_status.in_reply_to_id.map(|id| id.0)),
+        created_at: Set(created_at),
+        updated_at: Set(created_at),
+        deleted_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+
+    Ok(local_status_from_model(status))
+}
+
+/// Find a local status by id, excluding soft-deleted statuses.
+pub async fn find_local_status_by_id(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Option<LocalStatus>> {
+    let status = local_status::Entity::find_by_id(status_id.0)
+        .filter(local_status::Column::DeletedAt.is_null())
+        .one(db)
+        .await?;
+
+    Ok(status.map(local_status_from_model))
+}
+
+/// Soft-delete a local status when the authenticated account owns it.
+pub async fn delete_owned_local_status(
+    db: &DbConnection,
+    status_id: StatusId,
+    account_id: AccountId,
+) -> Result<Option<LocalStatus>> {
+    let Some(status) = local_status::Entity::find_by_id(status_id.0)
+        .filter(local_status::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if status.account_id != account_id.0 {
+        return Err(RoostError::InvalidInput(
+            "status is owned by another account".to_owned(),
+        ));
+    }
+
+    let mut active = status.into_active_model();
+    active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
+    active.updated_at = Set(OffsetDateTime::now_utc());
+
+    Ok(Some(local_status_from_model(active.update(db).await?)))
+}
+
+/// List public local statuses for the public timeline.
+pub async fn public_local_timeline(db: &DbConnection, limit: u64) -> Result<Vec<LocalStatus>> {
+    let statuses = local_status::Entity::find()
+        .filter(local_status::Column::Visibility.eq("public"))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .order_by_desc(local_status::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await?;
+
+    Ok(statuses.into_iter().map(local_status_from_model).collect())
+}
+
+/// List statuses authored by one account for the initial home timeline.
+pub async fn home_timeline_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<Vec<LocalStatus>> {
+    let statuses = local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .order_by_desc(local_status::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await?;
+
+    Ok(statuses.into_iter().map(local_status_from_model).collect())
 }
 
 /// Mark an active model field as changed only when an update value is present.
@@ -479,6 +621,21 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         default_language: account.default_language,
         default_quote_policy: account.default_quote_policy,
         profile_fields: account.profile_fields,
+    }
+}
+
+fn local_status_from_model(status: local_status::Model) -> LocalStatus {
+    LocalStatus {
+        id: StatusId(status.id),
+        account_id: AccountId(status.account_id),
+        content: status.content,
+        visibility: status.visibility,
+        sensitive: status.sensitive,
+        spoiler_text: status.spoiler_text,
+        language: status.language,
+        in_reply_to_id: status.in_reply_to_id.map(StatusId),
+        created_at: status.created_at,
+        deleted_at: status.deleted_at,
     }
 }
 

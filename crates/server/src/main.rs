@@ -17,6 +17,8 @@ mod config;
 mod http;
 mod instance;
 mod password;
+mod statuses;
+mod streaming;
 
 use crate::{
     config::{Config, database_url_from_env},

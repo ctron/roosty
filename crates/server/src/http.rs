@@ -22,6 +22,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Database connection pool.
     pub db: roost_db::DbConnection,
+    /// In-process Mastodon streaming event bus.
+    pub streaming_events: crate::streaming::StreamingEvents,
 }
 
 impl AppState {
@@ -30,6 +32,7 @@ impl AppState {
         Self {
             config: Arc::new(config),
             db,
+            streaming_events: crate::streaming::StreamingEvents::new(),
         }
     }
 }
@@ -40,6 +43,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::auth::router())
         .merge(crate::compat::router())
         .merge(crate::instance::router())
+        .merge(crate::statuses::router())
         .fallback(public_fallback)
         .layer(
             TraceLayer::new_for_http()

@@ -574,7 +574,7 @@ async fn revoke(
 }
 
 #[derive(Serialize)]
-struct AccountResponse {
+pub(crate) struct AccountResponse {
     id: String,
     username: String,
     acct: String,
@@ -601,7 +601,7 @@ struct AccountResponse {
 }
 
 #[derive(Serialize)]
-struct AccountSource {
+pub(crate) struct AccountSource {
     note: String,
     fields: Vec<serde_json::Value>,
     privacy: String,
@@ -612,7 +612,7 @@ struct AccountSource {
 }
 
 #[derive(Serialize)]
-struct AccountRole {
+pub(crate) struct AccountRole {
     id: String,
     name: String,
     color: String,
@@ -758,7 +758,10 @@ pub(crate) async fn account_from_bearer_token(
 }
 
 /// Build the Mastodon-compatible credential account response.
-fn account_response(state: &AppState, account: roost_db::LocalAccount) -> AccountResponse {
+pub(crate) fn account_response(
+    state: &AppState,
+    account: roost_db::LocalAccount,
+) -> AccountResponse {
     let account_url = match state
         .config
         .public_base_url
