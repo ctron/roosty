@@ -185,10 +185,10 @@ async fn notification_page_response(
     limit: u64,
 ) -> Response {
     let link_header = crate::statuses::CollectionLink::new(
-        page.items.len(),
         limit,
         page.first_cursor,
         page.last_cursor,
+        page.has_more,
         "/api/v1/notifications",
     )
     .header_value();

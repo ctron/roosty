@@ -8,6 +8,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
+    sea_query::Query,
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -406,6 +407,30 @@ pub struct CollectionPage<T> {
     pub first_cursor: Option<Uuid>,
     /// Cursor for the last row in the page.
     pub last_cursor: Option<Uuid>,
+    /// Whether one more row was found past the requested limit.
+    pub has_more: bool,
+}
+
+/// Page of Mastodon timeline items and UUID cursor metadata.
+#[derive(Clone, Debug)]
+pub struct TimelinePage<T> {
+    /// Items returned to the API caller.
+    pub items: Vec<T>,
+    /// Cursor for the first row in the page.
+    pub first_cursor: Option<Uuid>,
+    /// Cursor for the last row in the page.
+    pub last_cursor: Option<Uuid>,
+    /// Whether one more row was found past the requested limit.
+    pub has_more: bool,
+}
+
+/// Filters supported by Mastodon account status timeline requests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccountStatusTimelineOptions {
+    /// Exclude statuses that reply to another local status.
+    pub exclude_replies: bool,
+    /// Return only statuses with at least one media attachment.
+    pub only_media: bool,
 }
 
 /// Supported local Mastodon notification kinds.
@@ -769,7 +794,7 @@ pub async fn local_notifications_for_account(
         .filter(local_notification::Column::DismissedAt.is_null())
         .apply_collection_cursor(cursor)
         .order_by_desc(local_notification::Column::Id)
-        .limit(limit);
+        .limit(page_query_limit(limit));
 
     if !filter.include_types.is_empty() {
         query = query.filter(
@@ -788,6 +813,7 @@ pub async fn local_notifications_for_account(
     }
 
     let rows = query.all(db).await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|model| model.id);
     let last_cursor = rows.last().map(|model| model.id);
     let items = rows
@@ -799,6 +825,7 @@ pub async fn local_notifications_for_account(
         items,
         first_cursor,
         last_cursor,
+        has_more,
     })
 }
 
@@ -865,9 +892,10 @@ pub async fn local_followers_for_account(
         .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
         .apply_collection_cursor(cursor)
         .order_by_desc(local_follow::Column::Id)
-        .limit(limit)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|follow| follow.id);
     let last_cursor = rows.last().map(|follow| follow.id);
     let account_ids = rows
@@ -879,6 +907,7 @@ pub async fn local_followers_for_account(
         items: local_accounts_by_id(db, account_ids).await?,
         first_cursor,
         last_cursor,
+        has_more,
     })
 }
 
@@ -893,9 +922,10 @@ pub async fn local_following_for_account(
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .apply_collection_cursor(cursor)
         .order_by_desc(local_follow::Column::Id)
-        .limit(limit)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|follow| follow.id);
     let last_cursor = rows.last().map(|follow| follow.id);
     let account_ids = rows
@@ -907,6 +937,7 @@ pub async fn local_following_for_account(
         items: local_accounts_by_id(db, account_ids).await?,
         first_cursor,
         last_cursor,
+        has_more,
     })
 }
 
@@ -1447,9 +1478,10 @@ pub async fn local_favourites_for_account(
         .filter(local_status_favourite::Column::AccountId.eq(account_id.0))
         .apply_collection_cursor(cursor)
         .order_by_desc(local_status_favourite::Column::Id)
-        .limit(limit)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|model| model.id);
     let last_cursor = rows.last().map(|model| model.id);
     let status_ids = rows
@@ -1461,6 +1493,7 @@ pub async fn local_favourites_for_account(
         items: active_statuses_by_id(db, status_ids).await?,
         first_cursor,
         last_cursor,
+        has_more,
     })
 }
 
@@ -1529,9 +1562,10 @@ pub async fn local_bookmarks_for_account(
         .filter(local_status_bookmark::Column::AccountId.eq(account_id.0))
         .apply_collection_cursor(cursor)
         .order_by_desc(local_status_bookmark::Column::Id)
-        .limit(limit)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|model| model.id);
     let last_cursor = rows.last().map(|model| model.id);
     let status_ids = rows
@@ -1543,6 +1577,7 @@ pub async fn local_bookmarks_for_account(
         items: active_statuses_by_id(db, status_ids).await?,
         first_cursor,
         last_cursor,
+        has_more,
     })
 }
 
@@ -1622,9 +1657,10 @@ pub async fn local_reblogged_by_for_status(
         .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
         .apply_collection_cursor(cursor)
         .order_by_desc(local_status_reblog::Column::Id)
-        .limit(limit)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|model| model.id);
     let last_cursor = rows.last().map(|model| model.id);
     let account_ids = rows
@@ -1636,6 +1672,7 @@ pub async fn local_reblogged_by_for_status(
         items: local_accounts_by_id(db, account_ids).await?,
         first_cursor,
         last_cursor,
+        has_more,
     })
 }
 
@@ -1729,7 +1766,7 @@ pub async fn public_local_timeline(
     db: &DbConnection,
     limit: u64,
     cursor: TimelineCursor,
-) -> Result<Vec<LocalStatus>> {
+) -> Result<TimelinePage<LocalStatus>> {
     let statuses = apply_timeline_cursor(
         local_status::Entity::find()
             .filter(local_status::Column::Visibility.eq("public"))
@@ -1737,11 +1774,19 @@ pub async fn public_local_timeline(
         cursor,
     )
     .order_by_desc(local_status::Column::Id)
-    .limit(limit)
+    .limit(page_query_limit(limit))
     .all(db)
     .await?;
+    let (statuses, has_more) = trim_to_page(statuses, limit);
+    let first_cursor = statuses.first().map(|status| status.id);
+    let last_cursor = statuses.last().map(|status| status.id);
 
-    Ok(statuses.into_iter().map(local_status_from_model).collect())
+    Ok(TimelinePage {
+        items: statuses.into_iter().map(local_status_from_model).collect(),
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
 }
 
 /// List statuses visible on an account's profile timeline.
@@ -1751,7 +1796,8 @@ pub async fn local_statuses_by_account(
     viewer: Option<AccountId>,
     limit: u64,
     cursor: TimelineCursor,
-) -> Result<Vec<LocalStatus>> {
+    options: AccountStatusTimelineOptions,
+) -> Result<TimelinePage<LocalStatus>> {
     let owner = viewer.is_some_and(|viewer| viewer == account_id);
     let mut query = local_status::Entity::find()
         .filter(local_status::Column::AccountId.eq(account_id.0))
@@ -1759,14 +1805,33 @@ pub async fn local_statuses_by_account(
     if !owner {
         query = query.filter(local_status::Column::Visibility.is_in(["public", "unlisted"]));
     }
+    if options.exclude_replies {
+        query = query.filter(local_status::Column::InReplyToId.is_null());
+    }
+    if options.only_media {
+        let media_status_ids = Query::select()
+            .column(local_media_attachment::Column::StatusId)
+            .from(local_media_attachment::Entity)
+            .and_where(local_media_attachment::Column::StatusId.is_not_null())
+            .to_owned();
+        query = query.filter(local_status::Column::Id.in_subquery(media_status_ids));
+    }
 
     let statuses = apply_timeline_cursor(query, cursor)
         .order_by_desc(local_status::Column::Id)
-        .limit(limit)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let (statuses, has_more) = trim_to_page(statuses, limit);
+    let first_cursor = statuses.first().map(|status| status.id);
+    let last_cursor = statuses.last().map(|status| status.id);
 
-    Ok(statuses.into_iter().map(local_status_from_model).collect())
+    Ok(TimelinePage {
+        items: statuses.into_iter().map(local_status_from_model).collect(),
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
 }
 
 /// List statuses authored by the account and followed local accounts.
@@ -1775,7 +1840,7 @@ pub async fn home_timeline_for_account(
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
-) -> Result<Vec<HomeTimelineItem>> {
+) -> Result<TimelinePage<HomeTimelineItem>> {
     let follows = local_follow::Entity::find()
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .all(db)
@@ -1805,7 +1870,7 @@ pub async fn home_timeline_for_account(
         cursor,
     )
     .order_by_desc(local_status::Column::Id)
-    .limit(limit)
+    .limit(page_query_limit(limit))
     .all(db)
     .await?;
     let reblog_account_ids = std::iter::once(account_id.0)
@@ -1817,7 +1882,7 @@ pub async fn home_timeline_for_account(
         cursor,
     )
     .order_by_desc(local_status_reblog::Column::Id)
-    .limit(limit)
+    .limit(page_query_limit(limit))
     .all(db)
     .await?;
     let mut items = statuses
@@ -1832,9 +1897,16 @@ pub async fn home_timeline_for_account(
         )
         .collect::<Vec<_>>();
     items.sort_by_key(|item| Reverse(timeline_item_id(item)));
-    items.truncate(limit as usize);
+    let (items, has_more) = trim_to_page(items, limit);
+    let first_cursor = items.first().map(timeline_item_id);
+    let last_cursor = items.last().map(timeline_item_id);
 
-    Ok(items)
+    Ok(TimelinePage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
 }
 
 /// Apply Mastodon cursor parameters to a local status query.
@@ -1869,6 +1941,19 @@ fn apply_reblog_timeline_cursor(
         query = query.filter(local_status_reblog::Column::Id.gt(min_id.0));
     }
     query
+}
+
+fn page_query_limit(limit: u64) -> u64 {
+    limit.saturating_add(1)
+}
+
+fn trim_to_page<T>(mut items: Vec<T>, limit: u64) -> (Vec<T>, bool) {
+    let limit = limit as usize;
+    let has_more = items.len() > limit;
+    if has_more {
+        items.truncate(limit);
+    }
+    (items, has_more)
 }
 
 fn timeline_item_id(item: &HomeTimelineItem) -> Uuid {

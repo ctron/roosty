@@ -167,30 +167,20 @@ async fn account_statuses(
         viewer.as_ref().map(|account| account.id),
         limit,
         cursor,
+        roost_db::AccountStatusTimelineOptions {
+            exclude_replies: params.exclude_replies.unwrap_or(false),
+            only_media: params.only_media.unwrap_or(false),
+        },
     )
     .await
     {
-        Ok(mut statuses) => {
-            if params.exclude_replies.unwrap_or(false) {
-                statuses.retain(|status| status.in_reply_to_id.is_none());
-            }
+        Ok(page) => {
             if params.exclude_reblogs.unwrap_or(false) {
-                // Boosts are not implemented yet, so every local status already matches.
-            }
-            if params.only_media.unwrap_or(false) {
-                let mut media_statuses = Vec::new();
-                for status in statuses {
-                    match roost_db::local_status_has_media(&state.db, status.id).await {
-                        Ok(true) => media_statuses.push(status),
-                        Ok(false) => {}
-                        Err(error) => return server_error(error),
-                    }
-                }
-                statuses = media_statuses;
+                // Account status collections currently return authored statuses only.
             }
             crate::statuses::timeline_response(
                 &state,
-                statuses,
+                page,
                 limit,
                 &format!("/api/v1/accounts/{}/statuses", account_id.0),
                 viewer.as_ref().map(|account| account.id),
@@ -350,10 +340,10 @@ async fn account_collection(
                     }
                 };
                 let link_header = crate::statuses::CollectionLink::new(
-                    accounts.len(),
                     limit,
                     page.first_cursor,
                     page.last_cursor,
+                    page.has_more,
                     &path,
                 )
                 .header_value();
@@ -727,6 +717,7 @@ mod tests {
             ))
             .await;
         assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
         let body = json_body(next).await;
         assert_eq!(account_usernames(&body), ["first"]);
     }
@@ -768,6 +759,7 @@ mod tests {
             ))
             .await;
         assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
         let body = json_body(next).await;
         assert_eq!(account_usernames(&body), ["one"]);
     }

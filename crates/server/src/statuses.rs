@@ -915,10 +915,10 @@ async fn account_collection_response(
     path: &str,
 ) -> Response {
     let link_header = CollectionLink::new(
-        page.items.len(),
         limit,
         page.first_cursor,
         page.last_cursor,
+        page.has_more,
         path,
     )
     .header_value();
@@ -983,10 +983,10 @@ async fn status_collection_list(
                 StatusCollectionList::Bookmarks => "/api/v1/bookmarks",
             };
             let link_header = CollectionLink::new(
-                page.items.len(),
                 limit,
                 page.first_cursor,
                 page.last_cursor,
+                page.has_more,
                 path,
             )
             .header_value();
@@ -1038,13 +1038,13 @@ async fn home_timeline_models(
 /// Build a Mastodon home timeline response from statuses and boosts.
 async fn home_timeline_response(
     state: &AppState,
-    items: Vec<roost_db::HomeTimelineItem>,
+    page: roost_db::TimelinePage<roost_db::HomeTimelineItem>,
     limit: u64,
     path: &str,
     viewer: AccountId,
 ) -> Response {
-    let link_header = home_timeline_link_header(&items, limit, path);
-    let mut response = match home_timeline_models(state, items, viewer).await {
+    let link_header = home_timeline_link_header(&page, limit, path);
+    let mut response = match home_timeline_models(state, page.items, viewer).await {
         Ok(items) => Json(items).into_response(),
         Err(error) => return server_error(error),
     };
@@ -1057,13 +1057,13 @@ async fn home_timeline_response(
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
 pub(crate) async fn timeline_response(
     state: &AppState,
-    statuses: Vec<roost_db::LocalStatus>,
+    page: roost_db::TimelinePage<roost_db::LocalStatus>,
     limit: u64,
     path: &str,
     viewer: Option<AccountId>,
 ) -> Response {
-    let link_header = timeline_link_header(&statuses, limit, path);
-    let mut response = statuses_response(state, statuses, viewer).await;
+    let link_header = timeline_link_header(&page, limit, path);
+    let mut response = statuses_response(state, page.items, viewer).await;
     if let Some(link_header) = link_header {
         response.headers_mut().insert(header::LINK, link_header);
     }
@@ -1386,54 +1386,47 @@ fn collection_cursor(params: &CollectionParams) -> Result<roost_db::CollectionCu
 }
 
 fn timeline_link_header(
-    statuses: &[roost_db::LocalStatus],
+    page: &roost_db::TimelinePage<roost_db::LocalStatus>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {
-    if statuses.len() < limit as usize {
+    if !page.has_more {
         return None;
     }
-    let first = statuses.first()?;
-    let last = statuses.last()?;
+    let first = page.first_cursor?;
+    let last = page.last_cursor?;
     let value = format!(
-        r#"<{path}?min_id={}>; rel="prev", <{path}?max_id={}>; rel="next""#,
-        first.id.0, last.id.0,
+        r#"<{path}?limit={limit}&min_id={first}>; rel="prev", <{path}?limit={limit}&max_id={last}>; rel="next""#,
     );
     HeaderValue::from_str(&value).ok()
 }
 
 fn home_timeline_link_header(
-    items: &[roost_db::HomeTimelineItem],
+    page: &roost_db::TimelinePage<roost_db::HomeTimelineItem>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {
-    if items.len() < limit as usize {
+    if !page.has_more {
         return None;
     }
-    let first = home_timeline_item_id(items.first()?)?;
-    let last = home_timeline_item_id(items.last()?)?;
-    let value =
-        format!(r#"<{path}?min_id={first}>; rel="prev", <{path}?max_id={last}>; rel="next""#);
+    let first = page.first_cursor?;
+    let last = page.last_cursor?;
+    let value = format!(
+        r#"<{path}?limit={limit}&min_id={first}>; rel="prev", <{path}?limit={limit}&max_id={last}>; rel="next""#
+    );
     HeaderValue::from_str(&value).ok()
-}
-
-fn home_timeline_item_id(item: &roost_db::HomeTimelineItem) -> Option<Uuid> {
-    match item {
-        roost_db::HomeTimelineItem::Status(status) => Some(status.id.0),
-        roost_db::HomeTimelineItem::Reblog(reblog) => Some(reblog.id),
-    }
 }
 
 /// Data needed to build a Mastodon collection pagination Link header.
 pub(crate) struct CollectionLink<'a> {
-    /// Number of items returned in the response body.
-    item_count: usize,
     /// Effective clamped request limit.
     limit: u64,
     /// Opaque cursor for the first collection row returned.
     first_cursor: Option<Uuid>,
     /// Opaque cursor for the last collection row returned.
     last_cursor: Option<Uuid>,
+    /// Whether another page may exist.
+    has_more: bool,
     /// API path used to construct relative pagination links.
     path: &'a str,
 }
@@ -1441,24 +1434,24 @@ pub(crate) struct CollectionLink<'a> {
 impl<'a> CollectionLink<'a> {
     /// Create collection pagination metadata from a completed page.
     pub(crate) fn new(
-        item_count: usize,
         limit: u64,
         first_cursor: Option<Uuid>,
         last_cursor: Option<Uuid>,
+        has_more: bool,
         path: &'a str,
     ) -> Self {
         CollectionLink {
-            item_count,
             limit,
             first_cursor,
             last_cursor,
+            has_more,
             path,
         }
     }
 
     /// Render the pagination Link header when the page may have more rows.
     pub(crate) fn header_value(&self) -> Option<HeaderValue> {
-        if self.item_count < self.limit as usize {
+        if !self.has_more {
             return None;
         }
         let first_cursor = self.first_cursor?;
@@ -1960,19 +1953,25 @@ mod tests {
         let third = context.create_status(&token, "third", None, None).await;
 
         let page = context.get("/api/v1/timelines/public?limit=2").await;
-        assert!(page.headers().get(header::LINK).is_some());
+        let link = page
+            .headers()
+            .get(header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(link.contains("limit=2"));
         let body = json_body(page).await;
         assert_eq!(body.as_array().unwrap().len(), 2);
         assert_eq!(body[0]["id"], third["id"]);
         assert_eq!(body[1]["id"], second["id"]);
 
         let second_id = second["id"].as_str().unwrap();
-        let older = json_body(
-            context
-                .get(&format!("/api/v1/timelines/public?max_id={second_id}"))
-                .await,
-        )
-        .await;
+        let older_response = context
+            .get(&format!(
+                "/api/v1/timelines/public?limit=2&max_id={second_id}"
+            ))
+            .await;
+        assert!(older_response.headers().get(header::LINK).is_none());
+        let older = json_body(older_response).await;
         assert_eq!(older.as_array().unwrap().len(), 1);
         assert_eq!(older[0]["id"], first["id"]);
 
@@ -2610,6 +2609,7 @@ mod tests {
             ))
             .await;
         assert_eq!(next_page.status(), StatusCode::OK);
+        assert!(next_page.headers().get(header::LINK).is_none());
         assert_eq!(
             account_usernames(&json_body(next_page).await),
             serde_json::json!(["alice"])
@@ -2840,6 +2840,55 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given several local notifications, when paging to the final page, then no extra Link header is advertised.
+    async fn notifications_suppress_final_page_link(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let alice_token = context
+            .access_token_for("alice", "alice-notification-page@example.com")
+            .await;
+        let bob_token = context
+            .access_token_for("bob", "bob-notification-page@example.com")
+            .await;
+        let carol_token = context
+            .access_token_for("carol", "carol-notification-page@example.com")
+            .await;
+        let status = context
+            .create_status(&owner_token, "notification page target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        for token in [&alice_token, &bob_token, &carol_token] {
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/favourite"),
+                    token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let page = context
+            .authenticated_get("/api/v1/notifications?limit=2", &owner_token)
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let page_body = json_body(page).await;
+        assert_eq!(page_body.as_array().unwrap().len(), 2);
+
+        let next_page = context
+            .authenticated_get(
+                &format!("/api/v1/notifications?limit=2&max_id={next_cursor}"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(next_page.status(), StatusCode::OK);
+        assert!(next_page.headers().get(header::LINK).is_none());
+        assert_eq!(json_body(next_page).await.as_array().unwrap().len(), 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Given a follow notification, when it is dismissed, then it disappears from the recipient's collection.
     async fn follow_notifications_can_be_dismissed(context: &mut StatusContext) {
         let admin_token = context.access_token().await;
@@ -2931,6 +2980,7 @@ mod tests {
             )
             .await;
         assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
         let body = json_body(next).await;
         assert_eq!(
             status_ids(&body),
@@ -3146,6 +3196,7 @@ mod tests {
             )
             .await;
         assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
         let body = json_body(next).await;
         assert_eq!(
             status_ids(&body),
