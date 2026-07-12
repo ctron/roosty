@@ -26,6 +26,7 @@ Keep this as the default verification command for changes in this repository.
 - Document all non-trivial Rust functions, even when private. Trivial glue, accessors, and one-line helpers do not need comments.
 - For larger or non-obvious function bodies, add concise internal comments that explain the major steps or invariants.
 - Document non-obvious tests with concise comments that state the compatibility behavior or invariant being protected.
+- Update `docs/roadmap.md` and `docs/compatibility.md` when adding, removing, or materially changing ActivityPub or Mastodon-compatible behavior.
 
 ## Git
 
