@@ -19,6 +19,8 @@ mod instance;
 mod password;
 mod statuses;
 mod streaming;
+#[cfg(test)]
+mod test_postgres;
 
 use crate::{
     config::{Config, database_url_from_env},

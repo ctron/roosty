@@ -27,6 +27,9 @@ const SESSION_COOKIE: &str = "roost_session";
 /// Authenticated local account extracted from an OAuth bearer token.
 pub(crate) struct AuthenticatedAccount(pub roost_db::LocalAccount);
 
+/// Optional local account extracted from an OAuth bearer token when present.
+pub(crate) struct OptionalAuthenticatedAccount(pub Option<roost_db::LocalAccount>);
+
 impl<S> FromRequestParts<S> for AuthenticatedAccount
 where
     AppState: FromRef<S>,
@@ -37,6 +40,21 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let state = AppState::from_ref(state);
         authenticated_account(&state, &parts.headers)
+            .await
+            .map(Self)
+    }
+}
+
+impl<S> FromRequestParts<S> for OptionalAuthenticatedAccount
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let state = AppState::from_ref(state);
+        optional_authenticated_account(&state, &parts.headers)
             .await
             .map(Self)
     }
@@ -753,6 +771,18 @@ pub(crate) async fn authenticated_account(
     account_from_bearer_token(state, bearer).await
 }
 
+/// Resolve an OAuth bearer token to an account when the request has one.
+pub(crate) async fn optional_authenticated_account(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<roost_db::LocalAccount>, Response> {
+    let Some(bearer) = bearer_token(headers) else {
+        return Ok(None);
+    };
+
+    account_from_bearer_token(state, bearer).await.map(Some)
+}
+
 /// Resolve a raw OAuth bearer token to the authenticated local account.
 pub(crate) async fn account_from_bearer_token(
     state: &AppState,
@@ -1247,7 +1277,7 @@ where
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
@@ -1258,7 +1288,7 @@ mod tests {
             header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         },
     };
-    use postgresql_embedded::{PostgreSQL, SettingsBuilder, V18};
+    use postgresql_embedded::PostgreSQL;
     use roost_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
@@ -1726,10 +1756,6 @@ mod tests {
                 .prefix("roost-server-")
                 .tempdir()
                 .unwrap();
-            let install_cache_root = std::env::var_os("CARGO_TARGET_TMPDIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("roost-target-tmp"));
-            let install_cache = install_cache_root.join("embedded-postgres").join("install");
             let database_name = unique_name();
             let data_dir = temp_dir.path().join("data").join(&database_name);
             let password_file = temp_dir
@@ -1741,13 +1767,7 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
 
-            let settings = SettingsBuilder::new()
-                .version((*V18).clone())
-                .installation_dir(install_cache)
-                .data_dir(&data_dir)
-                .password_file(password_file)
-                .timeout(Some(StdDuration::from_secs(30)))
-                .build();
+            let settings = crate::test_postgres::settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();

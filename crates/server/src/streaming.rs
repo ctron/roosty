@@ -26,11 +26,10 @@ impl StreamingEvents {
         T: Serialize,
     {
         match streaming_update_message(status) {
-            Ok(event) => {
-                if let Err(error) = self.sender.send(event) {
-                    debug!(%error, "streaming update had no active receivers");
-                }
-            }
+            Ok(event) => match self.sender.send(event) {
+                Ok(_) => {}
+                Err(error) => debug!(%error, "streaming update had no active receivers"),
+            },
             Err(error) => warn!(%error, "failed to serialize streaming update"),
         }
     }
@@ -46,12 +45,19 @@ pub struct StreamingEvent {
 impl StreamingEvent {
     /// Serialize this event for one client's subscribed stream names.
     pub fn to_socket_message(&self, streams: &[String]) -> Result<String, serde_json::Error> {
-        serde_json::to_string(&serde_json::json!({
-            "stream": streams,
-            "event": self.event,
-            "payload": self.payload,
-        }))
+        serde_json::to_string(&SocketMessage {
+            stream: streams,
+            event: self.event,
+            payload: &self.payload,
+        })
     }
+}
+
+#[derive(Serialize)]
+struct SocketMessage<'a> {
+    stream: &'a [String],
+    event: &'static str,
+    payload: &'a str,
 }
 
 /// Build the update event stored in the in-process broadcast channel.
@@ -73,6 +79,7 @@ mod tests {
     use super::streaming_update_message;
 
     #[test]
+    /// Verifies streaming status payloads stay JSON-encoded strings.
     fn update_message_contains_a_string_payload() {
         // Mastodon clients expect the outer event as JSON and the status itself
         // as a JSON-encoded string in the payload field.

@@ -1,11 +1,13 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use postgresql_embedded::{PostgreSQL, SettingsBuilder, V18};
+use postgresql_embedded::{PostgreSQL, Settings, SettingsBuilder, VersionReq};
 use roost_migration::Migrator;
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use tempfile::TempDir;
 use test_context::{AsyncTestContext, test_context};
+
+const EMBEDDED_POSTGRES_VERSION: &str = "=18.4.0";
 
 #[test_context(EmbeddedDatabase)]
 #[tokio::test]
@@ -21,6 +23,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "oauth_access_token").await);
     assert!(table_exists(database.connection(), "oauth_refresh_token").await);
     assert!(table_exists(database.connection(), "local_status").await);
+    assert!(table_exists(database.connection(), "local_status_favourite").await);
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
@@ -39,12 +42,14 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_account").await);
     assert!(table_exists(database.connection(), "oauth_application").await);
     assert!(table_exists(database.connection(), "local_status").await);
+    assert!(table_exists(database.connection(), "local_status_favourite").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
     assert!(!table_exists(database.connection(), "local_account").await);
     assert!(!table_exists(database.connection(), "oauth_application").await);
     assert!(!table_exists(database.connection(), "local_status").await);
+    assert!(!table_exists(database.connection(), "local_status_favourite").await);
 }
 
 struct EmbeddedDatabase {
@@ -60,9 +65,6 @@ impl AsyncTestContext for EmbeddedDatabase {
             .prefix("roost-migration-")
             .tempdir()
             .unwrap();
-        let install_cache = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("embedded-postgres")
-            .join("install");
         let root = temp_dir.path();
         let database_name = unique_name();
         let data_dir = root.join("data").join(&database_name);
@@ -74,13 +76,7 @@ impl AsyncTestContext for EmbeddedDatabase {
             std::fs::create_dir_all(parent).unwrap();
         }
 
-        let settings = SettingsBuilder::new()
-            .version((*V18).clone())
-            .installation_dir(install_cache)
-            .data_dir(&data_dir)
-            .password_file(password_file)
-            .timeout(Some(Duration::from_secs(30)))
-            .build();
+        let settings = embedded_postgres_settings(&data_dir, password_file);
         let mut postgresql = PostgreSQL::new(settings);
 
         postgresql.setup().await.unwrap();
@@ -106,6 +102,19 @@ impl AsyncTestContext for EmbeddedDatabase {
             .unwrap();
         self.postgresql.stop().await.unwrap();
     }
+}
+
+/// Build embedded PostgreSQL settings with a fixed reusable installation.
+fn embedded_postgres_settings(
+    data_dir: &std::path::Path,
+    password_file: std::path::PathBuf,
+) -> Settings {
+    SettingsBuilder::new()
+        .version(VersionReq::parse(EMBEDDED_POSTGRES_VERSION).unwrap())
+        .data_dir(data_dir)
+        .password_file(password_file)
+        .timeout(Some(Duration::from_secs(30)))
+        .build()
 }
 
 impl EmbeddedDatabase {

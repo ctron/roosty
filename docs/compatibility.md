@@ -72,10 +72,12 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟢 | `POST /api/v1/statuses` | Local text statuses only. |
 | 🟢 | `GET /api/v1/statuses/:id` | Local, non-deleted statuses. |
+| 🟡 | `GET /api/v1/statuses/:id/context` | Local ancestors and descendants only. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
-| 🟡 | Replies | Reply targets are validated and reply metadata is returned; no conversation endpoint yet. |
+| 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Visibility semantics | Public/unlisted URL reads work; private/direct are owner-only until follow graph support exists. |
-| 🔴 | Favourites | Favourite/unfavourite APIs are missing. |
+| 🟡 | `GET /api/v1/favourites` | Returns authenticated user's local favourites; no cursor headers yet. |
+| 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
 | 🔴 | Boosts | Reblog/unreblog APIs are missing. |
 | 🔴 | Bookmarks | Bookmark/unbookmark APIs are missing. |
 
@@ -124,7 +126,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add federation delivery and inbound activity processing.
 - [ ] Add follow graph and real home timeline membership.
 - [ ] Add conversation endpoint support for replies.
-- [ ] Add favourites, boosts, and bookmarks.
+- [ ] Add favourites pagination, boosts, and bookmarks.
 - [ ] Add persisted notifications and notification streaming.
 - [ ] Add media upload and attachment responses.
 - [ ] Add moderation APIs and domain policy.

@@ -1,19 +1,21 @@
+use std::collections::{HashSet, VecDeque};
+
 use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use roost_core::{AccountId, RoostError, StatusId};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthenticatedAccount, account_response},
+    auth::{AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
     http::AppState,
 };
 
@@ -29,6 +31,16 @@ pub fn router() -> Router<AppState> {
             "/api/v1/statuses/{status_id}",
             get(show_status).delete(delete_status),
         )
+        .route("/api/v1/statuses/{status_id}/context", get(status_context))
+        .route(
+            "/api/v1/statuses/{status_id}/favourite",
+            post(favourite_status),
+        )
+        .route(
+            "/api/v1/statuses/{status_id}/unfavourite",
+            post(unfavourite_status),
+        )
+        .route("/api/v1/favourites", get(favourites))
         .route("/api/v1/timelines/home", get(home_timeline))
         .route("/api/v1/timelines/public", get(public_timeline))
 }
@@ -69,6 +81,11 @@ struct TimelineParams {
 }
 
 #[derive(Deserialize)]
+struct FavouritesParams {
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
 struct StatusInput {
     status: String,
     visibility: Option<String>,
@@ -93,7 +110,7 @@ struct StatusResponse {
     content: String,
     account: crate::auth::AccountResponse,
     media_attachments: Vec<Value>,
-    mentions: Vec<Value>,
+    mentions: Vec<MentionResponse>,
     tags: Vec<Value>,
     emojis: Vec<Value>,
     reblogs_count: u64,
@@ -106,6 +123,43 @@ struct StatusResponse {
     pinned: bool,
     reblog: Option<Value>,
     application: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct ContextResponse {
+    ancestors: Vec<StatusResponse>,
+    descendants: Vec<StatusResponse>,
+}
+
+#[derive(Serialize)]
+struct MentionResponse {
+    id: String,
+    username: String,
+    url: String,
+    acct: String,
+}
+
+impl MentionResponse {
+    /// Build the Mastodon mention shape for a local account referenced by a reply.
+    fn new(state: &AppState, account: &roost_db::LocalAccount) -> Self {
+        Self {
+            id: account.id.0.to_string(),
+            username: account.username.clone(),
+            url: public_url(state, &format!("@{}", account.username)),
+            acct: account.username.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorResponse<'a> {
+    error: &'a str,
+    error_description: &'a str,
+}
+
+struct ReplyTarget {
+    account_id: AccountId,
+    account: roost_db::LocalAccount,
 }
 
 async fn create_status(
@@ -160,16 +214,13 @@ async fn create_status(
 
 async fn show_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<StatusPath>,
 ) -> Response {
-    let viewer = match optional_account_from_headers(&state, &headers).await {
-        Ok(viewer) => viewer,
-        Err(response) => return response,
-    };
     match roost_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await {
         Ok(Some(status)) if can_view_status(&status, viewer.as_ref().map(|account| account.id)) => {
-            status_with_author_response(&state, status).await
+            status_with_author_response(&state, status, viewer.as_ref().map(|account| account.id))
+                .await
         }
         Ok(None) => not_found(),
         Ok(Some(_)) => not_found(),
@@ -194,6 +245,92 @@ async fn delete_status(
     }
 }
 
+async fn status_context(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    let status_id = StatusId(path.status_id);
+    let viewer = viewer.as_ref().map(|account| account.id);
+    let status = match roost_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) if can_view_status(&status, viewer) => status,
+        Ok(Some(_)) | Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+
+    let ancestors = match status_ancestors(&state, &status, viewer).await {
+        Ok(ancestors) => ancestors,
+        Err(error) => return server_error(error),
+    };
+    let descendants = match status_descendants(&state, status.id, viewer).await {
+        Ok(descendants) => descendants,
+        Err(error) => return server_error(error),
+    };
+    let ancestors = match status_models(&state, ancestors, viewer).await {
+        Ok(ancestors) => ancestors,
+        Err(error) => return server_error(error),
+    };
+    let descendants = match status_models(&state, descendants, viewer).await {
+        Ok(descendants) => descendants,
+        Err(error) => return server_error(error),
+    };
+
+    Json(ContextResponse {
+        ancestors,
+        descendants,
+    })
+    .into_response()
+}
+
+async fn favourite_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    let status_id = StatusId(path.status_id);
+    let status = match visible_status_for_account(&state, status_id, account.id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+
+    match roost_db::favourite_local_status(&state.db, account.id, status_id).await {
+        Ok(()) => status_with_author_response(&state, status, Some(account.id)).await,
+        Err(error) => server_error(error),
+    }
+}
+
+async fn unfavourite_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    let status_id = StatusId(path.status_id);
+    let status = match visible_status_for_account(&state, status_id, account.id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+
+    match roost_db::unfavourite_local_status(&state.db, account.id, status_id).await {
+        Ok(()) => status_with_author_response(&state, status, Some(account.id)).await,
+        Err(error) => server_error(error),
+    }
+}
+
+async fn favourites(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Query(params): Query<FavouritesParams>,
+) -> Response {
+    let limit = timeline_limit(params.limit);
+
+    match roost_db::local_favourites_for_account(&state.db, account.id, limit).await {
+        Ok(statuses) => statuses_response(&state, statuses, Some(account.id)).await,
+        Err(error) => server_error(error),
+    }
+}
+
 async fn home_timeline(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
@@ -207,7 +344,14 @@ async fn home_timeline(
         .await
     {
         Ok(statuses) => {
-            timeline_response(&state, statuses, query.limit, "/api/v1/timelines/home").await
+            timeline_response(
+                &state,
+                statuses,
+                query.limit,
+                "/api/v1/timelines/home",
+                Some(account.id),
+            )
+            .await
         }
         Err(error) => server_error(error),
     }
@@ -215,6 +359,7 @@ async fn home_timeline(
 
 async fn public_timeline(
     State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Query(params): Query<TimelineParams>,
 ) -> Response {
     let query = match timeline_query(params) {
@@ -223,7 +368,14 @@ async fn public_timeline(
     };
     match roost_db::public_local_timeline(&state.db, query.limit, query.cursor).await {
         Ok(statuses) => {
-            timeline_response(&state, statuses, query.limit, "/api/v1/timelines/public").await
+            timeline_response(
+                &state,
+                statuses,
+                query.limit,
+                "/api/v1/timelines/public",
+                viewer.as_ref().map(|account| account.id),
+            )
+            .await
         }
         Err(error) => server_error(error),
     }
@@ -287,16 +439,28 @@ fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, Sta
         .transpose()
 }
 
-async fn statuses_response(state: &AppState, statuses: Vec<roost_db::LocalStatus>) -> Response {
+async fn statuses_response(
+    state: &AppState,
+    statuses: Vec<roost_db::LocalStatus>,
+    viewer: Option<AccountId>,
+) -> Response {
+    match status_models(state, statuses, viewer).await {
+        Ok(statuses) => Json(statuses).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn status_models(
+    state: &AppState,
+    statuses: Vec<roost_db::LocalStatus>,
+    viewer: Option<AccountId>,
+) -> Result<Vec<StatusResponse>, RoostError> {
     let mut response = Vec::with_capacity(statuses.len());
     for status in statuses {
-        match status_with_author(state, status).await {
-            Ok(status) => response.push(status),
-            Err(error) => return server_error(error),
-        }
+        response.push(status_with_author(state, status, viewer).await?);
     }
 
-    Json(response).into_response()
+    Ok(response)
 }
 
 async fn timeline_response(
@@ -304,17 +468,22 @@ async fn timeline_response(
     statuses: Vec<roost_db::LocalStatus>,
     limit: u64,
     path: &str,
+    viewer: Option<AccountId>,
 ) -> Response {
     let link_header = timeline_link_header(&statuses, limit, path);
-    let mut response = statuses_response(state, statuses).await;
+    let mut response = statuses_response(state, statuses, viewer).await;
     if let Some(link_header) = link_header {
         response.headers_mut().insert(header::LINK, link_header);
     }
     response
 }
 
-async fn status_with_author_response(state: &AppState, status: roost_db::LocalStatus) -> Response {
-    match status_with_author(state, status).await {
+async fn status_with_author_response(
+    state: &AppState,
+    status: roost_db::LocalStatus,
+    viewer: Option<AccountId>,
+) -> Response {
+    match status_with_author(state, status, viewer).await {
         Ok(status) => Json(status).into_response(),
         Err(error) => server_error(error),
     }
@@ -323,12 +492,13 @@ async fn status_with_author_response(state: &AppState, status: roost_db::LocalSt
 async fn status_with_author(
     state: &AppState,
     status: roost_db::LocalStatus,
+    viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostError> {
     let account = roost_db::find_local_account_by_id(&state.db, status.account_id)
         .await?
         .ok_or_else(|| RoostError::InvalidInput("status author does not exist".to_owned()))?;
 
-    status_response(state, status, account).await
+    status_response_for_viewer(state, status, account, viewer).await
 }
 
 async fn status_response(
@@ -336,15 +506,33 @@ async fn status_response(
     status: roost_db::LocalStatus,
     account: roost_db::LocalAccount,
 ) -> Result<StatusResponse, RoostError> {
+    status_response_for_viewer(state, status, account.clone(), Some(account.id)).await
+}
+
+async fn status_response_for_viewer(
+    state: &AppState,
+    status: roost_db::LocalStatus,
+    account: roost_db::LocalAccount,
+    viewer: Option<AccountId>,
+) -> Result<StatusResponse, RoostError> {
     let status_path = format!("@{}/{}", account.username, status.id.0);
     let url = public_url(state, &status_path);
-    let in_reply_to_account_id = match status.in_reply_to_id {
-        Some(status_id) => roost_db::find_local_status_by_id(&state.db, status_id)
-            .await?
-            .map(|status| status.account_id.0.to_string()),
-        None => None,
-    };
+    let reply_target = reply_target(state, status.in_reply_to_id).await?;
+    let in_reply_to_account_id = reply_target
+        .as_ref()
+        .map(|target| target.account_id.0.to_string());
+    let mentions = reply_target
+        .as_ref()
+        .map(|target| vec![MentionResponse::new(state, &target.account)])
+        .unwrap_or_default();
     let replies_count = roost_db::count_local_replies(&state.db, status.id).await?;
+    let favourites_count = roost_db::count_local_favourites(&state.db, status.id).await?;
+    let favourited = match viewer {
+        Some(account_id) => {
+            roost_db::is_local_status_favourited(&state.db, account_id, status.id).await?
+        }
+        None => false,
+    };
 
     Ok(StatusResponse {
         id: status.id.0.to_string(),
@@ -360,13 +548,13 @@ async fn status_response(
         content: status_content_html(&status.content),
         account: account_response(state, account).await?,
         media_attachments: Vec::new(),
-        mentions: Vec::new(),
+        mentions,
         tags: Vec::new(),
         emojis: Vec::new(),
         reblogs_count: 0,
-        favourites_count: 0,
+        favourites_count,
         replies_count,
-        favourited: false,
+        favourited,
         reblogged: false,
         muted: false,
         bookmarked: false,
@@ -374,6 +562,92 @@ async fn status_response(
         reblog: None,
         application: None,
     })
+}
+
+/// Load the account targeted by a local reply, if the status is a reply.
+async fn reply_target(
+    state: &AppState,
+    in_reply_to_id: Option<StatusId>,
+) -> Result<Option<ReplyTarget>, RoostError> {
+    let Some(status_id) = in_reply_to_id else {
+        return Ok(None);
+    };
+    let Some(parent) = roost_db::find_local_status_by_id(&state.db, status_id).await? else {
+        return Ok(None);
+    };
+    let account = roost_db::find_local_account_by_id(&state.db, parent.account_id)
+        .await?
+        .ok_or_else(|| RoostError::InvalidInput("reply target author does not exist".to_owned()))?;
+
+    Ok(Some(ReplyTarget {
+        account_id: parent.account_id,
+        account,
+    }))
+}
+
+async fn visible_status_for_account(
+    state: &AppState,
+    status_id: StatusId,
+    account_id: AccountId,
+) -> Result<Option<roost_db::LocalStatus>, RoostError> {
+    let status = roost_db::find_local_status_by_id(&state.db, status_id).await?;
+    Ok(status.filter(|status| can_view_status(status, Some(account_id))))
+}
+
+/// Walk visible local parent statuses from root ancestor to direct parent.
+async fn status_ancestors(
+    state: &AppState,
+    status: &roost_db::LocalStatus,
+    viewer: Option<AccountId>,
+) -> Result<Vec<roost_db::LocalStatus>, RoostError> {
+    let mut ancestors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut next_id = status.in_reply_to_id;
+
+    while let Some(status_id) = next_id {
+        if !seen.insert(status_id) {
+            break;
+        }
+
+        let Some(parent) = roost_db::find_local_status_by_id(&state.db, status_id).await? else {
+            break;
+        };
+        if !can_view_status(&parent, viewer) {
+            break;
+        }
+
+        next_id = parent.in_reply_to_id;
+        ancestors.push(parent);
+    }
+
+    ancestors.reverse();
+    Ok(ancestors)
+}
+
+/// Collect visible local replies below a status in conversation order.
+async fn status_descendants(
+    state: &AppState,
+    status_id: StatusId,
+    viewer: Option<AccountId>,
+) -> Result<Vec<roost_db::LocalStatus>, RoostError> {
+    let mut descendants = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([status_id]);
+
+    while let Some(parent_id) = queue.pop_front() {
+        if !seen.insert(parent_id) {
+            continue;
+        }
+
+        let mut replies = roost_db::local_replies_to_status(&state.db, parent_id).await?;
+        replies.retain(|reply| can_view_status(reply, viewer));
+        for reply in replies {
+            queue.push_back(reply.id);
+            descendants.push(reply);
+        }
+    }
+
+    Ok(descendants)
 }
 
 fn timeline_limit(limit: Option<u64>) -> u64 {
@@ -411,26 +685,6 @@ fn timeline_link_header(
 fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) -> bool {
     matches!(status.visibility.as_str(), "public" | "unlisted")
         || viewer.is_some_and(|account_id| account_id == status.account_id)
-}
-
-async fn optional_account_from_headers(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<Option<roost_db::LocalAccount>, Response> {
-    let Some(bearer) = bearer_token(headers) else {
-        return Ok(None);
-    };
-
-    crate::auth::account_from_bearer_token(state, bearer)
-        .await
-        .map(Some)
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
 }
 
 fn status_content_html(content: &str) -> String {
@@ -498,10 +752,10 @@ fn server_error(error: RoostError) -> Response {
 fn error_response(status: StatusCode, error: &str, description: &str) -> Response {
     (
         status,
-        Json(json!({
-            "error": error,
-            "error_description": description,
-        })),
+        Json(ErrorResponse {
+            error,
+            error_description: description,
+        }),
     )
         .into_response()
 }
@@ -510,7 +764,7 @@ fn error_response(status: StatusCode, error: &str, description: &str) -> Respons
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
@@ -518,7 +772,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
-    use postgresql_embedded::{PostgreSQL, SettingsBuilder, V18};
+    use postgresql_embedded::PostgreSQL;
     use roost_core::AccountId;
     use roost_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
@@ -625,26 +879,51 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Verifies reply fields, mentions, and counts agree with stored parent relationships.
     async fn replies_validate_parent_statuses_and_return_reply_metadata(
         context: &mut StatusContext,
     ) {
-        // Reply fields are part of the public Mastodon status shape, so parent
-        // validation and reply counts must agree with stored relationships.
         let token = context.access_token().await;
-        let parent = context.create_status(&token, "parent", None, None).await;
+        let parent_token = context
+            .access_token_for("parent", "parent@example.com")
+            .await;
+        let parent = context
+            .create_status(&parent_token, "parent", None, None)
+            .await;
         let parent_id = parent["id"].as_str().unwrap();
+        let parent_account = parent["account"]["id"].as_str().unwrap();
 
         let reply = context
             .create_status(&token, "reply", None, Some(parent_id))
             .await;
+        let reply_id = reply["id"].as_str().unwrap();
         assert_eq!(reply["in_reply_to_id"], parent_id);
-        assert_eq!(
-            reply["in_reply_to_account_id"],
-            context.account_id.0.to_string()
+        assert_eq!(reply["in_reply_to_account_id"], parent_account);
+        assert_eq!(reply["mentions"][0]["id"], parent_account);
+        assert_eq!(reply["mentions"][0]["username"], "parent");
+        assert_eq!(reply["mentions"][0]["acct"], "parent");
+        assert!(
+            reply["mentions"][0]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("@parent")
         );
 
         let parent = context.get(&format!("/api/v1/statuses/{parent_id}")).await;
         assert_eq!(json_body(parent).await["replies_count"], 1);
+
+        let nested = context
+            .create_status(&parent_token, "nested", None, Some(reply_id))
+            .await;
+        let nested_id = nested["id"].as_str().unwrap();
+        let context_body = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{reply_id}/context"))
+                .await,
+        )
+        .await;
+        assert_eq!(context_body["ancestors"][0]["id"], parent_id);
+        assert_eq!(context_body["descendants"][0]["id"], nested_id);
 
         let missing_reply = context
             .authenticated_json(
@@ -662,11 +941,10 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Verifies local visibility behavior until follow graph support exists.
     async fn visibility_controls_public_timeline_and_direct_status_reads(
         context: &mut StatusContext,
     ) {
-        // Until follow graph support exists, private and direct statuses are
-        // owner-only while public and unlisted statuses remain URL-readable.
         let token = context.access_token().await;
         context
             .create_status(&token, "public", Some("public"), None)
@@ -723,9 +1001,8 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Verifies that Mastodon cursor parameters page local timelines.
     async fn timeline_cursors_page_through_local_statuses(context: &mut StatusContext) {
-        // Cursor support is what lets Mastodon clients incrementally load
-        // timeline pages without relying on offset pagination.
         let token = context.access_token().await;
         let first = context.create_status(&token, "first", None, None).await;
         let second = context.create_status(&token, "second", None, None).await;
@@ -760,9 +1037,8 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Verifies that account status metadata ignores soft-deleted statuses.
     async fn account_responses_include_local_status_metadata(context: &mut StatusContext) {
-        // Status counts are client-visible account metadata and should ignore
-        // soft-deleted statuses.
         let token = context.access_token().await;
         context.create_status(&token, "kept", None, None).await;
         let deleted = context.create_status(&token, "deleted", None, None).await;
@@ -781,6 +1057,164 @@ mod tests {
         let body = json_body(credentials).await;
         assert_eq!(body["statuses_count"], 1);
         assert!(body["last_status_at"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies that repeated favourite and unfavourite calls keep counts stable.
+    async fn favourites_are_idempotent_and_update_status_fields(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "favourite me", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let first = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &token,
+            )
+            .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = json_body(first).await;
+        assert_eq!(first["favourited"], true);
+        assert_eq!(first["favourites_count"], 1);
+
+        let second = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &token,
+            )
+            .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = json_body(second).await;
+        assert_eq!(second["favourited"], true);
+        assert_eq!(second["favourites_count"], 1);
+
+        let lookup = context
+            .authenticated_get(&format!("/api/v1/statuses/{status_id}"), &token)
+            .await;
+        let lookup = json_body(lookup).await;
+        assert_eq!(lookup["favourited"], true);
+        assert_eq!(lookup["favourites_count"], 1);
+
+        let favourites = json_body(
+            context
+                .authenticated_get("/api/v1/favourites?limit=30", &token)
+                .await,
+        )
+        .await;
+        assert_eq!(favourites.as_array().unwrap().len(), 1);
+        assert_eq!(favourites[0]["id"], status_id);
+        assert_eq!(favourites[0]["favourited"], true);
+        assert_eq!(favourites[0]["favourites_count"], 1);
+
+        let anonymous =
+            json_body(context.get(&format!("/api/v1/statuses/{status_id}")).await).await;
+        assert_eq!(anonymous["favourited"], false);
+        assert_eq!(anonymous["favourites_count"], 1);
+
+        let unfavourite = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/unfavourite"),
+                &token,
+            )
+            .await;
+        assert_eq!(unfavourite.status(), StatusCode::OK);
+        let unfavourite = json_body(unfavourite).await;
+        assert_eq!(unfavourite["favourited"], false);
+        assert_eq!(unfavourite["favourites_count"], 0);
+        let favourites = json_body(
+            context
+                .authenticated_get("/api/v1/favourites", &token)
+                .await,
+        )
+        .await;
+        assert_eq!(favourites, serde_json::json!([]));
+
+        let repeated = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/unfavourite"),
+                &token,
+            )
+            .await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(json_body(repeated).await["favourites_count"], 0);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies that public timelines preserve viewer-specific favourite state.
+    async fn public_timeline_marks_statuses_favourited_by_the_viewer(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "public favourite", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let favourite = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &token,
+            )
+            .await;
+        assert_eq!(favourite.status(), StatusCode::OK);
+
+        let anonymous = json_body(
+            context
+                .get("/api/v1/timelines/public?limit=30&local=true")
+                .await,
+        )
+        .await;
+        assert_eq!(anonymous[0]["id"], status_id);
+        assert_eq!(anonymous[0]["favourited"], false);
+        assert_eq!(anonymous[0]["favourites_count"], 1);
+
+        let authenticated = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/public?limit=30&local=true", &token)
+                .await,
+        )
+        .await;
+        assert_eq!(authenticated[0]["id"], status_id);
+        assert_eq!(authenticated[0]["favourited"], true);
+        assert_eq!(authenticated[0]["favourites_count"], 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies that favourite permissions use the same policy as status reads.
+    async fn favourites_follow_status_visibility(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let other_token = context.access_token_for("other", "other@example.com").await;
+        let status = context
+            .create_status(&owner_token, "private", Some("private"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let forbidden = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &other_token,
+            )
+            .await;
+        assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+
+        let owner = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(owner.status(), StatusCode::OK);
+        assert_eq!(json_body(owner).await["favourited"], true);
     }
 
     #[test]
@@ -810,10 +1244,6 @@ mod tests {
                 .prefix("roost-status-")
                 .tempdir()
                 .unwrap();
-            let install_cache_root = std::env::var_os("CARGO_TARGET_TMPDIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("roost-target-tmp"));
-            let install_cache = install_cache_root.join("embedded-postgres").join("install");
             let database_name = unique_name();
             let data_dir = temp_dir.path().join("data").join(&database_name);
             let password_file = temp_dir
@@ -825,13 +1255,7 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
 
-            let settings = SettingsBuilder::new()
-                .version((*V18).clone())
-                .installation_dir(install_cache)
-                .data_dir(&data_dir)
-                .password_file(password_file)
-                .timeout(Some(StdDuration::from_secs(30)))
-                .build();
+            let settings = crate::test_postgres::settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
@@ -985,6 +1409,25 @@ mod tests {
                 &self.db,
                 &self.config.token_pepper,
                 self.account_id,
+                self.application_id,
+                "read write follow push",
+            )
+            .await
+            .unwrap()
+            .token
+        }
+
+        async fn access_token_for(&self, username: &str, email: &str) -> String {
+            let password_hash = password::hash_password("password").unwrap();
+            let account_id = AccountId(
+                roost_db::create_local_account(&self.db, username, email, &password_hash)
+                    .await
+                    .unwrap(),
+            );
+            roost_db::create_access_token(
+                &self.db,
+                &self.config.token_pepper,
+                account_id,
                 self.application_id,
                 "read write follow push",
             )

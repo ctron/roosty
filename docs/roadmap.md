@@ -21,5 +21,5 @@
 - Fill Mastodon client startup gaps found by Elk and browser logs.
 - Add cursor pagination for account status collections.
 - Add a conversation endpoint for replies.
-- Add favourites, boosts, and bookmarks.
+- Add boosts and bookmarks.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.

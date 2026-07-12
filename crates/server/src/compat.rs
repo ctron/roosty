@@ -215,7 +215,7 @@ fn unauthorized() -> (StatusCode, Json<ErrorResponse<'static>>) {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
@@ -223,7 +223,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     };
-    use postgresql_embedded::{PostgreSQL, SettingsBuilder, V18};
+    use postgresql_embedded::PostgreSQL;
     use roost_core::AccountId;
     use roost_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
@@ -359,10 +359,6 @@ mod tests {
                 .prefix("roost-compat-")
                 .tempdir()
                 .unwrap();
-            let install_cache_root = std::env::var_os("CARGO_TARGET_TMPDIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("roost-target-tmp"));
-            let install_cache = install_cache_root.join("embedded-postgres").join("install");
             let database_name = unique_name();
             let data_dir = temp_dir.path().join("data").join(&database_name);
             let password_file = temp_dir
@@ -374,13 +370,7 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
 
-            let settings = SettingsBuilder::new()
-                .version((*V18).clone())
-                .installation_dir(install_cache)
-                .data_dir(&data_dir)
-                .password_file(password_file)
-                .timeout(Some(StdDuration::from_secs(30)))
-                .build();
+            let settings = crate::test_postgres::settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
