@@ -22,6 +22,7 @@ const MAX_ACCOUNT_LIMIT: u64 = 80;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/accounts/relationships", get(relationships))
+        .route("/api/v1/accounts/lookup", get(lookup_account))
         .route("/api/v1/accounts/{account_id}", get(show_account))
         .route(
             "/api/v1/accounts/{account_id}/statuses",
@@ -54,6 +55,11 @@ struct AccountStatusesParams {
 #[derive(Deserialize)]
 struct AccountCollectionParams {
     limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LookupParams {
+    acct: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +99,25 @@ struct RelationshipResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// Return a public local account profile by local username or address.
+async fn lookup_account(
+    State(state): State<AppState>,
+    Query(params): Query<LookupParams>,
+) -> Response {
+    let Some(username) = local_lookup_username(&state, params.acct.as_deref()) else {
+        return not_found();
+    };
+
+    match roost_db::find_local_account_by_username(&state.db, &username).await {
+        Ok(Some(account)) => match account_response(&state, account).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => server_error(error),
+        },
+        Ok(None) => not_found(),
+        Err(error) => server_error(error),
+    }
 }
 
 /// Return a public local account profile by account id.
@@ -399,6 +424,29 @@ fn relationship_ids(query: Option<&str>) -> Result<Vec<Uuid>, ()> {
         .map_err(|_| ())
 }
 
+/// Normalize a local account lookup query and reject remote addresses.
+fn local_lookup_username(state: &AppState, acct: Option<&str>) -> Option<String> {
+    let trimmed = acct?.trim().trim_start_matches('@');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((username, domain)) = trimmed.split_once('@') {
+        let host = state.config.public_base_url.host_str()?;
+        let authority = state.config.public_base_url.authority();
+        if domain != host && domain != authority {
+            return None;
+        }
+        return non_empty(username);
+    }
+
+    non_empty(trimmed)
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 /// Return a Mastodon-style bad request response with a compact error string.
 fn bad_request(description: &str) -> Response {
     (
@@ -479,6 +527,26 @@ mod tests {
         let statuses = json_body(statuses).await;
         assert_eq!(statuses.as_array().unwrap().len(), 1);
         assert_eq!(statuses[0]["content"], "<p>public</p>");
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Verifies account lookup is routed before dynamic UUID account routes.
+    async fn account_lookup_resolves_local_username(context: &mut AccountContext) {
+        let (alice_id, _alice_token) = context.create_account("alice", "alice@example.com").await;
+
+        let lookup = context.get("/api/v1/accounts/lookup?acct=alice").await;
+        let local_address = context
+            .get("/api/v1/accounts/lookup?acct=alice@localhost")
+            .await;
+        let remote_address = context
+            .get("/api/v1/accounts/lookup?acct=alice@example.org")
+            .await;
+
+        assert_eq!(lookup.status(), StatusCode::OK);
+        assert_eq!(json_body(lookup).await["id"], alice_id.0.to_string());
+        assert_eq!(local_address.status(), StatusCode::OK);
+        assert_eq!(remote_address.status(), StatusCode::NOT_FOUND);
     }
 
     #[test_context(AccountContext)]

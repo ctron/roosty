@@ -63,6 +63,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics and posting defaults. |
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
 | 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
+| 🟡 | `GET /api/v1/accounts/lookup` | Local username/address lookup only; no WebFinger resolution. |
 | 🟢 | Status metadata | Local `statuses_count` and `last_status_at` are populated. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |

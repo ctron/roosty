@@ -25,3 +25,4 @@
 - Add a conversation endpoint for replies.
 - Add boosts.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.
+- Fix an issue with follows not being announced on the stream
