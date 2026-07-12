@@ -5,8 +5,9 @@ use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use roost_core::{AccountId, JobId, Result, RoostError};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, Set, Statement,
+    ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, Database, DatabaseBackend,
+    DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, Set,
+    Statement,
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -15,113 +16,16 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-mod entity {
-    use sea_orm::entity::prelude::*;
-    use time::OffsetDateTime;
+mod entity;
 
-    pub mod local_account {
-        use super::*;
-
-        #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-        #[sea_orm(table_name = "local_account")]
-        pub struct Model {
-            #[sea_orm(primary_key, auto_increment = false)]
-            pub id: Uuid,
-            pub username: String,
-            pub email: String,
-            pub password_hash: String,
-            pub is_admin: bool,
-            pub created_at: OffsetDateTime,
-            pub updated_at: OffsetDateTime,
-        }
-
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-        pub enum Relation {}
-
-        impl ActiveModelBehavior for ActiveModel {}
-    }
-
-    pub mod oauth_application {
-        use super::*;
-
-        #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-        #[sea_orm(table_name = "oauth_application")]
-        pub struct Model {
-            #[sea_orm(primary_key, auto_increment = false)]
-            pub id: Uuid,
-            pub client_id: String,
-            pub client_secret_hash: String,
-            pub name: String,
-            pub redirect_uri: String,
-            pub scopes: String,
-            pub website: Option<String>,
-            pub created_at: OffsetDateTime,
-        }
-
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-        pub enum Relation {}
-
-        impl ActiveModelBehavior for ActiveModel {}
-    }
-
-    pub mod oauth_authorization_code {
-        use super::*;
-
-        #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-        #[sea_orm(table_name = "oauth_authorization_code")]
-        pub struct Model {
-            #[sea_orm(primary_key, auto_increment = false)]
-            pub id: Uuid,
-            pub code_hash: String,
-            pub account_id: Uuid,
-            pub application_id: Uuid,
-            pub redirect_uri: String,
-            pub scopes: String,
-            pub code_challenge: String,
-            pub code_challenge_method: String,
-            pub expires_at: OffsetDateTime,
-            pub consumed_at: Option<OffsetDateTime>,
-            pub created_at: OffsetDateTime,
-        }
-
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-        pub enum Relation {}
-
-        impl ActiveModelBehavior for ActiveModel {}
-    }
-
-    pub mod oauth_access_token {
-        use super::*;
-
-        #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-        #[sea_orm(table_name = "oauth_access_token")]
-        pub struct Model {
-            #[sea_orm(primary_key, auto_increment = false)]
-            pub id: Uuid,
-            pub token_hash: String,
-            pub account_id: Uuid,
-            pub application_id: Uuid,
-            pub scopes: String,
-            pub issued_at: OffsetDateTime,
-            pub expires_at: Option<OffsetDateTime>,
-            pub revoked_at: Option<OffsetDateTime>,
-        }
-
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-        pub enum Relation {}
-
-        impl ActiveModelBehavior for ActiveModel {}
-    }
-}
+use entity::{local_account, oauth_access_token, oauth_application, oauth_authorization_code};
 
 /// Shared database connection type used across Roost crates.
 pub type DbConnection = DatabaseConnection;
 
 /// Open a database connection using SeaORM's PostgreSQL driver.
 pub async fn connect(database_url: &str) -> Result<DbConnection> {
-    Database::connect(database_url)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))
+    Ok(Database::connect(database_url).await?)
 }
 
 /// Verify that the database connection can execute a trivial query.
@@ -130,8 +34,7 @@ pub async fn ping(db: &DbConnection) -> Result<()> {
         DatabaseBackend::Postgres,
         "SELECT 1".to_owned(),
     ))
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok(())
 }
@@ -145,10 +48,7 @@ pub async fn create_bootstrap_admin(
     email: &str,
     password_hash: &str,
 ) -> Result<Uuid> {
-    let count = entity::local_account::Entity::find()
-        .count(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+    let count = local_account::Entity::find().count(db).await?;
     if count != 0 {
         return Err(RoostError::InvalidInput(
             "bootstrap is only allowed before local accounts exist".to_owned(),
@@ -156,7 +56,7 @@ pub async fn create_bootstrap_admin(
     }
 
     let account_id = Uuid::now_v7();
-    entity::local_account::ActiveModel {
+    local_account::ActiveModel {
         id: Set(account_id),
         username: Set(username.to_owned()),
         email: Set(email.to_owned()),
@@ -165,8 +65,7 @@ pub async fn create_bootstrap_admin(
         ..Default::default()
     }
     .insert(db)
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok(account_id)
 }
@@ -184,6 +83,51 @@ pub struct LocalAccount {
     pub password_hash: String,
     /// Whether this account has administrator privileges.
     pub is_admin: bool,
+    /// Profile display name.
+    pub display_name: String,
+    /// Plain-text profile note.
+    pub note: String,
+    /// Whether follow requests require approval.
+    pub locked: bool,
+    /// Whether this account is automated.
+    pub bot: bool,
+    /// Whether this account can be discovered in profile directories.
+    pub discoverable: bool,
+    /// Default visibility for authored statuses.
+    pub default_visibility: String,
+    /// Whether authored statuses are sensitive by default.
+    pub default_sensitive: bool,
+    /// Default language for authored statuses.
+    pub default_language: Option<String>,
+    /// Default quote policy for authored statuses.
+    pub default_quote_policy: String,
+    /// Profile metadata fields.
+    pub profile_fields: JsonValue,
+}
+
+/// Mutable local account settings accepted from account update APIs.
+#[derive(Clone, Debug, Default)]
+pub struct LocalAccountSettingsUpdate {
+    /// Profile display name.
+    pub display_name: Option<String>,
+    /// Plain-text profile note.
+    pub note: Option<String>,
+    /// Whether follow requests require approval.
+    pub locked: Option<bool>,
+    /// Whether this account is automated.
+    pub bot: Option<bool>,
+    /// Whether this account can be discovered in profile directories.
+    pub discoverable: Option<bool>,
+    /// Default visibility for authored statuses.
+    pub default_visibility: Option<String>,
+    /// Whether authored statuses are sensitive by default.
+    pub default_sensitive: Option<bool>,
+    /// Default language for authored statuses.
+    pub default_language: Option<Option<String>>,
+    /// Default quote policy for authored statuses.
+    pub default_quote_policy: Option<String>,
+    /// Profile metadata fields.
+    pub profile_fields: Option<JsonValue>,
 }
 
 /// OAuth client application metadata.
@@ -223,15 +167,14 @@ pub async fn find_local_account_by_login(
     db: &DbConnection,
     login: &str,
 ) -> Result<Option<LocalAccount>> {
-    let account = entity::local_account::Entity::find()
+    let account = local_account::Entity::find()
         .filter(
-            entity::local_account::Column::Username
+            local_account::Column::Username
                 .eq(login)
-                .or(entity::local_account::Column::Email.eq(login)),
+                .or(local_account::Column::Email.eq(login)),
         )
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?;
 
     Ok(account.map(local_account_from_model))
 }
@@ -241,12 +184,51 @@ pub async fn find_local_account_by_id(
     db: &DbConnection,
     account_id: AccountId,
 ) -> Result<Option<LocalAccount>> {
-    let account = entity::local_account::Entity::find_by_id(account_id.0)
+    let account = local_account::Entity::find_by_id(account_id.0)
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?;
 
     Ok(account.map(local_account_from_model))
+}
+
+/// Update mutable local account settings and return the refreshed account.
+pub async fn update_local_account_settings(
+    db: &DbConnection,
+    account_id: AccountId,
+    update: LocalAccountSettingsUpdate,
+) -> Result<LocalAccount> {
+    let account = local_account::Entity::find_by_id(account_id.0)
+        .one(db)
+        .await?
+        .ok_or_else(|| RoostError::InvalidInput("local account does not exist".to_owned()))?;
+    let mut active = account.into_active_model();
+
+    set_if_some(&mut active.display_name, update.display_name);
+    set_if_some(&mut active.note, update.note);
+    set_if_some(&mut active.locked, update.locked);
+    set_if_some(&mut active.bot, update.bot);
+    set_if_some(&mut active.discoverable, update.discoverable);
+    set_if_some(&mut active.default_visibility, update.default_visibility);
+    set_if_some(&mut active.default_sensitive, update.default_sensitive);
+    set_if_some(&mut active.default_language, update.default_language);
+    set_if_some(
+        &mut active.default_quote_policy,
+        update.default_quote_policy,
+    );
+    set_if_some(&mut active.profile_fields, update.profile_fields);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+
+    Ok(local_account_from_model(active.update(db).await?))
+}
+
+/// Mark an active model field as changed only when an update value is present.
+fn set_if_some<T>(active_value: &mut ActiveValue<T>, value: Option<T>)
+where
+    T: Into<sea_orm::Value>,
+{
+    if let Some(value) = value {
+        *active_value = Set(value);
+    }
 }
 
 /// Register an OAuth application and return stored metadata plus the raw client secret.
@@ -263,7 +245,7 @@ pub async fn create_oauth_application(
     let client_secret = random_token();
     let client_secret_hash = secret_hash(token_pepper, &client_secret)?;
 
-    entity::oauth_application::ActiveModel {
+    oauth_application::ActiveModel {
         id: Set(app_id),
         client_id: Set(client_id.clone()),
         client_secret_hash: Set(client_secret_hash.clone()),
@@ -274,8 +256,7 @@ pub async fn create_oauth_application(
         ..Default::default()
     }
     .insert(db)
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok((
         OAuthApplication {
@@ -296,11 +277,10 @@ pub async fn find_oauth_application_by_client_id(
     db: &DbConnection,
     client_id: &str,
 ) -> Result<Option<OAuthApplication>> {
-    let app = entity::oauth_application::Entity::find()
-        .filter(entity::oauth_application::Column::ClientId.eq(client_id))
+    let app = oauth_application::Entity::find()
+        .filter(oauth_application::Column::ClientId.eq(client_id))
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?;
 
     Ok(app.map(oauth_application_from_model))
 }
@@ -331,7 +311,7 @@ pub async fn create_authorization_code(
     let code_hash = secret_hash(token_pepper, &code)?;
     let expires_at = OffsetDateTime::now_utc() + Duration::minutes(5);
 
-    entity::oauth_authorization_code::ActiveModel {
+    oauth_authorization_code::ActiveModel {
         id: Set(Uuid::now_v7()),
         code_hash: Set(code_hash),
         account_id: Set(new_code.account_id.0),
@@ -344,8 +324,7 @@ pub async fn create_authorization_code(
         ..Default::default()
     }
     .insert(db)
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok(code)
 }
@@ -359,14 +338,13 @@ pub async fn consume_authorization_code(
     redirect_uri: &str,
 ) -> Result<Option<(AccountId, String, String, String)>> {
     let code_hash = secret_hash(token_pepper, code)?;
-    let Some(code) = entity::oauth_authorization_code::Entity::find()
-        .filter(entity::oauth_authorization_code::Column::CodeHash.eq(code_hash))
-        .filter(entity::oauth_authorization_code::Column::ApplicationId.eq(application_id))
-        .filter(entity::oauth_authorization_code::Column::RedirectUri.eq(redirect_uri))
-        .filter(entity::oauth_authorization_code::Column::ConsumedAt.is_null())
+    let Some(code) = oauth_authorization_code::Entity::find()
+        .filter(oauth_authorization_code::Column::CodeHash.eq(code_hash))
+        .filter(oauth_authorization_code::Column::ApplicationId.eq(application_id))
+        .filter(oauth_authorization_code::Column::RedirectUri.eq(redirect_uri))
+        .filter(oauth_authorization_code::Column::ConsumedAt.is_null())
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?
+        .await?
     else {
         return Ok(None);
     };
@@ -380,12 +358,9 @@ pub async fn consume_authorization_code(
         code.code_challenge.clone(),
         code.code_challenge_method.clone(),
     );
-    let mut active_code: entity::oauth_authorization_code::ActiveModel = code.into();
+    let mut active_code = code.into_active_model();
     active_code.consumed_at = Set(Some(OffsetDateTime::now_utc()));
-    active_code
-        .update(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+    active_code.update(db).await?;
 
     Ok(Some(grant))
 }
@@ -402,7 +377,7 @@ pub async fn create_access_token(
     let token_hash = secret_hash(token_pepper, &token)?;
     let issued_at = OffsetDateTime::now_utc();
 
-    entity::oauth_access_token::ActiveModel {
+    oauth_access_token::ActiveModel {
         id: Set(Uuid::now_v7()),
         token_hash: Set(token_hash),
         account_id: Set(account_id.0),
@@ -412,8 +387,7 @@ pub async fn create_access_token(
         ..Default::default()
     }
     .insert(db)
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok(OAuthAccessToken {
         token,
@@ -430,12 +404,11 @@ pub async fn find_account_by_access_token(
     token: &str,
 ) -> Result<Option<(LocalAccount, String)>> {
     let token_hash = secret_hash(token_pepper, token)?;
-    let Some(token) = entity::oauth_access_token::Entity::find()
-        .filter(entity::oauth_access_token::Column::TokenHash.eq(token_hash))
-        .filter(entity::oauth_access_token::Column::RevokedAt.is_null())
+    let Some(token) = oauth_access_token::Entity::find()
+        .filter(oauth_access_token::Column::TokenHash.eq(token_hash))
+        .filter(oauth_access_token::Column::RevokedAt.is_null())
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?
+        .await?
     else {
         return Ok(None);
     };
@@ -446,10 +419,9 @@ pub async fn find_account_by_access_token(
         return Ok(None);
     }
 
-    let account = entity::local_account::Entity::find_by_id(token.account_id)
+    let account = local_account::Entity::find_by_id(token.account_id)
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?;
 
     Ok(account.map(|account| (local_account_from_model(account), token.scopes)))
 }
@@ -457,18 +429,14 @@ pub async fn find_account_by_access_token(
 /// Revoke an OAuth access token if it exists.
 pub async fn revoke_access_token(db: &DbConnection, token_pepper: &str, token: &str) -> Result<()> {
     let token_hash = secret_hash(token_pepper, token)?;
-    if let Some(token) = entity::oauth_access_token::Entity::find()
-        .filter(entity::oauth_access_token::Column::TokenHash.eq(token_hash))
+    if let Some(token) = oauth_access_token::Entity::find()
+        .filter(oauth_access_token::Column::TokenHash.eq(token_hash))
         .one(db)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?
+        .await?
     {
-        let mut active_token: entity::oauth_access_token::ActiveModel = token.into();
+        let mut active_token = token.into_active_model();
         active_token.revoked_at = Set(Some(OffsetDateTime::now_utc()));
-        active_token
-            .update(db)
-            .await
-            .map_err(|error| RoostError::Database(error.to_string()))?;
+        active_token.update(db).await?;
     }
 
     Ok(())
@@ -494,17 +462,27 @@ pub fn pkce_s256_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn local_account_from_model(account: entity::local_account::Model) -> LocalAccount {
+fn local_account_from_model(account: local_account::Model) -> LocalAccount {
     LocalAccount {
         id: AccountId(account.id),
         username: account.username,
         email: account.email,
         password_hash: account.password_hash,
         is_admin: account.is_admin,
+        display_name: account.display_name,
+        note: account.note,
+        locked: account.locked,
+        bot: account.bot,
+        discoverable: account.discoverable,
+        default_visibility: account.default_visibility,
+        default_sensitive: account.default_sensitive,
+        default_language: account.default_language,
+        default_quote_policy: account.default_quote_policy,
+        profile_fields: account.profile_fields,
     }
 }
 
-fn oauth_application_from_model(app: entity::oauth_application::Model) -> OAuthApplication {
+fn oauth_application_from_model(app: oauth_application::Model) -> OAuthApplication {
     OAuthApplication {
         id: app.id,
         client_id: app.client_id,
@@ -566,12 +544,13 @@ pub async fn enqueue_job(
                 run_after.into(),
             ],
         ))
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?
-        .ok_or_else(|| RoostError::Database("job enqueue returned no row".to_owned()))?;
-    let id: Uuid = row
-        .try_get("", "id")
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?
+        .ok_or_else(|| {
+            RoostError::from(DbErr::RecordNotFound(
+                "job enqueue returned no row".to_owned(),
+            ))
+        })?;
+    let id: Uuid = row.try_get("", "id")?;
 
     Ok(JobId(id))
 }
@@ -608,23 +587,14 @@ pub async fn claim_due_jobs(
                 (limit as i64).into(),
             ],
         ))
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?;
 
     rows.into_iter()
         .map(|row| {
-            let id: Uuid = row
-                .try_get("", "id")
-                .map_err(|error| RoostError::Database(error.to_string()))?;
-            let kind: String = row
-                .try_get("", "kind")
-                .map_err(|error| RoostError::Database(error.to_string()))?;
-            let payload: JsonValue = row
-                .try_get("", "payload")
-                .map_err(|error| RoostError::Database(error.to_string()))?;
-            let attempts: i32 = row
-                .try_get("", "attempts")
-                .map_err(|error| RoostError::Database(error.to_string()))?;
+            let id: Uuid = row.try_get("", "id")?;
+            let kind: String = row.try_get("", "kind")?;
+            let payload: JsonValue = row.try_get("", "payload")?;
+            let attempts: i32 = row.try_get("", "attempts")?;
 
             Ok(ClaimedJob {
                 id: JobId(id),
@@ -647,8 +617,7 @@ pub async fn mark_job_completed(db: &DbConnection, job_id: JobId) -> Result<()> 
         "#,
         vec![job_id.0.into()],
     ))
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok(())
 }
@@ -674,8 +643,7 @@ pub async fn mark_job_failed(
         "#,
         vec![job_id.0.into(), error.to_owned().into(), run_after.into()],
     ))
-    .await
-    .map_err(|error| RoostError::Database(error.to_string()))?;
+    .await?;
 
     Ok(run_after)
 }
@@ -693,8 +661,7 @@ pub async fn release_expired_claims(db: &DbConnection, claim_ttl: Duration) -> R
             "#,
             vec![expired_before.into()],
         ))
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))?;
+        .await?;
 
     Ok(result.rows_affected())
 }

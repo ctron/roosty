@@ -12,7 +12,7 @@ pub enum RoostError {
     Configuration(String),
 
     #[error("database error: {0}")]
-    Database(String),
+    Database(#[from] sea_orm::DbErr),
 
     #[error("invalid input: {0}")]
     InvalidInput(String),

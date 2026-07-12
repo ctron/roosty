@@ -5,12 +5,13 @@ use axum::{
     extract::{FromRequest, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use roost_core::{AccountId, RoostError};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
@@ -77,6 +78,11 @@ pub fn router() -> Router<AppState> {
             "/api/v1/accounts/verify_credentials",
             get(verify_credentials),
         )
+        .route(
+            "/api/v1/accounts/update_credentials",
+            patch(update_credentials),
+        )
+        .route("/api/v1/preferences", get(preferences))
 }
 
 #[derive(Deserialize)]
@@ -566,6 +572,8 @@ struct AccountResponse {
     avatar_static: String,
     header: String,
     header_static: String,
+    fields: Vec<Value>,
+    emojis: Vec<Value>,
     followers_count: u64,
     following_count: u64,
     statuses_count: u64,
@@ -581,6 +589,7 @@ struct AccountSource {
     privacy: String,
     sensitive: bool,
     language: String,
+    quote_policy: String,
     follow_requests_count: u64,
 }
 
@@ -593,29 +602,148 @@ struct AccountRole {
     highlighted: bool,
 }
 
-async fn verify_credentials(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let bearer = match bearer_token(&headers) {
-        Some(token) => token,
-        None => {
-            return oauth_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_token",
-                "missing bearer token",
-            );
+/// Mastodon preference response keyed by compatibility field names.
+#[derive(Serialize)]
+struct PreferencesResponse {
+    #[serde(rename = "posting:default:visibility")]
+    posting_default_visibility: String,
+    #[serde(rename = "posting:default:sensitive")]
+    posting_default_sensitive: bool,
+    #[serde(rename = "posting:default:language")]
+    posting_default_language: Option<String>,
+    #[serde(rename = "posting:default:quote_policy")]
+    posting_default_quote_policy: String,
+    #[serde(rename = "reading:expand:media")]
+    reading_expand_media: &'static str,
+    #[serde(rename = "reading:expand:spoilers")]
+    reading_expand_spoilers: bool,
+}
+
+/// Parsed account settings update from JSON or form input.
+#[derive(Default)]
+struct UpdateCredentialsInput {
+    display_name: Option<String>,
+    note: Option<String>,
+    locked: Option<bool>,
+    bot: Option<bool>,
+    discoverable: Option<bool>,
+    default_visibility: Option<String>,
+    default_sensitive: Option<bool>,
+    default_language: Option<Option<String>>,
+    default_quote_policy: Option<String>,
+    profile_fields: Option<Value>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum UpdateCredentialsError {
+    #[error("invalid JSON: {0}")]
+    Json(serde_json::Error),
+    #[error("boolean value is invalid")]
+    Boolean,
+    #[error("source[privacy] is invalid")]
+    Visibility,
+    #[error("source[quote_policy] is invalid")]
+    QuotePolicy,
+    #[error("source[language] is invalid")]
+    Language,
+}
+
+impl<S> FromRequest<S> for UpdateCredentialsInput
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let content_type = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| bad_request(&format!("invalid request body: {error}")))?;
+
+        let input = if content_type.contains("application/json") {
+            parse_update_credentials_json(&body)
+        } else {
+            parse_update_credentials_form(&body)
         }
+        .map_err(|error| bad_request(&error.to_string()))?;
+
+        Ok(input)
+    }
+}
+
+async fn verify_credentials(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let account = match authenticated_account(&state, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
     };
 
-    let account =
-        match roost_db::find_account_by_access_token(&state.db, &state.config.token_pepper, bearer)
-            .await
-        {
-            Ok(Some((account, _scopes))) => account,
-            Ok(None) => {
-                return oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token");
-            }
-            Err(error) => return server_error(error),
-        };
+    Json(account_response(&state, account)).into_response()
+}
 
+async fn preferences(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let account = match authenticated_account(&state, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+
+    Json(PreferencesResponse {
+        posting_default_visibility: account.default_visibility,
+        posting_default_sensitive: account.default_sensitive,
+        posting_default_language: account.default_language,
+        posting_default_quote_policy: account.default_quote_policy,
+        reading_expand_media: "default",
+        reading_expand_spoilers: false,
+    })
+    .into_response()
+}
+
+async fn update_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    input: UpdateCredentialsInput,
+) -> Response {
+    let account = match authenticated_account(&state, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let update = match settings_update_from_input(input) {
+        Ok(update) => update,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+
+    match roost_db::update_local_account_settings(&state.db, account.id, update).await {
+        Ok(account) => Json(account_response(&state, account)).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Resolve an OAuth bearer token to the authenticated local account.
+async fn authenticated_account(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<roost_db::LocalAccount, Response> {
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "missing bearer token",
+        )
+    })?;
+
+    roost_db::find_account_by_access_token(&state.db, &state.config.token_pepper, bearer)
+        .await
+        .map_err(server_error)?
+        .map(|(account, _scopes)| account)
+        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token"))
+}
+
+/// Build the Mastodon-compatible credential account response.
+fn account_response(state: &AppState, account: roost_db::LocalAccount) -> AccountResponse {
     let account_url = match state
         .config
         .public_base_url
@@ -624,33 +752,42 @@ async fn verify_credentials(State(state): State<AppState>, headers: HeaderMap) -
         Ok(url) => url.to_string(),
         Err(_) => format!("{}/@{}", state.config.public_base_url, account.username),
     };
+    let profile_fields = profile_fields_from_value(&account.profile_fields);
+    let display_name = if account.display_name.is_empty() {
+        account.username.clone()
+    } else {
+        account.display_name.clone()
+    };
 
-    Json(AccountResponse {
+    AccountResponse {
         id: account.id.0.to_string(),
         username: account.username.clone(),
         acct: account.username.clone(),
-        display_name: account.username,
-        locked: false,
-        bot: false,
-        discoverable: true,
+        display_name,
+        locked: account.locked,
+        bot: account.bot,
+        discoverable: account.discoverable,
         group: false,
         created_at: "1970-01-01T00:00:00.000Z".to_owned(),
-        note: String::new(),
+        note: account.note.clone(),
         url: account_url,
         avatar: String::new(),
         avatar_static: String::new(),
         header: String::new(),
         header_static: String::new(),
+        fields: profile_fields.clone(),
+        emojis: Vec::new(),
         followers_count: 0,
         following_count: 0,
         statuses_count: 0,
         last_status_at: None,
         source: AccountSource {
-            note: String::new(),
-            fields: Vec::new(),
-            privacy: "public".to_owned(),
-            sensitive: false,
-            language: "en".to_owned(),
+            note: account.note,
+            fields: profile_fields,
+            privacy: account.default_visibility,
+            sensitive: account.default_sensitive,
+            language: account.default_language.unwrap_or_default(),
+            quote_policy: account.default_quote_policy,
             follow_requests_count: 0,
         },
         role: AccountRole {
@@ -660,8 +797,242 @@ async fn verify_credentials(State(state): State<AppState>, headers: HeaderMap) -
             permissions: "0".to_owned(),
             highlighted: account.is_admin,
         },
+    }
+}
+
+/// Convert stored profile fields to the array shape expected by account APIs.
+fn profile_fields_from_value(value: &Value) -> Vec<Value> {
+    value.as_array().cloned().unwrap_or_default()
+}
+
+/// Convert parsed update input into a validated database update.
+fn settings_update_from_input(
+    input: UpdateCredentialsInput,
+) -> Result<roost_db::LocalAccountSettingsUpdate, UpdateCredentialsError> {
+    if let Some(visibility) = input.default_visibility.as_deref() {
+        validate_visibility(visibility)?;
+    }
+    if let Some(quote_policy) = input.default_quote_policy.as_deref() {
+        validate_quote_policy(quote_policy)?;
+    }
+    if let Some(Some(language)) = input.default_language.as_ref() {
+        validate_language(language)?;
+    }
+
+    Ok(roost_db::LocalAccountSettingsUpdate {
+        display_name: input.display_name,
+        note: input.note,
+        locked: input.locked,
+        bot: input.bot,
+        discoverable: input.discoverable,
+        default_visibility: input.default_visibility,
+        default_sensitive: input.default_sensitive,
+        default_language: input.default_language,
+        default_quote_policy: input.default_quote_policy,
+        profile_fields: input.profile_fields,
     })
-    .into_response()
+}
+
+/// Parse a JSON account update request.
+fn parse_update_credentials_json(
+    body: &[u8],
+) -> Result<UpdateCredentialsInput, UpdateCredentialsError> {
+    let value: Value = serde_json::from_slice(body).map_err(UpdateCredentialsError::Json)?;
+    let source = value.get("source");
+
+    Ok(UpdateCredentialsInput {
+        display_name: optional_string(value.get("display_name")),
+        note: optional_string(value.get("note")),
+        locked: optional_bool(value.get("locked"))?,
+        bot: optional_bool(value.get("bot"))?,
+        discoverable: optional_bool(value.get("discoverable"))?,
+        default_visibility: source
+            .and_then(|source| optional_string(source.get("privacy")))
+            .or_else(|| optional_string(value.get("source[privacy]"))),
+        default_sensitive: match source
+            .and_then(|source| optional_bool(source.get("sensitive")).transpose())
+        {
+            Some(result) => Some(result?),
+            None => optional_bool(value.get("source[sensitive]"))?,
+        },
+        default_language: json_language(source.and_then(|source| source.get("language")))
+            .or_else(|| json_language(value.get("source[language]"))),
+        default_quote_policy: source
+            .and_then(|source| optional_string(source.get("quote_policy")))
+            .or_else(|| optional_string(value.get("source[quote_policy]"))),
+        profile_fields: json_profile_fields(value.get("fields_attributes")),
+    })
+}
+
+/// Parse a form-encoded account update request.
+fn parse_update_credentials_form(
+    body: &[u8],
+) -> Result<UpdateCredentialsInput, UpdateCredentialsError> {
+    let pairs = form_urlencoded::parse(body).collect::<Vec<_>>();
+    let field = |name: &str| {
+        pairs
+            .iter()
+            .find_map(|(key, value)| (key == name).then(|| value.to_string()))
+    };
+
+    Ok(UpdateCredentialsInput {
+        display_name: field("display_name"),
+        note: field("note"),
+        locked: field("locked")
+            .map(|value| parse_bool(&value))
+            .transpose()?,
+        bot: field("bot").map(|value| parse_bool(&value)).transpose()?,
+        discoverable: field("discoverable")
+            .map(|value| parse_bool(&value))
+            .transpose()?,
+        default_visibility: field("source[privacy]"),
+        default_sensitive: field("source[sensitive]")
+            .map(|value| parse_bool(&value))
+            .transpose()?,
+        default_language: field("source[language]").map(normalize_language),
+        default_quote_policy: field("source[quote_policy]"),
+        profile_fields: form_profile_fields(&pairs),
+    })
+}
+
+/// Validate default status visibility values accepted by Mastodon clients.
+fn validate_visibility(value: &str) -> Result<(), UpdateCredentialsError> {
+    match value {
+        "public" | "unlisted" | "private" | "direct" => Ok(()),
+        _ => Err(UpdateCredentialsError::Visibility),
+    }
+}
+
+/// Validate default quote policy values accepted by Mastodon clients.
+fn validate_quote_policy(value: &str) -> Result<(), UpdateCredentialsError> {
+    match value {
+        "public" | "followers" | "nobody" => Ok(()),
+        _ => Err(UpdateCredentialsError::QuotePolicy),
+    }
+}
+
+/// Validate a short language tag for default posting language.
+fn validate_language(value: &str) -> Result<(), UpdateCredentialsError> {
+    let valid = value.len() <= 16
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphabetic() || character == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(UpdateCredentialsError::Language)
+    }
+}
+
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Parse an optional JSON boolean or string boolean field.
+fn optional_bool(value: Option<&Value>) -> Result<Option<bool>, UpdateCredentialsError> {
+    value
+        .map(|value| match value {
+            Value::Bool(value) => Ok(*value),
+            Value::String(value) => parse_bool(value),
+            _ => Err(UpdateCredentialsError::Boolean),
+        })
+        .transpose()
+}
+
+/// Normalize an optional JSON language value, preserving explicit null.
+fn json_language(value: Option<&Value>) -> Option<Option<String>> {
+    value.map(|value| match value {
+        Value::Null => None,
+        Value::String(value) => normalize_language(value.to_owned()),
+        _ => None,
+    })
+}
+
+/// Convert empty language strings to null storage values.
+fn normalize_language(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+/// Parse boolean values commonly submitted by HTML forms and clients.
+fn parse_bool(value: &str) -> Result<bool, UpdateCredentialsError> {
+    match value {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        _ => Err(UpdateCredentialsError::Boolean),
+    }
+}
+
+/// Convert JSON `fields_attributes` into the stored profile field array.
+fn json_profile_fields(value: Option<&Value>) -> Option<Value> {
+    let fields = value?.as_object()?;
+    let mut keys = fields.keys().collect::<Vec<_>>();
+    keys.sort();
+    let values = keys
+        .into_iter()
+        .filter_map(|key| profile_field_from_value(fields.get(key)?))
+        .collect::<Vec<_>>();
+    Some(Value::Array(values))
+}
+
+/// Convert form-encoded `fields_attributes[index][name|value]` pairs.
+fn form_profile_fields(
+    pairs: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
+) -> Option<Value> {
+    let mut fields = std::collections::BTreeMap::<String, (Option<String>, Option<String>)>::new();
+    for (key, value) in pairs {
+        let Some(rest) = key.strip_prefix("fields_attributes[") else {
+            continue;
+        };
+        let Some((index, field_name)) = rest.split_once("][") else {
+            continue;
+        };
+        let Some(field_name) = field_name.strip_suffix(']') else {
+            continue;
+        };
+        let entry = fields.entry(index.to_owned()).or_default();
+        match field_name {
+            "name" => entry.0 = Some(value.to_string()),
+            "value" => entry.1 = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        fields
+            .into_values()
+            .filter_map(|(name, value)| profile_field(name?, value?))
+            .collect(),
+    ))
+}
+
+/// Convert one JSON profile field object into the stored field shape.
+fn profile_field_from_value(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    profile_field(
+        object.get("name")?.as_str()?.to_owned(),
+        object.get("value")?.as_str()?.to_owned(),
+    )
+}
+
+/// Build a stored profile field, omitting fully blank rows.
+fn profile_field(name: String, value: String) -> Option<Value> {
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() && value.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "name": name,
+        "value": value,
+        "verified_at": null,
+    }))
 }
 
 fn account_id_from_session(
@@ -797,6 +1168,10 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
         "error_description": description,
     }))
     .into_response_with_status(status)
+}
+
+fn bad_request(description: &str) -> Response {
+    oauth_error(StatusCode::BAD_REQUEST, "invalid_request", description)
 }
 
 fn server_error(error: RoostError) -> Response {
@@ -1146,6 +1521,152 @@ mod tests {
         assert_eq!(body["error"], "invalid_token");
     }
 
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn preferences_require_a_valid_token(context: &mut EndpointContext) {
+        // Preferences expose account-specific defaults, so anonymous and bogus
+        // bearer requests must fail the same way as other user-token APIs.
+        let missing = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/preferences")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let invalid = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/preferences")
+                    .header(AUTHORIZATION, "Bearer not-a-real-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn preferences_return_persisted_posting_defaults(context: &mut EndpointContext) {
+        // Elk reads these immediately after login to seed composer defaults.
+        let token = context.authenticated_token().await;
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/preferences")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["posting:default:visibility"], "public");
+        assert_eq!(body["posting:default:sensitive"], false);
+        assert_eq!(body["posting:default:language"], "en");
+        assert_eq!(body["posting:default:quote_policy"], "followers");
+        assert_eq!(body["reading:expand:media"], "default");
+        assert_eq!(body["reading:expand:spoilers"], false);
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn update_credentials_persists_profile_and_preferences(context: &mut EndpointContext) {
+        // Mastodon clients update both profile settings and composer defaults
+        // through update_credentials; preferences should reflect those writes.
+        let token = context.authenticated_token().await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("display_name", "Admin Person"),
+                ("note", "A local administrator"),
+                ("locked", "true"),
+                ("bot", "false"),
+                ("discoverable", "false"),
+                ("source[privacy]", "unlisted"),
+                ("source[sensitive]", "true"),
+                ("source[language]", "de"),
+                ("source[quote_policy]", "nobody"),
+                ("fields_attributes[0][name]", "Website"),
+                ("fields_attributes[0][value]", "https://example.com"),
+            ])
+            .finish();
+        let update_response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let body = json_body(update_response).await;
+        assert_eq!(body["display_name"], "Admin Person");
+        assert_eq!(body["note"], "A local administrator");
+        assert_eq!(body["locked"], true);
+        assert_eq!(body["bot"], false);
+        assert_eq!(body["discoverable"], false);
+        assert_eq!(body["source"]["privacy"], "unlisted");
+        assert_eq!(body["source"]["sensitive"], true);
+        assert_eq!(body["source"]["language"], "de");
+        assert_eq!(body["source"]["quote_policy"], "nobody");
+        assert_eq!(body["fields"][0]["name"], "Website");
+
+        let preferences_response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/preferences")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(preferences_response.status(), StatusCode::OK);
+        let body = json_body(preferences_response).await;
+        assert_eq!(body["posting:default:visibility"], "unlisted");
+        assert_eq!(body["posting:default:sensitive"], true);
+        assert_eq!(body["posting:default:language"], "de");
+        assert_eq!(body["posting:default:quote_policy"], "nobody");
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn update_credentials_rejects_invalid_preferences(context: &mut EndpointContext) {
+        // Reject invalid enum-like settings before they can be persisted.
+        let token = context.authenticated_token().await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([("source[privacy]", "everyone")])
+            .finish();
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "invalid_request");
+    }
+
     struct EndpointContext {
         postgresql: PostgreSQL,
         db: roost_db::DbConnection,
@@ -1413,6 +1934,13 @@ mod tests {
             let body = json_body(response).await;
             assert_eq!(body["token_type"], "Bearer");
             body["access_token"].as_str().unwrap().to_owned()
+        }
+
+        async fn authenticated_token(&self) -> String {
+            let app = self.register_app().await;
+            let cookie = self.login().await;
+            let code = self.authorize(&app.client_id, &cookie).await;
+            self.token(&app, &code).await
         }
     }
 

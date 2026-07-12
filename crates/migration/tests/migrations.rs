@@ -10,6 +10,8 @@ use test_context::{AsyncTestContext, test_context};
 #[test_context(EmbeddedDatabase)]
 #[tokio::test]
 async fn migrations_run_up(database: &mut EmbeddedDatabase) {
+    // A fresh database should receive every table and account settings column
+    // required by the current application code.
     Migrator::up(database.connection(), None).await.unwrap();
 
     assert!(table_exists(database.connection(), "job").await);
@@ -18,11 +20,18 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "oauth_authorization_code").await);
     assert!(table_exists(database.connection(), "oauth_access_token").await);
     assert!(table_exists(database.connection(), "oauth_refresh_token").await);
+    // Account settings are part of the local account schema until profile
+    // boundaries justify a separate table.
+    assert!(column_exists(database.connection(), "local_account", "display_name").await);
+    assert!(column_exists(database.connection(), "local_account", "default_visibility").await);
+    assert!(column_exists(database.connection(), "local_account", "profile_fields").await);
 }
 
 #[test_context(EmbeddedDatabase)]
 #[tokio::test]
 async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
+    // Down migrations should leave a disposable test database clean enough for
+    // repeated migration runs.
     Migrator::up(database.connection(), None).await.unwrap();
     assert!(table_exists(database.connection(), "job").await);
     assert!(table_exists(database.connection(), "local_account").await);
@@ -129,4 +138,30 @@ async fn table_exists(connection: &DatabaseConnection, table_name: &str) -> bool
         .expect("table existence query returned no rows");
 
     row.try_get::<bool>("", "table_exists").unwrap()
+}
+
+async fn column_exists(
+    connection: &DatabaseConnection,
+    table_name: &str,
+    column_name: &str,
+) -> bool {
+    let row = connection
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND column_name = $2
+            ) AS column_exists
+            "#,
+            vec![table_name.to_owned().into(), column_name.to_owned().into()],
+        ))
+        .await
+        .unwrap()
+        .expect("column existence query returned no rows");
+
+    row.try_get::<bool>("", "column_exists").unwrap()
 }

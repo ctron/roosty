@@ -106,9 +106,7 @@ async fn migrate() -> Result<()> {
 }
 
 async fn run_migrations(db: &roost_db::DbConnection) -> Result<()> {
-    Migrator::up(db, None)
-        .await
-        .map_err(|error| RoostError::Database(error.to_string()))
+    Ok(Migrator::up(db, None).await?)
 }
 
 async fn bootstrap_admin(username: &str, email: &str) -> Result<()> {

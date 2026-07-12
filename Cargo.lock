@@ -2436,6 +2436,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "test-context",
+ "thiserror",
  "time",
  "tokio",
  "tower",
@@ -2450,6 +2451,7 @@ dependencies = [
 name = "roost-core"
 version = "0.1.0"
 dependencies = [
+ "sea-orm",
  "serde",
  "thiserror",
  "time",
