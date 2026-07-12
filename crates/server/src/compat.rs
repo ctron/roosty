@@ -1,0 +1,442 @@
+use std::collections::HashMap;
+
+use axum::{
+    Json, Router,
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+use tracing::{debug, warn};
+
+use crate::{
+    auth::{self, AuthenticatedAccount},
+    http::AppState,
+};
+
+/// Build compatibility routes probed by Mastodon browser clients.
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/push/subscription", get(push_subscription))
+        .route("/api/v1/followed_tags", get(followed_tags))
+        .route("/api/v1/markers", get(markers))
+        .route("/api/v1/notifications", get(notifications))
+        .route("/api/v1/timelines/home", get(home_timeline))
+        .route("/api/v1/timelines/public", get(public_timeline))
+        .route("/api/v1/streaming", get(streaming))
+        .route("/api/v1/streaming/health", get(streaming_health))
+}
+
+#[derive(Serialize)]
+struct ErrorResponse<'a> {
+    error: &'a str,
+}
+
+async fn push_subscription(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "Record not found",
+        }),
+    )
+        .into_response()
+}
+
+async fn followed_tags(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
+    Json(Vec::<Value>::new()).into_response()
+}
+
+async fn markers(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
+    Json(json!({})).into_response()
+}
+
+async fn home_timeline(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
+    Json(Vec::<Value>::new()).into_response()
+}
+
+async fn notifications(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
+    Json(Vec::<Value>::new()).into_response()
+}
+
+async fn public_timeline() -> Json<Vec<Value>> {
+    Json(Vec::new())
+}
+
+async fn streaming_health() -> &'static str {
+    "OK"
+}
+
+async fn streaming(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let Some(token) = streaming_token(&headers, &query) else {
+        return unauthorized().into_response();
+    };
+    if let Err(response) = auth::account_from_bearer_token(&state, &token).await {
+        return response;
+    }
+
+    let stream = query.get("stream").cloned();
+    websocket
+        .on_upgrade(move |socket| handle_streaming_socket(socket, stream))
+        .into_response()
+}
+
+/// Keep a validated streaming socket open until the client closes it.
+async fn handle_streaming_socket(mut socket: WebSocket, initial_stream: Option<String>) {
+    if let Some(stream) = initial_stream {
+        debug!(stream, "streaming client subscribed");
+    }
+
+    while let Some(message) = socket.recv().await {
+        match message {
+            Ok(Message::Text(text)) => handle_streaming_text(&text),
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(payload)) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "streaming websocket error");
+                break;
+            }
+        }
+    }
+}
+
+/// Log subscribe and unsubscribe messages until real event fan-out exists.
+fn handle_streaming_text(text: &str) {
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => {
+            let message_type = value.get("type").and_then(Value::as_str);
+            let stream = value.get("stream").and_then(Value::as_str);
+            debug!(?message_type, ?stream, "streaming control message");
+        }
+        Err(error) => debug!(%error, "ignored non-json streaming message"),
+    }
+}
+
+fn streaming_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
+    query
+        .get("access_token")
+        .cloned()
+        .or_else(|| bearer_token(headers).map(str::to_owned))
+        .or_else(|| websocket_protocol_token(headers))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn websocket_protocol_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|part| !part.is_empty() && *part != "Bearer")
+                .map(str::to_owned)
+        })
+}
+
+fn unauthorized() -> (StatusCode, Json<ErrorResponse<'static>>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: "The access token is invalid",
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+    };
+
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
+    };
+    use postgresql_embedded::{PostgreSQL, SettingsBuilder, V18};
+    use roost_core::AccountId;
+    use roost_migration::Migrator;
+    use sea_orm_migration::MigratorTrait;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use test_context::{AsyncTestContext, test_context};
+    use tower::ServiceExt;
+
+    use super::streaming_token;
+    use crate::{config::Config, http::AppState, password};
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn empty_startup_collections_require_valid_tokens(context: &mut CompatContext) {
+        // These Elk startup probes are account-specific and must keep the same
+        // token requirements even while they return empty compatibility data.
+        let token = context.access_token().await;
+
+        for uri in [
+            "/api/v1/followed_tags",
+            "/api/v1/markers?timeline[]=notifications",
+            "/api/v1/notifications?limit=30",
+            "/api/v1/timelines/home?limit=30",
+        ] {
+            let response = context.authenticated_get(uri, &token).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            if uri.starts_with("/api/v1/markers") {
+                assert_eq!(body, serde_json::json!({}));
+            } else {
+                assert_eq!(body, serde_json::json!([]));
+            }
+
+            let unauthorized = context.get(uri).await;
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn public_timeline_returns_an_empty_collection(context: &mut CompatContext) {
+        let response = context
+            .get("/api/v1/timelines/public?limit=30&local=true")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, serde_json::json!([]));
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_subscription_reports_missing_subscription(context: &mut CompatContext) {
+        // Push delivery is not implemented yet, but authenticated clients expect
+        // the probe to distinguish "no subscription" from "unknown endpoint".
+        let token = context.access_token().await;
+
+        let response = context
+            .authenticated_get("/api/v1/push/subscription", &token)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["error"], "Record not found");
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn streaming_health_works(context: &mut CompatContext) {
+        let health = context.get("/api/v1/streaming/health").await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let body = to_bytes(health.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"OK");
+    }
+
+    #[test]
+    fn streaming_token_accepts_browser_compatible_locations() {
+        // Browser WebSocket clients cannot set arbitrary Authorization headers,
+        // so Mastodon-compatible clients may use query or protocol locations.
+        let mut headers = HeaderMap::new();
+        let mut query = std::collections::HashMap::new();
+        query.insert("access_token".to_owned(), "query-token".to_owned());
+        assert_eq!(
+            streaming_token(&headers, &query),
+            Some("query-token".to_owned())
+        );
+
+        query.clear();
+        headers.insert(AUTHORIZATION, "Bearer header-token".parse().unwrap());
+        assert_eq!(
+            streaming_token(&headers, &query),
+            Some("header-token".to_owned())
+        );
+
+        headers.clear();
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            "Bearer, protocol-token".parse().unwrap(),
+        );
+        assert_eq!(
+            streaming_token(&headers, &query),
+            Some("protocol-token".to_owned())
+        );
+    }
+
+    struct CompatContext {
+        postgresql: PostgreSQL,
+        db: roost_db::DbConnection,
+        database_name: String,
+        config: Config,
+        account_id: AccountId,
+        application_id: uuid::Uuid,
+        _temp_dir: TempDir,
+    }
+
+    impl AsyncTestContext for CompatContext {
+        async fn setup() -> Self {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("roost-compat-")
+                .tempdir()
+                .unwrap();
+            let install_cache_root = std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("roost-target-tmp"));
+            let install_cache = install_cache_root.join("embedded-postgres").join("install");
+            let database_name = unique_name();
+            let data_dir = temp_dir.path().join("data").join(&database_name);
+            let password_file = temp_dir
+                .path()
+                .join("passwords")
+                .join(format!("{database_name}.pgpass"));
+
+            if let Some(parent) = password_file.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+
+            let settings = SettingsBuilder::new()
+                .version((*V18).clone())
+                .installation_dir(install_cache)
+                .data_dir(&data_dir)
+                .password_file(password_file)
+                .timeout(Some(StdDuration::from_secs(30)))
+                .build();
+            let mut postgresql = PostgreSQL::new(settings);
+
+            postgresql.setup().await.unwrap();
+            postgresql.start().await.unwrap();
+            postgresql.create_database(&database_name).await.unwrap();
+
+            let database_url = postgresql.settings().url(&database_name);
+            let db = roost_db::connect(&database_url).await.unwrap();
+            Migrator::up(&db, None).await.unwrap();
+
+            let password_hash = password::hash_password("password").unwrap();
+            let account_id = AccountId(
+                roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
+                    .await
+                    .unwrap(),
+            );
+            let (application, _secret) = roost_db::create_oauth_application(
+                &db,
+                "Elk",
+                "https://localhost:4001/oauth",
+                "read write follow push",
+                Some("https://localhost:4001"),
+                "test-token-pepper-change-me-0000",
+            )
+            .await
+            .unwrap();
+
+            let config = Config {
+                database_url,
+                public_base_url: "https://localhost:4000".parse().unwrap(),
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000),
+                infra_listen_addr: None,
+                session_secret: "test-session-secret-change-me-000".to_owned(),
+                token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+                object_storage_backend: "local".to_owned(),
+                media_root: "./media".to_owned(),
+                registration_mode: "closed".to_owned(),
+                federation_enabled: false,
+                instance_name: "Roost Test".to_owned(),
+                instance_description: Some("Endpoint test instance".to_owned()),
+            };
+
+            Self {
+                postgresql,
+                db,
+                database_name,
+                config,
+                account_id,
+                application_id: application.id,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        async fn teardown(self) {
+            self.db.close().await.unwrap();
+            self.postgresql
+                .drop_database(&self.database_name)
+                .await
+                .unwrap();
+            self.postgresql.stop().await.unwrap();
+        }
+    }
+
+    impl CompatContext {
+        fn app(&self) -> Router {
+            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+        }
+
+        async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
+            self.app().oneshot(request).await.unwrap()
+        }
+
+        async fn get(&self, uri: &str) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        async fn authenticated_get(&self, uri: &str, token: &str) -> axum::http::Response<Body> {
+            self.request(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        async fn access_token(&self) -> String {
+            roost_db::create_access_token(
+                &self.db,
+                &self.config.token_pepper,
+                self.account_id,
+                self.application_id,
+                "read write follow push",
+            )
+            .await
+            .unwrap()
+            .token
+        }
+    }
+
+    async fn json_body(response: axum::http::Response<Body>) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn unique_name() -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        format!("roost_compat_{}_{}", std::process::id(), timestamp)
+    }
+}

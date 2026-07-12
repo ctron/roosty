@@ -2,8 +2,8 @@ use askama::Template;
 use axum::{
     Form, Json, Router,
     body::to_bytes,
-    extract::{FromRequest, Query, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{FromRef, FromRequest, FromRequestParts, Query, Request, State},
+    http::{HeaderMap, StatusCode, header, request::Parts},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, patch, post},
 };
@@ -21,6 +21,24 @@ use crate::{http::AppState, password};
 type HmacSha256 = Hmac<Sha256>;
 
 const SESSION_COOKIE: &str = "roost_session";
+
+/// Authenticated local account extracted from an OAuth bearer token.
+pub(crate) struct AuthenticatedAccount(pub roost_db::LocalAccount);
+
+impl<S> FromRequestParts<S> for AuthenticatedAccount
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let state = AppState::from_ref(state);
+        authenticated_account(&state, &parts.headers)
+            .await
+            .map(Self)
+    }
+}
 
 struct FormOrJson<T>(T);
 
@@ -676,21 +694,14 @@ where
     }
 }
 
-async fn verify_credentials(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let account = match authenticated_account(&state, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
-
+async fn verify_credentials(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+) -> Response {
     Json(account_response(&state, account)).into_response()
 }
 
-async fn preferences(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let account = match authenticated_account(&state, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
-
+async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Response {
     Json(PreferencesResponse {
         posting_default_visibility: account.default_visibility,
         posting_default_sensitive: account.default_sensitive,
@@ -704,13 +715,9 @@ async fn preferences(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
 async fn update_credentials(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthenticatedAccount(account): AuthenticatedAccount,
     input: UpdateCredentialsInput,
 ) -> Response {
-    let account = match authenticated_account(&state, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
     let update = match settings_update_from_input(input) {
         Ok(update) => update,
         Err(error) => return bad_request(&error.to_string()),
@@ -723,7 +730,7 @@ async fn update_credentials(
 }
 
 /// Resolve an OAuth bearer token to the authenticated local account.
-async fn authenticated_account(
+pub(crate) async fn authenticated_account(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<roost_db::LocalAccount, Response> {
@@ -735,6 +742,14 @@ async fn authenticated_account(
         )
     })?;
 
+    account_from_bearer_token(state, bearer).await
+}
+
+/// Resolve a raw OAuth bearer token to the authenticated local account.
+pub(crate) async fn account_from_bearer_token(
+    state: &AppState,
+    bearer: &str,
+) -> Result<roost_db::LocalAccount, Response> {
     roost_db::find_account_by_access_token(&state.db, &state.config.token_pepper, bearer)
         .await
         .map_err(server_error)?

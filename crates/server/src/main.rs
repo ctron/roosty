@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod auth;
+mod compat;
 mod config;
 mod http;
 mod instance;

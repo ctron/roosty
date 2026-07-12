@@ -38,6 +38,7 @@ impl AppState {
 pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
     let public_router = Router::<AppState>::new()
         .merge(crate::auth::router())
+        .merge(crate::compat::router())
         .merge(crate::instance::router())
         .fallback(public_fallback)
         .layer(
