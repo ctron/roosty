@@ -23,3 +23,7 @@ Keep this as the default verification command for changes in this repository.
 
 - Document exported Rust functions, types, and modules with rustdoc comments (`///` or `//!`).
 - For larger or non-obvious function bodies, add concise internal comments that explain the major steps or invariants.
+
+## Git
+
+- Use Conventional Commits for commit messages.
