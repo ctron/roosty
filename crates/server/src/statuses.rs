@@ -51,6 +51,15 @@ pub fn router() -> Router<AppState> {
             "/api/v1/statuses/{status_id}/unbookmark",
             post(unbookmark_status),
         )
+        .route("/api/v1/statuses/{status_id}/reblog", post(reblog_status))
+        .route(
+            "/api/v1/statuses/{status_id}/unreblog",
+            post(unreblog_status),
+        )
+        .route(
+            "/api/v1/statuses/{status_id}/reblogged_by",
+            get(reblogged_by),
+        )
         .route("/api/v1/favourites", get(favourites))
         .route("/api/v1/bookmarks", get(bookmarks))
         .route("/api/v1/timelines/home", get(home_timeline))
@@ -156,7 +165,7 @@ pub(crate) struct StatusResponse {
     muted: bool,
     bookmarked: bool,
     pinned: bool,
-    reblog: Option<Value>,
+    reblog: Option<Box<StatusResponse>>,
     application: Option<Value>,
 }
 
@@ -198,6 +207,8 @@ enum StatusCollectionAction {
     Unfavourite,
     Bookmark,
     Unbookmark,
+    Reblog,
+    Unreblog,
 }
 
 #[derive(Clone, Copy)]
@@ -266,10 +277,12 @@ async fn create_status(
                 if let Err(error) = notify_mentioned_accounts(&state, &status, author_id).await {
                     warn!(%error, "failed to create mention notifications");
                 }
+                let recipients = status_stream_recipients(&state, &status).await;
                 state.streaming_events.publish_status_update(
                     &response,
                     author_id,
                     &response.visibility,
+                    &recipients,
                 );
                 (StatusCode::OK, Json(response)).into_response()
             }
@@ -349,7 +362,7 @@ async fn update_status(
     )
     .await
     {
-        Ok(Some(status)) => match status_response(&state, status, account).await {
+        Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
             Ok(status) => Json(status).into_response(),
             Err(error) => server_error(error),
         },
@@ -364,15 +377,46 @@ async fn delete_status(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
 ) -> Response {
-    match roost_db::delete_owned_local_status(&state.db, StatusId(path.status_id), account.id).await
-    {
-        Ok(Some(status)) => match status_response(&state, status, account).await {
-            Ok(status) => Json(status).into_response(),
+    let status_id = StatusId(path.status_id);
+    match roost_db::delete_owned_local_status(&state.db, status_id, account.id).await {
+        Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
+            Ok(response) => {
+                let reblogs = match roost_db::local_reblogs_for_status(&state.db, status_id).await {
+                    Ok(reblogs) => reblogs,
+                    Err(error) => return server_error(error),
+                };
+                publish_status_delete(&state, &status, &reblogs).await;
+                Json(response).into_response()
+            }
             Err(error) => server_error(error),
         },
         Ok(None) => not_found(),
         Err(RoostError::InvalidInput(error)) => forbidden(&error),
         Err(error) => server_error(error),
+    }
+}
+
+/// Publish delete events for a removed original status and its local boost wrappers.
+async fn publish_status_delete(
+    state: &AppState,
+    status: &roost_db::LocalStatus,
+    reblogs: &[roost_db::LocalStatusReblog],
+) {
+    let recipients = status_stream_recipients(state, status).await;
+    state.streaming_events.publish_delete(
+        &status.id.0.to_string(),
+        status.account_id,
+        &status.visibility,
+        &recipients,
+    );
+    for reblog in reblogs {
+        let recipients = reblog_stream_recipients(state, reblog.account_id).await;
+        state.streaming_events.publish_delete(
+            &reblog.id.to_string(),
+            reblog.account_id,
+            "direct",
+            &recipients,
+        );
     }
 }
 
@@ -451,6 +495,55 @@ async fn unbookmark_status(
     status_collection_action(&state, account.id, path, StatusCollectionAction::Unbookmark).await
 }
 
+async fn reblog_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    status_collection_action(&state, account.id, path, StatusCollectionAction::Reblog).await
+}
+
+async fn unreblog_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    status_collection_action(&state, account.id, path, StatusCollectionAction::Unreblog).await
+}
+
+async fn reblogged_by(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+    Query(params): Query<CollectionParams>,
+) -> Response {
+    let viewer_id = viewer.as_ref().map(|account| account.id);
+    let status_id = StatusId(path.status_id);
+    match roost_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) if can_view_status(&status, viewer_id) => {}
+        Ok(Some(_)) | Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+
+    let limit = timeline_limit(params.limit);
+    let cursor = match collection_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("collection cursor is invalid"),
+    };
+    match roost_db::local_reblogged_by_for_status(&state.db, status_id, limit, cursor).await {
+        Ok(page) => {
+            account_collection_response(
+                &state,
+                page,
+                limit,
+                &format!("/api/v1/statuses/{}/reblogged_by", path.status_id),
+            )
+            .await
+        }
+        Err(error) => server_error(error),
+    }
+}
+
 async fn favourites(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
@@ -479,13 +572,13 @@ async fn home_timeline(
     match roost_db::home_timeline_for_account(&state.db, account.id, query.limit, query.cursor)
         .await
     {
-        Ok(statuses) => {
-            timeline_response(
+        Ok(items) => {
+            home_timeline_response(
                 &state,
-                statuses,
+                items,
                 query.limit,
                 "/api/v1/timelines/home",
-                Some(account.id),
+                account.id,
             )
             .await
         }
@@ -687,6 +780,22 @@ async fn status_collection_action(
         Err(error) => return server_error(error),
     };
 
+    let reblog = if matches!(action, StatusCollectionAction::Reblog) {
+        match roost_db::reblog_local_status(&state.db, account_id, status_id).await {
+            Ok(reblog) => Some(reblog),
+            Err(error) => return server_error(error),
+        }
+    } else {
+        None
+    };
+    let removed_reblog = if matches!(action, StatusCollectionAction::Unreblog) {
+        match roost_db::unreblog_local_status(&state.db, account_id, status_id).await {
+            Ok(reblog) => reblog,
+            Err(error) => return server_error(error),
+        }
+    } else {
+        None
+    };
     let result = match action {
         StatusCollectionAction::Favourite => {
             roost_db::favourite_local_status(&state.db, account_id, status_id).await
@@ -700,6 +809,8 @@ async fn status_collection_action(
         StatusCollectionAction::Unbookmark => {
             roost_db::unbookmark_local_status(&state.db, account_id, status_id).await
         }
+        StatusCollectionAction::Reblog => Ok(()),
+        StatusCollectionAction::Unreblog => Ok(()),
     };
 
     match result {
@@ -717,10 +828,112 @@ async fn status_collection_action(
             {
                 warn!(%error, "failed to create favourite notification");
             }
+            if matches!(action, StatusCollectionAction::Reblog) {
+                return match reblog {
+                    Some(reblog) => {
+                        if status.account_id != account_id
+                            && let Err(error) =
+                                crate::notifications::create_and_stream_notification(
+                                    state,
+                                    status.account_id,
+                                    LocalNotificationType::Reblog,
+                                    account_id,
+                                    Some(status.id),
+                                )
+                                .await
+                        {
+                            warn!(%error, "failed to create reblog notification");
+                        }
+                        match reblog_response(state, reblog, Some(account_id)).await {
+                            Ok(Some(response)) => {
+                                let recipients = reblog_stream_recipients(state, account_id).await;
+                                state.streaming_events.publish_status_update(
+                                    &response,
+                                    account_id,
+                                    &response.visibility,
+                                    &recipients,
+                                );
+                                Json(response).into_response()
+                            }
+                            Ok(None) => not_found(),
+                            Err(error) => server_error(error),
+                        }
+                    }
+                    None => {
+                        server_error(RoostError::InvalidInput("boost was not created".to_owned()))
+                    }
+                };
+            }
+            if let Some(removed_reblog) = removed_reblog {
+                let recipients = reblog_stream_recipients(state, account_id).await;
+                state.streaming_events.publish_delete(
+                    &removed_reblog.id.to_string(),
+                    account_id,
+                    "direct",
+                    &recipients,
+                );
+            }
             status_with_author_response(state, status, Some(account_id)).await
         }
         Err(error) => server_error(error),
     }
+}
+
+/// Return followers that should receive this status in their home stream.
+async fn status_stream_recipients(
+    state: &AppState,
+    status: &roost_db::LocalStatus,
+) -> Vec<AccountId> {
+    if !matches!(status.visibility.as_str(), "public" | "unlisted") {
+        return Vec::new();
+    }
+    match roost_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
+        Ok(recipients) => recipients,
+        Err(error) => {
+            warn!(%error, "failed to resolve status stream recipients");
+            Vec::new()
+        }
+    }
+}
+
+/// Return followers that should receive this account's boost in their home stream.
+async fn reblog_stream_recipients(state: &AppState, account_id: AccountId) -> Vec<AccountId> {
+    match roost_db::local_follower_ids_for_account(&state.db, account_id, false).await {
+        Ok(recipients) => recipients,
+        Err(error) => {
+            warn!(%error, "failed to resolve reblog stream recipients");
+            Vec::new()
+        }
+    }
+}
+
+/// Return a Mastodon account collection with cursor pagination headers.
+async fn account_collection_response(
+    state: &AppState,
+    page: roost_db::CollectionPage<roost_db::LocalAccount>,
+    limit: u64,
+    path: &str,
+) -> Response {
+    let link_header = CollectionLink::new(
+        page.items.len(),
+        limit,
+        page.first_cursor,
+        page.last_cursor,
+        path,
+    )
+    .header_value();
+    let mut accounts = Vec::with_capacity(page.items.len());
+    for account in page.items {
+        match account_response(state, account).await {
+            Ok(account) => accounts.push(account),
+            Err(error) => return server_error(error),
+        }
+    }
+    let mut response = Json(accounts).into_response();
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
 }
 
 /// Notify local accounts mentioned in a newly created status.
@@ -800,6 +1013,47 @@ async fn status_models(
     Ok(response)
 }
 
+async fn home_timeline_models(
+    state: &AppState,
+    items: Vec<roost_db::HomeTimelineItem>,
+    viewer: AccountId,
+) -> Result<Vec<StatusResponse>, RoostError> {
+    let mut response = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            roost_db::HomeTimelineItem::Status(status) => {
+                response.push(status_with_author(state, status, Some(viewer)).await?);
+            }
+            roost_db::HomeTimelineItem::Reblog(reblog) => {
+                if let Some(reblog) = reblog_response(state, reblog, Some(viewer)).await? {
+                    response.push(reblog);
+                }
+            }
+        }
+    }
+
+    Ok(response)
+}
+
+/// Build a Mastodon home timeline response from statuses and boosts.
+async fn home_timeline_response(
+    state: &AppState,
+    items: Vec<roost_db::HomeTimelineItem>,
+    limit: u64,
+    path: &str,
+    viewer: AccountId,
+) -> Response {
+    let link_header = home_timeline_link_header(&items, limit, path);
+    let mut response = match home_timeline_models(state, items, viewer).await {
+        Ok(items) => Json(items).into_response(),
+        Err(error) => return server_error(error),
+    };
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
+}
+
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
 pub(crate) async fn timeline_response(
     state: &AppState,
@@ -847,6 +1101,61 @@ async fn status_response(
     status_response_for_viewer(state, status, account.clone(), Some(account.id)).await
 }
 
+async fn reblog_response(
+    state: &AppState,
+    reblog: roost_db::LocalStatusReblog,
+    viewer: Option<AccountId>,
+) -> Result<Option<StatusResponse>, RoostError> {
+    let Some(original) = roost_db::find_local_status_by_id(&state.db, reblog.status_id).await?
+    else {
+        return Ok(None);
+    };
+    if !can_view_status(&original, viewer) {
+        return Ok(None);
+    }
+    let Some(account) = roost_db::find_local_account_by_id(&state.db, reblog.account_id).await?
+    else {
+        return Ok(None);
+    };
+    let original = Box::new(status_with_author(state, original, viewer).await?);
+    let url = public_url(
+        state,
+        &format!("@{}/reblogs/{}", account.username, reblog.id),
+    );
+
+    let reblogged_by_viewer = viewer.is_some_and(|viewer| viewer == reblog.account_id);
+
+    Ok(Some(StatusResponse {
+        id: reblog.id.to_string(),
+        created_at: format_timestamp(reblog.created_at),
+        edited_at: None,
+        in_reply_to_id: None,
+        in_reply_to_account_id: None,
+        sensitive: original.sensitive,
+        spoiler_text: String::new(),
+        visibility: original.visibility.clone(),
+        language: None,
+        uri: url.clone(),
+        url,
+        content: String::new(),
+        account: account_response(state, account).await?,
+        media_attachments: Vec::new(),
+        mentions: Vec::new(),
+        tags: Vec::new(),
+        emojis: Vec::new(),
+        reblogs_count: 0,
+        favourites_count: 0,
+        replies_count: 0,
+        favourited: false,
+        reblogged: reblogged_by_viewer,
+        muted: false,
+        bookmarked: false,
+        pinned: false,
+        reblog: Some(original),
+        application: None,
+    }))
+}
+
 async fn status_response_for_viewer(
     state: &AppState,
     status: roost_db::LocalStatus,
@@ -862,6 +1171,7 @@ async fn status_response_for_viewer(
     let text_mentions = local_text_mentions(state, &status.content).await?;
     let mentions = status_mentions(state, reply_target.as_ref(), &text_mentions);
     let replies_count = roost_db::count_local_replies(&state.db, status.id).await?;
+    let reblogs_count = roost_db::count_local_reblogs(&state.db, status.id).await?;
     let favourites_count = roost_db::count_local_favourites(&state.db, status.id).await?;
     let favourited = match viewer {
         Some(account_id) => {
@@ -872,6 +1182,12 @@ async fn status_response_for_viewer(
     let bookmarked = match viewer {
         Some(account_id) => {
             roost_db::is_local_status_bookmarked(&state.db, account_id, status.id).await?
+        }
+        None => false,
+    };
+    let reblogged = match viewer {
+        Some(account_id) => {
+            roost_db::is_local_status_reblogged(&state.db, account_id, status.id).await?
         }
         None => false,
     };
@@ -900,11 +1216,11 @@ async fn status_response_for_viewer(
         mentions,
         tags: Vec::new(),
         emojis: Vec::new(),
-        reblogs_count: 0,
+        reblogs_count,
         favourites_count,
         replies_count,
         favourited,
-        reblogged: false,
+        reblogged,
         muted: false,
         bookmarked,
         pinned: false,
@@ -1084,6 +1400,28 @@ fn timeline_link_header(
         first.id.0, last.id.0,
     );
     HeaderValue::from_str(&value).ok()
+}
+
+fn home_timeline_link_header(
+    items: &[roost_db::HomeTimelineItem],
+    limit: u64,
+    path: &str,
+) -> Option<HeaderValue> {
+    if items.len() < limit as usize {
+        return None;
+    }
+    let first = home_timeline_item_id(items.first()?)?;
+    let last = home_timeline_item_id(items.last()?)?;
+    let value =
+        format!(r#"<{path}?min_id={first}>; rel="prev", <{path}?max_id={last}>; rel="next""#);
+    HeaderValue::from_str(&value).ok()
+}
+
+fn home_timeline_item_id(item: &roost_db::HomeTimelineItem) -> Option<Uuid> {
+    match item {
+        roost_db::HomeTimelineItem::Status(status) => Some(status.id.0),
+        roost_db::HomeTimelineItem::Reblog(reblog) => Some(reblog.id),
+    }
 }
 
 /// Data needed to build a Mastodon collection pagination Link header.
@@ -2143,6 +2481,244 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given repeated boost mutations, when the status is read, then count and viewer state remain stable.
+    async fn reblogs_are_idempotent_and_update_status_fields(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context.create_status(&token, "boost me", None, None).await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let first = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &token,
+            )
+            .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = json_body(first).await;
+        assert_eq!(
+            reblog_projection(&first),
+            serde_json::json!({
+                "account": "admin",
+                "reblogged": true,
+                "reblog": {
+                    "id": status_id,
+                    "reblogged": true,
+                    "reblogs_count": 1
+                }
+            })
+        );
+
+        let repeated = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &token,
+            )
+            .await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(
+            reblog_projection(&json_body(repeated).await),
+            serde_json::json!({
+                "account": "admin",
+                "reblogged": true,
+                "reblog": {
+                    "id": status_id,
+                    "reblogged": true,
+                    "reblogs_count": 1
+                }
+            })
+        );
+
+        let anonymous =
+            json_body(context.get(&format!("/api/v1/statuses/{status_id}")).await).await;
+        assert_eq!(
+            status_interaction_projection(&anonymous),
+            serde_json::json!({
+                "reblogged": false,
+                "reblogs_count": 1,
+                "favourited": false,
+                "favourites_count": 0,
+            })
+        );
+
+        let unreblog = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/unreblog"),
+                &token,
+            )
+            .await;
+        assert_eq!(unreblog.status(), StatusCode::OK);
+        assert_eq!(
+            status_interaction_projection(&json_body(unreblog).await),
+            serde_json::json!({
+                "reblogged": false,
+                "reblogs_count": 0,
+                "favourited": false,
+                "favourites_count": 0,
+            })
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given several local boosts, when `reblogged_by` is paged, then accounts and Link cursors are returned.
+    async fn reblogged_by_uses_cursor_pagination(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let alice_token = context
+            .access_token_for("alice", "alice-reblogged-by@example.com")
+            .await;
+        let bob_token = context
+            .access_token_for("bob", "bob-reblogged-by@example.com")
+            .await;
+        let carol_token = context
+            .access_token_for("carol", "carol-reblogged-by@example.com")
+            .await;
+        let status = context
+            .create_status(&owner_token, "boost target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        for token in [&alice_token, &bob_token, &carol_token] {
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/reblog"),
+                    token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let page = context
+            .get(&format!(
+                "/api/v1/statuses/{status_id}/reblogged_by?limit=2"
+            ))
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let page_body = json_body(page).await;
+        assert_eq!(
+            account_usernames(&page_body),
+            serde_json::json!(["carol", "bob"])
+        );
+
+        let next_page = context
+            .get(&format!(
+                "/api/v1/statuses/{status_id}/reblogged_by?limit=2&max_id={next_cursor}"
+            ))
+            .await;
+        assert_eq!(next_page.status(), StatusCode::OK);
+        assert_eq!(
+            account_usernames(&json_body(next_page).await),
+            serde_json::json!(["alice"])
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a followed account boosts a visible status, when home is loaded, then the boost appears as a reblog entry.
+    async fn home_timeline_includes_followed_reblogs(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-home-reblog@example.com")
+            .await;
+        let bob = roost_db::find_local_account_by_username(&context.db, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        let status = context
+            .create_status(&owner_token, "home boost target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob.id.0),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+        let reblog = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &bob_token,
+            )
+            .await;
+        assert_eq!(reblog.status(), StatusCode::OK);
+
+        let home = context
+            .authenticated_get("/api/v1/timelines/home?limit=30", &owner_token)
+            .await;
+        assert_eq!(home.status(), StatusCode::OK);
+        let home = json_body(home).await;
+
+        assert_eq!(
+            reblog_projection(&home[0]),
+            serde_json::json!({
+                "account": "bob",
+                "reblogged": false,
+                "reblog": {
+                    "id": status_id,
+                    "reblogged": false,
+                    "reblogs_count": 1
+                }
+            })
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an original status with a local boost, when the original is deleted, then the boost leaves home timelines too.
+    async fn deleting_original_status_removes_reblog_timeline_entries(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-delete-reblog@example.com")
+            .await;
+        let bob = roost_db::find_local_account_by_username(&context.db, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        let status = context
+            .create_status(&owner_token, "delete boost target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob.id.0),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+        let reblog = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &bob_token,
+            )
+            .await;
+        assert_eq!(reblog.status(), StatusCode::OK);
+
+        let delete = context
+            .authenticated_empty(
+                "DELETE",
+                &format!("/api/v1/statuses/{status_id}"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(delete.status(), StatusCode::OK);
+        let home = context
+            .authenticated_get("/api/v1/timelines/home?limit=30", &owner_token)
+            .await;
+
+        assert_eq!(json_body(home).await, serde_json::json!([]));
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Given a local mention, when the mentioned user lists notifications, then the mention appears with actor and status data.
     async fn mentions_create_local_notifications(context: &mut StatusContext) {
         let admin_token = context.access_token().await;
@@ -2211,6 +2787,51 @@ mod tests {
                 .unwrap(),
             vec![serde_json::json!({
                 "type": "favourite",
+                "account": "bob",
+                "status": status["id"],
+            })]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a local boost, when the status owner lists notifications, then the reblog notification is persisted.
+    async fn reblogs_create_local_notifications(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-reblog-notifications@example.com")
+            .await;
+        let status = context
+            .create_status(&owner_token, "reblog notification target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let reblog = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &bob_token,
+            )
+            .await;
+        assert_eq!(reblog.status(), StatusCode::OK);
+
+        let response = context
+            .authenticated_get("/api/v1/notifications?types[]=reblog", &owner_token)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let notifications = json_body(response).await;
+
+        assert_eq!(
+            notifications
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(notification_projection)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap(),
+            vec![serde_json::json!({
+                "type": "reblog",
                 "account": "bob",
                 "status": status["id"],
             })]
@@ -2386,6 +3007,43 @@ mod tests {
             .await;
         assert_eq!(owner.status(), StatusCode::OK);
         assert_eq!(json_body(owner).await["favourited"], true);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a private status, when boosting or listing boosts, then status read visibility is enforced.
+    async fn reblogs_follow_status_visibility(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let other_token = context
+            .access_token_for("other-reblog", "other-reblog@example.com")
+            .await;
+        let status = context
+            .create_status(&owner_token, "private boost", Some("private"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let forbidden = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &other_token,
+            )
+            .await;
+        let anonymous_reblogged_by = context
+            .get(&format!("/api/v1/statuses/{status_id}/reblogged_by"))
+            .await;
+        let owner = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &owner_token,
+            )
+            .await;
+
+        assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+        assert_eq!(anonymous_reblogged_by.status(), StatusCode::NOT_FOUND);
+        assert_eq!(owner.status(), StatusCode::OK);
+        assert_eq!(json_body(owner).await["reblogged"], true);
     }
 
     #[test_context(StatusContext)]
@@ -2607,6 +3265,38 @@ mod tests {
             "account": notification["account"]["username"],
             "status": notification.get("status").map(|status| status["id"].clone()),
         })
+    }
+
+    fn status_interaction_projection(status: &Value) -> Value {
+        serde_json::json!({
+            "reblogged": status["reblogged"],
+            "reblogs_count": status["reblogs_count"],
+            "favourited": status["favourited"],
+            "favourites_count": status["favourites_count"],
+        })
+    }
+
+    fn reblog_projection(status: &Value) -> Value {
+        serde_json::json!({
+            "account": status["account"]["username"],
+            "reblogged": status["reblogged"],
+            "reblog": {
+                "id": status["reblog"]["id"],
+                "reblogged": status["reblog"]["reblogged"],
+                "reblogs_count": status["reblog"]["reblogs_count"],
+            }
+        })
+    }
+
+    fn account_usernames(accounts: &Value) -> Value {
+        Value::Array(
+            accounts
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|account| account["username"].clone())
+                .collect(),
+        )
     }
 
     enum MultipartPart<'a> {

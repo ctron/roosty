@@ -92,14 +92,14 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local favourites with cursor pagination. |
 | 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
 | 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
-| 🔴 | Boosts | Reblog/unreblog APIs are missing. |
+| 🟡 | Boosts | Local reblog/unreblog APIs, `reblogs_count`, viewer `reblogged`, `reblogged_by`, home timeline boost entries, and reblog notifications are implemented; ActivityPub `Announce` is missing. |
 | 🟢 | Bookmarks | Bookmark/unbookmark APIs are implemented for local statuses. |
 
 ### Timelines
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses and followed local public/unlisted statuses. |
+| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed local public/unlisted statuses, and followed local boosts when enabled. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
 | 🔴 | `GET /api/v1/timelines/tag/:tag` | Hashtag timeline is missing. |
 | 🟡 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported; `Link` headers may still point to an empty final page. |
@@ -108,7 +108,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, and `follow` notifications with cursor pagination and basic filters. |
+| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, and `follow` notifications with cursor pagination and basic filters. |
 | 🔴 | `GET /api/v1/markers` | Placeholder currently returns an empty object. |
 | 🟡 | Persisted notifications | Local notifications are stored and can be dismissed or cleared; remote, grouped, policy, and request flows are missing. |
 | 🔴 | Notification read state | Marker updates are missing. |
@@ -132,7 +132,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
 | 🟡 | `notification` events | Local `mention`, `favourite`, and `follow` notifications are emitted to recipient `user` and `user:notification` streams. |
-| 🔴 | `delete` events | Not emitted yet. |
+| 🟡 | `delete` events | Emitted for local status deletes and removed local boost timeline entries. |
 | 🔴 | Multi-process fan-out | No Redis/Postgres pub-sub backend yet. |
 
 ## TODO
@@ -142,7 +142,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add remote follow graph and full private-status home timeline semantics.
 - [ ] Tighten timeline pagination by fetching one extra row before emitting `Link` headers.
 - [ ] Add conversation endpoint support for replies.
-- [ ] Add boosts.
+- [ ] Add remote ActivityPub `Announce` support.
 - [ ] Add notification markers, grouped notifications, push integration, and remote notification events.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.

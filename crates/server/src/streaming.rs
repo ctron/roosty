@@ -24,11 +24,16 @@ impl StreamingEvents {
     }
 
     /// Publish a Mastodon `update` event for a newly created local status.
-    pub fn publish_status_update<T>(&self, status: &T, author_id: AccountId, visibility: &str)
-    where
+    pub fn publish_status_update<T>(
+        &self,
+        status: &T,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+    ) where
         T: Serialize,
     {
-        match streaming_update_message(status, author_id, visibility) {
+        match streaming_update_message(status, author_id, visibility, user_recipient_ids) {
             Ok(event) => match self.sender.send(event) {
                 Ok(_) => {}
                 Err(error) => debug!(%error, "streaming update had no active receivers"),
@@ -50,6 +55,21 @@ impl StreamingEvents {
             Err(error) => warn!(%error, "failed to serialize streaming notification"),
         }
     }
+
+    /// Publish a Mastodon `delete` event for a removed status-like entry.
+    pub fn publish_delete(
+        &self,
+        status_id: &str,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+    ) {
+        let event = streaming_delete_message(status_id, author_id, visibility, user_recipient_ids);
+        match self.sender.send(event) {
+            Ok(_) => {}
+            Err(error) => debug!(%error, "streaming delete had no active receivers"),
+        }
+    }
 }
 
 /// Event payload shared with connected WebSocket subscribers.
@@ -58,6 +78,7 @@ pub struct StreamingEvent {
     event: StreamingEventType,
     payload: String,
     account_id: AccountId,
+    user_recipient_ids: Vec<AccountId>,
     visibility: String,
 }
 
@@ -93,7 +114,9 @@ impl StreamingEvent {
     /// Return whether one subscribed stream should receive this event.
     fn is_visible_to_stream(&self, account_id: AccountId, stream: &str) -> bool {
         match stream {
-            "user" => self.account_id == account_id,
+            "user" => {
+                self.account_id == account_id || self.user_recipient_ids.contains(&account_id)
+            }
             "user:notification" => {
                 self.event == StreamingEventType::Notification && self.account_id == account_id
             }
@@ -116,6 +139,8 @@ enum StreamingEventType {
     Update,
     #[strum(serialize = "notification")]
     Notification,
+    #[strum(serialize = "delete")]
+    Delete,
 }
 
 impl StreamingEventType {
@@ -130,6 +155,7 @@ fn streaming_update_message<T>(
     status: &T,
     author_id: AccountId,
     visibility: &str,
+    user_recipient_ids: &[AccountId],
 ) -> Result<StreamingEvent, serde_json::Error>
 where
     T: Serialize,
@@ -139,6 +165,7 @@ where
         event: StreamingEventType::Update,
         payload,
         account_id: author_id,
+        user_recipient_ids: user_recipient_ids.to_owned(),
         visibility: visibility.to_owned(),
     })
 }
@@ -156,8 +183,25 @@ where
         event: StreamingEventType::Notification,
         payload,
         account_id: recipient_id,
+        user_recipient_ids: Vec::new(),
         visibility: "direct".to_owned(),
     })
+}
+
+/// Build the delete event stored in the in-process broadcast channel.
+fn streaming_delete_message(
+    status_id: &str,
+    author_id: AccountId,
+    visibility: &str,
+    user_recipient_ids: &[AccountId],
+) -> StreamingEvent {
+    StreamingEvent {
+        event: StreamingEventType::Delete,
+        payload: status_id.to_owned(),
+        account_id: author_id,
+        user_recipient_ids: user_recipient_ids.to_owned(),
+        visibility: visibility.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +210,9 @@ mod tests {
     use serde_json::Value;
     use uuid::Uuid;
 
-    use super::{streaming_notification_message, streaming_update_message};
+    use super::{
+        streaming_delete_message, streaming_notification_message, streaming_update_message,
+    };
 
     #[test]
     /// Verifies streaming status payloads stay JSON-encoded strings.
@@ -174,8 +220,9 @@ mod tests {
         // Mastodon clients expect the outer event as JSON and the status itself
         // as a JSON-encoded string in the payload field.
         let account_id = AccountId(Uuid::now_v7());
-        let event = streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public")
-            .unwrap();
+        let event =
+            streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public", &[])
+                .unwrap();
         let message = event
             .to_socket_message(account_id, &["user".to_owned()])
             .unwrap()
@@ -198,7 +245,8 @@ mod tests {
         let author_id = AccountId(Uuid::now_v7());
         let viewer_id = AccountId(Uuid::now_v7());
         let event =
-            streaming_update_message(&serde_json::json!({"id": "1"}), author_id, "public").unwrap();
+            streaming_update_message(&serde_json::json!({"id": "1"}), author_id, "public", &[])
+                .unwrap();
 
         let user_message = event
             .to_socket_message(viewer_id, &["user".to_owned()])
@@ -274,13 +322,66 @@ mod tests {
     /// Given a status update, when serialized for notification-only streams, then it is not delivered there.
     fn update_messages_do_not_go_to_notification_only_streams() {
         let account_id = AccountId(Uuid::now_v7());
-        let event = streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public")
-            .unwrap();
+        let event =
+            streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public", &[])
+                .unwrap();
 
         let message = event
             .to_socket_message(account_id, &["user:notification".to_owned()])
             .unwrap();
 
         assert!(message.is_none());
+    }
+
+    #[test]
+    /// Given an update with home recipients, when serialized for a recipient user stream, then it is delivered.
+    fn update_messages_are_delivered_to_home_recipients() {
+        let author_id = AccountId(Uuid::now_v7());
+        let follower_id = AccountId(Uuid::now_v7());
+        let event = streaming_update_message(
+            &serde_json::json!({"id": "1"}),
+            author_id,
+            "public",
+            &[follower_id],
+        )
+        .unwrap();
+
+        let message = event
+            .to_socket_message(follower_id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stream": ["user"],
+                "event": "update",
+                "payload": "{\"id\":\"1\"}"
+            })
+        );
+    }
+
+    #[test]
+    /// Given a deleted boost id, when serialized for home recipients, then the payload is the plain id string.
+    fn delete_messages_use_plain_identifier_payloads() {
+        let author_id = AccountId(Uuid::now_v7());
+        let follower_id = AccountId(Uuid::now_v7());
+        let event = streaming_delete_message("boost-id", author_id, "direct", &[follower_id]);
+
+        let message = event
+            .to_socket_message(follower_id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stream": ["user"],
+                "event": "delete",
+                "payload": "boost-id"
+            })
+        );
     }
 }

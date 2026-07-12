@@ -11,6 +11,7 @@ use sea_orm::{
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::str::FromStr;
 use strum::{EnumString, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
@@ -22,8 +23,8 @@ mod entity;
 
 use entity::{
     local_account, local_follow, local_media_attachment, local_notification, local_status,
-    local_status_bookmark, local_status_favourite, oauth_access_token, oauth_application,
-    oauth_authorization_code,
+    local_status_bookmark, local_status_favourite, local_status_reblog, oauth_access_token,
+    oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -417,6 +418,30 @@ pub enum LocalNotificationType {
     Favourite,
     /// A local account followed the recipient.
     Follow,
+    /// A local account boosted one of the recipient's statuses.
+    Reblog,
+}
+
+/// Stored local boost relationship between an account and a status.
+#[derive(Clone, Debug)]
+pub struct LocalStatusReblog {
+    /// Opaque boost identifier used as the Mastodon status id for boost entries.
+    pub id: Uuid,
+    /// Account that boosted the status.
+    pub account_id: AccountId,
+    /// Status that was boosted.
+    pub status_id: StatusId,
+    /// Creation timestamp for the boost.
+    pub created_at: OffsetDateTime,
+}
+
+/// A home timeline row, either an authored status or a boost entry.
+#[derive(Clone, Debug)]
+pub enum HomeTimelineItem {
+    /// Authored local status.
+    Status(LocalStatus),
+    /// Local boost of an authored status.
+    Reblog(LocalStatusReblog),
 }
 
 impl LocalNotificationType {
@@ -596,6 +621,25 @@ pub async fn local_follow_relationship(
         .await?;
 
     Ok(follow.map(local_follow_from_model))
+}
+
+/// List local follower ids for streaming delivery.
+pub async fn local_follower_ids_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    include_reblog_muted: bool,
+) -> Result<Vec<AccountId>> {
+    let mut query = local_follow::Entity::find()
+        .filter(local_follow::Column::FollowedAccountId.eq(account_id.0));
+    if !include_reblog_muted {
+        query = query.filter(local_follow::Column::ShowReblogs.eq(true));
+    }
+    let follows = query.all(db).await?;
+
+    Ok(follows
+        .into_iter()
+        .map(|follow| AccountId(follow.follower_account_id))
+        .collect())
 }
 
 /// Follow a local account, updating follow options when it already exists.
@@ -1502,6 +1546,128 @@ pub async fn local_bookmarks_for_account(
     })
 }
 
+/// Mark a local status as boosted by an account.
+pub async fn reblog_local_status(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<LocalStatusReblog> {
+    if let Some(model) = local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
+        .one(db)
+        .await?
+    {
+        return Ok(local_status_reblog_from_model(model));
+    }
+
+    let model = local_status_reblog::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        status_id: Set(status_id.0),
+        created_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(db)
+    .await?;
+
+    Ok(local_status_reblog_from_model(model))
+}
+
+/// Remove a local account's boost from a status when it exists.
+pub async fn unreblog_local_status(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<Option<LocalStatusReblog>> {
+    if let Some(model) = local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
+        .one(db)
+        .await?
+    {
+        let reblog = local_status_reblog_from_model(model.clone());
+        model.into_active_model().delete(db).await?;
+        return Ok(Some(reblog));
+    }
+
+    Ok(None)
+}
+
+/// Count active local boosts on a status.
+pub async fn count_local_reblogs(db: &DbConnection, status_id: StatusId) -> Result<u64> {
+    Ok(local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
+        .count(db)
+        .await?)
+}
+
+/// Return whether a local account has boosted a status.
+pub async fn is_local_status_reblogged(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<bool> {
+    Ok(
+        local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
+            .one(db)
+            .await?
+            .is_some(),
+    )
+}
+
+/// List local accounts that boosted a status, newest boost first.
+pub async fn local_reblogged_by_for_status(
+    db: &DbConnection,
+    status_id: StatusId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalAccount>> {
+    let rows = local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_status_reblog::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await?;
+    let first_cursor = rows.first().map(|model| model.id);
+    let last_cursor = rows.last().map(|model| model.id);
+    let account_ids = rows
+        .into_iter()
+        .map(|model| AccountId(model.account_id))
+        .collect::<Vec<_>>();
+
+    Ok(CollectionPage {
+        items: local_accounts_by_id(db, account_ids).await?,
+        first_cursor,
+        last_cursor,
+    })
+}
+
+/// List local boost rows for an original status.
+pub async fn local_reblogs_for_status(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Vec<LocalStatusReblog>> {
+    let reblogs = local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
+        .all(db)
+        .await?;
+
+    Ok(reblogs
+        .into_iter()
+        .map(local_status_reblog_from_model)
+        .collect())
+}
+
+/// Find one local boost by its opaque id.
+pub async fn find_local_reblog_by_id(
+    db: &DbConnection,
+    reblog_id: Uuid,
+) -> Result<Option<LocalStatusReblog>> {
+    let reblog = local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::Id.eq(reblog_id))
+        .one(db)
+        .await?;
+
+    Ok(reblog.map(local_status_reblog_from_model))
+}
+
 /// Load active local statuses for ordered status identifiers.
 async fn active_statuses_by_id(
     db: &DbConnection,
@@ -1609,12 +1775,18 @@ pub async fn home_timeline_for_account(
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
-) -> Result<Vec<LocalStatus>> {
-    let followed_ids = local_follow::Entity::find()
+) -> Result<Vec<HomeTimelineItem>> {
+    let follows = local_follow::Entity::find()
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .all(db)
-        .await?
-        .into_iter()
+        .await?;
+    let followed_ids = follows
+        .iter()
+        .map(|follow| follow.followed_account_id)
+        .collect::<Vec<_>>();
+    let reblog_followed_ids = follows
+        .iter()
+        .filter(|follow| follow.show_reblogs)
         .map(|follow| follow.followed_account_id)
         .collect::<Vec<_>>();
 
@@ -1625,7 +1797,7 @@ pub async fn home_timeline_for_account(
                     .add(local_status::Column::AccountId.eq(account_id.0))
                     .add(
                         Condition::all()
-                            .add(local_status::Column::AccountId.is_in(followed_ids))
+                            .add(local_status::Column::AccountId.is_in(followed_ids.clone()))
                             .add(local_status::Column::Visibility.is_in(["public", "unlisted"])),
                     ),
             )
@@ -1636,8 +1808,33 @@ pub async fn home_timeline_for_account(
     .limit(limit)
     .all(db)
     .await?;
+    let reblog_account_ids = std::iter::once(account_id.0)
+        .chain(reblog_followed_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let reblogs = apply_reblog_timeline_cursor(
+        local_status_reblog::Entity::find()
+            .filter(local_status_reblog::Column::AccountId.is_in(reblog_account_ids)),
+        cursor,
+    )
+    .order_by_desc(local_status_reblog::Column::Id)
+    .limit(limit)
+    .all(db)
+    .await?;
+    let mut items = statuses
+        .into_iter()
+        .map(local_status_from_model)
+        .map(HomeTimelineItem::Status)
+        .chain(
+            reblogs
+                .into_iter()
+                .map(local_status_reblog_from_model)
+                .map(HomeTimelineItem::Reblog),
+        )
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| Reverse(timeline_item_id(item)));
+    items.truncate(limit as usize);
 
-    Ok(statuses.into_iter().map(local_status_from_model).collect())
+    Ok(items)
 }
 
 /// Apply Mastodon cursor parameters to a local status query.
@@ -1655,6 +1852,30 @@ fn apply_timeline_cursor(
         query = query.filter(local_status::Column::Id.gt(min_id.0));
     }
     query
+}
+
+/// Apply Mastodon timeline cursor parameters to a local boost query.
+fn apply_reblog_timeline_cursor(
+    mut query: Select<local_status_reblog::Entity>,
+    cursor: TimelineCursor,
+) -> Select<local_status_reblog::Entity> {
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(local_status_reblog::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(local_status_reblog::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(local_status_reblog::Column::Id.gt(min_id.0));
+    }
+    query
+}
+
+fn timeline_item_id(item: &HomeTimelineItem) -> Uuid {
+    match item {
+        HomeTimelineItem::Status(status) => status.id.0,
+        HomeTimelineItem::Reblog(reblog) => reblog.id,
+    }
 }
 
 /// Adds Mastodon cursor filters to SeaORM collection queries.
@@ -1688,6 +1909,21 @@ impl ApplyCollectionCursor for Select<local_status_bookmark::Entity> {
         }
         if let Some(min_id) = cursor.min_id {
             self = self.filter(local_status_bookmark::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_status_reblog::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_status_reblog::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_status_reblog::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_status_reblog::Column::Id.gt(min_id));
         }
         self
     }
@@ -2009,6 +2245,15 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
+    }
+}
+
+fn local_status_reblog_from_model(reblog: local_status_reblog::Model) -> LocalStatusReblog {
+    LocalStatusReblog {
+        id: reblog.id,
+        account_id: AccountId(reblog.account_id),
+        status_id: StatusId(reblog.status_id),
+        created_at: reblog.created_at,
     }
 }
 
