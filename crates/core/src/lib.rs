@@ -12,6 +12,9 @@ pub enum RoostError {
     #[error("database error: {0}")]
     Database(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("operation is not implemented yet: {0}")]
     NotImplemented(&'static str),
 }

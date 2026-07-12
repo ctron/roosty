@@ -9,5 +9,8 @@ repository.workspace = true
 [dependencies]
 roost-core.workspace = true
 sea-orm.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
+time.workspace = true
 tracing.workspace = true
+uuid.workspace = true

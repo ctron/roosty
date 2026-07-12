@@ -9,3 +9,10 @@ publish = false
 
 [dependencies]
 sea-orm-migration.workspace = true
+
+[dev-dependencies]
+postgresql_embedded.workspace = true
+sea-orm.workspace = true
+test-context.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

@@ -1,0 +1,54 @@
+services:
+  roost:
+    build:
+      context: ..
+      dockerfile: deploy/Containerfile
+    command: ["serve", "--with-worker"]
+    environment:
+      ROOST_DATABASE_URL: postgres://roost:roost@postgres:5432/roost
+      ROOST_PUBLIC_BASE_URL: http://localhost:3000
+      ROOST_LISTEN_ADDR: 0.0.0.0:3000
+      ROOST_INFRA_LISTEN_ADDR: 0.0.0.0:3001
+      ROOST_SESSION_SECRET: development-session-secret-change-me-000
+      ROOST_TOKEN_PEPPER: development-token-pepper-change-me-0000
+      ROOST_INSTANCE_NAME: Roost Development
+      ROOST_INSTANCE_DESCRIPTION: Local Roost development instance
+      ROOST_OBJECT_STORAGE_BACKEND: local
+      ROOST_MEDIA_ROOT: /var/lib/roost/media
+      ROOST_REGISTRATION_MODE: closed
+      ROOST_FEDERATION_ENABLED: "false"
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  elk:
+    build:
+      context: https://github.com/elk-zone/elk.git
+      dockerfile: Dockerfile
+    ports:
+      - "5314:5314"
+    volumes:
+      - elk-data:/elk/data
+    depends_on:
+      - roost
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: roost
+      POSTGRES_USER: roost
+      POSTGRES_PASSWORD: roost
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roost -d roost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  elk-data:
+  postgres-data:

@@ -10,7 +10,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/jreimann/mastodon-rs"
 
@@ -23,12 +23,16 @@ argon2 = "0.5.3"
 askama = "0.12.1"
 axum = { version = "0.8.4", features = ["macros", "ws"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+postgresql_embedded = { version = "0.20.4", default-features = false, features = ["rustls", "theseus", "tokio"] }
 reqwest = { version = "0.12.20", default-features = false, features = ["json", "rustls-tls"] }
 sea-orm = { version = "1.1.14", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
 sea-orm-migration = { version = "1.1.14", default-features = false, features = ["runtime-tokio-rustls", "sqlx-postgres"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "macros"] }
+test-context = "0.5.8"
+tempfile = "3.27.0"
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["serde"] }
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "signal"] }

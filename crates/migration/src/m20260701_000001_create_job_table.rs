@@ -51,10 +51,27 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                CREATE UNIQUE INDEX IF NOT EXISTS job_deduplication_key_idx
+                    ON job (kind, deduplication_key)
+                    WHERE deduplication_key IS NOT NULL
+                    AND completed_at IS NULL
+                "#,
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DROP INDEX IF EXISTS job_deduplication_key_idx")
+            .await?;
+
         manager
             .drop_table(Table::drop().table(Job::Table).if_exists().to_owned())
             .await
