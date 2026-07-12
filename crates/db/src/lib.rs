@@ -7,7 +7,7 @@ use roost_core::{AccountId, JobId, Result, RoostError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
+    QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -19,8 +19,8 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_follow, local_status, local_status_bookmark, local_status_favourite,
-    oauth_access_token, oauth_application, oauth_authorization_code,
+    local_account, local_follow, local_media_attachment, local_status, local_status_bookmark,
+    local_status_favourite, oauth_access_token, oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -239,6 +239,102 @@ pub struct NewLocalStatus {
     pub language: Option<String>,
     /// Optional local status this status replies to.
     pub in_reply_to_id: Option<StatusId>,
+}
+
+/// Stored local media attachment metadata.
+#[derive(Clone, Debug)]
+pub struct LocalMediaAttachment {
+    /// Internal media identifier exposed through Mastodon media APIs.
+    pub id: Uuid,
+    /// Local account that uploaded the media.
+    pub account_id: AccountId,
+    /// Local status this media is attached to, when already posted.
+    pub status_id: Option<StatusId>,
+    /// Position of this attachment on the status.
+    pub status_order: i32,
+    /// Original uploaded MIME type.
+    pub content_type: String,
+    /// Original filename supplied by the client.
+    pub original_filename: String,
+    /// Path relative to the configured media root.
+    pub file_path: String,
+    /// Preview path relative to the configured media root.
+    pub preview_file_path: Option<String>,
+    /// Stored file size in bytes.
+    pub file_size: i64,
+    /// Optional accessible media description.
+    pub description: Option<String>,
+    /// Optional horizontal focal point.
+    pub focus_x: Option<f64>,
+    /// Optional vertical focal point.
+    pub focus_y: Option<f64>,
+    /// Optional image width.
+    pub width: Option<i32>,
+    /// Optional image height.
+    pub height: Option<i32>,
+    /// Optional preview image width.
+    pub preview_width: Option<i32>,
+    /// Optional preview image height.
+    pub preview_height: Option<i32>,
+    /// Optional blurhash generated from the preview image.
+    pub blurhash: Option<String>,
+}
+
+/// New local media metadata ready to persist after storing the file.
+#[derive(Clone, Debug)]
+pub struct NewLocalMediaAttachment {
+    /// Local account that uploaded the media.
+    pub account_id: AccountId,
+    /// Original uploaded MIME type.
+    pub content_type: String,
+    /// Original filename supplied by the client.
+    pub original_filename: String,
+    /// Path relative to the configured media root.
+    pub file_path: String,
+    /// Preview path relative to the configured media root.
+    pub preview_file_path: Option<String>,
+    /// Stored file size in bytes.
+    pub file_size: i64,
+    /// Optional accessible media description.
+    pub description: Option<String>,
+    /// Optional horizontal focal point.
+    pub focus_x: Option<f64>,
+    /// Optional vertical focal point.
+    pub focus_y: Option<f64>,
+    /// Optional image width.
+    pub width: Option<i32>,
+    /// Optional image height.
+    pub height: Option<i32>,
+    /// Optional preview image width.
+    pub preview_width: Option<i32>,
+    /// Optional preview image height.
+    pub preview_height: Option<i32>,
+    /// Optional blurhash generated from the preview image.
+    pub blurhash: Option<String>,
+}
+
+/// Mutable media fields accepted before media is attached to a status.
+#[derive(Clone, Debug, Default)]
+pub struct LocalMediaAttachmentUpdate {
+    /// Optional accessible media description.
+    pub description: Option<Option<String>>,
+    /// Optional focal point update.
+    pub focus: Option<(f64, f64)>,
+    /// Optional replacement preview metadata.
+    pub preview: Option<LocalMediaPreviewUpdate>,
+}
+
+/// Replacement preview metadata for an unattached media attachment.
+#[derive(Clone, Debug)]
+pub struct LocalMediaPreviewUpdate {
+    /// Preview path relative to the configured media root.
+    pub preview_file_path: String,
+    /// Preview image width.
+    pub preview_width: i32,
+    /// Preview image height.
+    pub preview_height: i32,
+    /// Blurhash generated from the preview image.
+    pub blurhash: String,
 }
 
 /// Cursor filters accepted by local timeline queries.
@@ -597,6 +693,217 @@ pub async fn create_local_status(
     .await?;
 
     Ok(local_status_from_model(status))
+}
+
+/// Create a local status and attach pre-uploaded local media in one transaction.
+pub async fn create_local_status_with_media(
+    db: &DbConnection,
+    new_status: NewLocalStatus,
+    media_ids: &[Uuid],
+) -> Result<LocalStatus> {
+    if media_ids.is_empty() {
+        return create_local_status(db, new_status).await;
+    }
+
+    let txn = db.begin().await?;
+    let status_id = Uuid::now_v7();
+    let created_at = OffsetDateTime::now_utc();
+    let account_id = new_status.account_id;
+
+    for media_id in media_ids {
+        let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
+            .one(&txn)
+            .await?
+        else {
+            return Err(RoostError::InvalidInput(
+                "media attachment not found".to_owned(),
+            ));
+        };
+        if media.account_id != account_id.0 || media.status_id.is_some() {
+            return Err(RoostError::InvalidInput(
+                "media attachment is not available".to_owned(),
+            ));
+        }
+    }
+
+    let status = local_status::ActiveModel {
+        id: Set(status_id),
+        account_id: Set(account_id.0),
+        content: Set(new_status.content),
+        visibility: Set(new_status.visibility),
+        sensitive: Set(new_status.sensitive),
+        spoiler_text: Set(new_status.spoiler_text),
+        language: Set(new_status.language),
+        in_reply_to_id: Set(new_status.in_reply_to_id.map(|id| id.0)),
+        created_at: Set(created_at),
+        updated_at: Set(created_at),
+        deleted_at: Set(None),
+    }
+    .insert(&txn)
+    .await?;
+
+    for (index, media_id) in media_ids.iter().enumerate() {
+        let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
+            .one(&txn)
+            .await?
+        else {
+            return Err(RoostError::InvalidInput(
+                "media attachment not found".to_owned(),
+            ));
+        };
+        let mut active = media.into_active_model();
+        active.status_id = Set(Some(status_id));
+        active.status_order = Set(index as i32);
+        active.updated_at = Set(OffsetDateTime::now_utc());
+        active.update(&txn).await?;
+    }
+
+    txn.commit().await?;
+    Ok(local_status_from_model(status))
+}
+
+/// Create local media metadata after the uploaded file has been stored.
+pub async fn create_local_media_attachment(
+    db: &DbConnection,
+    media: NewLocalMediaAttachment,
+) -> Result<LocalMediaAttachment> {
+    let now = OffsetDateTime::now_utc();
+    let model = local_media_attachment::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(media.account_id.0),
+        status_id: Set(None),
+        status_order: Set(0),
+        content_type: Set(media.content_type),
+        original_filename: Set(media.original_filename),
+        file_path: Set(media.file_path),
+        preview_file_path: Set(media.preview_file_path),
+        file_size: Set(media.file_size),
+        description: Set(media.description),
+        focus_x: Set(media.focus_x),
+        focus_y: Set(media.focus_y),
+        width: Set(media.width),
+        height: Set(media.height),
+        preview_width: Set(media.preview_width),
+        preview_height: Set(media.preview_height),
+        blurhash: Set(media.blurhash),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    Ok(local_media_attachment_from_model(model))
+}
+
+/// Find a media attachment owned by a local account.
+pub async fn find_owned_media_attachment(
+    db: &DbConnection,
+    account_id: AccountId,
+    media_id: Uuid,
+) -> Result<Option<LocalMediaAttachment>> {
+    let media = local_media_attachment::Entity::find_by_id(media_id)
+        .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+        .one(db)
+        .await?;
+
+    Ok(media.map(local_media_attachment_from_model))
+}
+
+/// Find an unattached media attachment owned by a local account.
+pub async fn find_owned_unattached_media_attachment(
+    db: &DbConnection,
+    account_id: AccountId,
+    media_id: Uuid,
+) -> Result<Option<LocalMediaAttachment>> {
+    let media = local_media_attachment::Entity::find_by_id(media_id)
+        .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+        .filter(local_media_attachment::Column::StatusId.is_null())
+        .one(db)
+        .await?;
+
+    Ok(media.map(local_media_attachment_from_model))
+}
+
+/// Update mutable fields on an unattached media attachment owned by a local account.
+pub async fn update_owned_unattached_media_attachment(
+    db: &DbConnection,
+    account_id: AccountId,
+    media_id: Uuid,
+    update: LocalMediaAttachmentUpdate,
+) -> Result<Option<LocalMediaAttachment>> {
+    let Some(media) = local_media_attachment::Entity::find_by_id(media_id)
+        .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+        .filter(local_media_attachment::Column::StatusId.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active = media.into_active_model();
+    if let Some(description) = update.description {
+        active.description = Set(description);
+    }
+    if let Some((focus_x, focus_y)) = update.focus {
+        active.focus_x = Set(Some(focus_x));
+        active.focus_y = Set(Some(focus_y));
+    }
+    if let Some(preview) = update.preview {
+        active.preview_file_path = Set(Some(preview.preview_file_path));
+        active.preview_width = Set(Some(preview.preview_width));
+        active.preview_height = Set(Some(preview.preview_height));
+        active.blurhash = Set(Some(preview.blurhash));
+    }
+    active.updated_at = Set(OffsetDateTime::now_utc());
+
+    Ok(Some(local_media_attachment_from_model(
+        active.update(db).await?,
+    )))
+}
+
+/// Delete an unattached media attachment owned by a local account.
+pub async fn delete_owned_unattached_media_attachment(
+    db: &DbConnection,
+    account_id: AccountId,
+    media_id: Uuid,
+) -> Result<Option<LocalMediaAttachment>> {
+    let Some(media) = local_media_attachment::Entity::find_by_id(media_id)
+        .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+        .filter(local_media_attachment::Column::StatusId.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let value = local_media_attachment_from_model(media.clone());
+    media.into_active_model().delete(db).await?;
+
+    Ok(Some(value))
+}
+
+/// List media attachments for a local status in client-supplied order.
+pub async fn local_media_attachments_for_status(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Vec<LocalMediaAttachment>> {
+    let media = local_media_attachment::Entity::find()
+        .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
+        .order_by_asc(local_media_attachment::Column::StatusOrder)
+        .all(db)
+        .await?;
+
+    Ok(media
+        .into_iter()
+        .map(local_media_attachment_from_model)
+        .collect())
+}
+
+/// Return whether a local status has at least one media attachment.
+pub async fn local_status_has_media(db: &DbConnection, status_id: StatusId) -> Result<bool> {
+    Ok(local_media_attachment::Entity::find()
+        .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
+        .count(db)
+        .await?
+        > 0)
 }
 
 /// Find a local status by id, excluding soft-deleted statuses.
@@ -1324,6 +1631,28 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         in_reply_to_id: status.in_reply_to_id.map(StatusId),
         created_at: status.created_at,
         deleted_at: status.deleted_at,
+    }
+}
+
+fn local_media_attachment_from_model(media: local_media_attachment::Model) -> LocalMediaAttachment {
+    LocalMediaAttachment {
+        id: media.id,
+        account_id: AccountId(media.account_id),
+        status_id: media.status_id.map(StatusId),
+        status_order: media.status_order,
+        content_type: media.content_type,
+        original_filename: media.original_filename,
+        file_path: media.file_path,
+        preview_file_path: media.preview_file_path,
+        file_size: media.file_size,
+        description: media.description,
+        focus_x: media.focus_x,
+        focus_y: media.focus_y,
+        width: media.width,
+        height: media.height,
+        preview_width: media.preview_width,
+        preview_height: media.preview_height,
+        blurhash: media.blurhash,
     }
 }
 

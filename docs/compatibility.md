@@ -119,7 +119,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🔴 | `GET /api/v1/followed_tags` | Placeholder currently returns an empty list. |
 | 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
 | 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
-| 🔴 | Media upload | `POST /api/v2/media` is missing. |
+| 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
 | 🔴 | Custom emojis | `GET /api/v1/custom_emojis` is missing. |
 
 ### Streaming
@@ -142,5 +142,5 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add conversation endpoint support for replies.
 - [ ] Add boosts.
 - [ ] Add persisted notifications and notification streaming.
-- [ ] Add media upload and attachment responses.
+- [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.

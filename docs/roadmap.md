@@ -25,5 +25,6 @@
 - Tighten timeline `Link` header generation by fetching one extra row before advertising another page.
 - Add a conversation endpoint for replies.
 - Add boosts.
+- Extend media support with video/audio validation, async processing, and object storage.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.
 - Fix an issue with follows not being announced on the stream

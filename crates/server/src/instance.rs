@@ -2,7 +2,7 @@ use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{config::Config, http::AppState};
+use crate::{config::Config, http::AppState, media};
 
 const NODEINFO_REL_2_1: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
 
@@ -177,8 +177,8 @@ fn configuration(config: &Config) -> Value {
             "characters_reserved_per_url": 23,
         },
         "media_attachments": {
-            "supported_mime_types": [],
-            "image_size_limit": 0,
+            "supported_mime_types": media::supported_image_mime_types(),
+            "image_size_limit": 10485760,
             "image_matrix_limit": 0,
             "video_size_limit": 0,
             "video_frame_rate_limit": 0,

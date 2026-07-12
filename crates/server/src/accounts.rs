@@ -143,9 +143,7 @@ async fn account_statuses(
     Query(params): Query<AccountStatusesParams>,
 ) -> Response {
     let account_id = AccountId(path.account_id);
-    if params.only_media.unwrap_or(false)
-        || params.pinned.unwrap_or(false)
-        || params.tagged.as_deref().is_some_and(|tag| !tag.is_empty())
+    if params.pinned.unwrap_or(false) || params.tagged.as_deref().is_some_and(|tag| !tag.is_empty())
     {
         return Json(Vec::<serde_json::Value>::new()).into_response();
     }
@@ -176,6 +174,17 @@ async fn account_statuses(
             }
             if params.exclude_reblogs.unwrap_or(false) {
                 // Boosts are not implemented yet, so every local status already matches.
+            }
+            if params.only_media.unwrap_or(false) {
+                let mut media_statuses = Vec::new();
+                for status in statuses {
+                    match roost_db::local_status_has_media(&state.db, status.id).await {
+                        Ok(true) => media_statuses.push(status),
+                        Ok(false) => {}
+                        Err(error) => return server_error(error),
+                    }
+                }
+                statuses = media_statuses;
             }
             crate::statuses::timeline_response(
                 &state,

@@ -17,6 +17,7 @@ mod compat;
 mod config;
 mod http;
 mod instance;
+mod media;
 mod password;
 mod search;
 mod statuses;

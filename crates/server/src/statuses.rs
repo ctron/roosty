@@ -22,6 +22,7 @@ use crate::{
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 40;
 const MAX_STATUS_CHARS: usize = 500;
+const MAX_MEDIA_ATTACHMENTS: u64 = 4;
 
 /// Build routes for local status creation, lookup, deletion, and timelines.
 pub fn router() -> Router<AppState> {
@@ -59,7 +60,7 @@ enum StatusInputError {
     #[error("invalid JSON: {0}")]
     Json(serde_json::Error),
     #[error("invalid form body: {0}")]
-    Form(serde_urlencoded::de::Error),
+    Form(String),
     #[error("status must not be empty")]
     Empty,
     #[error("status is too long")]
@@ -68,6 +69,10 @@ enum StatusInputError {
     Visibility,
     #[error("status id is invalid")]
     StatusId,
+    #[error("media id is invalid")]
+    MediaId,
+    #[error("too many media attachments")]
+    TooManyMedia,
 }
 
 #[derive(Deserialize)]
@@ -99,12 +104,14 @@ struct CollectionParams {
 
 #[derive(Deserialize)]
 struct StatusInput {
-    status: String,
+    status: Option<String>,
     visibility: Option<String>,
     sensitive: Option<bool>,
     spoiler_text: Option<String>,
     language: Option<String>,
     in_reply_to_id: Option<String>,
+    #[serde(default)]
+    media_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -121,7 +128,7 @@ struct StatusResponse {
     url: String,
     content: String,
     account: crate::auth::AccountResponse,
-    media_attachments: Vec<Value>,
+    media_attachments: Vec<crate::media::MediaAttachmentResponse>,
     mentions: Vec<MentionResponse>,
     tags: Vec<Value>,
     emojis: Vec<Value>,
@@ -197,6 +204,10 @@ async fn create_status(
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
     };
+    let media_ids = match parse_media_ids(&input.media_ids) {
+        Ok(media_ids) => media_ids,
+        Err(error) => return bad_request(&error.to_string()),
+    };
 
     let visibility = input
         .visibility
@@ -218,7 +229,7 @@ async fn create_status(
 
     let new_status = roost_db::NewLocalStatus {
         account_id: account.id,
-        content: input.status.trim().to_owned(),
+        content: input.status.unwrap_or_default().trim().to_owned(),
         visibility,
         sensitive: input.sensitive.unwrap_or(account.default_sensitive),
         spoiler_text: input.spoiler_text.unwrap_or_default(),
@@ -227,7 +238,7 @@ async fn create_status(
     };
 
     let author_id = account.id;
-    match roost_db::create_local_status(&state.db, new_status).await {
+    match roost_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
         Ok(status) => match status_response(&state, status, account).await {
             Ok(response) => {
                 state.streaming_events.publish_status_update(
@@ -434,23 +445,51 @@ async fn parse_status_input(
     let input: StatusInput = if content_type.contains("application/json") {
         serde_json::from_slice(&body).map_err(StatusInputError::Json)?
     } else {
-        serde_urlencoded::from_bytes(&body).map_err(StatusInputError::Form)?
+        let body = String::from_utf8_lossy(&body);
+        serde_qs::Config::new()
+            .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+            .use_form_encoding(true)
+            .deserialize_str(&body)
+            .map_err(|error| StatusInputError::Form(error.to_string()))?
     };
 
-    validate_status_text(&input.status)?;
+    validate_status_text(
+        input.status.as_deref().unwrap_or_default(),
+        !input.media_ids.is_empty(),
+    )?;
     Ok(input)
 }
 
 /// Validate status text against the current local posting policy.
-fn validate_status_text(status: &str) -> Result<(), StatusInputError> {
+fn validate_status_text(status: &str, has_media: bool) -> Result<(), StatusInputError> {
     let trimmed = status.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && !has_media {
         return Err(StatusInputError::Empty);
     }
     if trimmed.chars().count() > MAX_STATUS_CHARS {
         return Err(StatusInputError::TooLong);
     }
     Ok(())
+}
+
+/// Parse media identifiers attached to a status creation request.
+fn parse_media_ids(values: &[String]) -> Result<Vec<Uuid>, StatusInputError> {
+    if values.len() > MAX_MEDIA_ATTACHMENTS as usize {
+        return Err(StatusInputError::TooManyMedia);
+    }
+    let mut seen = HashSet::new();
+    let mut media_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let media_id = value
+            .trim()
+            .parse::<Uuid>()
+            .map_err(|_| StatusInputError::MediaId)?;
+        if !seen.insert(media_id) {
+            return Err(StatusInputError::MediaId);
+        }
+        media_ids.push(media_id);
+    }
+    Ok(media_ids)
 }
 
 /// Validate Mastodon visibility values accepted for local statuses.
@@ -654,6 +693,11 @@ async fn status_response_for_viewer(
         }
         None => false,
     };
+    let media_attachments = roost_db::local_media_attachments_for_status(&state.db, status.id)
+        .await?
+        .iter()
+        .map(|media| crate::media::media_response(state, media))
+        .collect();
 
     Ok(StatusResponse {
         id: status.id.0.to_string(),
@@ -668,7 +712,7 @@ async fn status_response_for_viewer(
         url,
         content: status_content_html_with_mentions(state, &status.content, &text_mentions),
         account: account_response(state, account).await?,
-        media_attachments: Vec::new(),
+        media_attachments,
         mentions,
         tags: Vec::new(),
         emojis: Vec::new(),
@@ -1102,6 +1146,7 @@ fn error_response(status: StatusCode, error: &str, description: &str) -> Respons
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Cursor,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1111,6 +1156,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
     use roost_core::AccountId;
     use roost_migration::Migrator;
@@ -1440,6 +1486,248 @@ mod tests {
         let body = json_body(credentials).await;
         assert_eq!(body["statuses_count"], 1);
         assert!(body["last_status_at"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an uploaded image, status creation attaches it and exposes media responses.
+    async fn media_uploads_attach_to_statuses(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Png);
+        let thumbnail = encoded_test_image(ImageFormat::Png);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[
+                    MultipartPart::file("file", "avatar.png", "image/png", &image),
+                    MultipartPart::file("thumbnail", "preview.png", "image/png", &thumbnail),
+                    MultipartPart::text("description", "profile image"),
+                    MultipartPart::text("focus", "0.25,-0.5"),
+                ],
+            )
+            .await;
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload_body = json_body(upload).await;
+        let media_id = upload_body["id"].as_str().unwrap();
+        assert_eq!(upload_body["type"], "image");
+        assert_eq!(upload_body["description"], "profile image");
+        assert_eq!(upload_body["meta"]["original"]["width"], 3);
+        assert_eq!(upload_body["meta"]["original"]["height"], 2);
+        assert_eq!(upload_body["meta"]["small"]["width"], 3);
+        assert_eq!(upload_body["meta"]["small"]["height"], 2);
+        assert_eq!(upload_body["meta"]["focus"]["x"], 0.25);
+        assert_eq!(upload_body["meta"]["focus"]["y"], -0.5);
+        assert!(upload_body["blurhash"].as_str().unwrap().len() > 10);
+        assert_ne!(upload_body["url"], upload_body["preview_url"]);
+
+        let status = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &token,
+                serde_json::json!({
+                    "status": "",
+                    "media_ids": [media_id]
+                }),
+            )
+            .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body = json_body(status).await;
+        assert_eq!(status_body["media_attachments"][0]["id"], media_id);
+        assert_eq!(
+            status_body["media_attachments"][0]["description"],
+            "profile image"
+        );
+
+        let media_url = status_body["media_attachments"][0]["url"].as_str().unwrap();
+        let media_path = media_url.strip_prefix("https://localhost:4000").unwrap();
+        let served = context.get(media_path).await;
+        assert_eq!(served.status(), StatusCode::OK);
+
+        let attached_lookup = context
+            .authenticated_get(&format!("/api/v1/media/{media_id}"), &token)
+            .await;
+        assert_eq!(attached_lookup.status(), StatusCode::NOT_FOUND);
+
+        let only_media = json_body(
+            context
+                .get(&format!(
+                    "/api/v1/accounts/{}/statuses?only_media=true",
+                    context.account_id.0
+                ))
+                .await,
+        )
+        .await;
+        assert_eq!(only_media.as_array().unwrap().len(), 1);
+        assert_eq!(only_media[0]["id"], status_body["id"]);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a legacy Mastodon upload URL, accepts the same local image upload.
+    async fn media_upload_accepts_v1_endpoint(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Png);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v1/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "avatar.png",
+                    "image/png",
+                    &image,
+                )],
+            )
+            .await;
+
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload_body = json_body(upload).await;
+        assert_eq!(upload_body["type"], "image");
+        assert!(
+            upload_body["url"]
+                .as_str()
+                .unwrap()
+                .contains("/media_attachments/files/")
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given the instance descriptor, clients see the expanded local image formats.
+    async fn instance_descriptor_advertises_supported_image_formats(context: &mut StatusContext) {
+        let instance = json_body(context.get("/api/v2/instance").await).await;
+        let supported = instance["configuration"]["media_attachments"]["supported_mime_types"]
+            .as_array()
+            .unwrap();
+        let supported: Vec<&str> = supported
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+
+        assert!(supported.contains(&"image/avif"));
+        assert!(supported.contains(&"image/bmp"));
+        assert!(supported.contains(&"image/gif"));
+        assert!(supported.contains(&"image/jpeg"));
+        assert!(supported.contains(&"image/png"));
+        assert!(supported.contains(&"image/tiff"));
+        assert!(supported.contains(&"image/webp"));
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a newly advertised image format, upload processing accepts and previews it.
+    async fn media_upload_accepts_bmp_from_expanded_formats(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Bmp);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "avatar.bmp",
+                    "image/bmp",
+                    &image,
+                )],
+            )
+            .await;
+
+        assert_eq!(upload.status(), StatusCode::OK);
+        let body = json_body(upload).await;
+        assert_eq!(body["type"], "image");
+        assert_eq!(body["meta"]["original"]["size"], "3x2");
+        assert_eq!(body["meta"]["small"]["size"], "3x2");
+        assert!(
+            body["preview_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("-small.png")
+        );
+        assert!(body["blurhash"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given unattached media, updating its thumbnail replaces small metadata.
+    async fn media_update_accepts_custom_thumbnail(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Png);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "avatar.png",
+                    "image/png",
+                    &image,
+                )],
+            )
+            .await;
+        let upload = json_body(upload).await;
+        let media_id = upload["id"].as_str().unwrap();
+        assert_eq!(upload["meta"]["small"]["size"], "3x2");
+
+        let thumbnail = encoded_sized_test_image(ImageFormat::Png, 2, 4);
+        let update = context
+            .authenticated_multipart_method(
+                "PUT",
+                &format!("/api/v1/media/{media_id}"),
+                &token,
+                &[MultipartPart::file(
+                    "thumbnail",
+                    "preview.png",
+                    "image/png",
+                    &thumbnail,
+                )],
+            )
+            .await;
+
+        assert_eq!(update.status(), StatusCode::OK);
+        let update = json_body(update).await;
+        assert_eq!(update["meta"]["original"]["size"], "3x2");
+        assert_eq!(update["meta"]["small"]["size"], "2x4");
+        assert_ne!(upload["blurhash"], update["blurhash"]);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given unsupported media input, upload rejects it before storing metadata.
+    async fn media_upload_rejects_unsupported_content_type(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "notes.txt",
+                    "text/plain",
+                    b"plain text",
+                )],
+            )
+            .await;
+
+        assert_eq!(upload.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a browser sends `file=null`, upload returns validation instead of extractor failure.
+    async fn media_upload_rejects_null_text_file_field(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::text("file", "null")],
+            )
+            .await;
+
+        assert_eq!(upload.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(upload).await["error"], "file is required");
     }
 
     #[test_context(StatusContext)]
@@ -1813,6 +2101,25 @@ mod tests {
         );
     }
 
+    /// Build a small valid image fixture for media upload compatibility tests.
+    fn encoded_test_image(format: ImageFormat) -> Vec<u8> {
+        encoded_sized_test_image(format, 3, 2)
+    }
+
+    /// Build a valid image fixture with caller-controlled dimensions.
+    fn encoded_sized_test_image(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            if (x + y) % 2 == 0 {
+                Rgba([220_u8, 20, 60, 255])
+            } else {
+                Rgba([20_u8, 80, 220, 255])
+            }
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    }
+
     /// Extract status identifiers from a Mastodon status collection response.
     fn status_ids(body: &Value) -> Vec<String> {
         body.as_array()
@@ -1840,6 +2147,34 @@ mod tests {
             .next()
             .unwrap()
             .to_owned()
+    }
+
+    enum MultipartPart<'a> {
+        Text {
+            name: &'a str,
+            value: &'a str,
+        },
+        File {
+            name: &'a str,
+            filename: &'a str,
+            content_type: &'a str,
+            bytes: &'a [u8],
+        },
+    }
+
+    impl<'a> MultipartPart<'a> {
+        fn text(name: &'a str, value: &'a str) -> Self {
+            Self::Text { name, value }
+        }
+
+        fn file(name: &'a str, filename: &'a str, content_type: &'a str, bytes: &'a [u8]) -> Self {
+            Self::File {
+                name,
+                filename,
+                content_type,
+                bytes,
+            }
+        }
     }
 
     struct StatusContext {
@@ -1905,7 +2240,7 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 object_storage_backend: "local".to_owned(),
-                media_root: "./media".to_owned(),
+                media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
                 registration_mode: "closed".to_owned(),
                 federation_enabled: false,
                 instance_name: "Roost Test".to_owned(),
@@ -1996,6 +2331,70 @@ mod tests {
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+        }
+
+        async fn authenticated_multipart(
+            &self,
+            uri: &str,
+            token: &str,
+            parts: &[MultipartPart<'_>],
+        ) -> axum::http::Response<Body> {
+            self.authenticated_multipart_method("POST", uri, token, parts)
+                .await
+        }
+
+        async fn authenticated_multipart_method(
+            &self,
+            method: &str,
+            uri: &str,
+            token: &str,
+            parts: &[MultipartPart<'_>],
+        ) -> axum::http::Response<Body> {
+            let boundary = "roost-test-boundary";
+            let mut body = Vec::new();
+            for part in parts {
+                body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                match part {
+                    MultipartPart::Text { name, value } => {
+                        body.extend_from_slice(
+                            format!(
+                                "Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    MultipartPart::File {
+                        name,
+                        filename,
+                        content_type,
+                        bytes,
+                    } => {
+                        body.extend_from_slice(
+                            format!(
+                                "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                        body.extend_from_slice(bytes);
+                        body.extend_from_slice(b"\r\n");
+                    }
+                }
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+            self.request(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
