@@ -4,6 +4,10 @@ Roost is a standalone Rust federated social server targeting Mastodon-compatible
 
 The project is early. The current local setup brings up the Rust server, PostgreSQL, infrastructure endpoints, and Elk as an external Mastodon-compatible UI for compatibility testing as API support is implemented.
 
+## Builds and Releases
+
+Every commit pushed to `main` publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/jreimann/mastodon-rs`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roost` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
+
 ## Local Development
 
 Prerequisites:
