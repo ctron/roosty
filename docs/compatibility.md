@@ -101,7 +101,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses and followed local public/unlisted statuses. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
 | 🔴 | `GET /api/v1/timelines/tag/:tag` | Hashtag timeline is missing. |
-| 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for local timelines. |
+| 🟡 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported; `Link` headers may still point to an empty final page. |
 
 ### Notifications and Markers
 
@@ -138,6 +138,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add WebFinger, actor documents, inbox, and outbox.
 - [ ] Add federation delivery and inbound activity processing.
 - [ ] Add remote follow graph and full private-status home timeline semantics.
+- [ ] Tighten timeline pagination by fetching one extra row before emitting `Link` headers.
 - [ ] Add conversation endpoint support for replies.
 - [ ] Add boosts.
 - [ ] Add persisted notifications and notification streaming.

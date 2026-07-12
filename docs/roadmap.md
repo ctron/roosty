@@ -22,6 +22,7 @@
 - Improve local account administration now that multiple local users can be operator-created.
 - Expand local account search into remote discovery when WebFinger support lands.
 - Add cursor pagination for account status collections.
+- Tighten timeline `Link` header generation by fetching one extra row before advertising another page.
 - Add a conversation endpoint for replies.
 - Add boosts.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.
