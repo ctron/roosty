@@ -4,8 +4,8 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::Router;
 use clap::{Parser, Subcommand};
-use roost_core::{Result, RoostError};
-use roost_migration::Migrator;
+use roosty_core::{Result, RoostyError};
+use roosty_migration::Migrator;
 use sea_orm_migration::MigratorTrait;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -35,7 +35,7 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "roost")]
+#[command(name = "roosty")]
 #[command(about = "Standalone Rust ActivityPub server")]
 struct Cli {
     #[command(subcommand)]
@@ -131,18 +131,18 @@ async fn main() -> Result<()> {
 /// Initialize tracing with the default formatter and a RUST_LOG override.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("roost=info,tower_http=info"));
+        .unwrap_or_else(|_| EnvFilter::new("roosty=info,tower_http=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 async fn migrate() -> Result<()> {
     let database_url = database_url_from_env()?;
-    let db = roost_db::connect(&database_url).await?;
+    let db = roosty_db::connect(&database_url).await?;
 
     run_migrations(&db).await
 }
 
-async fn run_migrations(db: &roost_db::DbConnection) -> Result<()> {
+async fn run_migrations(db: &roosty_db::DbConnection) -> Result<()> {
     Ok(Migrator::up(db, None).await?)
 }
 
@@ -151,11 +151,12 @@ async fn bootstrap_admin(username: &str, email: &str) -> Result<()> {
     validate_email(email)?;
 
     let database_url = database_url_from_env()?;
-    let db = roost_db::connect(&database_url).await?;
+    let db = roosty_db::connect(&database_url).await?;
     let temporary_password = password::generate_temporary_password();
     let password_hash = password::hash_password(&temporary_password)?;
 
-    let account_id = roost_db::create_bootstrap_admin(&db, username, email, &password_hash).await?;
+    let account_id =
+        roosty_db::create_bootstrap_admin(&db, username, email, &password_hash).await?;
 
     println!("Created bootstrap administrator account {account_id}");
     println!("Username: {username}");
@@ -172,14 +173,14 @@ async fn create_user(username: &str, email: &str, admin: bool) -> Result<()> {
     validate_email(email)?;
 
     let database_url = database_url_from_env()?;
-    let db = roost_db::connect(&database_url).await?;
+    let db = roosty_db::connect(&database_url).await?;
     let temporary_password = password::generate_temporary_password();
     let password_hash = password::hash_password(&temporary_password)?;
 
     let account_id = if admin {
-        roost_db::create_admin_account(&db, username, email, &password_hash).await?
+        roosty_db::create_admin_account(&db, username, email, &password_hash).await?
     } else {
-        roost_db::create_local_account(&db, username, email, &password_hash).await?
+        roosty_db::create_local_account(&db, username, email, &password_hash).await?
     };
     let role = if admin { "administrator" } else { "user" };
 
@@ -196,13 +197,13 @@ async fn reset_password(username: &str) -> Result<()> {
     validate_username(username)?;
 
     let database_url = database_url_from_env()?;
-    let db = roost_db::connect(&database_url).await?;
+    let db = roosty_db::connect(&database_url).await?;
     let temporary_password = password::generate_temporary_password();
     let password_hash = password::hash_password(&temporary_password)?;
 
-    let account = roost_db::update_local_account_password_hash(&db, username, &password_hash)
+    let account = roosty_db::update_local_account_password_hash(&db, username, &password_hash)
         .await?
-        .ok_or_else(|| RoostError::InvalidInput("local account does not exist".to_owned()))?;
+        .ok_or_else(|| RoostyError::InvalidInput("local account does not exist".to_owned()))?;
 
     println!("Reset password for local account {}", account.id.0);
     println!("Username: {}", account.username);
@@ -217,7 +218,7 @@ async fn serve(
     with_worker: bool,
 ) -> Result<()> {
     let config = Config::from_env(listen_override)?;
-    let db = roost_db::connect(&config.database_url).await?;
+    let db = roosty_db::connect(&config.database_url).await?;
     if run_startup_migrations {
         info!("running database migrations before server startup");
         run_migrations(&db).await?;
@@ -229,7 +230,11 @@ async fn serve(
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
     let worker_task = if with_worker {
         info!("starting in-process durable worker");
-        Some(tokio::spawn(worker_loop(db, shutdown_rx.clone())))
+        Some(tokio::spawn(worker_loop(
+            db,
+            config.clone(),
+            shutdown_rx.clone(),
+        )))
     } else {
         None
     };
@@ -252,7 +257,7 @@ async fn serve(
     if let Some(worker_task) = worker_task {
         worker_task
             .await
-            .map_err(|error| RoostError::Configuration(error.to_string()))??;
+            .map_err(|error| RoostyError::Configuration(error.to_string()))??;
     }
     shutdown_task.abort();
 
@@ -260,11 +265,11 @@ async fn serve(
 }
 
 async fn worker() -> Result<()> {
-    let database_url = database_url_from_env()?;
-    let db = roost_db::connect(&database_url).await?;
+    let config = Config::from_env(None)?;
+    let db = roosty_db::connect(&config.database_url).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
-    let result = worker_loop(db, shutdown_rx).await;
+    let result = worker_loop(db, config, shutdown_rx).await;
     shutdown_task.abort();
     result
 }
@@ -276,7 +281,7 @@ async fn serve_router(
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
-        .map_err(|error| RoostError::Configuration(error.to_string()))?;
+        .map_err(|error| RoostyError::Configuration(error.to_string()))?;
 
     info!(%listen, "listening");
 
@@ -289,7 +294,7 @@ async fn serve_router(
             }
         })
         .await
-        .map_err(|error| RoostError::Configuration(error.to_string()))
+        .map_err(|error| RoostyError::Configuration(error.to_string()))
 }
 
 async fn wait_for_shutdown(shutdown_tx: watch::Sender<bool>) {
@@ -300,7 +305,8 @@ async fn wait_for_shutdown(shutdown_tx: watch::Sender<bool>) {
 }
 
 async fn worker_loop(
-    db: roost_db::DbConnection,
+    db: roosty_db::DbConnection,
+    config: Config,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let claim_ttl = time::Duration::minutes(5);
@@ -314,9 +320,27 @@ async fn worker_loop(
                 }
             }
             () = tokio::time::sleep(Duration::from_secs(5)) => {
-                let released = roost_db::release_expired_claims(&db, claim_ttl).await?;
+                let released = roosty_db::release_expired_claims(&db, claim_ttl).await?;
                 if released > 0 {
                     info!(released, "released expired job claims");
+                }
+                for job in roosty_db::claim_due_jobs(&db, "roosty-worker", 20, claim_ttl).await? {
+                    let result = if job.kind == "federation_follow_response" {
+                        crate::federation::deliver_follow_response(&AppState::new(config.clone(), db.clone()), job.payload).await
+                    } else { Ok(()) };
+                    match result {
+                        Ok(()) => roosty_db::mark_job_completed(&db, job.id).await?,
+                        Err(error) => {
+                            let permanent = roosty_db::job_has_exceeded_max_age(job.created_at, config.federation_delivery_max_age)
+                                || error.to_string().starts_with("permanent federation delivery failure:");
+                            if permanent {
+                                roosty_db::mark_job_permanently_failed(&db, job.id, &error.to_string()).await?;
+                                warn!(job_id = %job.id.0, %error, "federation delivery failed permanently");
+                            } else {
+                                roosty_db::mark_job_failed(&db, job.id, &error.to_string(), job.attempts).await?;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -330,7 +354,7 @@ fn validate_username(username: &str) -> Result<()> {
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
     {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "username must be 2-30 ASCII letters, numbers, or underscores".to_owned(),
         ));
     }
@@ -340,7 +364,7 @@ fn validate_username(username: &str) -> Result<()> {
 
 fn validate_email(email: &str) -> Result<()> {
     if !email.contains('@') || email.trim() != email {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "email must contain @ and must not contain surrounding whitespace".to_owned(),
         ));
     }
@@ -355,7 +379,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use postgresql_embedded::PostgreSQL;
-    use roost_migration::Migrator;
+    use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
 
@@ -379,7 +403,7 @@ mod tests {
     #[test]
     fn parses_create_user_command() {
         let cli = Cli::parse_from([
-            "roost",
+            "roosty",
             "admin",
             "create-user",
             "--username",
@@ -410,7 +434,7 @@ mod tests {
     /// Keeps the operator-facing password reset CLI shape stable.
     #[test]
     fn parses_reset_password_command() {
-        let cli = Cli::parse_from(["roost", "admin", "reset-password", "--username", "alice"]);
+        let cli = Cli::parse_from(["roosty", "admin", "reset-password", "--username", "alice"]);
 
         let parsed = match cli.command {
             Command::Admin {
@@ -428,14 +452,14 @@ mod tests {
         let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
         let password_hash = password::hash_password("password").unwrap();
 
-        roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
+        roosty_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
             .await
             .unwrap();
         let user_id =
-            roost_db::create_local_account(&db, "alice", "alice@example.com", &password_hash)
+            roosty_db::create_local_account(&db, "alice", "alice@example.com", &password_hash)
                 .await
                 .unwrap();
-        let admin_id = roost_db::create_admin_account(
+        let admin_id = roosty_db::create_admin_account(
             &db,
             "moderator",
             "moderator@example.com",
@@ -444,30 +468,30 @@ mod tests {
         .await
         .unwrap();
 
-        let user = roost_db::find_local_account_by_id(&db, roost_core::AccountId(user_id))
+        let user = roosty_db::find_local_account_by_id(&db, roosty_core::AccountId(user_id))
             .await
             .unwrap()
             .unwrap();
-        let admin = roost_db::find_local_account_by_id(&db, roost_core::AccountId(admin_id))
+        let admin = roosty_db::find_local_account_by_id(&db, roosty_core::AccountId(admin_id))
             .await
             .unwrap()
             .unwrap();
         let duplicate_username =
-            roost_db::create_local_account(&db, "alice", "alice2@example.com", &password_hash)
+            roosty_db::create_local_account(&db, "alice", "alice2@example.com", &password_hash)
                 .await;
         let duplicate_email =
-            roost_db::create_local_account(&db, "alice2", "alice@example.com", &password_hash)
+            roosty_db::create_local_account(&db, "alice2", "alice@example.com", &password_hash)
                 .await;
 
         assert!(!user.is_admin);
         assert!(admin.is_admin);
         assert!(matches!(
             duplicate_username,
-            Err(RoostError::InvalidInput(message)) if message == "username is already in use"
+            Err(RoostyError::InvalidInput(message)) if message == "username is already in use"
         ));
         assert!(matches!(
             duplicate_email,
-            Err(RoostError::InvalidInput(message)) if message == "email is already in use"
+            Err(RoostyError::InvalidInput(message)) if message == "email is already in use"
         ));
 
         db.close().await.unwrap();
@@ -480,16 +504,16 @@ mod tests {
     async fn resets_local_account_password_hash() {
         let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
         let old_hash = password::hash_password("old-password").unwrap();
-        roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &old_hash)
+        roosty_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &old_hash)
             .await
             .unwrap();
         let new_hash = password::hash_password("new-password").unwrap();
 
-        let account = roost_db::update_local_account_password_hash(&db, "admin", &new_hash)
+        let account = roosty_db::update_local_account_password_hash(&db, "admin", &new_hash)
             .await
             .unwrap()
             .unwrap();
-        let missing = roost_db::update_local_account_password_hash(&db, "missing", &new_hash)
+        let missing = roosty_db::update_local_account_password_hash(&db, "missing", &new_hash)
             .await
             .unwrap();
 
@@ -504,9 +528,9 @@ mod tests {
     }
 
     /// Starts a migrated temporary PostgreSQL database for CLI-adjacent DB tests.
-    async fn migrated_test_database() -> (PostgreSQL, roost_db::DbConnection, String, TempDir) {
+    async fn migrated_test_database() -> (PostgreSQL, roosty_db::DbConnection, String, TempDir) {
         let temp_dir = tempfile::Builder::new()
-            .prefix("roost-admin-")
+            .prefix("roosty-admin-")
             .tempdir()
             .unwrap();
         let database_name = unique_name();
@@ -528,7 +552,7 @@ mod tests {
         postgresql.create_database(&database_name).await.unwrap();
 
         let database_url = postgresql.settings().url(&database_name);
-        let db = roost_db::connect(&database_url).await.unwrap();
+        let db = roosty_db::connect(&database_url).await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
         (postgresql, db, database_name, temp_dir)
@@ -540,6 +564,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("roost_admin_{nanos}")
+        format!("roosty_admin_{nanos}")
     }
 }

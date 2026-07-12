@@ -1,12 +1,12 @@
-# Roost
+# Roosty
 
-Roost is a standalone Rust federated social server targeting Mastodon-compatible clients and ActivityPub federation.
+Roosty is a standalone Rust federated social server targeting Mastodon-compatible clients and ActivityPub federation.
 
 The project is early. The current local setup brings up the Rust server, PostgreSQL, infrastructure endpoints, and Elk as an external Mastodon-compatible UI for compatibility testing as API support is implemented.
 
 ## Builds and Releases
 
-Every commit pushed to `main` publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/jreimann/mastodon-rs`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roost` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
+Every commit pushed to `main` publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/jreimann/mastodon-rs`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
 
 ## Local Development
 
@@ -21,51 +21,51 @@ Start the local stack:
 podman compose -f deploy/compose.yaml up --build
 ```
 
-The compose command starts Roost with `serve --with-migrations --with-worker`, so database migrations run automatically before the server begins listening.
+The compose command starts Roosty with `serve --with-migrations --with-worker`, so database migrations run automatically before the server begins listening.
 
-The local stack uses Caddy with an internal development certificate so Roost and Elk can run over HTTPS. Your browser may ask you to accept the local certificate.
+The local stack uses Caddy with an internal development certificate so Roosty and Elk can run over HTTPS. Your browser may ask you to accept the local certificate.
 
 This starts:
 
-- Roost API server through Caddy: `https://roost.localhost:4000`
-- Roost infrastructure endpoints: `http://localhost:3001`
+- Roosty API server through Caddy: `https://roosty.localhost:4000`
+- Roosty infrastructure endpoints: `http://localhost:3001`
 - Elk web client through Caddy: `https://localhost:4001`
 - PostgreSQL 18
 
 To run migrations manually instead:
 
 ```sh
-podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost migrate
+podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty migrate
 ```
 
 Bootstrap the first administrator:
 
 ```sh
-podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin bootstrap --username admin --email admin@example.com
+podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin bootstrap --username admin --email admin@example.com
 ```
 
 Create another local user:
 
 ```sh
-podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin create-user --username alice --email alice@example.com
+podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin create-user --username alice --email alice@example.com
 ```
 
 Create another local administrator:
 
 ```sh
-podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin create-user --username moderator --email moderator@example.com --admin
+podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin create-user --username moderator --email moderator@example.com --admin
 ```
 
 Reset a local user's password and print a temporary replacement:
 
 ```sh
-podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin reset-password --username alice
+podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin reset-password --username alice
 ```
 
-Elk is preset to use the local Roost instance. If it asks for an instance URL, use:
+Elk is preset to use the local Roosty instance. If it asks for an instance URL, use:
 
 ```text
-https://roost.localhost:4000
+https://roosty.localhost:4000
 ```
 
 If Elk keeps trying an old saved instance, open this URL once to clear its local browser state:
@@ -94,6 +94,27 @@ Remove local volumes, including PostgreSQL data, uploaded media, and Elk client 
 podman compose -f deploy/compose.yaml down -v
 ```
 
+## Production deployment
+
+The Ansible deployment reuses the Roosty/PostgreSQL/media Compose topology with
+the published Roosty image and Caddy-managed public TLS. It targets Debian/Ubuntu
+hosts with APT package names for Docker Engine and the Compose v2 plugin.
+
+Copy the example production inventory, point `roosty.example.com` at the
+target, and run:
+
+```sh
+cd deploy/ansible
+ansible-playbook site.yml
+```
+
+The included example deploys `https://roosty.example.com` with a Let's Encrypt
+certificate. Set `roosty_acme_email` to an operator contact address, ensure the
+host's public DNS A/AAAA records point to the target, and allow inbound ports 80
+and 443 before Caddy obtains its certificate. Set
+`roosty_federation_enabled: true` only after configuring its allow-list and key
+encryption secret.
+
 ## Verification
 
 After Rust code or manifest changes, run:
@@ -106,12 +127,14 @@ cargo clippy --all-targets
 ## Federation
 
 Federation is disabled by default. To expose local ActivityPub identities, set
-`ROOST_FEDERATION_ENABLED=true`, use an absolute HTTPS `ROOST_PUBLIC_BASE_URL`,
-and provide a distinct `ROOST_FEDERATION_KEY_ENCRYPTION_SECRET` of at least 32
-bytes. Roost uses this secret to encrypt per-account signing keys at rest. Set
-`ROOST_FEDERATION_ALLOWED_DOMAINS` to a comma-separated exact list of remote
-DNS domains permitted for discovery; `ROOST_FEDERATION_BLOCKED_DOMAINS` can
-exclude domains from that list.
+`ROOSTY_FEDERATION_ENABLED=true`, use an absolute HTTPS `ROOSTY_PUBLIC_BASE_URL`,
+and provide a distinct `ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET` of at least 32
+bytes. Roosty uses this secret to encrypt per-account signing keys at rest. Set
+`ROOSTY_FEDERATION_ALLOWED_DOMAINS` to a comma-separated exact list of remote
+DNS domains permitted for discovery; `ROOSTY_FEDERATION_BLOCKED_DOMAINS` can
+exclude domains from that list. Configure `ROOSTY_FEDERATION_DELIVERY_MAX_AGE`
+with a human-readable duration such as `7d`, `12h`, or `30m`; failed delivery
+jobs retry with exponential backoff until this age is exceeded.
 
 This initial surface provides WebFinger, local actor documents, public Notes,
 outboxes, follower/following collection metadata, and safe allow-listed remote

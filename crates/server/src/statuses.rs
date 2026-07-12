@@ -8,8 +8,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use roost_core::{AccountId, RoostError, StatusId};
-use roost_db::LocalNotificationType;
+use roosty_core::{AccountId, RoostyError, StatusId};
+use roosty_db::LocalNotificationType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -105,7 +105,7 @@ struct TagPath {
 #[derive(Clone, Copy, Debug)]
 struct TimelineQuery {
     limit: u64,
-    cursor: roost_db::TimelineCursor,
+    cursor: roosty_db::TimelineCursor,
 }
 
 #[derive(Deserialize)]
@@ -217,8 +217,8 @@ impl TagResponse {
     /// Build the public tag response for a local tag and computed usage history.
     pub(crate) fn new(
         state: &AppState,
-        tag: roost_db::LocalTag,
-        history: Vec<roost_db::LocalTagHistory>,
+        tag: roosty_db::LocalTag,
+        history: Vec<roosty_db::LocalTagHistory>,
         following: Option<bool>,
     ) -> Self {
         Self {
@@ -254,7 +254,7 @@ struct MentionResponse {
 
 impl MentionResponse {
     /// Build the Mastodon mention shape for a local account referenced by a reply.
-    fn new(state: &AppState, account: &roost_db::LocalAccount) -> Self {
+    fn new(state: &AppState, account: &roosty_db::LocalAccount) -> Self {
         Self {
             id: account.id.0.to_string(),
             username: account.username.clone(),
@@ -288,7 +288,7 @@ enum StatusCollectionList {
 
 struct ReplyTarget {
     account_id: AccountId,
-    account: roost_db::LocalAccount,
+    account: roosty_db::LocalAccount,
 }
 
 async fn create_status(
@@ -322,7 +322,7 @@ async fn create_status(
         Err(error) => return bad_request(&error.to_string()),
     };
     if let Some(parent_id) = in_reply_to_id {
-        match roost_db::find_local_status_by_id(&state.db, parent_id).await {
+        match roosty_db::find_local_status_by_id(&state.db, parent_id).await {
             Ok(Some(parent)) => {
                 match status_visible_to_viewer(&state, &parent, Some(account.id)).await {
                     Ok(true) => {}
@@ -335,7 +335,7 @@ async fn create_status(
         }
     }
 
-    let new_status = roost_db::NewLocalStatus {
+    let new_status = roosty_db::NewLocalStatus {
         account_id: account.id,
         content: input.status.unwrap_or_default().trim().to_owned(),
         visibility,
@@ -346,7 +346,7 @@ async fn create_status(
     };
 
     let author_id = account.id;
-    match roost_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
+    match roosty_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
         Ok(mut status) => {
             if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
                 return server_error(error);
@@ -389,7 +389,7 @@ async fn show_status(
     Path(path): Path<StatusPath>,
 ) -> Response {
     let viewer_id = viewer.as_ref().map(|account| account.id);
-    match roost_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await {
+    match roosty_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await {
         Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer_id).await {
             Ok(true) => status_with_author_response(&state, status, viewer_id).await,
             Ok(false) => not_found(),
@@ -407,7 +407,7 @@ async fn update_status(
     request: axum::extract::Request,
 ) -> Response {
     let status_id = StatusId(path.status_id);
-    match roost_db::find_local_status_by_id(&state.db, status_id).await {
+    match roosty_db::find_local_status_by_id(&state.db, status_id).await {
         Ok(Some(status)) if status.account_id == account.id && status.deleted_at.is_none() => {}
         Ok(Some(_)) | Ok(None) => return not_found(),
         Err(error) => return server_error(error),
@@ -427,7 +427,7 @@ async fn update_status(
     };
     let has_media = match media_ids.as_ref() {
         Some(media_ids) => !media_ids.is_empty(),
-        None => match roost_db::local_status_has_media(&state.db, status_id).await {
+        None => match roosty_db::local_status_has_media(&state.db, status_id).await {
             Ok(has_media) => has_media,
             Err(error) => return server_error(error),
         },
@@ -438,13 +438,13 @@ async fn update_status(
         return bad_request(&error.to_string());
     }
 
-    let update = roost_db::LocalStatusUpdate {
+    let update = roosty_db::LocalStatusUpdate {
         content: input.status.map(|status| status.trim().to_owned()),
         sensitive: input.sensitive,
         spoiler_text: input.spoiler_text,
         language: input.language.map(Some),
     };
-    match roost_db::update_owned_local_status(
+    match roosty_db::update_owned_local_status(
         &state.db,
         status_id,
         account.id,
@@ -464,7 +464,7 @@ async fn update_status(
             }
         }
         Ok(None) => not_found(),
-        Err(RoostError::InvalidInput(error)) => bad_request(&error),
+        Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
 }
@@ -475,10 +475,11 @@ async fn delete_status(
     Path(path): Path<StatusPath>,
 ) -> Response {
     let status_id = StatusId(path.status_id);
-    match roost_db::delete_owned_local_status(&state.db, status_id, account.id).await {
+    match roosty_db::delete_owned_local_status(&state.db, status_id, account.id).await {
         Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
             Ok(response) => {
-                let reblogs = match roost_db::local_reblogs_for_status(&state.db, status_id).await {
+                let reblogs = match roosty_db::local_reblogs_for_status(&state.db, status_id).await
+                {
                     Ok(reblogs) => reblogs,
                     Err(error) => return server_error(error),
                 };
@@ -488,7 +489,7 @@ async fn delete_status(
             Err(error) => server_error(error),
         },
         Ok(None) => not_found(),
-        Err(RoostError::InvalidInput(error)) => forbidden(&error),
+        Err(RoostyError::InvalidInput(error)) => forbidden(&error),
         Err(error) => server_error(error),
     }
 }
@@ -496,8 +497,8 @@ async fn delete_status(
 /// Publish delete events for a removed original status and its local boost wrappers.
 async fn publish_status_delete(
     state: &AppState,
-    status: &roost_db::LocalStatus,
-    reblogs: &[roost_db::LocalStatusReblog],
+    status: &roosty_db::LocalStatus,
+    reblogs: &[roosty_db::LocalStatusReblog],
 ) {
     let recipients = status_stream_recipients(state, status).await;
     state.streaming_events.publish_delete(
@@ -524,7 +525,7 @@ async fn status_context(
 ) -> Response {
     let status_id = StatusId(path.status_id);
     let viewer = viewer.as_ref().map(|account| account.id);
-    let status = match roost_db::find_local_status_by_id(&state.db, status_id).await {
+    let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
         Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer).await {
             Ok(true) => status,
             Ok(false) => return not_found(),
@@ -620,7 +621,7 @@ async fn reblogged_by(
 ) -> Response {
     let viewer_id = viewer.as_ref().map(|account| account.id);
     let status_id = StatusId(path.status_id);
-    match roost_db::find_local_status_by_id(&state.db, status_id).await {
+    match roosty_db::find_local_status_by_id(&state.db, status_id).await {
         Ok(Some(status)) if can_view_status(&status, viewer_id) => {}
         Ok(Some(_)) | Ok(None) => return not_found(),
         Err(error) => return server_error(error),
@@ -631,7 +632,7 @@ async fn reblogged_by(
         Ok(cursor) => cursor,
         Err(()) => return bad_request("collection cursor is invalid"),
     };
-    match roost_db::local_reblogged_by_for_status(&state.db, status_id, limit, cursor).await {
+    match roosty_db::local_reblogged_by_for_status(&state.db, status_id, limit, cursor).await {
         Ok(page) => {
             account_collection_response(
                 &state,
@@ -670,7 +671,7 @@ async fn home_timeline(
         Ok(query) => query,
         Err(error) => return bad_request(&error.to_string()),
     };
-    match roost_db::home_timeline_for_account(&state.db, account.id, query.limit, query.cursor)
+    match roosty_db::home_timeline_for_account(&state.db, account.id, query.limit, query.cursor)
         .await
     {
         Ok(items) => {
@@ -696,7 +697,7 @@ async fn public_timeline(
         Ok(query) => query,
         Err(error) => return bad_request(&error.to_string()),
     };
-    match roost_db::public_local_timeline(&state.db, query.limit, query.cursor).await {
+    match roosty_db::public_local_timeline(&state.db, query.limit, query.cursor).await {
         Ok(statuses) => {
             timeline_response(
                 &state,
@@ -733,7 +734,7 @@ async fn tag_timeline(
     if params.remote.unwrap_or(false) && !params.local.unwrap_or(false) {
         return timeline_response(
             &state,
-            roost_db::TimelinePage {
+            roosty_db::TimelinePage {
                 items: Vec::new(),
                 first_cursor: None,
                 last_cursor: None,
@@ -746,10 +747,10 @@ async fn tag_timeline(
         .await;
     }
 
-    match roost_db::local_tag_timeline(
+    match roosty_db::local_tag_timeline(
         &state.db,
         &path.hashtag,
-        roost_db::LocalTagTimelineOptions {
+        roosty_db::LocalTagTimelineOptions {
             any: params.any,
             all: params.all,
             none: params.none,
@@ -797,7 +798,7 @@ async fn follow_tag(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    match roost_db::follow_local_tag(&state.db, account.id, &path.hashtag).await {
+    match roosty_db::follow_local_tag(&state.db, account.id, &path.hashtag).await {
         Ok(tag) => tag_response(&state, tag, Some(true)).await,
         Err(error) => server_error(error),
     }
@@ -808,7 +809,7 @@ async fn unfollow_tag(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    match roost_db::unfollow_local_tag(&state.db, account.id, &path.hashtag).await {
+    match roosty_db::unfollow_local_tag(&state.db, account.id, &path.hashtag).await {
         Ok(Some(tag)) => tag_response(&state, tag, Some(false)).await,
         Ok(None) => tag_not_found(),
         Err(error) => server_error(error),
@@ -820,13 +821,13 @@ async fn tag_response_by_name(
     state: &AppState,
     name: &str,
     viewer: Option<AccountId>,
-) -> Result<Option<TagResponse>, RoostError> {
-    let Some(tag) = roost_db::find_local_tag_by_name(&state.db, name).await? else {
+) -> Result<Option<TagResponse>, RoostyError> {
+    let Some(tag) = roosty_db::find_local_tag_by_name(&state.db, name).await? else {
         return Ok(None);
     };
     let following = match viewer {
         Some(account_id) => {
-            Some(roost_db::is_local_tag_followed(&state.db, account_id, tag.id).await?)
+            Some(roosty_db::is_local_tag_followed(&state.db, account_id, tag.id).await?)
         }
         None => None,
     };
@@ -837,16 +838,16 @@ async fn tag_response_by_name(
 /// Convert stored local tag metadata into a Mastodon tag response.
 pub(crate) async fn tag_response_model(
     state: &AppState,
-    tag: roost_db::LocalTag,
+    tag: roosty_db::LocalTag,
     following: Option<bool>,
-) -> Result<TagResponse, RoostError> {
-    let history = roost_db::local_tag_history(&state.db, tag.id).await?;
+) -> Result<TagResponse, RoostyError> {
+    let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
     Ok(TagResponse::new(state, tag, history, following))
 }
 
 async fn tag_response(
     state: &AppState,
-    tag: roost_db::LocalTag,
+    tag: roosty_db::LocalTag,
     following: Option<bool>,
 ) -> Response {
     match tag_response_model(state, tag, following).await {
@@ -910,9 +911,9 @@ fn validate_status_text(status: &str, has_media: bool) -> Result<(), StatusInput
 /// Attach newly created direct statuses to a local Mastodon conversation.
 async fn attach_direct_conversation(
     state: &AppState,
-    status: &mut roost_db::LocalStatus,
+    status: &mut roosty_db::LocalStatus,
     author_id: AccountId,
-) -> Result<(), RoostError> {
+) -> Result<(), RoostyError> {
     if status.visibility != "direct" {
         return Ok(());
     }
@@ -923,7 +924,7 @@ async fn attach_direct_conversation(
         .map(|account| account.id)
         .collect::<Vec<_>>();
     if let Some(parent_id) = status.in_reply_to_id
-        && let Some(parent) = roost_db::find_local_status_by_id(&state.db, parent_id).await?
+        && let Some(parent) = roosty_db::find_local_status_by_id(&state.db, parent_id).await?
     {
         participant_ids.push(parent.account_id);
     }
@@ -931,7 +932,7 @@ async fn attach_direct_conversation(
     participant_ids.sort_by_key(|account_id| account_id.0);
     participant_ids.dedup();
 
-    let conversation_id = roost_db::attach_direct_status_to_conversation(
+    let conversation_id = roosty_db::attach_direct_status_to_conversation(
         &state.db,
         status.id,
         author_id,
@@ -967,7 +968,7 @@ fn parse_media_ids(values: &[String]) -> Result<Vec<Uuid>, StatusInputError> {
 /// Parse media metadata updates accepted by Mastodon status edit requests.
 fn parse_media_attributes(
     values: &[MediaAttributeInput],
-) -> Result<Vec<roost_db::LocalStatusMediaAttributeUpdate>, StatusInputError> {
+) -> Result<Vec<roosty_db::LocalStatusMediaAttributeUpdate>, StatusInputError> {
     let mut seen = HashSet::new();
     let mut attributes = Vec::with_capacity(values.len());
     for value in values {
@@ -988,7 +989,7 @@ fn parse_media_attributes(
         };
         let focus = parse_media_focus(value.focus.as_deref())
             .map_err(|_| StatusInputError::MediaAttribute)?;
-        attributes.push(roost_db::LocalStatusMediaAttributeUpdate {
+        attributes.push(roosty_db::LocalStatusMediaAttributeUpdate {
             media_id,
             description,
             focus,
@@ -1051,7 +1052,7 @@ fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, Sta
 
 async fn statuses_response(
     state: &AppState,
-    statuses: Vec<roost_db::LocalStatus>,
+    statuses: Vec<roosty_db::LocalStatus>,
     viewer: Option<AccountId>,
 ) -> Response {
     match status_models(state, statuses, viewer).await {
@@ -1075,7 +1076,7 @@ async fn status_collection_action(
     };
 
     let reblog = if matches!(action, StatusCollectionAction::Reblog) {
-        match roost_db::reblog_local_status(&state.db, account_id, status_id).await {
+        match roosty_db::reblog_local_status(&state.db, account_id, status_id).await {
             Ok(reblog) => Some(reblog),
             Err(error) => return server_error(error),
         }
@@ -1083,7 +1084,7 @@ async fn status_collection_action(
         None
     };
     let removed_reblog = if matches!(action, StatusCollectionAction::Unreblog) {
-        match roost_db::unreblog_local_status(&state.db, account_id, status_id).await {
+        match roosty_db::unreblog_local_status(&state.db, account_id, status_id).await {
             Ok(reblog) => reblog,
             Err(error) => return server_error(error),
         }
@@ -1092,16 +1093,16 @@ async fn status_collection_action(
     };
     let result = match action {
         StatusCollectionAction::Favourite => {
-            roost_db::favourite_local_status(&state.db, account_id, status_id).await
+            roosty_db::favourite_local_status(&state.db, account_id, status_id).await
         }
         StatusCollectionAction::Unfavourite => {
-            roost_db::unfavourite_local_status(&state.db, account_id, status_id).await
+            roosty_db::unfavourite_local_status(&state.db, account_id, status_id).await
         }
         StatusCollectionAction::Bookmark => {
-            roost_db::bookmark_local_status(&state.db, account_id, status_id).await
+            roosty_db::bookmark_local_status(&state.db, account_id, status_id).await
         }
         StatusCollectionAction::Unbookmark => {
-            roost_db::unbookmark_local_status(&state.db, account_id, status_id).await
+            roosty_db::unbookmark_local_status(&state.db, account_id, status_id).await
         }
         StatusCollectionAction::Reblog => Ok(()),
         StatusCollectionAction::Unreblog => Ok(()),
@@ -1153,9 +1154,9 @@ async fn status_collection_action(
                             Err(error) => server_error(error),
                         }
                     }
-                    None => {
-                        server_error(RoostError::InvalidInput("boost was not created".to_owned()))
-                    }
+                    None => server_error(RoostyError::InvalidInput(
+                        "boost was not created".to_owned(),
+                    )),
                 };
             }
             if let Some(removed_reblog) = removed_reblog {
@@ -1176,12 +1177,12 @@ async fn status_collection_action(
 /// Return followers that should receive this status in their home stream.
 async fn status_stream_recipients(
     state: &AppState,
-    status: &roost_db::LocalStatus,
+    status: &roosty_db::LocalStatus,
 ) -> Vec<AccountId> {
     if !matches!(status.visibility.as_str(), "public" | "unlisted") {
         return Vec::new();
     }
-    match roost_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
+    match roosty_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
         Ok(recipients) => filter_stream_recipients(state, status.account_id, recipients).await,
         Err(error) => {
             warn!(%error, "failed to resolve status stream recipients");
@@ -1192,7 +1193,7 @@ async fn status_stream_recipients(
 
 /// Return followers that should receive this account's boost in their home stream.
 async fn reblog_stream_recipients(state: &AppState, account_id: AccountId) -> Vec<AccountId> {
-    match roost_db::local_follower_ids_for_account(&state.db, account_id, false).await {
+    match roosty_db::local_follower_ids_for_account(&state.db, account_id, false).await {
         Ok(recipients) => filter_stream_recipients(state, account_id, recipients).await,
         Err(error) => {
             warn!(%error, "failed to resolve reblog stream recipients");
@@ -1209,7 +1210,7 @@ async fn filter_stream_recipients(
 ) -> Vec<AccountId> {
     let mut visible = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        match roost_db::local_account_is_hidden_for_viewer(&state.db, recipient, author_id).await {
+        match roosty_db::local_account_is_hidden_for_viewer(&state.db, recipient, author_id).await {
             Ok(false) => visible.push(recipient),
             Ok(true) => {}
             Err(error) => warn!(%error, "failed to filter muted or blocked stream recipient"),
@@ -1222,7 +1223,7 @@ async fn filter_stream_recipients(
 /// Return a Mastodon account collection with cursor pagination headers.
 async fn account_collection_response(
     state: &AppState,
-    page: roost_db::CollectionPage<roost_db::LocalAccount>,
+    page: roosty_db::CollectionPage<roosty_db::LocalAccount>,
     limit: u64,
     path: &str,
 ) -> Response {
@@ -1251,9 +1252,9 @@ async fn account_collection_response(
 /// Notify local accounts mentioned in a newly created status.
 async fn notify_mentioned_accounts(
     state: &AppState,
-    status: &roost_db::LocalStatus,
+    status: &roosty_db::LocalStatus,
     author_id: AccountId,
-) -> Result<(), RoostError> {
+) -> Result<(), RoostyError> {
     for mention in local_text_mentions(state, &status.content).await? {
         crate::notifications::create_and_stream_notification(
             state,
@@ -1281,10 +1282,10 @@ async fn status_collection_list(
     };
     let result = match collection {
         StatusCollectionList::Favourites => {
-            roost_db::local_favourites_for_account(&state.db, account_id, limit, cursor).await
+            roosty_db::local_favourites_for_account(&state.db, account_id, limit, cursor).await
         }
         StatusCollectionList::Bookmarks => {
-            roost_db::local_bookmarks_for_account(&state.db, account_id, limit, cursor).await
+            roosty_db::local_bookmarks_for_account(&state.db, account_id, limit, cursor).await
         }
     };
 
@@ -1314,9 +1315,9 @@ async fn status_collection_list(
 
 async fn status_models(
     state: &AppState,
-    statuses: Vec<roost_db::LocalStatus>,
+    statuses: Vec<roosty_db::LocalStatus>,
     viewer: Option<AccountId>,
-) -> Result<Vec<StatusResponse>, RoostError> {
+) -> Result<Vec<StatusResponse>, RoostyError> {
     let mut response = Vec::with_capacity(statuses.len());
     for status in statuses {
         response.push(status_with_author(state, status, viewer).await?);
@@ -1327,16 +1328,16 @@ async fn status_models(
 
 async fn home_timeline_models(
     state: &AppState,
-    items: Vec<roost_db::HomeTimelineItem>,
+    items: Vec<roosty_db::HomeTimelineItem>,
     viewer: AccountId,
-) -> Result<Vec<StatusResponse>, RoostError> {
+) -> Result<Vec<StatusResponse>, RoostyError> {
     let mut response = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            roost_db::HomeTimelineItem::Status(status) => {
+            roosty_db::HomeTimelineItem::Status(status) => {
                 response.push(status_with_author(state, status, Some(viewer)).await?);
             }
-            roost_db::HomeTimelineItem::Reblog(reblog) => {
+            roosty_db::HomeTimelineItem::Reblog(reblog) => {
                 if let Some(reblog) = reblog_response(state, reblog, Some(viewer)).await? {
                     response.push(reblog);
                 }
@@ -1350,7 +1351,7 @@ async fn home_timeline_models(
 /// Build a Mastodon home timeline response from statuses and boosts.
 async fn home_timeline_response(
     state: &AppState,
-    page: roost_db::TimelinePage<roost_db::HomeTimelineItem>,
+    page: roosty_db::TimelinePage<roosty_db::HomeTimelineItem>,
     limit: u64,
     path: &str,
     viewer: AccountId,
@@ -1369,7 +1370,7 @@ async fn home_timeline_response(
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
 pub(crate) async fn timeline_response(
     state: &AppState,
-    page: roost_db::TimelinePage<roost_db::LocalStatus>,
+    page: roosty_db::TimelinePage<roosty_db::LocalStatus>,
     limit: u64,
     path: &str,
     viewer: Option<AccountId>,
@@ -1384,7 +1385,7 @@ pub(crate) async fn timeline_response(
 
 async fn status_with_author_response(
     state: &AppState,
-    status: roost_db::LocalStatus,
+    status: roosty_db::LocalStatus,
     viewer: Option<AccountId>,
 ) -> Response {
     match status_with_author(state, status, viewer).await {
@@ -1395,37 +1396,37 @@ async fn status_with_author_response(
 
 pub(crate) async fn status_with_author(
     state: &AppState,
-    status: roost_db::LocalStatus,
+    status: roosty_db::LocalStatus,
     viewer: Option<AccountId>,
-) -> Result<StatusResponse, RoostError> {
-    let account = roost_db::find_local_account_by_id(&state.db, status.account_id)
+) -> Result<StatusResponse, RoostyError> {
+    let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
         .await?
-        .ok_or_else(|| RoostError::InvalidInput("status author does not exist".to_owned()))?;
+        .ok_or_else(|| RoostyError::InvalidInput("status author does not exist".to_owned()))?;
 
     status_response_for_viewer(state, status, account, viewer).await
 }
 
 async fn status_response(
     state: &AppState,
-    status: roost_db::LocalStatus,
-    account: roost_db::LocalAccount,
-) -> Result<StatusResponse, RoostError> {
+    status: roosty_db::LocalStatus,
+    account: roosty_db::LocalAccount,
+) -> Result<StatusResponse, RoostyError> {
     status_response_for_viewer(state, status, account.clone(), Some(account.id)).await
 }
 
 async fn reblog_response(
     state: &AppState,
-    reblog: roost_db::LocalStatusReblog,
+    reblog: roosty_db::LocalStatusReblog,
     viewer: Option<AccountId>,
-) -> Result<Option<StatusResponse>, RoostError> {
-    let Some(original) = roost_db::find_local_status_by_id(&state.db, reblog.status_id).await?
+) -> Result<Option<StatusResponse>, RoostyError> {
+    let Some(original) = roosty_db::find_local_status_by_id(&state.db, reblog.status_id).await?
     else {
         return Ok(None);
     };
     if !can_view_status(&original, viewer) {
         return Ok(None);
     }
-    let Some(account) = roost_db::find_local_account_by_id(&state.db, reblog.account_id).await?
+    let Some(account) = roosty_db::find_local_account_by_id(&state.db, reblog.account_id).await?
     else {
         return Ok(None);
     };
@@ -1437,7 +1438,7 @@ async fn reblog_response(
 
     let reblogged_by_viewer = viewer.is_some_and(|viewer| viewer == reblog.account_id);
     let muted = match viewer {
-        Some(viewer) => roost_db::active_local_account_mute(&state.db, viewer, reblog.account_id)
+        Some(viewer) => roosty_db::active_local_account_mute(&state.db, viewer, reblog.account_id)
             .await?
             .is_some(),
         None => false,
@@ -1476,10 +1477,10 @@ async fn reblog_response(
 
 async fn status_response_for_viewer(
     state: &AppState,
-    status: roost_db::LocalStatus,
-    account: roost_db::LocalAccount,
+    status: roosty_db::LocalStatus,
+    account: roosty_db::LocalAccount,
     viewer: Option<AccountId>,
-) -> Result<StatusResponse, RoostError> {
+) -> Result<StatusResponse, RoostyError> {
     let status_path = format!("@{}/{}", account.username, status.id.0);
     let url = public_url(state, &status_path);
     let reply_target = reply_target(state, status.in_reply_to_id).await?;
@@ -1489,34 +1490,34 @@ async fn status_response_for_viewer(
     let text_mentions = local_text_mentions(state, &status.content).await?;
     let mentions = status_mentions(state, reply_target.as_ref(), &text_mentions);
     let tags = status_tags(state, status.id).await?;
-    let replies_count = roost_db::count_local_replies(&state.db, status.id).await?;
-    let reblogs_count = roost_db::count_local_reblogs(&state.db, status.id).await?;
-    let favourites_count = roost_db::count_local_favourites(&state.db, status.id).await?;
+    let replies_count = roosty_db::count_local_replies(&state.db, status.id).await?;
+    let reblogs_count = roosty_db::count_local_reblogs(&state.db, status.id).await?;
+    let favourites_count = roosty_db::count_local_favourites(&state.db, status.id).await?;
     let favourited = match viewer {
         Some(account_id) => {
-            roost_db::is_local_status_favourited(&state.db, account_id, status.id).await?
+            roosty_db::is_local_status_favourited(&state.db, account_id, status.id).await?
         }
         None => false,
     };
     let bookmarked = match viewer {
         Some(account_id) => {
-            roost_db::is_local_status_bookmarked(&state.db, account_id, status.id).await?
+            roosty_db::is_local_status_bookmarked(&state.db, account_id, status.id).await?
         }
         None => false,
     };
     let reblogged = match viewer {
         Some(account_id) => {
-            roost_db::is_local_status_reblogged(&state.db, account_id, status.id).await?
+            roosty_db::is_local_status_reblogged(&state.db, account_id, status.id).await?
         }
         None => false,
     };
     let muted = match viewer {
-        Some(viewer) => roost_db::active_local_account_mute(&state.db, viewer, status.account_id)
+        Some(viewer) => roosty_db::active_local_account_mute(&state.db, viewer, status.account_id)
             .await?
             .is_some(),
         None => false,
     };
-    let media_attachments = roost_db::local_media_attachments_for_status(&state.db, status.id)
+    let media_attachments = roosty_db::local_media_attachments_for_status(&state.db, status.id)
         .await?
         .iter()
         .map(|media| crate::media::media_response(state, media))
@@ -1564,19 +1565,19 @@ async fn sync_status_tags(
     state: &AppState,
     status_id: StatusId,
     content: &str,
-) -> Result<(), RoostError> {
-    roost_db::replace_local_status_tags(&state.db, status_id, &hashtag_names(content)).await
+) -> Result<(), RoostyError> {
+    roosty_db::replace_local_status_tags(&state.db, status_id, &hashtag_names(content)).await
 }
 
 /// Load Mastodon tag responses attached to a local status.
 async fn status_tags(
     state: &AppState,
     status_id: StatusId,
-) -> Result<Vec<TagResponse>, RoostError> {
-    let tags = roost_db::local_tags_for_status(&state.db, status_id).await?;
+) -> Result<Vec<TagResponse>, RoostyError> {
+    let tags = roosty_db::local_tags_for_status(&state.db, status_id).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
-        let history = roost_db::local_tag_history(&state.db, tag.id).await?;
+        let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
         responses.push(TagResponse::new(state, tag, history, None));
     }
 
@@ -1587,7 +1588,7 @@ async fn status_tags(
 async fn local_text_mentions(
     state: &AppState,
     content: &str,
-) -> Result<Vec<roost_db::LocalAccount>, RoostError> {
+) -> Result<Vec<roosty_db::LocalAccount>, RoostyError> {
     let mut accounts = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1596,7 +1597,7 @@ async fn local_text_mentions(
             continue;
         }
         if let Some(account) =
-            roost_db::find_local_account_by_username(&state.db, &username).await?
+            roosty_db::find_local_account_by_username(&state.db, &username).await?
         {
             accounts.push(account);
         }
@@ -1609,7 +1610,7 @@ async fn local_text_mentions(
 fn status_mentions(
     state: &AppState,
     reply_target: Option<&ReplyTarget>,
-    text_mentions: &[roost_db::LocalAccount],
+    text_mentions: &[roosty_db::LocalAccount],
 ) -> Vec<MentionResponse> {
     let mut mentions = Vec::new();
     let mut seen = HashSet::new();
@@ -1632,16 +1633,18 @@ fn status_mentions(
 async fn reply_target(
     state: &AppState,
     in_reply_to_id: Option<StatusId>,
-) -> Result<Option<ReplyTarget>, RoostError> {
+) -> Result<Option<ReplyTarget>, RoostyError> {
     let Some(status_id) = in_reply_to_id else {
         return Ok(None);
     };
-    let Some(parent) = roost_db::find_local_status_by_id(&state.db, status_id).await? else {
+    let Some(parent) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
         return Ok(None);
     };
-    let account = roost_db::find_local_account_by_id(&state.db, parent.account_id)
+    let account = roosty_db::find_local_account_by_id(&state.db, parent.account_id)
         .await?
-        .ok_or_else(|| RoostError::InvalidInput("reply target author does not exist".to_owned()))?;
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("reply target author does not exist".to_owned())
+        })?;
 
     Ok(Some(ReplyTarget {
         account_id: parent.account_id,
@@ -1653,8 +1656,8 @@ async fn visible_status_for_account(
     state: &AppState,
     status_id: StatusId,
     account_id: AccountId,
-) -> Result<Option<roost_db::LocalStatus>, RoostError> {
-    let status = roost_db::find_local_status_by_id(&state.db, status_id).await?;
+) -> Result<Option<roosty_db::LocalStatus>, RoostyError> {
+    let status = roosty_db::find_local_status_by_id(&state.db, status_id).await?;
     match status {
         Some(status) if status_visible_to_viewer(state, &status, Some(account_id)).await? => {
             Ok(Some(status))
@@ -1666,9 +1669,9 @@ async fn visible_status_for_account(
 /// Walk visible local parent statuses from root ancestor to direct parent.
 async fn status_ancestors(
     state: &AppState,
-    status: &roost_db::LocalStatus,
+    status: &roosty_db::LocalStatus,
     viewer: Option<AccountId>,
-) -> Result<Vec<roost_db::LocalStatus>, RoostError> {
+) -> Result<Vec<roosty_db::LocalStatus>, RoostyError> {
     let mut ancestors = Vec::new();
     let mut seen = HashSet::new();
     let mut next_id = status.in_reply_to_id;
@@ -1678,7 +1681,7 @@ async fn status_ancestors(
             break;
         }
 
-        let Some(parent) = roost_db::find_local_status_by_id(&state.db, status_id).await? else {
+        let Some(parent) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
             break;
         };
         if !status_visible_to_viewer(state, &parent, viewer).await? {
@@ -1698,7 +1701,7 @@ async fn status_descendants(
     state: &AppState,
     status_id: StatusId,
     viewer: Option<AccountId>,
-) -> Result<Vec<roost_db::LocalStatus>, RoostError> {
+) -> Result<Vec<roosty_db::LocalStatus>, RoostyError> {
     let mut descendants = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::from([status_id]);
@@ -1708,7 +1711,7 @@ async fn status_descendants(
             continue;
         }
 
-        let replies = roost_db::local_replies_to_status(&state.db, parent_id).await?;
+        let replies = roosty_db::local_replies_to_status(&state.db, parent_id).await?;
         for reply in replies {
             if !status_visible_to_viewer(state, &reply, viewer).await? {
                 continue;
@@ -1729,7 +1732,7 @@ pub(crate) fn timeline_limit(limit: Option<u64>) -> u64 {
 fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputError> {
     Ok(TimelineQuery {
         limit: timeline_limit(params.limit),
-        cursor: roost_db::TimelineCursor {
+        cursor: roosty_db::TimelineCursor {
             max_id: parse_optional_status_id(params.max_id.as_deref())?,
             since_id: parse_optional_status_id(params.since_id.as_deref())?,
             min_id: parse_optional_status_id(params.min_id.as_deref())?,
@@ -1738,8 +1741,8 @@ fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputEr
 }
 
 /// Parse Mastodon cursor parameters from a local collection request.
-fn collection_cursor(params: &CollectionParams) -> Result<roost_db::CollectionCursor, ()> {
-    Ok(roost_db::CollectionCursor {
+fn collection_cursor(params: &CollectionParams) -> Result<roosty_db::CollectionCursor, ()> {
+    Ok(roosty_db::CollectionCursor {
         max_id: parse_optional_uuid(params.max_id.as_deref())?,
         since_id: parse_optional_uuid(params.since_id.as_deref())?,
         min_id: parse_optional_uuid(params.min_id.as_deref())?,
@@ -1747,7 +1750,7 @@ fn collection_cursor(params: &CollectionParams) -> Result<roost_db::CollectionCu
 }
 
 fn timeline_link_header(
-    page: &roost_db::TimelinePage<roost_db::LocalStatus>,
+    page: &roosty_db::TimelinePage<roosty_db::LocalStatus>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {
@@ -1763,7 +1766,7 @@ fn timeline_link_header(
 }
 
 fn home_timeline_link_header(
-    page: &roost_db::TimelinePage<roost_db::HomeTimelineItem>,
+    page: &roosty_db::TimelinePage<roosty_db::HomeTimelineItem>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {
@@ -1831,7 +1834,7 @@ fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
     value.map(Uuid::parse_str).transpose().map_err(|_| ())
 }
 
-fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) -> bool {
+fn can_view_status(status: &roosty_db::LocalStatus, viewer: Option<AccountId>) -> bool {
     matches!(status.visibility.as_str(), "public" | "unlisted")
         || viewer.is_some_and(|account_id| account_id == status.account_id)
 }
@@ -1839,14 +1842,14 @@ fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) ->
 /// Return whether a viewer can read a local status, including direct conversation membership.
 pub(crate) async fn status_visible_to_viewer(
     state: &AppState,
-    status: &roost_db::LocalStatus,
+    status: &roosty_db::LocalStatus,
     viewer: Option<AccountId>,
-) -> Result<bool, RoostError> {
+) -> Result<bool, RoostyError> {
     let Some(viewer) = viewer else {
         return Ok(can_view_status(status, viewer));
     };
     if viewer != status.account_id
-        && roost_db::local_accounts_are_blocked(&state.db, viewer, status.account_id).await?
+        && roosty_db::local_accounts_are_blocked(&state.db, viewer, status.account_id).await?
     {
         return Ok(false);
     }
@@ -1854,7 +1857,7 @@ pub(crate) async fn status_visible_to_viewer(
         return Ok(true);
     }
 
-    roost_db::local_status_visible_to_account(&state.db, status, viewer).await
+    roosty_db::local_status_visible_to_account(&state.db, status, viewer).await
 }
 
 #[cfg(test)]
@@ -1867,7 +1870,7 @@ fn status_content_html(content: &str) -> String {
 fn status_content_html_with_mentions_and_tags(
     state: &AppState,
     content: &str,
-    mentions: &[roost_db::LocalAccount],
+    mentions: &[roosty_db::LocalAccount],
     tags: &[TagResponse],
 ) -> String {
     let mention_urls = mentions
@@ -2137,7 +2140,7 @@ fn tag_not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "tag not found")
 }
 
-fn server_error(error: RoostError) -> Response {
+fn server_error(error: RoostyError) -> Response {
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "server_error",
@@ -2171,8 +2174,8 @@ mod tests {
     };
     use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
-    use roost_core::AccountId;
-    use roost_migration::Migrator;
+    use roosty_core::AccountId;
+    use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -2196,13 +2199,13 @@ mod tests {
                 "POST",
                 "/api/v1/statuses",
                 &token,
-                serde_json::json!({"status": "hello <roost>"}),
+                serde_json::json!({"status": "hello <roosty>"}),
             )
             .await;
 
         assert_eq!(create.status(), StatusCode::OK);
         let created = json_body(create).await;
-        assert_eq!(created["content"], "<p>hello &lt;roost&gt;</p>");
+        assert_eq!(created["content"], "<p>hello &lt;roosty&gt;</p>");
 
         let status_id = created["id"].as_str().unwrap();
         let lookup = context.get(&format!("/api/v1/statuses/{status_id}")).await;
@@ -2288,13 +2291,13 @@ mod tests {
                 "PUT",
                 &format!("/api/v1/statuses/{status_id}"),
                 &token,
-                serde_json::json!({"status": "renamed #Roost"}),
+                serde_json::json!({"status": "renamed #Roosty"}),
             )
             .await;
         assert_eq!(edit.status(), StatusCode::OK);
         assert_eq!(
             status_tag_names(&json_body(edit).await),
-            ["roost".to_owned()]
+            ["roosty".to_owned()]
         );
     }
 
@@ -2726,7 +2729,7 @@ mod tests {
         let bob_token = context
             .access_token_for("bob", "bob-direct-stream@example.com")
             .await;
-        let bob = roost_db::find_local_account_by_username(&context.db, "bob")
+        let bob = roosty_db::find_local_account_by_username(&context.db, "bob")
             .await
             .unwrap()
             .unwrap();
@@ -3500,7 +3503,7 @@ mod tests {
         let bob_token = context
             .access_token_for("bob", "bob-home-reblog@example.com")
             .await;
-        let bob = roost_db::find_local_account_by_username(&context.db, "bob")
+        let bob = roosty_db::find_local_account_by_username(&context.db, "bob")
             .await
             .unwrap()
             .unwrap();
@@ -3553,7 +3556,7 @@ mod tests {
         let bob_token = context
             .access_token_for("bob", "bob-delete-reblog@example.com")
             .await;
-        let bob = roost_db::find_local_account_by_username(&context.db, "bob")
+        let bob = roosty_db::find_local_account_by_username(&context.db, "bob")
             .await
             .unwrap()
             .unwrap();
@@ -3771,7 +3774,7 @@ mod tests {
         let bob_token = context
             .access_token_for("bob", "bob-follow-notifications@example.com")
             .await;
-        let admin = roost_db::find_local_account_by_username(&context.db, "admin")
+        let admin = roosty_db::find_local_account_by_username(&context.db, "admin")
             .await
             .unwrap()
             .unwrap();
@@ -4270,7 +4273,7 @@ mod tests {
 
     struct StatusContext {
         postgresql: PostgreSQL,
-        db: roost_db::DbConnection,
+        db: roosty_db::DbConnection,
         database_name: String,
         config: Config,
         state: AppState,
@@ -4282,7 +4285,7 @@ mod tests {
     impl AsyncTestContext for StatusContext {
         async fn setup() -> Self {
             let temp_dir = tempfile::Builder::new()
-                .prefix("roost-status-")
+                .prefix("roosty-status-")
                 .tempdir()
                 .unwrap();
             let database_name = unique_name();
@@ -4304,16 +4307,21 @@ mod tests {
             postgresql.create_database(&database_name).await.unwrap();
 
             let database_url = postgresql.settings().url(&database_name);
-            let db = roost_db::connect(&database_url).await.unwrap();
+            let db = roosty_db::connect(&database_url).await.unwrap();
             Migrator::up(&db, None).await.unwrap();
 
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
-                roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
-                    .await
-                    .unwrap(),
+                roosty_db::create_bootstrap_admin(
+                    &db,
+                    "admin",
+                    "admin@example.com",
+                    &password_hash,
+                )
+                .await
+                .unwrap(),
             );
-            let (application, _secret) = roost_db::create_oauth_application(
+            let (application, _secret) = roosty_db::create_oauth_application(
                 &db,
                 "Elk",
                 "https://localhost:4001/oauth",
@@ -4338,7 +4346,8 @@ mod tests {
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
                 federation_blocked_domains: Vec::new(),
-                instance_name: "Roost Test".to_owned(),
+                federation_delivery_max_age: time::Duration::days(7),
+                instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
 
@@ -4456,7 +4465,7 @@ mod tests {
             token: &str,
             parts: &[MultipartPart<'_>],
         ) -> axum::http::Response<Body> {
-            let boundary = "roost-test-boundary";
+            let boundary = "roosty-test-boundary";
             let mut body = Vec::new();
             for part in parts {
                 body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -4521,7 +4530,7 @@ mod tests {
         }
 
         async fn access_token(&self) -> String {
-            roost_db::create_access_token(
+            roosty_db::create_access_token(
                 &self.db,
                 &self.config.token_pepper,
                 self.account_id,
@@ -4536,11 +4545,11 @@ mod tests {
         async fn access_token_for(&self, username: &str, email: &str) -> String {
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
-                roost_db::create_local_account(&self.db, username, email, &password_hash)
+                roosty_db::create_local_account(&self.db, username, email, &password_hash)
                     .await
                     .unwrap(),
             );
-            roost_db::create_access_token(
+            roosty_db::create_access_token(
                 &self.db,
                 &self.config.token_pepper,
                 account_id,
@@ -4586,6 +4595,6 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roost_status_{}_{}", std::process::id(), timestamp)
+        format!("roosty_status_{}_{}", std::process::id(), timestamp)
     }
 }

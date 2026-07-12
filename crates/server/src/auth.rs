@@ -12,7 +12,7 @@ use axum::{
 use axum_params::{Params, UploadFile};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use roost_core::{AccountId, RoostError};
+use roosty_core::{AccountId, RoostyError};
 use serde::{
     Deserialize, Serialize,
     de::{self, DeserializeOwned, MapAccess, Visitor},
@@ -27,13 +27,13 @@ use crate::{http::AppState, password};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SESSION_COOKIE: &str = "roost_session";
+const SESSION_COOKIE: &str = "roosty_session";
 
 /// Authenticated local account extracted from an OAuth bearer token.
-pub(crate) struct AuthenticatedAccount(pub roost_db::LocalAccount);
+pub(crate) struct AuthenticatedAccount(pub roosty_db::LocalAccount);
 
 /// Optional local account extracted from an OAuth bearer token when present.
-pub(crate) struct OptionalAuthenticatedAccount(pub Option<roost_db::LocalAccount>);
+pub(crate) struct OptionalAuthenticatedAccount(pub Option<roosty_db::LocalAccount>);
 
 impl<S> FromRequestParts<S> for AuthenticatedAccount
 where
@@ -172,7 +172,7 @@ async fn login_form(State(state): State<AppState>, Query(query): Query<LoginQuer
 
 async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     let next = sanitize_next(form.next.as_deref());
-    let account = match roost_db::find_local_account_by_login(&state.db, &form.login).await {
+    let account = match roosty_db::find_local_account_by_login(&state.db, &form.login).await {
         Ok(Some(account)) => account,
         Ok(None) => return render_login(&state, &next, Some("Invalid username or password.")),
         Err(error) => return server_error(error),
@@ -216,7 +216,7 @@ fn render_login(state: &AppState, next: &str, error: Option<&str>) -> Response {
     .render()
     {
         Ok(html) => Html(html).into_response(),
-        Err(error) => server_error(RoostError::InvalidInput(error.to_string())),
+        Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
     }
 }
 
@@ -252,7 +252,7 @@ async fn register_app(
     }
 
     let scopes = form.scopes.as_deref().unwrap_or("read write follow push");
-    match roost_db::create_oauth_application(
+    match roosty_db::create_oauth_application(
         &state.db,
         &form.client_name,
         &form.redirect_uris,
@@ -295,7 +295,7 @@ struct AuthorizeParams {
 <body>
 <main>
 <h1>Authorize {{ client_name }}</h1>
-<p>This application is requesting access to your Roost account.</p>
+<p>This application is requesting access to your Roosty account.</p>
 <form method="post" action="{{ action }}">
 <input type="hidden" name="response_type" value="{{ params.response_type }}">
 <input type="hidden" name="client_id" value="{{ params.client_id }}">
@@ -344,7 +344,7 @@ async fn authorize_form(
     }
 
     let app =
-        match roost_db::find_oauth_application_by_client_id(&state.db, &params.client_id).await {
+        match roosty_db::find_oauth_application_by_client_id(&state.db, &params.client_id).await {
             Ok(Some(app)) => app,
             Ok(None) => {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client");
@@ -352,7 +352,7 @@ async fn authorize_form(
             Err(error) => return server_error(error),
         };
 
-    if roost_db::find_local_account_by_id(&state.db, account_id)
+    if roosty_db::find_local_account_by_id(&state.db, account_id)
         .await
         .ok()
         .flatten()
@@ -378,7 +378,7 @@ async fn authorize_form(
     .render()
     {
         Ok(html) => Html(html).into_response(),
-        Err(error) => server_error(RoostError::InvalidInput(error.to_string())),
+        Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
     }
 }
 
@@ -401,10 +401,10 @@ async fn authorize(
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let challenge = optional_non_empty(params.code_challenge.as_deref()).unwrap_or_default();
     let method = optional_non_empty(params.code_challenge_method.as_deref()).unwrap_or_default();
-    let code = match roost_db::create_authorization_code(
+    let code = match roosty_db::create_authorization_code(
         &state.db,
         &state.config.token_pepper,
-        roost_db::NewAuthorizationCode {
+        roosty_db::NewAuthorizationCode {
             account_id,
             application_id: app.id,
             redirect_uri: &params.redirect_uri,
@@ -441,7 +441,7 @@ async fn authorize(
 async fn validate_authorize_request(
     state: &AppState,
     params: &AuthorizeParams,
-) -> Result<roost_db::OAuthApplication, Response> {
+) -> Result<roosty_db::OAuthApplication, Response> {
     if params.response_type != "code" {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
@@ -459,7 +459,7 @@ async fn validate_authorize_request(
         ));
     }
 
-    let app = roost_db::find_oauth_application_by_client_id(&state.db, &params.client_id)
+    let app = roosty_db::find_oauth_application_by_client_id(&state.db, &params.client_id)
         .await
         .map_err(server_error)?
         .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client"))?;
@@ -501,7 +501,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         );
     }
 
-    let app = match roost_db::find_oauth_application_by_client_id(&state.db, &form.client_id).await
+    let app = match roosty_db::find_oauth_application_by_client_id(&state.db, &form.client_id).await
     {
         Ok(Some(app)) => app,
         Ok(None) => {
@@ -517,7 +517,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         );
     }
     if let Some(secret) = form.client_secret.as_deref() {
-        let supplied_hash = match roost_db::secret_hash(&state.config.token_pepper, secret) {
+        let supplied_hash = match roosty_db::secret_hash(&state.config.token_pepper, secret) {
             Ok(hash) => hash,
             Err(error) => return server_error(error),
         };
@@ -530,18 +530,20 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         }
     }
 
-    let Some((account_id, scopes, challenge, method)) = (match roost_db::consume_authorization_code(
-        &state.db,
-        &state.config.token_pepper,
-        &form.code,
-        app.id,
-        &form.redirect_uri,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => return server_error(error),
-    }) else {
+    let Some((account_id, scopes, challenge, method)) =
+        (match roosty_db::consume_authorization_code(
+            &state.db,
+            &state.config.token_pepper,
+            &form.code,
+            app.id,
+            &form.redirect_uri,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return server_error(error),
+        })
+    else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -554,7 +556,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
             || form
                 .code_verifier
                 .as_deref()
-                .is_none_or(|verifier| roost_db::pkce_s256_challenge(verifier) != challenge))
+                .is_none_or(|verifier| roosty_db::pkce_s256_challenge(verifier) != challenge))
     {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -563,7 +565,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         );
     }
 
-    match roost_db::create_access_token(
+    match roosty_db::create_access_token(
         &state.db,
         &state.config.token_pepper,
         account_id,
@@ -592,7 +594,7 @@ async fn revoke(
     State(state): State<AppState>,
     FormOrJson(form): FormOrJson<RevokeForm>,
 ) -> Response {
-    match roost_db::revoke_access_token(&state.db, &state.config.token_pepper, &form.token).await {
+    match roosty_db::revoke_access_token(&state.db, &state.config.token_pepper, &form.token).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => server_error(error),
     }
@@ -861,7 +863,7 @@ async fn update_credentials(
         Err(error) => return bad_request(&error.to_string()),
     };
 
-    match roost_db::update_local_account_settings(&state.db, account.id, update).await {
+    match roosty_db::update_local_account_settings(&state.db, account.id, update).await {
         Ok(account) => match account_response(&state, account).await {
             Ok(account) => Json(account).into_response(),
             Err(error) => server_error(error),
@@ -874,7 +876,7 @@ async fn update_credentials(
 pub(crate) async fn authenticated_account(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<roost_db::LocalAccount, Response> {
+) -> Result<roosty_db::LocalAccount, Response> {
     let bearer = bearer_token(headers).ok_or_else(|| {
         oauth_error(
             StatusCode::UNAUTHORIZED,
@@ -890,7 +892,7 @@ pub(crate) async fn authenticated_account(
 pub(crate) async fn optional_authenticated_account(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<Option<roost_db::LocalAccount>, Response> {
+) -> Result<Option<roosty_db::LocalAccount>, Response> {
     let Some(bearer) = bearer_token(headers) else {
         return Ok(None);
     };
@@ -902,8 +904,8 @@ pub(crate) async fn optional_authenticated_account(
 pub(crate) async fn account_from_bearer_token(
     state: &AppState,
     bearer: &str,
-) -> Result<roost_db::LocalAccount, Response> {
-    roost_db::find_account_by_access_token(&state.db, &state.config.token_pepper, bearer)
+) -> Result<roosty_db::LocalAccount, Response> {
+    roosty_db::find_account_by_access_token(&state.db, &state.config.token_pepper, bearer)
         .await
         .map_err(server_error)?
         .map(|(account, _scopes)| account)
@@ -913,8 +915,8 @@ pub(crate) async fn account_from_bearer_token(
 /// Build the Mastodon-compatible credential account response.
 pub(crate) async fn account_response(
     state: &AppState,
-    account: roost_db::LocalAccount,
-) -> Result<AccountResponse, RoostError> {
+    account: roosty_db::LocalAccount,
+) -> Result<AccountResponse, RoostyError> {
     let account_url = match state
         .config
         .public_base_url
@@ -929,10 +931,11 @@ pub(crate) async fn account_response(
     } else {
         account.display_name.clone()
     };
-    let statuses_count = roost_db::count_local_statuses_by_account(&state.db, account.id).await?;
-    let followers_count = roost_db::count_local_followers(&state.db, account.id).await?;
-    let following_count = roost_db::count_local_following(&state.db, account.id).await?;
-    let last_status_at = roost_db::last_local_status_at(&state.db, account.id)
+    let statuses_count = roosty_db::count_local_statuses_by_account(&state.db, account.id).await?;
+    let followers_count = roosty_db::count_local_followers(&state.db, account.id).await?
+        + roosty_db::count_remote_followers(&state.db, account.id).await?;
+    let following_count = roosty_db::count_local_following(&state.db, account.id).await?;
+    let last_status_at = roosty_db::last_local_status_at(&state.db, account.id)
         .await?
         .map(|timestamp| DateOnly(timestamp).to_string());
     let avatar = account
@@ -1010,7 +1013,7 @@ impl fmt::Display for DateOnly {
 /// Convert parsed update input into a validated database update.
 fn settings_update_from_input(
     input: UpdateCredentialsInput,
-) -> Result<roost_db::LocalAccountSettingsUpdate, UpdateCredentialsError> {
+) -> Result<roosty_db::LocalAccountSettingsUpdate, UpdateCredentialsError> {
     if let Some(visibility) = input.default_visibility.as_deref() {
         validate_visibility(visibility)?;
     }
@@ -1021,7 +1024,7 @@ fn settings_update_from_input(
         validate_language(language)?;
     }
 
-    Ok(roost_db::LocalAccountSettingsUpdate {
+    Ok(roosty_db::LocalAccountSettingsUpdate {
         display_name: input.display_name,
         note: input.note,
         locked: input.locked,
@@ -1093,11 +1096,11 @@ async fn store_profile_image(
     account_id: AccountId,
     kind: &str,
     upload: ProfileImageUpload,
-) -> Result<String, RoostError> {
+) -> Result<String, RoostyError> {
     let extension = crate::media::supported_image_extension(&upload.content_type)
-        .ok_or_else(|| RoostError::InvalidInput("profile image type is invalid".to_owned()))?;
+        .ok_or_else(|| RoostyError::InvalidInput("profile image type is invalid".to_owned()))?;
     image::load_from_memory(&upload.bytes)
-        .map_err(|error| RoostError::InvalidInput(format!("profile image is invalid: {error}")))?;
+        .map_err(|error| RoostyError::InvalidInput(format!("profile image is invalid: {error}")))?;
 
     let relative_path = format!(
         "accounts/{}/{}-{}.{}",
@@ -1231,7 +1234,7 @@ fn profile_field(name: String, value: String) -> Option<Value> {
 fn account_id_from_session(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<Option<AccountId>, RoostError> {
+) -> Result<Option<AccountId>, RoostyError> {
     let Some(cookie_header) = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -1249,7 +1252,7 @@ fn account_id_from_session(
     parse_session_cookie(&state.config.session_secret, cookie_value)
 }
 
-fn session_cookie(state: &AppState, account_id: AccountId) -> Result<String, RoostError> {
+fn session_cookie(state: &AppState, account_id: AccountId) -> Result<String, RoostyError> {
     let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
     let payload = format!("{}.{}", account_id.0, expires_at.unix_timestamp());
     let signature = sign(&state.config.session_secret, &payload)?;
@@ -1258,7 +1261,7 @@ fn session_cookie(state: &AppState, account_id: AccountId) -> Result<String, Roo
     ))
 }
 
-fn parse_session_cookie(secret: &str, value: &str) -> Result<Option<AccountId>, RoostError> {
+fn parse_session_cookie(secret: &str, value: &str) -> Result<Option<AccountId>, RoostyError> {
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return Ok(None);
@@ -1282,9 +1285,9 @@ fn parse_session_cookie(secret: &str, value: &str) -> Result<Option<AccountId>, 
     Ok(Some(AccountId(account_id)))
 }
 
-fn sign(secret: &str, payload: &str) -> Result<String, RoostError> {
+fn sign(secret: &str, payload: &str) -> Result<String, RoostyError> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|error| RoostError::InvalidInput(error.to_string()))?;
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     mac.update(payload.as_bytes());
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
@@ -1367,7 +1370,7 @@ fn bad_request(description: &str) -> Response {
     oauth_error(StatusCode::BAD_REQUEST, "invalid_request", description)
 }
 
-fn server_error(error: RoostError) -> Response {
+fn server_error(error: RoostyError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
@@ -1409,7 +1412,7 @@ mod tests {
     };
     use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
-    use roost_migration::Migrator;
+    use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1459,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn registers_elk_oauth_app_from_json(context: &mut EndpointContext) {
         let redirect_uri =
-            "https://localhost:4001/api/roost.localhost:4000/oauth/https%3A%2F%2Flocalhost%3A4001";
+            "https://localhost:4001/api/roosty.localhost:4000/oauth/https%3A%2F%2Flocalhost%3A4001";
         let response = context
             .json(
                 "POST",
@@ -1528,7 +1531,7 @@ mod tests {
             header_value(&response, LOCATION),
             "https://localhost:4000/oauth/authorize"
         );
-        assert!(session_cookie(&response).starts_with("roost_session="));
+        assert!(session_cookie(&response).starts_with("roosty_session="));
     }
 
     #[test_context(EndpointContext)]
@@ -2160,7 +2163,7 @@ mod tests {
 
     struct EndpointContext {
         postgresql: PostgreSQL,
-        db: roost_db::DbConnection,
+        db: roosty_db::DbConnection,
         database_name: String,
         config: Config,
         _temp_dir: TempDir,
@@ -2169,7 +2172,7 @@ mod tests {
     impl AsyncTestContext for EndpointContext {
         async fn setup() -> Self {
             let temp_dir = tempfile::Builder::new()
-                .prefix("roost-server-")
+                .prefix("roosty-server-")
                 .tempdir()
                 .unwrap();
             let database_name = unique_name();
@@ -2191,11 +2194,11 @@ mod tests {
             postgresql.create_database(&database_name).await.unwrap();
 
             let database_url = postgresql.settings().url(&database_name);
-            let db = roost_db::connect(&database_url).await.unwrap();
+            let db = roosty_db::connect(&database_url).await.unwrap();
             Migrator::up(&db, None).await.unwrap();
 
             let password_hash = password::hash_password("password").unwrap();
-            roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
+            roosty_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
                 .await
                 .unwrap();
 
@@ -2213,7 +2216,8 @@ mod tests {
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
                 federation_blocked_domains: Vec::new(),
-                instance_name: "Roost Test".to_owned(),
+                federation_delivery_max_age: time::Duration::days(7),
+                instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
 
@@ -2478,6 +2482,6 @@ mod tests {
             .expect("system time is before the Unix epoch")
             .as_nanos();
 
-        format!("roost_server_{}_{}", std::process::id(), timestamp)
+        format!("roosty_server_{}_{}", std::process::id(), timestamp)
     }
 }

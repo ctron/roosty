@@ -1,0 +1,52 @@
+services:
+  roosty:
+    image: ghcr.io/jreimann/mastodon-rs:${ROOSTY_IMAGE_TAG:-main}
+    command: ["serve", "--with-migrations", "--with-worker"]
+    env_file:
+      - .env
+      - secrets.env
+    environment:
+      ROOSTY_LISTEN_ADDR: 0.0.0.0:4000
+      ROOSTY_INFRA_LISTEN_ADDR: 0.0.0.0:3001
+      ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
+    volumes:
+      - roosty-media:/var/lib/roosty/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - roosty
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    env_file: secrets.env
+    environment:
+      POSTGRES_DB: roosty
+      POSTGRES_USER: roosty
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roosty -d roosty"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    restart: unless-stopped
+
+volumes:
+  caddy-config:
+  caddy-data:
+  postgres-data:
+  roosty-media:

@@ -8,17 +8,17 @@ COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/cargo-target \
-    CARGO_TARGET_DIR=/cargo-target cargo build --release --locked -p roost \
-    && cp /cargo-target/release/roost /usr/local/bin/roost
+    CARGO_TARGET_DIR=/cargo-target cargo build --release --locked -p roosty \
+    && cp /cargo-target/release/roosty /usr/local/bin/roosty
 
 FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && install -d -o 65532 -g 65532 /var/lib/roost/media \
+    && install -d -o 65532 -g 65532 /var/lib/roosty/media \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/bin/roost /usr/local/bin/roost
+COPY --from=builder /usr/local/bin/roosty /usr/local/bin/roosty
 
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/roost"]
+ENTRYPOINT ["/usr/local/bin/roosty"]

@@ -1,0 +1,11 @@
+---
+roosty_domain: roosty.example.com
+roosty_acme_email: admin@example.com
+roosty_image_tag: main
+roosty_instance_name: Roosty
+roosty_instance_description: A Roosty instance
+roosty_registration_mode: closed
+roosty_federation_enabled: false
+roosty_federation_allowed_domains: []
+roosty_federation_blocked_domains: []
+roosty_federation_delivery_max_age: 7d

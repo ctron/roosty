@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use postgresql_embedded::{PostgreSQL, Settings, SettingsBuilder, VersionReq};
-use roost_migration::Migrator;
+use roosty_migration::Migrator;
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use tempfile::TempDir;
@@ -220,7 +220,7 @@ struct EmbeddedDatabase {
 impl AsyncTestContext for EmbeddedDatabase {
     async fn setup() -> Self {
         let temp_dir = tempfile::Builder::new()
-            .prefix("roost-migration-")
+            .prefix("roosty-migration-")
             .tempdir()
             .unwrap();
         let root = temp_dir.path();
@@ -287,7 +287,7 @@ fn unique_name() -> String {
         .expect("system time is before the Unix epoch")
         .as_nanos();
 
-    format!("roost_migration_{}_{}", std::process::id(), timestamp)
+    format!("roosty_migration_{}_{}", std::process::id(), timestamp)
 }
 
 async fn table_exists(connection: &DatabaseConnection, table_name: &str) -> bool {

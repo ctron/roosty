@@ -1,5 +1,5 @@
 [package]
-name = "roost-db"
+name = "roosty-db"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-roost-core = { workspace = true }
+roosty-core = { workspace = true }
 base64 = { workspace = true }
 hmac = { workspace = true }
 rand_core = { workspace = true }

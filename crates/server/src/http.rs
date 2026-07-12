@@ -21,14 +21,14 @@ pub struct AppState {
     /// Validated application configuration.
     pub config: Arc<Config>,
     /// Database connection pool.
-    pub db: roost_db::DbConnection,
+    pub db: roosty_db::DbConnection,
     /// In-process Mastodon streaming event bus.
     pub streaming_events: crate::streaming::StreamingEvents,
 }
 
 impl AppState {
     /// Create shared application state from config and database connection.
-    pub fn new(config: Config, db: roost_db::DbConnection) -> Self {
+    pub fn new(config: Config, db: roosty_db::DbConnection) -> Self {
         Self {
             config: Arc::new(config),
             db,
@@ -120,7 +120,7 @@ async fn healthz() -> &'static str {
 
 /// Check whether the server can reach its configured database.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    match roost_db::ping(&state.db).await {
+    match roosty_db::ping(&state.db).await {
         Ok(()) => (StatusCode::OK, "ok\n").into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -135,12 +135,12 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let federation_enabled = u8::from(state.config.federation_enabled);
     let body = format!(
         concat!(
-            "# HELP roost_process_up Process liveness marker.\n",
-            "# TYPE roost_process_up gauge\n",
-            "roost_process_up 1\n",
-            "# HELP roost_federation_enabled Federation enabled configuration flag.\n",
-            "# TYPE roost_federation_enabled gauge\n",
-            "roost_federation_enabled {}\n",
+            "# HELP roosty_process_up Process liveness marker.\n",
+            "# TYPE roosty_process_up gauge\n",
+            "roosty_process_up 1\n",
+            "# HELP roosty_federation_enabled Federation enabled configuration flag.\n",
+            "# TYPE roosty_federation_enabled gauge\n",
+            "roosty_federation_enabled {}\n",
         ),
         federation_enabled
     );

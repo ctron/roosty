@@ -3,7 +3,7 @@ use strum::IntoStaticStr;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use roost_core::AccountId;
+use roosty_core::AccountId;
 
 /// In-process event bus for Mastodon streaming API compatibility.
 #[derive(Clone)]
@@ -245,7 +245,7 @@ fn streaming_delete_message(
 
 #[cfg(test)]
 mod tests {
-    use roost_core::AccountId;
+    use roosty_core::AccountId;
     use serde_json::Value;
     use uuid::Uuid;
 

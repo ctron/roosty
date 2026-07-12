@@ -13,7 +13,7 @@ use axum::{
 };
 use axum_params::{Params, UploadFile};
 use image::{GenericImageView, ImageFormat, ImageReader};
-use roost_core::{AccountId, RoostError};
+use roosty_core::{AccountId, RoostyError};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::task;
@@ -80,7 +80,7 @@ pub(crate) fn supported_image_mime_types() -> Vec<&'static str> {
         .collect()
 }
 
-/// Return whether a content type is one of the image types Roost accepts locally.
+/// Return whether a content type is one of the image types Roosty accepts locally.
 pub(crate) fn supported_image_extension(content_type: &str) -> Option<&'static str> {
     SUPPORTED_IMAGE_FORMATS
         .iter()
@@ -306,7 +306,7 @@ async fn upload_media(
     {
         Ok(media) => Json(media_response(&state, &media)).into_response(),
         Err(MediaStoreError::Validation(error)) => unprocessable(&error),
-        Err(MediaStoreError::Roost(error)) => server_error(error),
+        Err(MediaStoreError::Roosty(error)) => server_error(error),
     }
 }
 
@@ -315,7 +315,7 @@ async fn get_media(
     AuthenticatedAccount(account): AuthenticatedAccount,
     AxumPath(path): AxumPath<MediaPath>,
 ) -> Response {
-    match roost_db::find_owned_unattached_media_attachment(&state.db, account.id, path.media_id)
+    match roosty_db::find_owned_unattached_media_attachment(&state.db, account.id, path.media_id)
         .await
     {
         Ok(Some(media)) => Json(media_response(&state, &media)).into_response(),
@@ -345,15 +345,15 @@ async fn update_media(
     let preview = match replacement_preview(&state, path.media_id, thumbnail).await {
         Ok(preview) => preview,
         Err(MediaStoreError::Validation(error)) => return unprocessable(&error),
-        Err(MediaStoreError::Roost(error)) => return server_error(error),
+        Err(MediaStoreError::Roosty(error)) => return server_error(error),
     };
-    let update = roost_db::LocalMediaAttachmentUpdate {
+    let update = roosty_db::LocalMediaAttachmentUpdate {
         description,
         focus,
         preview,
     };
 
-    match roost_db::update_owned_unattached_media_attachment(
+    match roosty_db::update_owned_unattached_media_attachment(
         &state.db,
         account.id,
         path.media_id,
@@ -372,7 +372,7 @@ async fn delete_media(
     AuthenticatedAccount(account): AuthenticatedAccount,
     AxumPath(path): AxumPath<MediaPath>,
 ) -> Response {
-    match roost_db::delete_owned_unattached_media_attachment(&state.db, account.id, path.media_id)
+    match roosty_db::delete_owned_unattached_media_attachment(&state.db, account.id, path.media_id)
         .await
     {
         Ok(Some(media)) => {
@@ -411,7 +411,7 @@ async fn serve_media_attachment(
 /// Build a local media response from stored metadata.
 pub(crate) fn media_response(
     state: &AppState,
-    media: &roost_db::LocalMediaAttachment,
+    media: &roosty_db::LocalMediaAttachment,
 ) -> MediaAttachmentResponse {
     let url = media_url(state, &media.file_path);
     let preview_url = media
@@ -440,7 +440,7 @@ async fn store_upload(
     format: SupportedImageFormat,
     description: Option<String>,
     focus: Option<(f64, f64)>,
-) -> Result<roost_db::LocalMediaAttachment, MediaStoreError> {
+) -> Result<roosty_db::LocalMediaAttachment, MediaStoreError> {
     let media_id = Uuid::now_v7();
     let relative_path = relative_media_path(media_id, "", format.extension);
     let preview_path = relative_media_path(media_id, "small", "png");
@@ -461,7 +461,7 @@ async fn store_upload(
     tokio::fs::write(&full_path, &original_bytes).await?;
     tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
-    let media = roost_db::NewLocalMediaAttachment {
+    let media = roosty_db::NewLocalMediaAttachment {
         account_id,
         content_type: format.content_type.to_owned(),
         original_filename,
@@ -477,9 +477,9 @@ async fn store_upload(
         preview_height: Some(processed.preview_height),
         blurhash: Some(processed.blurhash),
     };
-    roost_db::create_local_media_attachment(&state.db, media)
+    roosty_db::create_local_media_attachment(&state.db, media)
         .await
-        .map_err(MediaStoreError::Roost)
+        .map_err(MediaStoreError::Roosty)
 }
 
 /// Build replacement preview metadata from a custom thumbnail upload.
@@ -487,7 +487,7 @@ async fn replacement_preview(
     state: &AppState,
     media_id: Uuid,
     thumbnail: Option<UploadFile>,
-) -> Result<Option<roost_db::LocalMediaPreviewUpdate>, MediaStoreError> {
+) -> Result<Option<roosty_db::LocalMediaPreviewUpdate>, MediaStoreError> {
     let Some(thumbnail) = thumbnail else {
         return Ok(None);
     };
@@ -505,7 +505,7 @@ async fn replacement_preview(
     .await?;
     tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
-    Ok(Some(roost_db::LocalMediaPreviewUpdate {
+    Ok(Some(roosty_db::LocalMediaPreviewUpdate {
         preview_file_path: preview_path,
         preview_width: processed.preview_width,
         preview_height: processed.preview_height,
@@ -578,7 +578,7 @@ async fn process_image(
         })
     })
     .await
-    .map_err(|error| MediaStoreError::Roost(RoostError::InvalidInput(error.to_string())))?
+    .map_err(|error| MediaStoreError::Roosty(RoostyError::InvalidInput(error.to_string())))?
 }
 
 /// Decode bytes using the MIME-derived image format accepted by upload validation.
@@ -597,11 +597,11 @@ fn decode_image_guessed(bytes: &[u8]) -> Result<image::DynamicImage, MediaStoreE
 }
 
 /// Ensure media writes use the local filesystem backend implemented by this module.
-fn ensure_local_storage(state: &AppState) -> Result<(), RoostError> {
+fn ensure_local_storage(state: &AppState) -> Result<(), RoostyError> {
     if state.config.object_storage_backend == "local" {
         Ok(())
     } else {
-        Err(RoostError::Configuration(format!(
+        Err(RoostyError::Configuration(format!(
             "unsupported object storage backend: {}",
             state.config.object_storage_backend
         )))
@@ -653,7 +653,7 @@ fn parse_focus(value: Option<&str>) -> Result<Option<(f64, f64)>, String> {
 }
 
 /// Build Mastodon-compatible structured metadata from stored local media metadata.
-fn media_meta(media: &roost_db::LocalMediaAttachment) -> MediaMeta {
+fn media_meta(media: &roosty_db::LocalMediaAttachment) -> MediaMeta {
     MediaMeta {
         original: image_meta(media.width, media.height),
         small: image_meta(media.preview_width, media.preview_height),
@@ -767,7 +767,7 @@ fn not_found() -> Response {
         .into_response()
 }
 
-fn server_error(error: RoostError) -> Response {
+fn server_error(error: RoostyError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ApiError::new(error.to_string())),
@@ -780,11 +780,11 @@ enum MediaStoreError {
     #[error("{0}")]
     Validation(String),
     #[error(transparent)]
-    Roost(#[from] RoostError),
+    Roosty(#[from] RoostyError),
 }
 
 impl From<std::io::Error> for MediaStoreError {
     fn from(error: std::io::Error) -> Self {
-        Self::Roost(RoostError::from(error))
+        Self::Roosty(RoostyError::from(error))
     }
 }

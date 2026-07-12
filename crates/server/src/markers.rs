@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use roost_db::{LocalTimeline, LocalTimelineMarker};
+use roosty_db::{LocalTimeline, LocalTimelineMarker};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -64,7 +64,7 @@ async fn markers(
         .filter_map(|timeline| parse_timeline(timeline))
         .collect::<Vec<_>>();
 
-    match roost_db::local_timeline_markers_for_account(&state.db, account.id, &timelines).await {
+    match roosty_db::local_timeline_markers_for_account(&state.db, account.id, &timelines).await {
         Ok(markers) => Json(marker_response_map(markers)).into_response(),
         Err(error) => server_error(error),
     }
@@ -82,7 +82,7 @@ async fn save_markers(
     };
     let mut markers = Vec::with_capacity(updates.len());
     for (timeline, last_read_id) in updates {
-        match roost_db::save_local_timeline_marker(&state.db, account.id, timeline, last_read_id)
+        match roosty_db::save_local_timeline_marker(&state.db, account.id, timeline, last_read_id)
             .await
         {
             Ok(marker) => markers.push(marker),
@@ -164,7 +164,7 @@ fn bad_request() -> Response {
 }
 
 /// Return an internal error without exposing database details to the client.
-fn server_error(error: roost_core::RoostError) -> Response {
+fn server_error(error: roosty_core::RoostyError) -> Response {
     tracing::warn!(%error, "marker request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,

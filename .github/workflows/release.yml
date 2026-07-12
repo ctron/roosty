@@ -25,7 +25,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "roost") | .version')"
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "roosty") | .version')"
           case "$RELEASE_TAG" in
             "$version"|"v$version") ;;
             *)
@@ -36,7 +36,7 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: cargo build --release --locked -p roost
+        run: cargo build --release --locked -p roosty
 
       - name: Package release binary
         id: package
@@ -44,9 +44,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          asset="roost-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          asset="roosty-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
           mkdir -p dist
-          tar -C target/release -czf "dist/$asset" roost
+          tar -C target/release -czf "dist/$asset" roosty
           sha256sum "dist/$asset" > "dist/$asset.sha256"
           printf 'asset=%s\n' "$asset" >> "$GITHUB_OUTPUT"
 

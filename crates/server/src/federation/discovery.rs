@@ -9,7 +9,7 @@ use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE},
 };
-use roost_core::{Result, RoostError};
+use roosty_core::{Result, RoostyError};
 use serde::Deserialize;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use url::Url;
@@ -66,10 +66,14 @@ struct RemotePublicKey {
 }
 
 /// Resolve and cache a remote actor after applying the configured network policy.
-pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<roost_db::RemoteActor> {
+pub async fn resolve_remote_actor(
+    state: &AppState,
+    handle: &str,
+) -> Result<roosty_db::RemoteActor> {
     let (username, domain) = parse_remote_handle(handle)?;
     let domain = domain.to_ascii_lowercase();
-    if let Some(actor) = roost_db::find_remote_actor_by_handle(&state.db, username, &domain).await?
+    if let Some(actor) =
+        roosty_db::find_remote_actor_by_handle(&state.db, username, &domain).await?
         && actor.expires_at > OffsetDateTime::now_utc()
     {
         return Ok(actor);
@@ -99,8 +103,8 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<roos
         Url::parse(&actor_url).map_err(|_| invalid("WebFinger actor URL is invalid"))?;
     let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
     validate_actor_document(&document, &actor_url, username, &domain)?;
-    let actor = roost_db::RemoteActor {
-        id: roost_core::AccountId(Uuid::now_v7()),
+    let actor = roosty_db::RemoteActor {
+        id: roosty_core::AccountId(Uuid::now_v7()),
         activitypub_id: document.id,
         username: document.preferred_username,
         domain,
@@ -112,7 +116,62 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<roos
         public_key_pem: document.public_key.public_key_pem,
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
     };
-    roost_db::upsert_remote_actor(&state.db, &actor).await
+    roosty_db::upsert_remote_actor(&state.db, &actor).await
+}
+
+/// Resolve an actor by canonical ActivityPub ID for an authenticated inbox activity.
+pub async fn resolve_remote_actor_by_id(
+    state: &AppState,
+    activitypub_id: &str,
+) -> Result<roosty_db::RemoteActor> {
+    if let Some(actor) =
+        roosty_db::find_remote_actor_by_activitypub_id(&state.db, activitypub_id).await?
+        && actor.expires_at > OffsetDateTime::now_utc()
+    {
+        return Ok(actor);
+    }
+    let actor_url =
+        Url::parse(activitypub_id).map_err(|_| invalid("remote actor ID is invalid"))?;
+    let domain = actor_url
+        .host_str()
+        .ok_or_else(|| invalid("remote actor ID has no host"))?
+        .to_ascii_lowercase();
+    let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
+    if document.actor_type != "Person"
+        || document.id != activitypub_id
+        || document.preferred_username.is_empty()
+        || document.public_key.owner != document.id
+        || document.public_key.id.is_empty()
+        || document.public_key.public_key_pem.is_empty()
+    {
+        return Err(invalid("remote actor document is invalid"));
+    }
+    let inbox =
+        Url::parse(&document.inbox).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
+    if inbox.scheme() != "https"
+        || inbox
+            .host_str()
+            .is_none_or(|host| !host.eq_ignore_ascii_case(&domain))
+    {
+        return Err(invalid("remote actor inbox is outside its actor domain"));
+    }
+    roosty_db::upsert_remote_actor(
+        &state.db,
+        &roosty_db::RemoteActor {
+            id: roosty_core::AccountId(Uuid::now_v7()),
+            activitypub_id: document.id,
+            username: document.preferred_username,
+            domain,
+            display_name: document.name,
+            summary: document.summary,
+            inbox_url: document.inbox,
+            shared_inbox_url: document.endpoints.shared_inbox,
+            public_key_id: document.public_key.id,
+            public_key_pem: document.public_key.public_key_pem,
+            expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
+        },
+    )
+    .await
 }
 
 /// Fetch a JSON document with policy revalidation before every request.
@@ -170,7 +229,7 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
 }
 
 /// Enforce HTTPS, exact domain policy, and public DNS resolution before connecting.
-async fn validate_remote_url(state: &AppState, url: &Url) -> Result<SocketAddr> {
+pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<SocketAddr> {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return Err(invalid("remote URL must be an unauthenticated HTTPS URL"));
     }
@@ -316,8 +375,8 @@ fn is_unsafe_address(address: IpAddr) -> bool {
     }
 }
 
-fn invalid(message: &str) -> RoostError {
-    RoostError::InvalidInput(message.to_owned())
+fn invalid(message: &str) -> RoostyError {
+    RoostyError::InvalidInput(message.to_owned())
 }
 
 #[cfg(test)]

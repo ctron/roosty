@@ -15,9 +15,9 @@ license = "Apache-2.0"
 repository = "https://github.com/jreimann/mastodon-rs"
 
 [workspace.dependencies]
-roost-core = { path = "crates/core" }
-roost-db = { path = "crates/db" }
-roost-migration = { path = "crates/migration" }
+roosty-core = { path = "crates/core" }
+roosty-db = { path = "crates/db" }
+roosty-migration = { path = "crates/migration" }
 
 argon2 = "0.5.3"
 askama = "0.12.1"
@@ -27,6 +27,8 @@ base64 = "0.22.1"
 blurhash = "0.2.3"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 hmac = "0.12.1"
+humantime = "2.3.0"
+httpdate = "1.0.3"
 image = "0.25.10"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 ring = "0.17.14"
@@ -39,7 +41,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde_qs = "1.1.2"
 serde_urlencoded = "0.7.1"
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", features = ["oid"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "macros"] }
 strum = { version = "0.27.2", features = ["derive"] }
 test-context = "0.5.8"

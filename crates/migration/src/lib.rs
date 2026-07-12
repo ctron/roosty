@@ -24,6 +24,9 @@ mod m20260701_000019_create_local_timeline_marker_table;
 mod m20260701_000020_create_local_account_moderation_tables;
 mod m20260701_000021_create_local_actor_key_table;
 mod m20260701_000022_create_remote_actor_table;
+mod m20260701_000023_create_remote_follow_tables;
+mod m20260701_000024_allow_remote_notification_actors;
+mod m20260701_000025_constrain_job_attempts_nonnegative;
 
 pub struct Migrator;
 
@@ -53,6 +56,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000020_create_local_account_moderation_tables::Migration),
             Box::new(m20260701_000021_create_local_actor_key_table::Migration),
             Box::new(m20260701_000022_create_remote_actor_table::Migration),
+            Box::new(m20260701_000023_create_remote_follow_tables::Migration),
+            Box::new(m20260701_000024_allow_remote_notification_actors::Migration),
+            Box::new(m20260701_000025_constrain_job_attempts_nonnegative::Migration),
         ]
     }
 }

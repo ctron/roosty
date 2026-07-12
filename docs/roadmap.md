@@ -40,6 +40,17 @@
 
 ## Short Term
 
+- [x] Harden inbound remote follow handling with signed HTTP `Date` freshness checks and activity-ID idempotency.
+- [ ] Add replay protection beyond activity-ID idempotency where remote actors reuse or omit canonical activity IDs.
+- Add cursor pagination and `Link` headers to remote follow-request listing.
+- [x] Retry federation deliveries with exponential backoff until the operator-configured `ROOSTY_FEDERATION_DELIVERY_MAX_AGE` horizon, then record permanent failures and emit diagnostics.
+- Add signature, retry, and two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, and Undo.
+- Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
+- Apply local mute/block policy to remote follow requests and remote follow notifications.
+- Enrich remote account projections with profile media and remote relationship/status counts as those data become available.
+- Implement local-to-remote Follow and Undo(Follow) initiation and relationship state.
+- Add remote public status Create/Update/Delete delivery, caching, and home-timeline fan-out.
+- Add remote replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Fill Mastodon client startup gaps found by Elk and browser logs.
 - Improve local account administration now that multiple local users can be operator-created.
 - Extend the safe, allow-listed WebFinger remote-account lookup to account search and controlled cache refresh.

@@ -1,0 +1,6 @@
+---
+- name: Deploy Roosty with Docker Compose
+  hosts: roosty
+  become: true
+  roles:
+    - roosty

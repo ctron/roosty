@@ -165,6 +165,6 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add remote ActivityPub `Announce` support.
 - [ ] Add remote hashtag support.
 - [ ] Add grouped notifications, push integration, and remote notification events.
-- [ ] Support multiple Roost processes with shared streaming fan-out and cross-process coordination.
+- [ ] Support multiple Roosty processes with shared streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.

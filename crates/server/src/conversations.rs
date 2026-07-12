@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use roost_core::{AccountId, RoostError, StatusId};
+use roosty_core::{AccountId, RoostyError, StatusId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -72,7 +72,7 @@ async fn conversations(
         Err(()) => return bad_request("conversation cursor is invalid"),
     };
 
-    match roost_db::local_conversations_for_account(&state.db, account.id, limit, cursor).await {
+    match roosty_db::local_conversations_for_account(&state.db, account.id, limit, cursor).await {
         Ok(page) => conversation_page_response(&state, account.id, page, limit).await,
         Err(error) => server_error(error),
     }
@@ -84,7 +84,7 @@ async fn delete_conversation(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ConversationPath>,
 ) -> Response {
-    match roost_db::hide_local_conversation(&state.db, account.id, path.conversation_id).await {
+    match roosty_db::hide_local_conversation(&state.db, account.id, path.conversation_id).await {
         Ok(true) => Json(json!({})).into_response(),
         Ok(false) => not_found(),
         Err(error) => server_error(error),
@@ -97,7 +97,7 @@ async fn read_conversation(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ConversationPath>,
 ) -> Response {
-    match roost_db::mark_local_conversation_read(&state.db, account.id, path.conversation_id).await
+    match roosty_db::mark_local_conversation_read(&state.db, account.id, path.conversation_id).await
     {
         Ok(Some(conversation)) => {
             match conversation_response(&state, account.id, conversation).await {
@@ -113,7 +113,7 @@ async fn read_conversation(
 async fn conversation_page_response(
     state: &AppState,
     account_id: AccountId,
-    page: roost_db::CollectionPage<roost_db::LocalConversationView>,
+    page: roosty_db::CollectionPage<roosty_db::LocalConversationView>,
     limit: u64,
 ) -> Response {
     let link_header = CollectionLink::new(
@@ -141,8 +141,8 @@ async fn conversation_page_response(
 async fn conversation_response(
     state: &AppState,
     account_id: AccountId,
-    view: roost_db::LocalConversationView,
-) -> Result<ConversationResponse, RoostError> {
+    view: roosty_db::LocalConversationView,
+) -> Result<ConversationResponse, RoostyError> {
     let accounts = conversation_accounts(state, account_id, view.conversation.id).await?;
     let last_status = match view.conversation.last_status_id {
         Some(status_id) => conversation_status(state, account_id, status_id).await?,
@@ -161,8 +161,8 @@ async fn conversation_response(
 pub(crate) async fn publish_conversation_update(
     state: &AppState,
     conversation_id: Uuid,
-) -> Result<(), RoostError> {
-    for view in roost_db::local_conversation_views(&state.db, conversation_id).await? {
+) -> Result<(), RoostyError> {
+    for view in roosty_db::local_conversation_views(&state.db, conversation_id).await? {
         let account_id = view.account.account_id;
         let response = conversation_response(state, account_id, view).await?;
         state
@@ -177,9 +177,9 @@ async fn conversation_accounts(
     state: &AppState,
     account_id: AccountId,
     conversation_id: Uuid,
-) -> Result<Vec<AccountResponse>, RoostError> {
+) -> Result<Vec<AccountResponse>, RoostyError> {
     let participants =
-        roost_db::local_conversation_participants(&state.db, conversation_id).await?;
+        roosty_db::local_conversation_participants(&state.db, conversation_id).await?;
     let mut accounts = Vec::new();
     for participant in participants {
         if participant.id != account_id {
@@ -194,8 +194,8 @@ async fn conversation_status(
     state: &AppState,
     account_id: AccountId,
     status_id: StatusId,
-) -> Result<Option<StatusResponse>, RoostError> {
-    let Some(status) = roost_db::find_local_status_by_id(&state.db, status_id).await? else {
+) -> Result<Option<StatusResponse>, RoostyError> {
+    let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
         return Ok(None);
     };
     if !crate::statuses::status_visible_to_viewer(state, &status, Some(account_id)).await? {
@@ -213,8 +213,8 @@ fn conversation_limit(limit: Option<u64>) -> u64 {
         .clamp(1, MAX_CONVERSATION_LIMIT)
 }
 
-fn collection_cursor(params: &ConversationParams) -> Result<roost_db::CollectionCursor, ()> {
-    Ok(roost_db::CollectionCursor {
+fn collection_cursor(params: &ConversationParams) -> Result<roosty_db::CollectionCursor, ()> {
+    Ok(roosty_db::CollectionCursor {
         max_id: parse_optional_uuid(params.max_id.as_deref())?,
         since_id: parse_optional_uuid(params.since_id.as_deref())?,
         min_id: parse_optional_uuid(params.min_id.as_deref())?,
@@ -247,7 +247,7 @@ fn not_found() -> Response {
         .into_response()
 }
 
-fn server_error(error: RoostError) -> Response {
+fn server_error(error: RoostyError) -> Response {
     let description = error.to_string();
     (
         StatusCode::INTERNAL_SERVER_ERROR,

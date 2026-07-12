@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use roost_core::AccountId;
+use roosty_core::AccountId;
 
 use crate::{
     auth::{self, AuthenticatedAccount},
@@ -50,7 +50,7 @@ async fn followed_tags(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    match roost_db::followed_local_tags(&state.db, account.id).await {
+    match roosty_db::followed_local_tags(&state.db, account.id).await {
         Ok(tags) => {
             let mut response = Vec::with_capacity(tags.len());
             for tag in tags {
@@ -241,7 +241,7 @@ fn unauthorized() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-fn server_error(error: roost_core::RoostError) -> Response {
+fn server_error(error: roosty_core::RoostyError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
@@ -264,8 +264,8 @@ mod tests {
         http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     };
     use postgresql_embedded::PostgreSQL;
-    use roost_core::AccountId;
-    use roost_migration::Migrator;
+    use roosty_core::AccountId;
+    use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -456,7 +456,7 @@ mod tests {
 
     struct CompatContext {
         postgresql: PostgreSQL,
-        db: roost_db::DbConnection,
+        db: roosty_db::DbConnection,
         database_name: String,
         config: Config,
         account_id: AccountId,
@@ -467,7 +467,7 @@ mod tests {
     impl AsyncTestContext for CompatContext {
         async fn setup() -> Self {
             let temp_dir = tempfile::Builder::new()
-                .prefix("roost-compat-")
+                .prefix("roosty-compat-")
                 .tempdir()
                 .unwrap();
             let database_name = unique_name();
@@ -489,16 +489,21 @@ mod tests {
             postgresql.create_database(&database_name).await.unwrap();
 
             let database_url = postgresql.settings().url(&database_name);
-            let db = roost_db::connect(&database_url).await.unwrap();
+            let db = roosty_db::connect(&database_url).await.unwrap();
             Migrator::up(&db, None).await.unwrap();
 
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
-                roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
-                    .await
-                    .unwrap(),
+                roosty_db::create_bootstrap_admin(
+                    &db,
+                    "admin",
+                    "admin@example.com",
+                    &password_hash,
+                )
+                .await
+                .unwrap(),
             );
-            let (application, _secret) = roost_db::create_oauth_application(
+            let (application, _secret) = roosty_db::create_oauth_application(
                 &db,
                 "Elk",
                 "https://localhost:4001/oauth",
@@ -523,7 +528,8 @@ mod tests {
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
                 federation_blocked_domains: Vec::new(),
-                instance_name: "Roost Test".to_owned(),
+                federation_delivery_max_age: time::Duration::days(7),
+                instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
 
@@ -603,7 +609,7 @@ mod tests {
         }
 
         async fn access_token(&self) -> String {
-            roost_db::create_access_token(
+            roosty_db::create_access_token(
                 &self.db,
                 &self.config.token_pepper,
                 self.account_id,
@@ -627,6 +633,6 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roost_compat_{}_{}", std::process::id(), timestamp)
+        format!("roosty_compat_{}_{}", std::process::id(), timestamp)
     }
 }

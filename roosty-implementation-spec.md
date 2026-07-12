@@ -1,4 +1,4 @@
-# Roost Implementation Specification
+# Roosty Implementation Specification
 
 ## Purpose
 
@@ -125,7 +125,7 @@ Avoid circular dependencies. HTTP handlers should call domain services rather th
 Use a Cargo workspace.
 
 ```text
-roost/
+roosty/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── crates/
@@ -175,11 +175,11 @@ Use Clap.
 Initial command shape:
 
 ```text
-roost serve
-roost serve --with-worker
-roost worker
-roost migrate
-roost admin bootstrap --username alice --email alice@example.com
+roosty serve
+roosty serve --with-worker
+roosty worker
+roosty migrate
+roosty admin bootstrap --username alice --email alice@example.com
 ```
 
 Suggested CLI structure:
@@ -188,7 +188,7 @@ Suggested CLI structure:
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "roost")]
+#[command(name = "roosty")]
 #[command(about = "Standalone Rust ActivityPub server")]
 pub struct Cli {
     #[command(subcommand)]
@@ -238,7 +238,7 @@ pub enum AdminCommand {
 For initial deployments, support:
 
 ```text
-roost serve --with-worker
+roosty serve --with-worker
 ```
 
 This starts:
@@ -255,8 +255,8 @@ The worker must still operate through the durable Postgres job table. It must no
 Later, allow independent scaling:
 
 ```text
-roost serve
-roost worker
+roosty serve
+roosty worker
 ```
 
 ---
@@ -984,9 +984,9 @@ Test:
 Add admin tooling eventually:
 
 ```text
-roost admin replay-activity <id>
-roost admin redeliver <id>
-roost admin inspect-job <id>
+roosty admin replay-activity <id>
+roosty admin redeliver <id>
+roosty admin inspect-job <id>
 ```
 
 ---
@@ -999,7 +999,7 @@ Provide Podman Compose configuration:
 
 ```text
 services:
-  roost:
+  roosty:
     build: .
     command: ["serve", "--with-worker"]
     environment:
@@ -1021,14 +1021,14 @@ Use local filesystem media storage by default in development.
 Initial production deployment can still be one process:
 
 ```text
-roost serve --with-worker
+roosty serve --with-worker
 ```
 
 Later split:
 
 ```text
-roost serve
-roost worker
+roosty serve
+roosty worker
 ```
 
 Keep all processes stateless except for:
@@ -1059,8 +1059,8 @@ Success criteria:
 
 ```text
 podman compose up
-roost migrate
-roost admin bootstrap --username admin --email admin@example.com
+roosty migrate
+roosty admin bootstrap --username admin --email admin@example.com
 ```
 
 ### Phase 1: local accounts and OAuth
@@ -1158,13 +1158,13 @@ When a single combined process is no longer enough:
 
 ```text
 API deployment:
-  roost serve
+  roosty serve
 
 Worker deployment:
-  roost worker
+  roosty worker
 
 Optional streaming deployment:
-  roost streaming
+  roosty streaming
 ```
 
 Keep the same Postgres job model initially. Add Redis or another pub/sub layer only after a measured need for multi-process streaming fan-out or cache pressure.
@@ -1325,7 +1325,7 @@ The project is ready for an early public technical preview when all of these are
 3. It can run as one process with:
 
    ```text
-   roost serve --with-worker
+   roosty serve --with-worker
    ```
 
 4. Phanpy can register an OAuth app, authenticate with PKCE, read timelines, create a post, and receive updates.

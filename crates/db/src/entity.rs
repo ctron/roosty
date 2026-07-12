@@ -1,4 +1,4 @@
-//! SeaORM entity modules for Roost database tables.
+//! SeaORM entity modules for Roosty database tables.
 
 pub mod local_account;
 pub mod local_account_block;

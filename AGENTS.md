@@ -2,7 +2,7 @@
 
 ## Project Target
 
-- Roost targets compatibility with the ActivityPub specification and Mastodon-compatible client APIs.
+- Roosty targets compatibility with the ActivityPub specification and Mastodon-compatible client APIs.
 - The focus is on the backend, allowing integration with UIs
 
 ## Verification

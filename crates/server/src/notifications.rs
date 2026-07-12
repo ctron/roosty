@@ -5,8 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use roost_core::{AccountId, RoostError, StatusId};
-use roost_db::{
+use roosty_core::{AccountId, RoostyError, StatusId};
+use roosty_db::{
     CollectionCursor, CollectionPage, LocalNotification, LocalNotificationType, NotificationFilter,
 };
 use serde::{Deserialize, Serialize};
@@ -62,9 +62,16 @@ struct NotificationResponse {
     notification_type: String,
     group_key: String,
     created_at: String,
-    account: crate::auth::AccountResponse,
+    account: NotificationAccountResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<crate::statuses::StatusResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum NotificationAccountResponse {
+    Local(Box<crate::auth::AccountResponse>),
+    Remote(Box<crate::accounts::RemoteAccountResponse>),
 }
 
 #[derive(Serialize)]
@@ -98,7 +105,7 @@ async fn notifications(
         return Json(Vec::<NotificationResponse>::new()).into_response();
     }
 
-    match roost_db::local_notifications_for_account(&state.db, account.id, limit, cursor, filter)
+    match roosty_db::local_notifications_for_account(&state.db, account.id, limit, cursor, filter)
         .await
     {
         Ok(page) => notification_page_response(&state, account.id, page, limit).await,
@@ -112,8 +119,12 @@ async fn show_notification(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<NotificationPath>,
 ) -> Response {
-    match roost_db::find_local_notification_for_account(&state.db, account.id, path.notification_id)
-        .await
+    match roosty_db::find_local_notification_for_account(
+        &state.db,
+        account.id,
+        path.notification_id,
+    )
+    .await
     {
         Ok(Some(notification)) => {
             match notification_response(&state, account.id, notification).await {
@@ -133,7 +144,7 @@ async fn dismiss_notification(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<NotificationPath>,
 ) -> Response {
-    match roost_db::dismiss_local_notification(&state.db, account.id, path.notification_id).await {
+    match roosty_db::dismiss_local_notification(&state.db, account.id, path.notification_id).await {
         Ok(true) => Json(json!({})).into_response(),
         Ok(false) => not_found(),
         Err(error) => server_error(error),
@@ -145,7 +156,7 @@ async fn clear_notifications(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    match roost_db::clear_local_notifications(&state.db, account.id).await {
+    match roosty_db::clear_local_notifications(&state.db, account.id).await {
         Ok(()) => Json(json!({})).into_response(),
         Err(error) => server_error(error),
     }
@@ -158,15 +169,16 @@ pub(crate) async fn create_and_stream_notification(
     notification_type: LocalNotificationType,
     actor_account_id: AccountId,
     status_id: Option<StatusId>,
-) -> Result<(), RoostError> {
+) -> Result<(), RoostyError> {
     if account_id == actor_account_id {
         return Ok(());
     }
-    if !roost_db::local_account_allows_notification(&state.db, account_id, actor_account_id).await?
+    if !roosty_db::local_account_allows_notification(&state.db, account_id, actor_account_id)
+        .await?
     {
         return Ok(());
     }
-    let notification = roost_db::notify_local_account(
+    let notification = roosty_db::notify_local_account(
         &state.db,
         account_id,
         notification_type,
@@ -174,6 +186,22 @@ pub(crate) async fn create_and_stream_notification(
         status_id,
     )
     .await?;
+    if let Some(response) = notification_response(state, account_id, notification).await? {
+        state
+            .streaming_events
+            .publish_notification(&response, account_id);
+    }
+    Ok(())
+}
+
+/// Create and publish a follow notification caused by a remote actor.
+pub(crate) async fn create_and_stream_remote_follow_notification(
+    state: &AppState,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<(), RoostyError> {
+    let notification =
+        roosty_db::notify_remote_actor_follow(&state.db, account_id, remote_actor_id).await?;
     if let Some(response) = notification_response(state, account_id, notification).await? {
         state
             .streaming_events
@@ -216,15 +244,28 @@ async fn notification_response(
     state: &AppState,
     viewer_id: AccountId,
     notification: LocalNotification,
-) -> Result<Option<NotificationResponse>, RoostError> {
-    let Some(actor) =
-        roost_db::find_local_account_by_id(&state.db, notification.actor_account_id).await?
-    else {
-        return Ok(None);
+) -> Result<Option<NotificationResponse>, RoostyError> {
+    let actor = match (notification.actor_account_id, notification.remote_actor_id) {
+        (Some(actor_id), None) => {
+            let Some(actor) = roosty_db::find_local_account_by_id(&state.db, actor_id).await?
+            else {
+                return Ok(None);
+            };
+            NotificationAccountResponse::Local(Box::new(account_response(state, actor).await?))
+        }
+        (None, Some(actor_id)) => {
+            let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, actor_id).await? else {
+                return Ok(None);
+            };
+            NotificationAccountResponse::Remote(Box::new(crate::accounts::remote_account_response(
+                actor,
+            )))
+        }
+        _ => return Ok(None),
     };
     let status = match notification.status_id {
         Some(status_id) => {
-            let Some(status) = roost_db::find_local_status_by_id(&state.db, status_id).await?
+            let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
             else {
                 return Ok(None);
             };
@@ -238,7 +279,7 @@ async fn notification_response(
         notification_type: notification.notification_type.as_str().to_owned(),
         group_key: format!("ungrouped-{}", notification.id),
         created_at: crate::statuses::format_timestamp(notification.created_at),
-        account: account_response(state, actor).await?,
+        account: actor,
         status,
     }))
 }
@@ -321,7 +362,7 @@ fn not_found() -> Response {
         .into_response()
 }
 
-fn server_error(error: RoostError) -> Response {
+fn server_error(error: RoostyError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {

@@ -3,11 +3,11 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
-use roost_core::{AccountId, JobId, Result, RoostError, StatusId};
+use roosty_core::{AccountId, JobId, Result, RoostyError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
-    DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
+    DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, FromQueryResult, IntoActiveModel,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
     sea_query::Query,
 };
 use serde_json::Value as JsonValue;
@@ -30,7 +30,7 @@ use entity::{
     oauth_application, oauth_authorization_code, remote_actor,
 };
 
-/// Shared database connection type used across Roost crates.
+/// Shared database connection type used across Roosty crates.
 pub type DbConnection = DatabaseConnection;
 
 /// Open a database connection using SeaORM's PostgreSQL driver.
@@ -60,7 +60,7 @@ pub async fn create_bootstrap_admin(
 ) -> Result<Uuid> {
     let count = local_account::Entity::find().count(db).await?;
     if count != 0 {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "bootstrap is only allowed before local accounts exist".to_owned(),
         ));
     }
@@ -125,7 +125,7 @@ async fn ensure_local_account_available(
         .await?
         .is_some()
     {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "username is already in use".to_owned(),
         ));
     }
@@ -136,7 +136,7 @@ async fn ensure_local_account_available(
         .await?
         .is_some()
     {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "email is already in use".to_owned(),
         ));
     }
@@ -228,6 +228,17 @@ pub async fn find_remote_actor_by_activitypub_id(
 ) -> Result<Option<RemoteActor>> {
     Ok(remote_actor::Entity::find()
         .filter(remote_actor::Column::ActivitypubId.eq(activitypub_id))
+        .one(db)
+        .await?
+        .map(remote_actor_from_model))
+}
+
+/// Find a remote actor by its UUID-backed API identifier.
+pub async fn find_remote_actor_by_id(
+    db: &DbConnection,
+    actor_id: AccountId,
+) -> Result<Option<RemoteActor>> {
+    Ok(remote_actor::Entity::find_by_id(actor_id.0)
         .one(db)
         .await?
         .map(remote_actor_from_model))
@@ -712,13 +723,146 @@ pub struct LocalNotification {
     /// Mastodon notification type.
     pub notification_type: LocalNotificationType,
     /// Account that caused the notification.
-    pub actor_account_id: AccountId,
+    pub actor_account_id: Option<AccountId>,
+    /// Optional remote actor that caused the notification.
+    pub remote_actor_id: Option<AccountId>,
     /// Related local status for mention and favourite notifications.
     pub status_id: Option<StatusId>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Soft-dismiss timestamp.
     pub dismissed_at: Option<OffsetDateTime>,
+}
+
+/// Persisted inbound remote follow request or accepted remote follower.
+#[derive(Clone, Debug)]
+pub struct RemoteFollow {
+    pub id: Uuid,
+    pub remote_actor_id: AccountId,
+    pub local_account_id: AccountId,
+    pub activity_id: String,
+    pub activity: JsonValue,
+    pub state: String,
+}
+
+#[derive(FromQueryResult)]
+struct RemoteFollowRow {
+    id: Uuid,
+    remote_actor_id: Uuid,
+    local_account_id: Uuid,
+    activity_id: String,
+    activity: JsonValue,
+    state: String,
+}
+
+/// Store or refresh an inbound remote Follow request.
+pub async fn upsert_remote_follow(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    local_account_id: AccountId,
+    activity_id: &str,
+    activity: JsonValue,
+    state: &str,
+) -> Result<RemoteFollow> {
+    let row = RemoteFollowRow::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
+        INSERT INTO remote_follow (id, remote_actor_id, local_account_id, activity_id, activity, state)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (remote_actor_id, local_account_id) DO UPDATE
+        SET activity_id = EXCLUDED.activity_id, activity = EXCLUDED.activity, state = EXCLUDED.state, updated_at = now()
+        RETURNING id, remote_actor_id, local_account_id, activity_id, activity, state
+    "#, vec![Uuid::now_v7().into(), remote_actor_id.0.into(), local_account_id.0.into(), activity_id.to_owned().into(), activity.into(), state.to_owned().into()])).one(db).await?
+        .ok_or_else(|| RoostyError::InvalidInput("remote follow could not be saved".to_owned()))?;
+    Ok(remote_follow_from_row(row))
+}
+
+/// Mark a remote follow as accepted and return its original Follow activity.
+pub async fn accept_remote_follow(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<Option<RemoteFollow>> {
+    let row = RemoteFollowRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+        UPDATE remote_follow SET state = 'accepted', updated_at = now()
+        WHERE local_account_id = $1 AND remote_actor_id = $2 AND state = 'pending'
+        RETURNING id, remote_actor_id, local_account_id, activity_id, activity, state
+    "#,
+        vec![local_account_id.0.into(), remote_actor_id.0.into()],
+    ))
+    .one(db)
+    .await?;
+    Ok(row.map(remote_follow_from_row))
+}
+
+/// Remove an incoming remote follow by its original activity identity.
+pub async fn delete_remote_follow_by_activity(db: &DbConnection, activity_id: &str) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM remote_follow WHERE activity_id = $1",
+        vec![activity_id.to_owned().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Reject or remove a remote follow owned by a local account.
+pub async fn delete_remote_follow(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<bool> {
+    let result = db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, "DELETE FROM remote_follow WHERE local_account_id = $1 AND remote_actor_id = $2 AND state = 'pending'", vec![local_account_id.0.into(), remote_actor_id.0.into()])).await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// List pending remote follow requests for a local account.
+pub async fn pending_remote_follows(
+    db: &DbConnection,
+    local_account_id: AccountId,
+) -> Result<Vec<RemoteFollow>> {
+    let rows = RemoteFollowRow::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT id, remote_actor_id, local_account_id, activity_id, activity, state FROM remote_follow WHERE local_account_id = $1 AND state = 'pending' ORDER BY id DESC", vec![local_account_id.0.into()])).all(db).await?;
+    Ok(rows.into_iter().map(remote_follow_from_row).collect())
+}
+
+/// Return whether an accepted remote actor follows a local account.
+pub async fn remote_actor_follows_local_account(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    local_account_id: AccountId,
+) -> Result<bool> {
+    Ok(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT 1 FROM remote_follow WHERE remote_actor_id = $1 AND local_account_id = $2 AND state = 'accepted'", vec![remote_actor_id.0.into(), local_account_id.0.into()])).await?.is_some())
+}
+
+/// Record a successfully validated inbox activity, returning false for duplicates.
+pub async fn record_processed_inbox_activity(
+    db: &DbConnection,
+    activity_id: &str,
+    remote_actor_id: AccountId,
+) -> Result<bool> {
+    let result = db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, "INSERT INTO processed_inbox_activity (activity_id, remote_actor_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", vec![activity_id.to_owned().into(), remote_actor_id.0.into()])).await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Create a follow notification attributable to a remote actor.
+pub async fn notify_remote_actor_follow(
+    db: &DbConnection,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<LocalNotification> {
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("follow".to_owned()),
+        actor_account_id: Set(None),
+        remote_actor_id: Set(Some(remote_actor_id.0)),
+        status_id: Set(None),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(local_notification_from_model(model))
 }
 
 /// Timelines that support persisted Mastodon read markers.
@@ -903,6 +1047,11 @@ pub async fn count_local_followers(db: &DbConnection, account_id: AccountId) -> 
         .await?)
 }
 
+/// Count accepted remote actors following this local account.
+pub async fn count_remote_followers(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+    Ok(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT count(*) AS count FROM remote_follow WHERE local_account_id = $1 AND state = 'accepted'", vec![account_id.0.into()])).await?.map(|row| row.try_get::<i64>("", "count")).transpose()?.unwrap_or(0) as u64)
+}
+
 /// Count local accounts this account follows.
 pub async fn count_local_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
     Ok(local_follow::Entity::find()
@@ -952,7 +1101,7 @@ pub async fn follow_local_account(
     notify: bool,
 ) -> Result<LocalFollow> {
     if follower_account_id == followed_account_id {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "accounts cannot follow themselves".to_owned(),
         ));
     }
@@ -960,12 +1109,12 @@ pub async fn follow_local_account(
         .await?
         .is_none()
     {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "followed account does not exist".to_owned(),
         ));
     }
     if local_accounts_are_blocked(db, follower_account_id, followed_account_id).await? {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "follow is blocked by an account relationship".to_owned(),
         ));
     }
@@ -1078,7 +1227,7 @@ pub async fn mute_local_account(
         None
     } else {
         let seconds = i64::try_from(duration_seconds)
-            .map_err(|_| RoostError::InvalidInput("mute duration is too large".to_owned()))?;
+            .map_err(|_| RoostyError::InvalidInput("mute duration is too large".to_owned()))?;
         Some(now + Duration::seconds(seconds))
     };
     let mute = match local_account_mute::Entity::find_by_id((account_id.0, target_account_id.0))
@@ -1345,7 +1494,7 @@ async fn ensure_local_relation_target(
     target_account_id: AccountId,
 ) -> Result<()> {
     if account_id == target_account_id {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "accounts cannot moderate themselves".to_owned(),
         ));
     }
@@ -1353,7 +1502,7 @@ async fn ensure_local_relation_target(
         .await?
         .is_none()
     {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "target account does not exist".to_owned(),
         ));
     }
@@ -1370,7 +1519,7 @@ pub async fn notify_local_account(
     status_id: Option<StatusId>,
 ) -> Result<LocalNotification> {
     if account_id == actor_account_id {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "accounts cannot notify themselves".to_owned(),
         ));
     }
@@ -1379,7 +1528,7 @@ pub async fn notify_local_account(
     if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq(type_value))
-        .filter(local_notification::Column::ActorAccountId.eq(actor_account_id.0))
+        .filter(local_notification::Column::ActorAccountId.eq(Some(actor_account_id.0)))
         .filter(match status_uuid {
             Some(status_id) => local_notification::Column::StatusId.eq(status_id),
             None => local_notification::Column::StatusId.is_null(),
@@ -1394,7 +1543,8 @@ pub async fn notify_local_account(
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
         notification_type: Set(type_value.to_owned()),
-        actor_account_id: Set(actor_account_id.0),
+        actor_account_id: Set(Some(actor_account_id.0)),
+        remote_actor_id: Set(None),
         status_id: Set(status_uuid),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
@@ -1546,7 +1696,7 @@ pub async fn save_local_timeline_marker(
     let marker = match marker {
         Some(marker) => {
             let version = marker.version.checked_add(1).ok_or_else(|| {
-                RoostError::InvalidInput("timeline marker version is exhausted".to_owned())
+                RoostyError::InvalidInput("timeline marker version is exhausted".to_owned())
             })?;
             let mut active = marker.into_active_model();
             active.last_read_id = Set(last_read_id);
@@ -1639,7 +1789,7 @@ pub async fn update_local_account_settings(
     let account = local_account::Entity::find_by_id(account_id.0)
         .one(db)
         .await?
-        .ok_or_else(|| RoostError::InvalidInput("local account does not exist".to_owned()))?;
+        .ok_or_else(|| RoostyError::InvalidInput("local account does not exist".to_owned()))?;
     let mut active = account.into_active_model();
 
     set_if_some(&mut active.display_name, update.display_name);
@@ -1734,12 +1884,12 @@ pub async fn create_local_status_with_media(
             .one(&txn)
             .await?
         else {
-            return Err(RoostError::InvalidInput(
+            return Err(RoostyError::InvalidInput(
                 "media attachment not found".to_owned(),
             ));
         };
         if media.account_id != account_id.0 || media.status_id.is_some() {
-            return Err(RoostError::InvalidInput(
+            return Err(RoostyError::InvalidInput(
                 "media attachment is not available".to_owned(),
             ));
         }
@@ -1767,7 +1917,7 @@ pub async fn create_local_status_with_media(
             .one(&txn)
             .await?
         else {
-            return Err(RoostError::InvalidInput(
+            return Err(RoostyError::InvalidInput(
                 "media attachment not found".to_owned(),
             ));
         };
@@ -2166,7 +2316,7 @@ pub async fn update_owned_local_status(
                 .one(&txn)
                 .await?
             else {
-                return Err(RoostError::InvalidInput(
+                return Err(RoostyError::InvalidInput(
                     "media attachment not found".to_owned(),
                 ));
             };
@@ -2174,7 +2324,7 @@ pub async fn update_owned_local_status(
                 .status_id
                 .is_none_or(|existing| existing == status_id.0);
             if media.account_id != account_id.0 || !available {
-                return Err(RoostError::InvalidInput(
+                return Err(RoostyError::InvalidInput(
                     "media attachment is not available".to_owned(),
                 ));
             }
@@ -2200,7 +2350,7 @@ pub async fn update_owned_local_status(
                 .one(&txn)
                 .await?
             else {
-                return Err(RoostError::InvalidInput(
+                return Err(RoostyError::InvalidInput(
                     "media attachment not found".to_owned(),
                 ));
             };
@@ -2219,7 +2369,7 @@ pub async fn update_owned_local_status(
             .one(&txn)
             .await?
         else {
-            return Err(RoostError::InvalidInput(
+            return Err(RoostyError::InvalidInput(
                 "media attachment is not available".to_owned(),
             ));
         };
@@ -2520,7 +2670,7 @@ pub async fn attach_direct_status_to_conversation(
     let mut status = local_status::Entity::find_by_id(status_id.0)
         .one(&txn)
         .await?
-        .ok_or_else(|| RoostError::InvalidInput("conversation status not found".to_owned()))?
+        .ok_or_else(|| RoostyError::InvalidInput("conversation status not found".to_owned()))?
         .into_active_model();
     status.conversation_id = Set(Some(conversation_id));
     status.updated_at = Set(now);
@@ -2529,7 +2679,7 @@ pub async fn attach_direct_status_to_conversation(
     let mut conversation = local_conversation::Entity::find_by_id(conversation_id)
         .one(&txn)
         .await?
-        .ok_or_else(|| RoostError::InvalidInput("conversation not found".to_owned()))?
+        .ok_or_else(|| RoostyError::InvalidInput("conversation not found".to_owned()))?
         .into_active_model();
     conversation.last_status_id = Set(Some(status_id.0));
     conversation.updated_at = Set(now);
@@ -3127,7 +3277,7 @@ pub async fn delete_owned_local_status(
         return Ok(None);
     };
     if status.account_id != account_id.0 {
-        return Err(RoostError::InvalidInput(
+        return Err(RoostyError::InvalidInput(
             "status is owned by another account".to_owned(),
         ));
     }
@@ -3732,7 +3882,7 @@ pub fn random_token() -> String {
 /// Compute the stable HMAC hash stored for opaque secrets and tokens.
 pub fn secret_hash(pepper: &str, secret: &str) -> Result<String> {
     let mut mac = HmacSha256::new_from_slice(pepper.as_bytes())
-        .map_err(|error| RoostError::InvalidInput(error.to_string()))?;
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     mac.update(secret.as_bytes());
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
@@ -3778,6 +3928,17 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         public_key_id: actor.public_key_id,
         public_key_pem: actor.public_key_pem,
         expires_at: actor.expires_at,
+    }
+}
+
+fn remote_follow_from_row(row: RemoteFollowRow) -> RemoteFollow {
+    RemoteFollow {
+        id: row.id,
+        remote_actor_id: AccountId(row.remote_actor_id),
+        local_account_id: AccountId(row.local_account_id),
+        activity_id: row.activity_id,
+        activity: row.activity,
+        state: row.state,
     }
 }
 
@@ -3866,7 +4027,8 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         account_id: AccountId(notification.account_id),
         notification_type: LocalNotificationType::from_str(&notification.notification_type)
             .unwrap_or(LocalNotificationType::Mention),
-        actor_account_id: AccountId(notification.actor_account_id),
+        actor_account_id: notification.actor_account_id.map(AccountId),
+        remote_actor_id: notification.remote_actor_id.map(AccountId),
         status_id: notification.status_id.map(StatusId),
         created_at: notification.created_at,
         dismissed_at: notification.dismissed_at,
@@ -3879,7 +4041,7 @@ fn local_timeline_marker_from_model(
 ) -> Result<LocalTimelineMarker> {
     Ok(LocalTimelineMarker {
         timeline: LocalTimeline::from_str(&marker.timeline).map_err(|_| {
-            RoostError::InvalidInput("stored timeline marker type is invalid".to_owned())
+            RoostyError::InvalidInput("stored timeline marker type is invalid".to_owned())
         })?,
         last_read_id: marker.last_read_id,
         version: marker.version,
@@ -3931,7 +4093,9 @@ pub struct ClaimedJob {
     /// JSON job payload.
     pub payload: JsonValue,
     /// Number of prior failed attempts.
-    pub attempts: i32,
+    pub attempts: u32,
+    /// Time the job was first enqueued.
+    pub created_at: OffsetDateTime,
 }
 
 /// Enqueue a durable job, reusing an active deduplicated job when present.
@@ -3973,7 +4137,7 @@ pub async fn enqueue_job(
         ))
         .await?
         .ok_or_else(|| {
-            RoostError::from(DbErr::RecordNotFound(
+            RoostyError::from(DbErr::RecordNotFound(
                 "job enqueue returned no row".to_owned(),
             ))
         })?;
@@ -4006,7 +4170,7 @@ pub async fn claim_due_jobs(
                 LIMIT $3
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, kind, payload, attempts
+            RETURNING id, kind, payload, attempts, created_at
             "#,
             vec![
                 worker_id.to_owned().into(),
@@ -4022,12 +4186,17 @@ pub async fn claim_due_jobs(
             let kind: String = row.try_get("", "kind")?;
             let payload: JsonValue = row.try_get("", "payload")?;
             let attempts: i32 = row.try_get("", "attempts")?;
+            let attempts = u32::try_from(attempts).map_err(|_| {
+                RoostyError::InvalidInput("stored job attempts must not be negative".to_owned())
+            })?;
+            let created_at: OffsetDateTime = row.try_get("", "created_at")?;
 
             Ok(ClaimedJob {
                 id: JobId(id),
                 kind,
                 payload,
                 attempts,
+                created_at,
             })
         })
         .collect()
@@ -4054,7 +4223,7 @@ pub async fn mark_job_failed(
     db: &DbConnection,
     job_id: JobId,
     error: &str,
-    attempts: i32,
+    attempts: u32,
 ) -> Result<OffsetDateTime> {
     let run_after = next_retry_at(attempts);
     db.execute(Statement::from_sql_and_values(
@@ -4073,6 +4242,25 @@ pub async fn mark_job_failed(
     .await?;
 
     Ok(run_after)
+}
+
+/// Mark a job as permanently failed while retaining its diagnostic error.
+pub async fn mark_job_permanently_failed(
+    db: &DbConnection,
+    job_id: JobId,
+    error: &str,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE job SET last_error = $2, completed_at = now(), locked_at = NULL, locked_by = NULL WHERE id = $1",
+        vec![job_id.0.into(), error.to_owned().into()],
+    )).await?;
+    Ok(())
+}
+
+/// Return whether a job has exceeded its configured retry age.
+pub fn job_has_exceeded_max_age(created_at: OffsetDateTime, max_age: Duration) -> bool {
+    OffsetDateTime::now_utc() - created_at >= max_age
 }
 
 /// Release job claims older than the configured claim TTL.
@@ -4094,9 +4282,9 @@ pub async fn release_expired_claims(db: &DbConnection, claim_ttl: Duration) -> R
 }
 
 /// Calculate the next retry timestamp for a failed job.
-pub fn next_retry_at(attempts: i32) -> OffsetDateTime {
-    let exponent = attempts.clamp(0, 8) as u32;
-    let seconds = 2_i64.pow(exponent);
+pub fn next_retry_at(attempts: u32) -> OffsetDateTime {
+    let exponent = attempts.min(12);
+    let seconds = 2_i64.pow(exponent).min(3_600);
     OffsetDateTime::now_utc() + Duration::seconds(seconds)
 }
 

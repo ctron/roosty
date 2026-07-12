@@ -1,0 +1,90 @@
+---
+- name: Validate deployment configuration
+  ansible.builtin.assert:
+    that:
+      - roosty_acme_email is match('^[^@[:space:]]+@[^@[:space:]]+$')
+      - not roosty_federation_enabled or roosty_federation_allowed_domains | length > 0
+    fail_msg: Configure a valid ACME email and federation allow-list before deploying.
+
+- name: Install Docker Engine and Compose plugin
+  ansible.builtin.apt:
+    name: "{{ roosty_docker_packages }}"
+    state: present
+    update_cache: true
+
+- name: Enable Docker
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Create deployment directory
+  ansible.builtin.file:
+    path: "{{ roosty_deploy_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Copy production Compose definition
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../compose.production.yaml"
+    dest: "{{ roosty_deploy_dir }}/compose.yaml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Copy production Caddyfile
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../Caddyfile.production"
+    dest: "{{ roosty_deploy_dir }}/Caddyfile"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Generate persistent deployment secrets on first deployment
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      umask 077
+      postgres_password="$(openssl rand -hex 32)"
+      session_secret="$(openssl rand -hex 48)"
+      token_pepper="$(openssl rand -hex 48)"
+      federation_secret="$(openssl rand -hex 48)"
+      printf '%s\n' \
+        "POSTGRES_PASSWORD=${postgres_password}" \
+        "ROOSTY_DATABASE_URL=postgres://roosty:${postgres_password}@postgres:5432/roosty" \
+        "ROOSTY_SESSION_SECRET=${session_secret}" \
+        "ROOSTY_TOKEN_PEPPER=${token_pepper}" \
+        "ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET=${federation_secret}" \
+        > secrets.env
+    chdir: "{{ roosty_deploy_dir }}"
+    creates: "{{ roosty_deploy_dir }}/secrets.env"
+  no_log: true
+
+- name: Protect persistent deployment secrets
+  ansible.builtin.file:
+    path: "{{ roosty_deploy_dir }}/secrets.env"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Render Roosty environment
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ roosty_deploy_dir }}/.env"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Pull Roosty deployment images
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ roosty_deploy_dir }}"
+  changed_when: false
+
+- name: Apply Roosty Compose deployment
+  ansible.builtin.command:
+    cmd: docker compose up -d --remove-orphans
+    chdir: "{{ roosty_deploy_dir }}"
+  changed_when: true

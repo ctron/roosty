@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub type Result<T, E = RoostError> = std::result::Result<T, E>;
+pub type Result<T, E = RoostyError> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
-pub enum RoostError {
+pub enum RoostyError {
     #[error("configuration error: {0}")]
     Configuration(String),
 

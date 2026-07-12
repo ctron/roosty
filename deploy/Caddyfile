@@ -1,6 +1,6 @@
-https://localhost:4000, https://roost.localhost:4000 {
+https://localhost:4000, https://roosty.localhost:4000 {
 	tls internal
-	reverse_proxy roost:4000
+	reverse_proxy roosty:4000
 }
 
 https://localhost:4001 {

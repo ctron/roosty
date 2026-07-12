@@ -1,26 +1,26 @@
 services:
-  roost:
+  roosty:
     build:
       context: ..
       dockerfile: deploy/Containerfile
     command: ["serve", "--with-migrations", "--with-worker"]
     environment:
-      ROOST_DATABASE_URL: postgres://roost:roost@postgres:5432/roost
-      ROOST_PUBLIC_BASE_URL: https://roost.localhost:4000
-      ROOST_LISTEN_ADDR: 0.0.0.0:4000
-      ROOST_INFRA_LISTEN_ADDR: 0.0.0.0:3001
-      ROOST_SESSION_SECRET: development-session-secret-change-me-000
-      ROOST_TOKEN_PEPPER: development-token-pepper-change-me-0000
-      ROOST_INSTANCE_NAME: Roost Development
-      ROOST_INSTANCE_DESCRIPTION: Local Roost development instance
-      ROOST_OBJECT_STORAGE_BACKEND: local
-      ROOST_MEDIA_ROOT: /var/lib/roost/media
-      ROOST_REGISTRATION_MODE: closed
-      ROOST_FEDERATION_ENABLED: "false"
+      ROOSTY_DATABASE_URL: postgres://roosty:roosty@postgres:5432/roosty
+      ROOSTY_PUBLIC_BASE_URL: https://roosty.localhost:4000
+      ROOSTY_LISTEN_ADDR: 0.0.0.0:4000
+      ROOSTY_INFRA_LISTEN_ADDR: 0.0.0.0:3001
+      ROOSTY_SESSION_SECRET: development-session-secret-change-me-000
+      ROOSTY_TOKEN_PEPPER: development-token-pepper-change-me-0000
+      ROOSTY_INSTANCE_NAME: Roosty Development
+      ROOSTY_INSTANCE_DESCRIPTION: Local Roosty development instance
+      ROOSTY_OBJECT_STORAGE_BACKEND: local
+      ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
+      ROOSTY_REGISTRATION_MODE: closed
+      ROOSTY_FEDERATION_ENABLED: "false"
     ports:
       - "3001:3001"
     volumes:
-      - roost-media:/var/lib/roost/media
+      - roosty-media:/var/lib/roosty/media
     depends_on:
       postgres:
         condition: service_healthy
@@ -29,14 +29,14 @@ services:
     image: ghcr.io/elk-zone/elk:v1.0.0
     user: "0:0"
     environment:
-      NUXT_PUBLIC_DEFAULT_SERVER: roost.localhost:4000
+      NUXT_PUBLIC_DEFAULT_SERVER: roosty.localhost:4000
       NUXT_PUBLIC_SINGLE_INSTANCE: "true"
       NUXT_STORAGE_DRIVER: fs
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
     volumes:
       - elk-data:/elk/data
     depends_on:
-      - roost
+      - roosty
 
   caddy:
     build:
@@ -45,7 +45,7 @@ services:
     networks:
       default:
         aliases:
-          - roost.localhost
+          - roosty.localhost
     ports:
       - "4000:4000"
       - "4001:4001"
@@ -53,17 +53,17 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     depends_on:
-      - roost
+      - roosty
       - elk
 
   postgres:
     image: postgres:18
     environment:
-      POSTGRES_DB: roost
-      POSTGRES_USER: roost
-      POSTGRES_PASSWORD: roost
+      POSTGRES_DB: roosty
+      POSTGRES_USER: roosty
+      POSTGRES_PASSWORD: roosty
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U roost -d roost"]
+      test: ["CMD-SHELL", "pg_isready -U roosty -d roosty"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -75,4 +75,4 @@ volumes:
   caddy-data:
   elk-data:
   postgres-data:
-  roost-media:
+  roosty-media:

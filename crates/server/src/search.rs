@@ -88,10 +88,10 @@ async fn account_search(
 /// Search local accounts and convert them to Mastodon account responses.
 async fn search_accounts(
     state: &AppState,
-    account_id: roost_core::AccountId,
+    account_id: roosty_core::AccountId,
     params: &SearchParams,
     max_limit: u64,
-) -> roost_core::Result<Vec<crate::auth::AccountResponse>> {
+) -> roosty_core::Result<Vec<crate::auth::AccountResponse>> {
     let _resolve = params.resolve.unwrap_or(false);
     let _following = params.following.unwrap_or(false);
     let Some(query) = normalized_local_query(state, params.q.as_deref()) else {
@@ -103,7 +103,7 @@ async fn search_accounts(
         .clamp(1, max_limit);
     let offset = params.offset.unwrap_or(0);
     let accounts =
-        roost_db::search_local_accounts(&state.db, account_id, &query, limit, offset).await?;
+        roosty_db::search_local_accounts(&state.db, account_id, &query, limit, offset).await?;
     let mut responses = Vec::with_capacity(accounts.len());
 
     for account in accounts {
@@ -117,7 +117,7 @@ async fn search_accounts(
 async fn search_hashtags(
     state: &AppState,
     params: &SearchParams,
-) -> roost_core::Result<Vec<crate::statuses::TagResponse>> {
+) -> roosty_core::Result<Vec<crate::statuses::TagResponse>> {
     let Some(query) = normalized_tag_query(params.q.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -126,10 +126,10 @@ async fn search_hashtags(
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
     let offset = params.offset.unwrap_or(0);
-    let tags = roost_db::search_local_tags(&state.db, &query, limit, offset).await?;
+    let tags = roosty_db::search_local_tags(&state.db, &query, limit, offset).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
-        let history = roost_db::local_tag_history(&state.db, tag.id).await?;
+        let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
         responses.push(crate::statuses::TagResponse::new(state, tag, history, None));
     }
 
@@ -164,7 +164,7 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn server_error(error: roost_core::RoostError) -> Response {
+fn server_error(error: roosty_core::RoostyError) -> Response {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
@@ -188,8 +188,8 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use postgresql_embedded::PostgreSQL;
-    use roost_core::AccountId;
-    use roost_migration::Migrator;
+    use roosty_core::AccountId;
+    use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -227,9 +227,9 @@ mod tests {
     /// Given stored local hashtags, when v2 search requests hashtags, then Mastodon tag results include usage history.
     async fn search_returns_local_hashtags(context: &mut SearchContext) {
         let token = context.access_token().await;
-        let status = roost_db::create_local_status(
+        let status = roosty_db::create_local_status(
             &context.db,
-            roost_db::NewLocalStatus {
+            roosty_db::NewLocalStatus {
                 account_id: context.account_id,
                 content: "searchable #RoostTag".to_owned(),
                 visibility: "public".to_owned(),
@@ -241,7 +241,7 @@ mod tests {
         )
         .await
         .unwrap();
-        roost_db::replace_local_status_tags(&context.db, status.id, &["roosttag".to_owned()])
+        roosty_db::replace_local_status_tags(&context.db, status.id, &["roosttag".to_owned()])
             .await
             .unwrap();
 
@@ -258,7 +258,7 @@ mod tests {
             serde_json::json!([{
                 "id": body["hashtags"][0]["id"],
                 "name": "roosttag",
-                "url": "https://roost.localhost:4000/tags/roosttag",
+                "url": "https://roosty.localhost:4000/tags/roosttag",
                 "history": [{
                     "day": body["hashtags"][0]["history"][0]["day"],
                     "uses": "1",
@@ -289,7 +289,7 @@ mod tests {
 
     struct SearchContext {
         postgresql: PostgreSQL,
-        db: roost_db::DbConnection,
+        db: roosty_db::DbConnection,
         database_name: String,
         config: Config,
         account_id: AccountId,
@@ -300,7 +300,7 @@ mod tests {
     impl AsyncTestContext for SearchContext {
         async fn setup() -> Self {
             let temp_dir = tempfile::Builder::new()
-                .prefix("roost-search-")
+                .prefix("roosty-search-")
                 .tempdir()
                 .unwrap();
             let database_name = unique_name();
@@ -322,16 +322,21 @@ mod tests {
             postgresql.create_database(&database_name).await.unwrap();
 
             let database_url = postgresql.settings().url(&database_name);
-            let db = roost_db::connect(&database_url).await.unwrap();
+            let db = roosty_db::connect(&database_url).await.unwrap();
             Migrator::up(&db, None).await.unwrap();
 
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
-                roost_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
-                    .await
-                    .unwrap(),
+                roosty_db::create_bootstrap_admin(
+                    &db,
+                    "admin",
+                    "admin@example.com",
+                    &password_hash,
+                )
+                .await
+                .unwrap(),
             );
-            let (application, _secret) = roost_db::create_oauth_application(
+            let (application, _secret) = roosty_db::create_oauth_application(
                 &db,
                 "Elk",
                 "https://localhost:4001/oauth",
@@ -344,7 +349,7 @@ mod tests {
 
             let config = Config {
                 database_url,
-                public_base_url: "https://roost.localhost:4000".parse().unwrap(),
+                public_base_url: "https://roosty.localhost:4000".parse().unwrap(),
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000),
                 infra_listen_addr: None,
                 session_secret: "test-session-secret-change-me-000".to_owned(),
@@ -356,7 +361,8 @@ mod tests {
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
                 federation_blocked_domains: Vec::new(),
-                instance_name: "Roost Test".to_owned(),
+                federation_delivery_max_age: time::Duration::days(7),
+                instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
 
@@ -414,7 +420,7 @@ mod tests {
         }
 
         async fn access_token(&self) -> String {
-            roost_db::create_access_token(
+            roosty_db::create_access_token(
                 &self.db,
                 &self.config.token_pepper,
                 self.account_id,
@@ -429,14 +435,14 @@ mod tests {
         async fn create_account(&self, username: &str, email: &str, display_name: &str) {
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
-                roost_db::create_local_account(&self.db, username, email, &password_hash)
+                roosty_db::create_local_account(&self.db, username, email, &password_hash)
                     .await
                     .unwrap(),
             );
-            roost_db::update_local_account_settings(
+            roosty_db::update_local_account_settings(
                 &self.db,
                 account_id,
-                roost_db::LocalAccountSettingsUpdate {
+                roosty_db::LocalAccountSettingsUpdate {
                     display_name: Some(display_name.to_owned()),
                     ..Default::default()
                 },
@@ -457,6 +463,6 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roost_search_{}_{}", std::process::id(), timestamp)
+        format!("roosty_search_{}_{}", std::process::id(), timestamp)
     }
 }

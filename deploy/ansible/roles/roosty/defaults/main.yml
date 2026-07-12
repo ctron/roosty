@@ -1,0 +1,6 @@
+---
+roosty_deploy_dir: /opt/roosty
+roosty_docker_packages:
+  - docker.io
+  - docker-compose-v2
+  - openssl

@@ -59,7 +59,7 @@ fn nodeinfo_response(config: &Config) -> Value {
     json!({
         "version": "2.1",
         "software": {
-            "name": "roost",
+            "name": "roosty",
             "version": env!("CARGO_PKG_VERSION"),
             "repository": env!("CARGO_PKG_REPOSITORY"),
             "homepage": env!("CARGO_PKG_REPOSITORY"),
@@ -91,7 +91,7 @@ fn instance_v2_response(config: &Config) -> Value {
     json!({
         "domain": domain(config),
         "title": config.instance_name,
-        "version": roost_version(),
+        "version": roosty_version(),
         "source_url": env!("CARGO_PKG_REPOSITORY"),
         "description": config.instance_description.as_deref().unwrap_or_default(),
         "usage": {
@@ -135,7 +135,7 @@ fn instance_v1_response(config: &Config) -> Value {
         "short_description": config.instance_description.as_deref().unwrap_or_default(),
         "description": config.instance_description.as_deref().unwrap_or_default(),
         "email": "",
-        "version": roost_version(),
+        "version": roosty_version(),
         "urls": {
             "streaming_api": streaming_url(config),
         },
@@ -208,10 +208,10 @@ fn registrations_approval_required(config: &Config) -> bool {
     config.registration_mode == "approval"
 }
 
-/// Build a Mastodon-compatible version string that still identifies Roost.
-fn roost_version() -> String {
+/// Build a Mastodon-compatible version string that still identifies Roosty.
+fn roosty_version() -> String {
     format!(
-        "{} (compatible; Roost {})",
+        "{} (compatible; Roosty {})",
         "4.3.0",
         env!("CARGO_PKG_VERSION")
     )
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(discovery.links[0].rel, NODEINFO_REL_2_1);
         assert_eq!(
             discovery.links[0].href,
-            "https://roost.localhost:4000/nodeinfo/2.1"
+            "https://roosty.localhost:4000/nodeinfo/2.1"
         );
     }
 
@@ -279,14 +279,14 @@ mod tests {
 
         let body = instance_v2_response(&config);
 
-        assert_eq!(body["domain"], "roost.localhost");
-        assert_eq!(body["title"], "Roost Test");
+        assert_eq!(body["domain"], "roosty.localhost");
+        assert_eq!(body["title"], "Roosty Test");
         assert_eq!(body["description"], "Endpoint test instance");
         assert_eq!(body["registrations"]["enabled"], false);
         assert_eq!(body["registrations"]["approval_required"], false);
         assert_eq!(
             body["configuration"]["urls"]["streaming"],
-            "wss://roost.localhost:4000/api/v1/streaming"
+            "wss://roosty.localhost:4000/api/v1/streaming"
         );
         assert_eq!(
             body["configuration"]["media_attachments"]["image_matrix_limit"],
@@ -300,7 +300,7 @@ mod tests {
 
         let body = instance_v1_response(&config);
 
-        assert_eq!(body["uri"], "roost.localhost");
+        assert_eq!(body["uri"], "roosty.localhost");
         assert_eq!(body["short_description"], "Endpoint test instance");
         assert_eq!(body["registrations"], true);
         assert_eq!(body["approval_required"], true);
@@ -308,21 +308,21 @@ mod tests {
     }
 
     #[test]
-    fn nodeinfo_reports_roost_and_registration_status() {
+    fn nodeinfo_reports_roosty_and_registration_status() {
         let config = test_config("open");
 
         let body = nodeinfo_response(&config);
 
-        assert_eq!(body["software"]["name"], "roost");
+        assert_eq!(body["software"]["name"], "roosty");
         assert_eq!(body["protocols"][0], "activitypub");
         assert_eq!(body["openRegistrations"], true);
-        assert_eq!(body["metadata"]["nodeName"], "Roost Test");
+        assert_eq!(body["metadata"]["nodeName"], "Roosty Test");
     }
 
     fn test_config(registration_mode: &str) -> Arc<Config> {
         Arc::new(Config {
-            database_url: "postgres://roost:roost@localhost/roost".to_owned(),
-            public_base_url: "https://roost.localhost:4000".parse().unwrap(),
+            database_url: "postgres://roosty:roosty@localhost/roosty".to_owned(),
+            public_base_url: "https://roosty.localhost:4000".parse().unwrap(),
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000),
             infra_listen_addr: None,
             session_secret: "test-session-secret-change-me-000".to_owned(),
@@ -334,7 +334,8 @@ mod tests {
             federation_key_encryption_secret: None,
             federation_allowed_domains: Vec::new(),
             federation_blocked_domains: Vec::new(),
-            instance_name: "Roost Test".to_owned(),
+            federation_delivery_max_age: time::Duration::days(7),
+            instance_name: "Roosty Test".to_owned(),
             instance_description: Some("Endpoint test instance".to_owned()),
         })
     }
