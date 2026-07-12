@@ -17,6 +17,7 @@ mod m20260701_000012_add_local_account_profile_images;
 mod m20260701_000013_create_local_notification_table;
 mod m20260701_000014_create_local_status_reblog_table;
 mod m20260701_000015_allow_reblog_notifications;
+mod m20260701_000016_create_local_conversation_tables;
 
 pub struct Migrator;
 
@@ -39,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000013_create_local_notification_table::Migration),
             Box::new(m20260701_000014_create_local_status_reblog_table::Migration),
             Box::new(m20260701_000015_allow_reblog_notifications::Migration),
+            Box::new(m20260701_000016_create_local_conversation_tables::Migration),
         ]
     }
 }

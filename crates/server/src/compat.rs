@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/followed_tags", get(followed_tags))
         .route("/api/v1/markers", get(markers))
         .route("/api/v1/streaming", get(streaming))
+        .route("/api/v1/streaming/direct", get(streaming_direct))
         .route("/api/v1/streaming/health", get(streaming_health))
 }
 
@@ -58,11 +59,31 @@ async fn streaming_health() -> &'static str {
     "OK"
 }
 
+async fn streaming_direct(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    streaming_response(state, headers, query, websocket, Some("direct".to_owned())).await
+}
+
 async fn streaming(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     websocket: WebSocketUpgrade,
+) -> Response {
+    let stream = query.get("stream").cloned();
+    streaming_response(state, headers, query, websocket, stream).await
+}
+
+async fn streaming_response(
+    state: AppState,
+    headers: HeaderMap,
+    query: HashMap<String, String>,
+    websocket: WebSocketUpgrade,
+    stream: Option<String>,
 ) -> Response {
     let Some(token) = streaming_token(&headers, &query) else {
         return unauthorized().into_response();
@@ -72,7 +93,6 @@ async fn streaming(
         Err(response) => return response,
     };
 
-    let stream = query.get("stream").cloned();
     let events = state.streaming_events.clone();
     websocket
         .on_upgrade(move |socket| handle_streaming_socket(socket, account.id, stream, events))

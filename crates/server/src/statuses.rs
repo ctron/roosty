@@ -254,8 +254,14 @@ async fn create_status(
     };
     if let Some(parent_id) = in_reply_to_id {
         match roost_db::find_local_status_by_id(&state.db, parent_id).await {
-            Ok(Some(parent)) if can_view_status(&parent, Some(account.id)) => {}
-            Ok(Some(_)) | Ok(None) => return bad_request("reply target status does not exist"),
+            Ok(Some(parent)) => {
+                match status_visible_to_viewer(&state, &parent, Some(account.id)).await {
+                    Ok(true) => {}
+                    Ok(false) => return bad_request("reply target status does not exist"),
+                    Err(error) => return server_error(error),
+                }
+            }
+            Ok(None) => return bad_request("reply target status does not exist"),
             Err(error) => return server_error(error),
         }
     }
@@ -272,22 +278,35 @@ async fn create_status(
 
     let author_id = account.id;
     match roost_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
-        Ok(status) => match status_response(&state, status.clone(), account).await {
-            Ok(response) => {
-                if let Err(error) = notify_mentioned_accounts(&state, &status, author_id).await {
-                    warn!(%error, "failed to create mention notifications");
-                }
-                let recipients = status_stream_recipients(&state, &status).await;
-                state.streaming_events.publish_status_update(
-                    &response,
-                    author_id,
-                    &response.visibility,
-                    &recipients,
-                );
-                (StatusCode::OK, Json(response)).into_response()
+        Ok(mut status) => {
+            if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
+                return server_error(error);
             }
-            Err(error) => server_error(error),
-        },
+            if let Some(conversation_id) = status.conversation_id
+                && let Err(error) =
+                    crate::conversations::publish_conversation_update(&state, conversation_id).await
+            {
+                warn!(%error, "failed to publish conversation update");
+            }
+
+            match status_response(&state, status.clone(), account).await {
+                Ok(response) => {
+                    if let Err(error) = notify_mentioned_accounts(&state, &status, author_id).await
+                    {
+                        warn!(%error, "failed to create mention notifications");
+                    }
+                    let recipients = status_stream_recipients(&state, &status).await;
+                    state.streaming_events.publish_status_update(
+                        &response,
+                        author_id,
+                        &response.visibility,
+                        &recipients,
+                    );
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+                Err(error) => server_error(error),
+            }
+        }
         Err(error) => server_error(error),
     }
 }
@@ -297,13 +316,14 @@ async fn show_status(
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<StatusPath>,
 ) -> Response {
+    let viewer_id = viewer.as_ref().map(|account| account.id);
     match roost_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await {
-        Ok(Some(status)) if can_view_status(&status, viewer.as_ref().map(|account| account.id)) => {
-            status_with_author_response(&state, status, viewer.as_ref().map(|account| account.id))
-                .await
-        }
+        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer_id).await {
+            Ok(true) => status_with_author_response(&state, status, viewer_id).await,
+            Ok(false) => not_found(),
+            Err(error) => server_error(error),
+        },
         Ok(None) => not_found(),
-        Ok(Some(_)) => not_found(),
         Err(error) => server_error(error),
     }
 }
@@ -428,8 +448,12 @@ async fn status_context(
     let status_id = StatusId(path.status_id);
     let viewer = viewer.as_ref().map(|account| account.id);
     let status = match roost_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) if can_view_status(&status, viewer) => status,
-        Ok(Some(_)) | Ok(None) => return not_found(),
+        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer).await {
+            Ok(true) => status,
+            Ok(false) => return not_found(),
+            Err(error) => return server_error(error),
+        },
+        Ok(None) => return not_found(),
         Err(error) => return server_error(error),
     };
 
@@ -647,6 +671,43 @@ fn validate_status_text(status: &str, has_media: bool) -> Result<(), StatusInput
     if trimmed.chars().count() > MAX_STATUS_CHARS {
         return Err(StatusInputError::TooLong);
     }
+    Ok(())
+}
+
+/// Attach newly created direct statuses to a local Mastodon conversation.
+async fn attach_direct_conversation(
+    state: &AppState,
+    status: &mut roost_db::LocalStatus,
+    author_id: AccountId,
+) -> Result<(), RoostError> {
+    if status.visibility != "direct" {
+        return Ok(());
+    }
+
+    let mut participant_ids = local_text_mentions(state, &status.content)
+        .await?
+        .into_iter()
+        .map(|account| account.id)
+        .collect::<Vec<_>>();
+    if let Some(parent_id) = status.in_reply_to_id
+        && let Some(parent) = roost_db::find_local_status_by_id(&state.db, parent_id).await?
+    {
+        participant_ids.push(parent.account_id);
+    }
+    participant_ids.push(author_id);
+    participant_ids.sort_by_key(|account_id| account_id.0);
+    participant_ids.dedup();
+
+    let conversation_id = roost_db::attach_direct_status_to_conversation(
+        &state.db,
+        status.id,
+        author_id,
+        status.in_reply_to_id,
+        &participant_ids,
+    )
+    .await?;
+    status.conversation_id = Some(conversation_id);
+
     Ok(())
 }
 
@@ -1322,7 +1383,7 @@ async fn status_ancestors(
         let Some(parent) = roost_db::find_local_status_by_id(&state.db, status_id).await? else {
             break;
         };
-        if !can_view_status(&parent, viewer) {
+        if !status_visible_to_viewer(state, &parent, viewer).await? {
             break;
         }
 
@@ -1349,9 +1410,11 @@ async fn status_descendants(
             continue;
         }
 
-        let mut replies = roost_db::local_replies_to_status(&state.db, parent_id).await?;
-        replies.retain(|reply| can_view_status(reply, viewer));
+        let replies = roost_db::local_replies_to_status(&state.db, parent_id).await?;
         for reply in replies {
+            if !status_visible_to_viewer(state, &reply, viewer).await? {
+                continue;
+            }
             queue.push_back(reply.id);
             descendants.push(reply);
         }
@@ -1473,6 +1536,22 @@ fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
 fn can_view_status(status: &roost_db::LocalStatus, viewer: Option<AccountId>) -> bool {
     matches!(status.visibility.as_str(), "public" | "unlisted")
         || viewer.is_some_and(|account_id| account_id == status.account_id)
+}
+
+/// Return whether a viewer can read a local status, including direct conversation membership.
+pub(crate) async fn status_visible_to_viewer(
+    state: &AppState,
+    status: &roost_db::LocalStatus,
+    viewer: Option<AccountId>,
+) -> Result<bool, RoostError> {
+    if can_view_status(status, viewer) {
+        return Ok(true);
+    }
+    let Some(viewer) = viewer else {
+        return Ok(false);
+    };
+
+    roost_db::local_status_visible_to_account(&state.db, status, viewer).await
 }
 
 #[cfg(test)]
@@ -1679,6 +1758,7 @@ mod tests {
     use serde_json::Value;
     use tempfile::TempDir;
     use test_context::{AsyncTestContext, test_context};
+    use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
     use super::{escape_html, mention_usernames, status_content_html, timeline_limit};
@@ -1941,6 +2021,184 @@ mod tests {
                 StatusCode::OK
             );
         }
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a direct status mentioning a local account, when conversations are listed, then both participants see it with read state.
+    async fn direct_statuses_create_local_conversations(context: &mut StatusContext) {
+        let alice_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-conversation@example.com")
+            .await;
+        let direct = context
+            .create_status(&alice_token, "hello @bob", Some("direct"), None)
+            .await;
+        let direct_id = direct["id"].as_str().unwrap();
+
+        let bob_lookup = context
+            .authenticated_get(&format!("/api/v1/statuses/{direct_id}"), &bob_token)
+            .await;
+        assert_eq!(bob_lookup.status(), StatusCode::OK);
+
+        let bob_conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &bob_token)
+                .await,
+        )
+        .await;
+        let alice_conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &alice_token)
+                .await,
+        )
+        .await;
+
+        assert_eq!(bob_conversations.as_array().unwrap().len(), 1);
+        assert_eq!(alice_conversations.as_array().unwrap().len(), 1);
+        assert_eq!(bob_conversations[0]["unread"], true);
+        assert_eq!(alice_conversations[0]["unread"], false);
+        assert_eq!(bob_conversations[0]["accounts"][0]["username"], "admin");
+        assert_eq!(alice_conversations[0]["accounts"][0]["username"], "bob");
+        assert_eq!(bob_conversations[0]["last_status"]["id"], direct_id);
+        assert!(bob_conversations[0]["last_status"]["status"].is_null());
+
+        let conversation_id = bob_conversations[0]["id"].as_str().unwrap();
+        let read = json_body(
+            context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/conversations/{conversation_id}/read"),
+                    &bob_token,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(read["unread"], false);
+
+        let delete = context
+            .authenticated_empty(
+                "DELETE",
+                &format!("/api/v1/conversations/{conversation_id}"),
+                &bob_token,
+            )
+            .await;
+        assert_eq!(delete.status(), StatusCode::OK);
+        let bob_conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &bob_token)
+                .await,
+        )
+        .await;
+        let alice_conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &alice_token)
+                .await,
+        )
+        .await;
+        assert_eq!(bob_conversations, serde_json::json!([]));
+        assert_eq!(alice_conversations.as_array().unwrap().len(), 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a direct status, when a recipient listens on the direct stream, then a conversation event is emitted.
+    async fn direct_statuses_emit_conversation_stream_events(context: &mut StatusContext) {
+        let alice_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-direct-stream@example.com")
+            .await;
+        let bob = roost_db::find_local_account_by_username(&context.db, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut receiver = context.state.streaming_events.subscribe();
+
+        context
+            .create_status(&alice_token, "stream hello @bob", Some("direct"), None)
+            .await;
+
+        let mut stream_messages = None;
+        for _ in 0..4 {
+            let event = timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(message) = event
+                .to_socket_message(bob.id, &["direct".to_owned()])
+                .unwrap()
+            {
+                let user_message = event
+                    .to_socket_message(bob.id, &["user".to_owned()])
+                    .unwrap();
+                stream_messages = Some((message, user_message));
+                break;
+            }
+        }
+        let (direct_message, user_message) = stream_messages.unwrap();
+        let value: Value = serde_json::from_str(&direct_message).unwrap();
+        let payload: Value = serde_json::from_str(value["payload"].as_str().unwrap()).unwrap();
+        let conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &bob_token)
+                .await,
+        )
+        .await;
+
+        assert_eq!(value["event"], "conversation");
+        assert_eq!(value["stream"], serde_json::json!(["direct"]));
+        assert_eq!(payload["id"], conversations[0]["id"]);
+        assert_eq!(payload["unread"], true);
+        assert_eq!(payload["last_status"]["visibility"], "direct");
+        assert!(user_message.is_none());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given several direct conversations, when listing with a limit, then Mastodon cursor pagination is exposed.
+    async fn conversations_use_cursor_pagination(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        context
+            .access_token_for("one", "one-conversation@example.com")
+            .await;
+        context
+            .access_token_for("two", "two-conversation@example.com")
+            .await;
+        context
+            .access_token_for("three", "three-conversation@example.com")
+            .await;
+
+        context
+            .create_status(&token, "first @one", Some("direct"), None)
+            .await;
+        context
+            .create_status(&token, "second @two", Some("direct"), None)
+            .await;
+        context
+            .create_status(&token, "third @three", Some("direct"), None)
+            .await;
+
+        let page = context
+            .authenticated_get("/api/v1/conversations?limit=2", &token)
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let body = json_body(page).await;
+        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(body[0]["accounts"][0]["username"], "three");
+        assert_eq!(body[1]["accounts"][0]["username"], "two");
+
+        let next = context
+            .authenticated_get(
+                &format!("/api/v1/conversations?limit=2&max_id={next_cursor}"),
+                &token,
+            )
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
+        let body = json_body(next).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["accounts"][0]["username"], "one");
     }
 
     #[test_context(StatusContext)]
@@ -3383,6 +3641,7 @@ mod tests {
         db: roost_db::DbConnection,
         database_name: String,
         config: Config,
+        state: AppState,
         account_id: AccountId,
         application_id: uuid::Uuid,
         _temp_dir: TempDir,
@@ -3450,6 +3709,7 @@ mod tests {
 
             Self {
                 postgresql,
+                state: AppState::new(config.clone(), db.clone()),
                 db,
                 database_name,
                 config,
@@ -3460,18 +3720,25 @@ mod tests {
         }
 
         async fn teardown(self) {
-            self.db.close().await.unwrap();
-            self.postgresql
-                .drop_database(&self.database_name)
-                .await
-                .unwrap();
-            self.postgresql.stop().await.unwrap();
+            let StatusContext {
+                postgresql,
+                db,
+                database_name,
+                state,
+                ..
+            } = self;
+            let AppState { db: state_db, .. } = state;
+
+            state_db.close().await.unwrap();
+            db.close().await.unwrap();
+            postgresql.drop_database(&database_name).await.unwrap();
+            postgresql.stop().await.unwrap();
         }
     }
 
     impl StatusContext {
         fn app(&self) -> Router {
-            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+            crate::http::app_router(self.state.clone(), false)
         }
 
         async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {

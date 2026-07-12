@@ -15,6 +15,7 @@ mod accounts;
 mod auth;
 mod compat;
 mod config;
+mod conversations;
 mod http;
 mod instance;
 mod media;

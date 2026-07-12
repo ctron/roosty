@@ -88,7 +88,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local `@username` mentions render as links, populate `mentions`, and create local notifications; remote mentions are missing. |
-| 🟡 | Visibility semantics | Public/unlisted URL reads work; private/direct are owner-only until follow graph support exists. |
+| 🟡 | Conversations | Local direct-message conversations list/read/delete and direct stream events work for direct statuses with local participants; remote conversations are missing. |
+| 🟡 | Visibility semantics | Public/unlisted URL reads work; direct reads work for local conversation participants; private remains owner-only until follow graph support exists. |
 | 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local favourites with cursor pagination. |
 | 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
 | 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
@@ -128,6 +129,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/streaming` | WebSocket auth works; in-process only. |
+| 🟡 | `GET /api/v1/streaming/direct` | Local direct conversation updates emit `conversation` events; remote direct messages are missing. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
 | 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
@@ -140,7 +142,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add WebFinger, actor documents, inbox, and outbox.
 - [ ] Add federation delivery and inbound activity processing.
 - [ ] Add remote follow graph and full private-status home timeline semantics.
-- [ ] Add conversation endpoint support for replies.
+- [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote ActivityPub `Announce` support.
 - [ ] Add notification markers, grouped notifications, push integration, and remote notification events.
 - [ ] Add video/audio media handling, async processing, and object storage.

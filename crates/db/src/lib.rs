@@ -23,9 +23,10 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_follow, local_media_attachment, local_notification, local_status,
-    local_status_bookmark, local_status_favourite, local_status_reblog, oauth_access_token,
-    oauth_application, oauth_authorization_code,
+    local_account, local_conversation, local_conversation_account, local_follow,
+    local_media_attachment, local_notification, local_status, local_status_bookmark,
+    local_status_favourite, local_status_reblog, oauth_access_token, oauth_application,
+    oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -229,6 +230,8 @@ pub struct LocalStatus {
     pub language: Option<String>,
     /// Optional local status this status replies to.
     pub in_reply_to_id: Option<StatusId>,
+    /// Optional local direct-message conversation containing this status.
+    pub conversation_id: Option<Uuid>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Last update timestamp.
@@ -254,6 +257,49 @@ pub struct NewLocalStatus {
     pub language: Option<String>,
     /// Optional local status this status replies to.
     pub in_reply_to_id: Option<StatusId>,
+}
+
+/// Stored local direct-message conversation.
+#[derive(Clone, Debug)]
+pub struct LocalConversation {
+    /// Internal conversation identifier.
+    pub id: Uuid,
+    /// Most recent status in the conversation, when still available.
+    pub last_status_id: Option<StatusId>,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Last update timestamp.
+    pub updated_at: OffsetDateTime,
+}
+
+/// A local account's view of one direct-message conversation.
+#[derive(Clone, Debug)]
+pub struct LocalConversationAccount {
+    /// Per-account conversation identifier exposed through Mastodon APIs.
+    pub id: Uuid,
+    /// Cursor identifier used for conversation pagination.
+    pub cursor_id: Uuid,
+    /// Shared local conversation identifier.
+    pub conversation_id: Uuid,
+    /// Local account that owns this conversation view.
+    pub account_id: AccountId,
+    /// Whether the conversation has unread activity for this account.
+    pub unread: bool,
+    /// Soft-hide timestamp for this account's conversation view.
+    pub hidden_at: Option<OffsetDateTime>,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Last update timestamp.
+    pub updated_at: OffsetDateTime,
+}
+
+/// Local conversation row with the authenticated account's view state.
+#[derive(Clone, Debug)]
+pub struct LocalConversationView {
+    /// Shared conversation row.
+    pub conversation: LocalConversation,
+    /// Authenticated account's conversation row.
+    pub account: LocalConversationAccount,
 }
 
 /// Mutable local status fields accepted by Mastodon status edit APIs.
@@ -1014,6 +1060,7 @@ pub async fn create_local_status(
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
         in_reply_to_id: Set(new_status.in_reply_to_id.map(|id| id.0)),
+        conversation_id: Set(None),
         created_at: Set(created_at),
         updated_at: Set(created_at),
         deleted_at: Set(None),
@@ -1064,6 +1111,7 @@ pub async fn create_local_status_with_media(
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
         in_reply_to_id: Set(new_status.in_reply_to_id.map(|id| id.0)),
+        conversation_id: Set(None),
         created_at: Set(created_at),
         updated_at: Set(created_at),
         deleted_at: Set(None),
@@ -1403,6 +1451,304 @@ pub async fn local_replies_to_status(
         .await?;
 
     Ok(statuses.into_iter().map(local_status_from_model).collect())
+}
+
+/// Attach a direct status to a local conversation and update participant views.
+pub async fn attach_direct_status_to_conversation(
+    db: &DbConnection,
+    status_id: StatusId,
+    author_id: AccountId,
+    parent_id: Option<StatusId>,
+    participant_ids: &[AccountId],
+) -> Result<Uuid> {
+    let txn = db.begin().await?;
+    let now = OffsetDateTime::now_utc();
+    let parent_conversation_id = match parent_id {
+        Some(parent_id) => local_status::Entity::find_by_id(parent_id.0)
+            .one(&txn)
+            .await?
+            .and_then(|status| status.conversation_id),
+        None => None,
+    };
+    let conversation_id = match parent_conversation_id {
+        Some(conversation_id) => conversation_id,
+        None => {
+            local_conversation::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                last_status_id: Set(Some(status_id.0)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&txn)
+            .await?
+            .id
+        }
+    };
+
+    let mut status = local_status::Entity::find_by_id(status_id.0)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| RoostError::InvalidInput("conversation status not found".to_owned()))?
+        .into_active_model();
+    status.conversation_id = Set(Some(conversation_id));
+    status.updated_at = Set(now);
+    status.update(&txn).await?;
+
+    let mut conversation = local_conversation::Entity::find_by_id(conversation_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| RoostError::InvalidInput("conversation not found".to_owned()))?
+        .into_active_model();
+    conversation.last_status_id = Set(Some(status_id.0));
+    conversation.updated_at = Set(now);
+    conversation.update(&txn).await?;
+
+    let existing_participants = local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .all(&txn)
+        .await?;
+    let mut account_ids = existing_participants
+        .iter()
+        .map(|participant| AccountId(participant.account_id))
+        .chain(std::iter::once(author_id))
+        .chain(participant_ids.iter().copied())
+        .collect::<Vec<_>>();
+    account_ids.sort_by_key(|account_id| account_id.0);
+    account_ids.dedup();
+
+    for account_id in account_ids {
+        let unread = account_id != author_id;
+        let existing = existing_participants
+            .iter()
+            .find(|participant| participant.account_id == account_id.0);
+        match existing {
+            Some(participant) => {
+                let mut active = participant.clone().into_active_model();
+                active.cursor_id = Set(Uuid::now_v7());
+                active.unread = Set(unread);
+                active.hidden_at = Set(None);
+                active.updated_at = Set(now);
+                active.update(&txn).await?;
+            }
+            None => {
+                local_conversation_account::ActiveModel {
+                    id: Set(Uuid::now_v7()),
+                    cursor_id: Set(Uuid::now_v7()),
+                    conversation_id: Set(conversation_id),
+                    account_id: Set(account_id.0),
+                    unread: Set(unread),
+                    hidden_at: Set(None),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(&txn)
+                .await?;
+            }
+        }
+    }
+
+    txn.commit().await?;
+    Ok(conversation_id)
+}
+
+/// Return whether an account participates in a status's direct conversation.
+pub async fn local_status_visible_to_account(
+    db: &DbConnection,
+    status: &LocalStatus,
+    account_id: AccountId,
+) -> Result<bool> {
+    if matches!(status.visibility.as_str(), "public" | "unlisted")
+        || status.account_id == account_id
+    {
+        return Ok(true);
+    }
+    if status.visibility != "direct" {
+        return Ok(false);
+    }
+    let Some(conversation_id) = status.conversation_id else {
+        return Ok(false);
+    };
+
+    Ok(local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .filter(local_conversation_account::Column::AccountId.eq(account_id.0))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// List visible local direct conversations for an account.
+pub async fn local_conversations_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<LocalConversationView>> {
+    let rows = local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::AccountId.eq(account_id.0))
+        .filter(local_conversation_account::Column::HiddenAt.is_null())
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_conversation_account::Column::CursorId)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let first_cursor = rows.first().map(|row| row.cursor_id);
+    let last_cursor = rows.last().map(|row| row.cursor_id);
+    let mut items = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let Some(conversation) = local_conversation::Entity::find_by_id(row.conversation_id)
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        items.push(LocalConversationView {
+            conversation: local_conversation_from_model(conversation),
+            account: local_conversation_account_from_model(row),
+        });
+    }
+
+    Ok(CollectionPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// Find one visible local conversation owned by an account.
+pub async fn find_local_conversation_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    conversation_account_id: Uuid,
+) -> Result<Option<LocalConversationView>> {
+    let Some(row) = local_conversation_account::Entity::find_by_id(conversation_account_id)
+        .filter(local_conversation_account::Column::AccountId.eq(account_id.0))
+        .filter(local_conversation_account::Column::HiddenAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(conversation) = local_conversation::Entity::find_by_id(row.conversation_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(LocalConversationView {
+        conversation: local_conversation_from_model(conversation),
+        account: local_conversation_account_from_model(row),
+    }))
+}
+
+/// List visible account-specific views for one local conversation.
+pub async fn local_conversation_views(
+    db: &DbConnection,
+    conversation_id: Uuid,
+) -> Result<Vec<LocalConversationView>> {
+    let Some(conversation) = local_conversation::Entity::find_by_id(conversation_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let rows = local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .filter(local_conversation_account::Column::HiddenAt.is_null())
+        .all(db)
+        .await?;
+    let conversation = local_conversation_from_model(conversation);
+
+    Ok(rows
+        .into_iter()
+        .map(|row| LocalConversationView {
+            conversation: conversation.clone(),
+            account: local_conversation_account_from_model(row),
+        })
+        .collect())
+}
+
+/// Mark a local conversation as read for one account.
+pub async fn mark_local_conversation_read(
+    db: &DbConnection,
+    account_id: AccountId,
+    conversation_account_id: Uuid,
+) -> Result<Option<LocalConversationView>> {
+    let Some(row) =
+        find_local_conversation_account_model(db, account_id, conversation_account_id).await?
+    else {
+        return Ok(None);
+    };
+    let mut active = row.into_active_model();
+    active.unread = Set(false);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    let row = active.update(db).await?;
+
+    let Some(conversation) = local_conversation::Entity::find_by_id(row.conversation_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(LocalConversationView {
+        conversation: local_conversation_from_model(conversation),
+        account: local_conversation_account_from_model(row),
+    }))
+}
+
+/// Hide a local conversation for one account.
+pub async fn hide_local_conversation(
+    db: &DbConnection,
+    account_id: AccountId,
+    conversation_account_id: Uuid,
+) -> Result<bool> {
+    let Some(row) =
+        find_local_conversation_account_model(db, account_id, conversation_account_id).await?
+    else {
+        return Ok(false);
+    };
+    let mut active = row.into_active_model();
+    active.hidden_at = Set(Some(OffsetDateTime::now_utc()));
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+
+    Ok(true)
+}
+
+/// List local accounts participating in a conversation.
+pub async fn local_conversation_participants(
+    db: &DbConnection,
+    conversation_id: Uuid,
+) -> Result<Vec<LocalAccount>> {
+    let rows = local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .all(db)
+        .await?;
+    let account_ids = rows
+        .into_iter()
+        .map(|row| AccountId(row.account_id))
+        .collect::<Vec<_>>();
+
+    local_accounts_by_id(db, account_ids).await
+}
+
+async fn find_local_conversation_account_model(
+    db: &DbConnection,
+    account_id: AccountId,
+    conversation_account_id: Uuid,
+) -> Result<Option<local_conversation_account::Model>> {
+    Ok(
+        local_conversation_account::Entity::find_by_id(conversation_account_id)
+            .filter(local_conversation_account::Column::AccountId.eq(account_id.0))
+            .filter(local_conversation_account::Column::HiddenAt.is_null())
+            .one(db)
+            .await?,
+    )
 }
 
 /// Mark a local status as favourited by an account.
@@ -2044,6 +2390,21 @@ impl ApplyCollectionCursor for Select<local_notification::Entity> {
     }
 }
 
+impl ApplyCollectionCursor for Select<local_conversation_account::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_conversation_account::Column::CursorId.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_conversation_account::Column::CursorId.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_conversation_account::Column::CursorId.gt(min_id));
+        }
+        self
+    }
+}
+
 /// Mark an active model field as changed only when an update value is present.
 fn set_if_some<T>(active_value: &mut ActiveValue<T>, value: Option<T>)
 where
@@ -2327,9 +2688,34 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         spoiler_text: status.spoiler_text,
         language: status.language,
         in_reply_to_id: status.in_reply_to_id.map(StatusId),
+        conversation_id: status.conversation_id,
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
+    }
+}
+
+fn local_conversation_from_model(conversation: local_conversation::Model) -> LocalConversation {
+    LocalConversation {
+        id: conversation.id,
+        last_status_id: conversation.last_status_id.map(StatusId),
+        created_at: conversation.created_at,
+        updated_at: conversation.updated_at,
+    }
+}
+
+fn local_conversation_account_from_model(
+    account: local_conversation_account::Model,
+) -> LocalConversationAccount {
+    LocalConversationAccount {
+        id: account.id,
+        cursor_id: account.cursor_id,
+        conversation_id: account.conversation_id,
+        account_id: AccountId(account.account_id),
+        unread: account.unread,
+        hidden_at: account.hidden_at,
+        created_at: account.created_at,
+        updated_at: account.updated_at,
     }
 }
 

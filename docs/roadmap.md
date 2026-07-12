@@ -22,7 +22,8 @@
 - Improve local account administration now that multiple local users can be operator-created.
 - Expand local account search into remote discovery when WebFinger support lands.
 - Add cursor pagination for account status collections.
-- Add a conversation endpoint for replies.
+- Expand local direct conversations toward remote conversation support.
 - Add remote ActivityPub `Announce` support for boosts.
 - Extend media support with video/audio validation, async processing, and object storage.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.
+- Check why the conversations feed doesn't automatically update

@@ -56,6 +56,20 @@ impl StreamingEvents {
         }
     }
 
+    /// Publish a Mastodon `conversation` event to the recipient's direct stream.
+    pub fn publish_conversation<T>(&self, conversation: &T, recipient_id: AccountId)
+    where
+        T: Serialize,
+    {
+        match streaming_conversation_message(conversation, recipient_id) {
+            Ok(event) => match self.sender.send(event) {
+                Ok(_) => {}
+                Err(error) => debug!(%error, "streaming conversation had no active receivers"),
+            },
+            Err(error) => warn!(%error, "failed to serialize streaming conversation"),
+        }
+    }
+
     /// Publish a Mastodon `delete` event for a removed status-like entry.
     pub fn publish_delete(
         &self,
@@ -115,10 +129,15 @@ impl StreamingEvent {
     fn is_visible_to_stream(&self, account_id: AccountId, stream: &str) -> bool {
         match stream {
             "user" => {
-                self.account_id == account_id || self.user_recipient_ids.contains(&account_id)
+                self.event != StreamingEventType::Conversation
+                    && (self.account_id == account_id
+                        || self.user_recipient_ids.contains(&account_id))
             }
             "user:notification" => {
                 self.event == StreamingEventType::Notification && self.account_id == account_id
+            }
+            "direct" => {
+                self.event == StreamingEventType::Conversation && self.account_id == account_id
             }
             "public" | "public:local" => self.visibility == "public",
             _ => false,
@@ -139,6 +158,8 @@ enum StreamingEventType {
     Update,
     #[strum(serialize = "notification")]
     Notification,
+    #[strum(serialize = "conversation")]
+    Conversation,
     #[strum(serialize = "delete")]
     Delete,
 }
@@ -188,6 +209,24 @@ where
     })
 }
 
+/// Build the conversation event stored in the in-process broadcast channel.
+fn streaming_conversation_message<T>(
+    conversation: &T,
+    recipient_id: AccountId,
+) -> Result<StreamingEvent, serde_json::Error>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_string(conversation)?;
+    Ok(StreamingEvent {
+        event: StreamingEventType::Conversation,
+        payload,
+        account_id: recipient_id,
+        user_recipient_ids: Vec::new(),
+        visibility: "direct".to_owned(),
+    })
+}
+
 /// Build the delete event stored in the in-process broadcast channel.
 fn streaming_delete_message(
     status_id: &str,
@@ -211,7 +250,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        streaming_delete_message, streaming_notification_message, streaming_update_message,
+        streaming_conversation_message, streaming_delete_message, streaming_notification_message,
+        streaming_update_message,
     };
 
     #[test]
@@ -331,6 +371,38 @@ mod tests {
             .unwrap();
 
         assert!(message.is_none());
+    }
+
+    #[test]
+    /// Given a conversation event, when serialized for streams, then only the recipient's direct stream receives it.
+    fn conversation_messages_are_scoped_to_the_recipient_direct_stream() {
+        let recipient_id = AccountId(Uuid::now_v7());
+        let viewer_id = AccountId(Uuid::now_v7());
+        let event =
+            streaming_conversation_message(&serde_json::json!({"id": "1"}), recipient_id).unwrap();
+
+        let direct_message = event
+            .to_socket_message(recipient_id, &["direct".to_owned()])
+            .unwrap()
+            .unwrap();
+        let user_message = event
+            .to_socket_message(recipient_id, &["user".to_owned()])
+            .unwrap();
+        let viewer_message = event
+            .to_socket_message(viewer_id, &["direct".to_owned()])
+            .unwrap();
+        let value: Value = serde_json::from_str(&direct_message).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stream": ["direct"],
+                "event": "conversation",
+                "payload": "{\"id\":\"1\"}"
+            })
+        );
+        assert!(user_message.is_none());
+        assert!(viewer_message.is_none());
     }
 
     #[test]

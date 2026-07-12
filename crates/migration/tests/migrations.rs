@@ -29,6 +29,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_media_attachment").await);
     assert!(table_exists(database.connection(), "local_notification").await);
     assert!(table_exists(database.connection(), "local_status_reblog").await);
+    assert!(table_exists(database.connection(), "local_conversation").await);
+    assert!(table_exists(database.connection(), "local_conversation_account").await);
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
@@ -37,6 +39,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_account", "avatar_file_path").await);
     assert!(column_exists(database.connection(), "local_account", "header_file_path").await);
     assert!(column_exists(database.connection(), "local_status", "deleted_at").await);
+    assert!(column_exists(database.connection(), "local_status", "conversation_id").await);
     assert!(column_exists(database.connection(), "local_status_favourite", "id").await);
     assert!(column_exists(database.connection(), "local_status_bookmark", "id").await);
     assert!(column_exists(database.connection(), "local_follow", "id").await);
@@ -97,6 +100,38 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_status_reblog", "id").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "account_id").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "status_id").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_conversation",
+            "last_status_id"
+        )
+        .await
+    );
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_conversation_account",
+            "cursor_id"
+        )
+        .await
+    );
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_conversation_account",
+            "unread"
+        )
+        .await
+    );
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_conversation_account",
+            "hidden_at"
+        )
+        .await
+    );
 }
 
 #[test_context(EmbeddedDatabase)]
@@ -115,6 +150,8 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_media_attachment").await);
     assert!(table_exists(database.connection(), "local_notification").await);
     assert!(table_exists(database.connection(), "local_status_reblog").await);
+    assert!(table_exists(database.connection(), "local_conversation").await);
+    assert!(table_exists(database.connection(), "local_conversation_account").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
@@ -127,6 +164,8 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_media_attachment").await);
     assert!(!table_exists(database.connection(), "local_notification").await);
     assert!(!table_exists(database.connection(), "local_status_reblog").await);
+    assert!(!table_exists(database.connection(), "local_conversation").await);
+    assert!(!table_exists(database.connection(), "local_conversation_account").await);
 }
 
 struct EmbeddedDatabase {
