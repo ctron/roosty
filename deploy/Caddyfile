@@ -1,0 +1,15 @@
+https://localhost:4000, https://roost.localhost:4000 {
+	tls internal
+	reverse_proxy roost:4000
+}
+
+https://localhost:4001 {
+	tls internal
+
+	handle /reset {
+		header Clear-Site-Data "\"cache\", \"cookies\", \"storage\""
+		respond "Elk local browser state cleared. Open https://localhost:4001/ again." 200
+	}
+
+	reverse_proxy elk:5314
+}

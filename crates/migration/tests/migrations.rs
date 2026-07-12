@@ -14,6 +14,10 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
 
     assert!(table_exists(database.connection(), "job").await);
     assert!(table_exists(database.connection(), "local_account").await);
+    assert!(table_exists(database.connection(), "oauth_application").await);
+    assert!(table_exists(database.connection(), "oauth_authorization_code").await);
+    assert!(table_exists(database.connection(), "oauth_access_token").await);
+    assert!(table_exists(database.connection(), "oauth_refresh_token").await);
 }
 
 #[test_context(EmbeddedDatabase)]
@@ -22,10 +26,12 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     Migrator::up(database.connection(), None).await.unwrap();
     assert!(table_exists(database.connection(), "job").await);
     assert!(table_exists(database.connection(), "local_account").await);
+    assert!(table_exists(database.connection(), "oauth_application").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
     assert!(!table_exists(database.connection(), "local_account").await);
+    assert!(!table_exists(database.connection(), "oauth_application").await);
 }
 
 struct EmbeddedDatabase {

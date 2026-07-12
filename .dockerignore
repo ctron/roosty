@@ -1,0 +1,10 @@
+target/
+.git/
+.gitignore
+.dockerignore
+README.md
+docs/
+deploy/compose.yaml
+!deploy/Caddyfile
+!deploy/Caddy.Containerfile
+!deploy/Containerfile

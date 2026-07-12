@@ -17,29 +17,39 @@ Start the local stack:
 podman compose -f deploy/compose.yaml up --build
 ```
 
+The compose command starts Roost with `serve --with-migrations --with-worker`, so database migrations run automatically before the server begins listening.
+
+The local stack uses Caddy with an internal development certificate so Roost and Elk can run over HTTPS. Your browser may ask you to accept the local certificate.
+
 This starts:
 
-- Roost API server: `http://localhost:3000`
+- Roost API server through Caddy: `https://roost.localhost:4000`
 - Roost infrastructure endpoints: `http://localhost:3001`
-- Elk web client: `http://localhost:5314`
+- Elk web client through Caddy: `https://localhost:4001`
 - PostgreSQL 18
 
-Run migrations against the local database:
+To run migrations manually instead:
 
 ```sh
-ROOST_DATABASE_URL=postgres://roost:roost@localhost:5432/roost cargo run -p roost -- migrate
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost migrate
 ```
 
 Bootstrap the first administrator:
 
 ```sh
-ROOST_DATABASE_URL=postgres://roost:roost@localhost:5432/roost cargo run -p roost -- admin bootstrap --username admin --email admin@example.com
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin bootstrap --username admin --email admin@example.com
 ```
 
-When Elk asks for an instance URL, use:
+Elk is preset to use the local Roost instance. If it asks for an instance URL, use:
 
 ```text
-http://localhost:3000
+https://roost.localhost:4000
+```
+
+If Elk keeps trying an old saved instance, open this URL once to clear its local browser state:
+
+```text
+https://localhost:4001/reset
 ```
 
 Useful local endpoints:

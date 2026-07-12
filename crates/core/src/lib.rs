@@ -1,3 +1,5 @@
+#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;

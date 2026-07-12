@@ -10,13 +10,17 @@ use axum::{
 
 use crate::config::Config;
 
+/// Shared Axum application state.
 #[derive(Clone)]
 pub struct AppState {
+    /// Validated application configuration.
     pub config: Arc<Config>,
+    /// Database connection pool.
     pub db: roost_db::DbConnection,
 }
 
 impl AppState {
+    /// Create shared application state from config and database connection.
     pub fn new(config: Config, db: roost_db::DbConnection) -> Self {
         Self {
             config: Arc::new(config),
@@ -25,8 +29,10 @@ impl AppState {
     }
 }
 
+/// Build the public application router.
 pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
     let router = Router::<AppState>::new();
+    let router = router.merge(crate::auth::router());
     let router = if include_infra_routes {
         router.merge(infra_routes())
     } else {
@@ -36,6 +42,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
     router.with_state(state)
 }
 
+/// Build the infrastructure-only router.
 pub fn infra_router(state: AppState) -> Router {
     infra_routes().with_state(state)
 }

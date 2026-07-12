@@ -1,3 +1,5 @@
+#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use std::{net::SocketAddr, time::Duration};
 
 use axum::Router;
@@ -8,6 +10,7 @@ use sea_orm_migration::MigratorTrait;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+mod auth;
 mod config;
 mod http;
 mod password;
@@ -29,6 +32,10 @@ struct Cli {
 enum Command {
     /// Run the HTTP server.
     Serve {
+        /// Run database migrations before starting the HTTP server.
+        #[arg(long = "with-migrations")]
+        migrations: bool,
+
         /// Run durable background jobs in the same process.
         #[arg(long)]
         with_worker: bool,
@@ -72,9 +79,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Serve {
+            migrations,
             with_worker,
             listen,
-        } => serve(listen, with_worker).await,
+        } => serve(listen, migrations, with_worker).await,
         Command::Worker => worker().await,
         Command::Migrate => migrate().await,
         Command::Admin { command } => match command {
@@ -87,7 +95,11 @@ async fn migrate() -> Result<()> {
     let database_url = database_url_from_env()?;
     let db = roost_db::connect(&database_url).await?;
 
-    Migrator::up(&db, None)
+    run_migrations(&db).await
+}
+
+async fn run_migrations(db: &roost_db::DbConnection) -> Result<()> {
+    Migrator::up(db, None)
         .await
         .map_err(|error| RoostError::Database(error.to_string()))
 }
@@ -112,9 +124,18 @@ async fn bootstrap_admin(username: &str, email: &str) -> Result<()> {
     Ok(())
 }
 
-async fn serve(listen_override: Option<SocketAddr>, with_worker: bool) -> Result<()> {
+async fn serve(
+    listen_override: Option<SocketAddr>,
+    run_startup_migrations: bool,
+    with_worker: bool,
+) -> Result<()> {
     let config = Config::from_env(listen_override)?;
     let db = roost_db::connect(&config.database_url).await?;
+    if run_startup_migrations {
+        info!("running database migrations before server startup");
+        run_migrations(&db).await?;
+    }
+
     let state = AppState::new(config.clone(), db.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 

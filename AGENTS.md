@@ -18,3 +18,8 @@ Keep this as the default verification command for changes in this repository.
 - Current license: `Apache-2.0`.
 - Use SeaORM migrations as the canonical migration system from the start.
 - Keep SQLx available for explicit query paths where direct SQL is the clearer fit.
+
+## Documentation
+
+- Document exported Rust functions, types, and modules with rustdoc comments (`///` or `//!`).
+- For larger or non-obvious function bodies, add concise internal comments that explain the major steps or invariants.

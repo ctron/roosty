@@ -3,11 +3,11 @@ services:
     build:
       context: ..
       dockerfile: deploy/Containerfile
-    command: ["serve", "--with-worker"]
+    command: ["serve", "--with-migrations", "--with-worker"]
     environment:
       ROOST_DATABASE_URL: postgres://roost:roost@postgres:5432/roost
-      ROOST_PUBLIC_BASE_URL: http://localhost:3000
-      ROOST_LISTEN_ADDR: 0.0.0.0:3000
+      ROOST_PUBLIC_BASE_URL: https://roost.localhost:4000
+      ROOST_LISTEN_ADDR: 0.0.0.0:4000
       ROOST_INFRA_LISTEN_ADDR: 0.0.0.0:3001
       ROOST_SESSION_SECRET: development-session-secret-change-me-000
       ROOST_TOKEN_PEPPER: development-token-pepper-change-me-0000
@@ -18,22 +18,41 @@ services:
       ROOST_REGISTRATION_MODE: closed
       ROOST_FEDERATION_ENABLED: "false"
     ports:
-      - "3000:3000"
       - "3001:3001"
     depends_on:
       postgres:
         condition: service_healthy
 
   elk:
-    build:
-      context: https://github.com/elk-zone/elk.git
-      dockerfile: Dockerfile
-    ports:
-      - "5314:5314"
+    image: ghcr.io/elk-zone/elk:v1.0.0
+    user: "0:0"
+    environment:
+      NUXT_PUBLIC_DEFAULT_SERVER: roost.localhost:4000
+      NUXT_PUBLIC_SINGLE_INSTANCE: "true"
+      NUXT_STORAGE_DRIVER: fs
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
     volumes:
       - elk-data:/elk/data
     depends_on:
       - roost
+
+  caddy:
+    build:
+      context: ..
+      dockerfile: deploy/Caddy.Containerfile
+    networks:
+      default:
+        aliases:
+          - roost.localhost
+    ports:
+      - "4000:4000"
+      - "4001:4001"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - roost
+      - elk
 
   postgres:
     image: postgres:18
@@ -47,8 +66,10 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
 
 volumes:
+  caddy-config:
+  caddy-data:
   elk-data:
   postgres-data:

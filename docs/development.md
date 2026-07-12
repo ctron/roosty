@@ -6,27 +6,39 @@ Run the local stack:
 podman compose -f deploy/compose.yaml up --build
 ```
 
+The local stack starts Roost with `serve --with-migrations --with-worker`, so migrations run before the server begins listening.
+
+The local stack uses Caddy with an internal development certificate so Roost and Elk can run over HTTPS. Your browser may ask you to accept the local certificate.
+
 The local deployment also starts Elk, an external Mastodon-compatible web client:
 
 ```text
-http://localhost:5314
+https://localhost:4001
 ```
 
-Use `http://localhost:3000` as the instance URL when the client asks which server to connect to.
+Elk is configured for Roost as a single-instance client using `roost.localhost:4000`.
 
-Run migrations against the compose database:
+If Elk keeps trying an old saved instance, open `https://localhost:4001/reset` once to clear its local browser state.
+
+To smoke-test Elk's server-side login handoff to Roost:
 
 ```sh
-ROOST_DATABASE_URL=postgres://roost:roost@localhost:5432/roost cargo run -p roost -- migrate
+deploy/test-elk-login.sh
+```
+
+To run migrations manually instead:
+
+```sh
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost migrate
 ```
 
 Bootstrap the first administrator:
 
 ```sh
-ROOST_DATABASE_URL=postgres://roost:roost@localhost:5432/roost cargo run -p roost -- admin bootstrap --username admin --email admin@example.com
+podman compose -f deploy/compose.yaml exec roost /usr/local/bin/roost admin bootstrap --username admin --email admin@example.com
 ```
 
-The application listener defaults to port 3000. When `ROOST_INFRA_LISTEN_ADDR` is set, infrastructure endpoints are served only from that listener:
+The local application listener is exposed through Caddy on `https://roost.localhost:4000`. When `ROOST_INFRA_LISTEN_ADDR` is set, infrastructure endpoints are served only from that listener:
 
 ```text
 http://localhost:3001/healthz

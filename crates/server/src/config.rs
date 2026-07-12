@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use roost_core::{Result, RoostError};
 use url::Url;
 
-const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:3000";
+const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:4000";
 const DEFAULT_MEDIA_ROOT: &str = "./media";
 const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
