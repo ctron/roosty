@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -64,6 +64,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/bookmarks", get(bookmarks))
         .route("/api/v1/timelines/home", get(home_timeline))
         .route("/api/v1/timelines/public", get(public_timeline))
+        .route("/api/v1/timelines/tag/{hashtag}", get(tag_timeline))
+        .route("/api/v1/tags/{hashtag}", get(show_tag))
+        .route("/api/v1/tags/{hashtag}/follow", post(follow_tag))
+        .route("/api/v1/tags/{hashtag}/unfollow", post(unfollow_tag))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +97,11 @@ struct StatusPath {
     status_id: Uuid,
 }
 
+#[derive(Deserialize)]
+struct TagPath {
+    hashtag: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TimelineQuery {
     limit: u64,
@@ -105,6 +114,23 @@ struct TimelineParams {
     max_id: Option<String>,
     since_id: Option<String>,
     min_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct TagTimelineParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
+    #[serde(default)]
+    any: Vec<String>,
+    #[serde(default)]
+    all: Vec<String>,
+    #[serde(default)]
+    none: Vec<String>,
+    local: Option<bool>,
+    remote: Option<bool>,
+    only_media: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -155,7 +181,7 @@ pub(crate) struct StatusResponse {
     account: crate::auth::AccountResponse,
     media_attachments: Vec<crate::media::MediaAttachmentResponse>,
     mentions: Vec<MentionResponse>,
-    tags: Vec<Value>,
+    tags: Vec<TagResponse>,
     emojis: Vec<Value>,
     reblogs_count: u64,
     favourites_count: u64,
@@ -167,6 +193,49 @@ pub(crate) struct StatusResponse {
     pinned: bool,
     reblog: Option<Box<StatusResponse>>,
     application: Option<Value>,
+}
+
+/// Mastodon-compatible hashtag response.
+#[derive(Clone, Serialize)]
+pub(crate) struct TagResponse {
+    id: String,
+    name: String,
+    url: String,
+    history: Vec<TagHistoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    following: Option<bool>,
+}
+
+#[derive(Clone, Serialize)]
+struct TagHistoryResponse {
+    day: String,
+    uses: String,
+    accounts: String,
+}
+
+impl TagResponse {
+    /// Build the public tag response for a local tag and computed usage history.
+    pub(crate) fn new(
+        state: &AppState,
+        tag: roost_db::LocalTag,
+        history: Vec<roost_db::LocalTagHistory>,
+        following: Option<bool>,
+    ) -> Self {
+        Self {
+            id: tag.id.to_string(),
+            name: tag.name.clone(),
+            url: public_url(state, &format!("tags/{}", tag.name)),
+            history: history
+                .into_iter()
+                .map(|bucket| TagHistoryResponse {
+                    day: bucket.day.to_string(),
+                    uses: bucket.uses.to_string(),
+                    accounts: bucket.accounts.to_string(),
+                })
+                .collect(),
+            following,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -282,6 +351,9 @@ async fn create_status(
             if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
                 return server_error(error);
             }
+            if let Err(error) = sync_status_tags(&state, status.id, &status.content).await {
+                return server_error(error);
+            }
             if let Some(conversation_id) = status.conversation_id
                 && let Err(error) =
                     crate::conversations::publish_conversation_update(&state, conversation_id).await
@@ -382,10 +454,15 @@ async fn update_status(
     )
     .await
     {
-        Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
-            Ok(status) => Json(status).into_response(),
-            Err(error) => server_error(error),
-        },
+        Ok(Some(status)) => {
+            if let Err(error) = sync_status_tags(&state, status.id, &status.content).await {
+                return server_error(error);
+            }
+            match status_response(&state, status.clone(), account).await {
+                Ok(status) => Json(status).into_response(),
+                Err(error) => server_error(error),
+            }
+        }
         Ok(None) => not_found(),
         Err(RoostError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
@@ -632,6 +709,162 @@ async fn public_timeline(
         }
         Err(error) => server_error(error),
     }
+}
+
+async fn tag_timeline(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<TagPath>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let params = match tag_timeline_params(query.as_deref()) {
+        Ok(params) => params,
+        Err(()) => return bad_request("tag timeline query is invalid"),
+    };
+    let query = match timeline_query(TimelineParams {
+        limit: params.limit,
+        max_id: params.max_id,
+        since_id: params.since_id,
+        min_id: params.min_id,
+    }) {
+        Ok(query) => query,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    if params.remote.unwrap_or(false) && !params.local.unwrap_or(false) {
+        return timeline_response(
+            &state,
+            roost_db::TimelinePage {
+                items: Vec::new(),
+                first_cursor: None,
+                last_cursor: None,
+                has_more: false,
+            },
+            query.limit,
+            &format!("/api/v1/timelines/tag/{}", path.hashtag),
+            viewer.as_ref().map(|account| account.id),
+        )
+        .await;
+    }
+
+    match roost_db::local_tag_timeline(
+        &state.db,
+        &path.hashtag,
+        roost_db::LocalTagTimelineOptions {
+            any: params.any,
+            all: params.all,
+            none: params.none,
+            only_media: params.only_media.unwrap_or(false),
+        },
+        query.limit,
+        query.cursor,
+    )
+    .await
+    {
+        Ok(statuses) => {
+            timeline_response(
+                &state,
+                statuses,
+                query.limit,
+                &format!("/api/v1/timelines/tag/{}", path.hashtag),
+                viewer.as_ref().map(|account| account.id),
+            )
+            .await
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn show_tag(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(account): OptionalAuthenticatedAccount,
+    Path(path): Path<TagPath>,
+) -> Response {
+    match tag_response_by_name(
+        &state,
+        &path.hashtag,
+        account.as_ref().map(|account| account.id),
+    )
+    .await
+    {
+        Ok(Some(tag)) => Json(tag).into_response(),
+        Ok(None) => tag_not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn follow_tag(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<TagPath>,
+) -> Response {
+    match roost_db::follow_local_tag(&state.db, account.id, &path.hashtag).await {
+        Ok(tag) => tag_response(&state, tag, Some(true)).await,
+        Err(error) => server_error(error),
+    }
+}
+
+async fn unfollow_tag(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<TagPath>,
+) -> Response {
+    match roost_db::unfollow_local_tag(&state.db, account.id, &path.hashtag).await {
+        Ok(Some(tag)) => tag_response(&state, tag, Some(false)).await,
+        Ok(None) => tag_not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Build a Mastodon tag response for one locally known hashtag.
+async fn tag_response_by_name(
+    state: &AppState,
+    name: &str,
+    viewer: Option<AccountId>,
+) -> Result<Option<TagResponse>, RoostError> {
+    let Some(tag) = roost_db::find_local_tag_by_name(&state.db, name).await? else {
+        return Ok(None);
+    };
+    let following = match viewer {
+        Some(account_id) => {
+            Some(roost_db::is_local_tag_followed(&state.db, account_id, tag.id).await?)
+        }
+        None => None,
+    };
+
+    Ok(Some(tag_response_model(state, tag, following).await?))
+}
+
+/// Convert stored local tag metadata into a Mastodon tag response.
+pub(crate) async fn tag_response_model(
+    state: &AppState,
+    tag: roost_db::LocalTag,
+    following: Option<bool>,
+) -> Result<TagResponse, RoostError> {
+    let history = roost_db::local_tag_history(&state.db, tag.id).await?;
+    Ok(TagResponse::new(state, tag, history, following))
+}
+
+async fn tag_response(
+    state: &AppState,
+    tag: roost_db::LocalTag,
+    following: Option<bool>,
+) -> Response {
+    match tag_response_model(state, tag, following).await {
+        Ok(tag) => Json(tag).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+fn tag_timeline_params(query: Option<&str>) -> Result<TagTimelineParams, ()> {
+    let Some(query) = query else {
+        return Ok(TagTimelineParams::default());
+    };
+
+    serde_qs::Config::new()
+        .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+        .use_form_encoding(true)
+        .deserialize_str(query)
+        .map_err(|_| ())
 }
 
 /// Parse either JSON or form-encoded Mastodon status creation input.
@@ -1231,6 +1464,7 @@ async fn status_response_for_viewer(
         .map(|target| target.account_id.0.to_string());
     let text_mentions = local_text_mentions(state, &status.content).await?;
     let mentions = status_mentions(state, reply_target.as_ref(), &text_mentions);
+    let tags = status_tags(state, status.id).await?;
     let replies_count = roost_db::count_local_replies(&state.db, status.id).await?;
     let reblogs_count = roost_db::count_local_reblogs(&state.db, status.id).await?;
     let favourites_count = roost_db::count_local_favourites(&state.db, status.id).await?;
@@ -1271,11 +1505,16 @@ async fn status_response_for_viewer(
         language: status.language,
         uri: url.clone(),
         url,
-        content: status_content_html_with_mentions(state, &status.content, &text_mentions),
+        content: status_content_html_with_mentions_and_tags(
+            state,
+            &status.content,
+            &text_mentions,
+            &tags,
+        ),
         account: account_response(state, account).await?,
         media_attachments,
         mentions,
-        tags: Vec::new(),
+        tags,
         emojis: Vec::new(),
         reblogs_count,
         favourites_count,
@@ -1288,6 +1527,30 @@ async fn status_response_for_viewer(
         reblog: None,
         application: None,
     })
+}
+
+/// Replace stored hashtag links for a local status based on its plain text content.
+async fn sync_status_tags(
+    state: &AppState,
+    status_id: StatusId,
+    content: &str,
+) -> Result<(), RoostError> {
+    roost_db::replace_local_status_tags(&state.db, status_id, &hashtag_names(content)).await
+}
+
+/// Load Mastodon tag responses attached to a local status.
+async fn status_tags(
+    state: &AppState,
+    status_id: StatusId,
+) -> Result<Vec<TagResponse>, RoostError> {
+    let tags = roost_db::local_tags_for_status(&state.db, status_id).await?;
+    let mut responses = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let history = roost_db::local_tag_history(&state.db, tag.id).await?;
+        responses.push(TagResponse::new(state, tag, history, None));
+    }
+
+    Ok(responses)
 }
 
 /// Resolve local `@username` references present in status text.
@@ -1561,10 +1824,11 @@ fn status_content_html(content: &str) -> String {
     format!("<p>{escaped}</p>")
 }
 
-fn status_content_html_with_mentions(
+fn status_content_html_with_mentions_and_tags(
     state: &AppState,
     content: &str,
     mentions: &[roost_db::LocalAccount],
+    tags: &[TagResponse],
 ) -> String {
     let mention_urls = mentions
         .iter()
@@ -1575,26 +1839,73 @@ fn status_content_html_with_mentions(
             )
         })
         .collect::<HashMap<_, _>>();
-    let matches = local_mention_matches(content);
+    let tag_urls = tags
+        .iter()
+        .map(|tag| (tag.name.as_str(), tag.url.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut matches = local_mention_matches(content)
+        .into_iter()
+        .map(TextLinkMatch::Mention)
+        .chain(
+            local_hashtag_matches(content)
+                .into_iter()
+                .map(TextLinkMatch::Hashtag),
+        )
+        .collect::<Vec<_>>();
+    matches.sort_by_key(TextLinkMatch::start);
     let mut html = String::new();
     let mut last = 0;
 
-    for mention in matches {
-        push_escaped_html_with_breaks(&mut html, &content[last..mention.start]);
-        if let Some(url) = mention_urls.get(mention.username.as_str()) {
-            html.push_str(r#"<a href=""#);
-            html.push_str(&escape_html(url));
-            html.push_str(r#"" class="u-url mention">@"#);
-            html.push_str(&escape_html(&mention.username));
-            html.push_str("</a>");
-        } else {
-            push_escaped_html_with_breaks(&mut html, &content[mention.start..mention.end]);
+    for link in matches {
+        if link.start() < last {
+            continue;
         }
-        last = mention.end;
+        push_escaped_html_with_breaks(&mut html, &content[last..link.start()]);
+        match link {
+            TextLinkMatch::Mention(mention) => {
+                if let Some(url) = mention_urls.get(mention.username.as_str()) {
+                    html.push_str(r#"<a href=""#);
+                    html.push_str(&escape_html(url));
+                    html.push_str(r#"" class="u-url mention">@"#);
+                    html.push_str(&escape_html(&mention.username));
+                    html.push_str("</a>");
+                } else {
+                    push_escaped_html_with_breaks(&mut html, &content[mention.start..mention.end]);
+                }
+                last = mention.end;
+            }
+            TextLinkMatch::Hashtag(hashtag) => {
+                if let Some(url) = tag_urls.get(hashtag.name.as_str()) {
+                    html.push_str(r#"<a href=""#);
+                    html.push_str(&escape_html(url));
+                    html.push_str(r#"" class="mention hashtag" rel="tag">#<span>"#);
+                    html.push_str(&escape_html(&hashtag.name));
+                    html.push_str("</span></a>");
+                } else {
+                    push_escaped_html_with_breaks(&mut html, &content[hashtag.start..hashtag.end]);
+                }
+                last = hashtag.end;
+            }
+        }
     }
 
     push_escaped_html_with_breaks(&mut html, &content[last..]);
     format!("<p>{html}</p>")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TextLinkMatch {
+    Mention(MentionMatch),
+    Hashtag(HashtagMatch),
+}
+
+impl TextLinkMatch {
+    fn start(&self) -> usize {
+        match self {
+            TextLinkMatch::Mention(mention) => mention.start,
+            TextLinkMatch::Hashtag(hashtag) => hashtag.start,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1604,12 +1915,32 @@ struct MentionMatch {
     username: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HashtagMatch {
+    start: usize,
+    end: usize,
+    name: String,
+}
+
 /// Return local mention usernames in first-seen order.
 fn mention_usernames(content: &str) -> Vec<String> {
     local_mention_matches(content)
         .into_iter()
         .map(|mention| mention.username)
         .collect()
+}
+
+/// Return normalized hashtag names in first-seen order.
+fn hashtag_names(content: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for hashtag in local_hashtag_matches(content) {
+        if seen.insert(hashtag.name.clone()) {
+            names.push(hashtag.name);
+        }
+    }
+
+    names
 }
 
 /// Locate syntactic local `@username` mentions in a plain-text status.
@@ -1656,6 +1987,50 @@ fn valid_mention_prefix(previous: Option<char>) -> bool {
 
 fn valid_mention_name_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// Locate syntactic `#tag` references in plain-text status content.
+fn local_hashtag_matches(content: &str) -> Vec<HashtagMatch> {
+    let mut matches = Vec::new();
+    let mut previous = None;
+    let mut iter = content.char_indices().peekable();
+
+    while let Some((start, character)) = iter.next() {
+        if character != '#' || !valid_hashtag_prefix(previous) {
+            previous = Some(character);
+            continue;
+        }
+
+        let mut end = start + character.len_utf8();
+        let mut name = String::new();
+        while let Some((index, next)) = iter.peek().copied() {
+            if !valid_hashtag_character(next) {
+                break;
+            }
+            iter.next();
+            end = index + next.len_utf8();
+            name.push(next);
+        }
+
+        if name.chars().any(|character| character.is_alphanumeric()) {
+            matches.push(HashtagMatch {
+                start,
+                end,
+                name: name.to_lowercase(),
+            });
+        }
+        previous = content[start..end].chars().last();
+    }
+
+    matches
+}
+
+fn valid_hashtag_prefix(previous: Option<char>) -> bool {
+    previous.is_none_or(|character| !(character.is_alphanumeric() || character == '_'))
+}
+
+fn valid_hashtag_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
 }
 
 fn push_escaped_html_with_breaks(output: &mut String, value: &str) {
@@ -1718,6 +2093,10 @@ fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "status not found")
 }
 
+fn tag_not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found", "tag not found")
+}
+
 fn server_error(error: RoostError) -> Response {
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1761,7 +2140,9 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
-    use super::{escape_html, mention_usernames, status_content_html, timeline_limit};
+    use super::{
+        escape_html, hashtag_names, mention_usernames, status_content_html, timeline_limit,
+    };
     use crate::{config::Config, http::AppState, password};
 
     #[test_context(StatusContext)]
@@ -1841,6 +2222,203 @@ mod tests {
             r#"<a href="https://localhost:4000/@alice" class="u-url mention">@alice</a>"#
         ));
         assert!(status["content"].as_str().unwrap().contains("@missing"));
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given local hashtag text, when creating and editing a status, then Mastodon tag metadata tracks the current content.
+    async fn local_hashtags_are_linked_returned_and_replaced(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "hello #Rust and #Web_Dev #rust", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        assert_eq!(
+            status_tag_names(&status),
+            ["rust".to_owned(), "web_dev".to_owned()]
+        );
+        assert!(status["content"].as_str().unwrap().contains(
+            r#"<a href="https://localhost:4000/tags/rust" class="mention hashtag" rel="tag">#<span>rust</span></a>"#
+        ));
+        assert_eq!(status["tags"][0]["following"], serde_json::Value::Null);
+
+        let edit = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &token,
+                serde_json::json!({"status": "renamed #Roost"}),
+            )
+            .await;
+        assert_eq!(edit.status(), StatusCode::OK);
+        assert_eq!(
+            status_tag_names(&json_body(edit).await),
+            ["roost".to_owned()]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given tagged public statuses, when reading tag and account timelines, then Mastodon tag filters are honored.
+    async fn tag_timelines_and_account_tag_filters_return_matching_statuses(
+        context: &mut StatusContext,
+    ) {
+        let token = context.access_token().await;
+        let rust_web = context
+            .create_status(&token, "public #rust #web", Some("public"), None)
+            .await;
+        let rust_cli = context
+            .create_status(&token, "public #rust #cli", Some("public"), None)
+            .await;
+        context
+            .create_status(&token, "public #other", Some("public"), None)
+            .await;
+
+        let tag_page = json_body(context.get("/api/v1/timelines/tag/rust?limit=30").await).await;
+        assert_eq!(
+            status_ids(&tag_page),
+            [
+                rust_cli["id"].as_str().unwrap().to_owned(),
+                rust_web["id"].as_str().unwrap().to_owned(),
+            ]
+        );
+
+        let only_web = json_body(context.get("/api/v1/timelines/tag/rust?all[]=web").await).await;
+        assert_eq!(
+            status_ids(&only_web),
+            [rust_web["id"].as_str().unwrap().to_owned()]
+        );
+
+        let without_web =
+            json_body(context.get("/api/v1/timelines/tag/rust?none[]=web").await).await;
+        assert_eq!(
+            status_ids(&without_web),
+            [rust_cli["id"].as_str().unwrap().to_owned()]
+        );
+
+        let account = rust_web["account"]["id"].as_str().unwrap();
+        let account_tagged = json_body(
+            context
+                .get(&format!("/api/v1/accounts/{account}/statuses?tagged=cli"))
+                .await,
+        )
+        .await;
+        assert_eq!(
+            status_ids(&account_tagged),
+            [rust_cli["id"].as_str().unwrap().to_owned()]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a stored local hashtag, when viewing the tag API, then Mastodon's public tag lookup returns metadata.
+    async fn tag_lookup_returns_local_tag_metadata(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        context
+            .create_status(&token, "public #Testing", Some("public"), None)
+            .await;
+
+        let response = context.get("/api/v1/tags/testing").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let tag = json_body(response).await;
+        assert_eq!(
+            tag,
+            serde_json::json!({
+                "id": tag["id"],
+                "name": "testing",
+                "url": "https://localhost:4000/tags/testing",
+                "history": [{
+                    "day": tag["history"][0]["day"],
+                    "uses": "1",
+                    "accounts": "1"
+                }]
+            })
+        );
+
+        let mixed_case = context.get("/api/v1/tags/Testing").await;
+        assert_eq!(mixed_case.status(), StatusCode::OK);
+        assert_eq!(json_body(mixed_case).await["name"], "testing");
+        assert_eq!(
+            context.get("/api/v1/tags/missing").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an account follows a tag, when matching public statuses exist, then followed tags and home timeline reflect that state.
+    async fn followed_tags_are_listed_and_insert_matching_statuses_into_home(
+        context: &mut StatusContext,
+    ) {
+        let admin_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-tags@example.com")
+            .await;
+
+        let follow = context
+            .authenticated_empty("POST", "/api/v1/tags/testing/follow", &bob_token)
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+        assert_eq!(json_body(follow).await["following"], true);
+
+        let status = context
+            .create_status(&admin_token, "public #Testing", Some("public"), None)
+            .await;
+        context
+            .create_status(&admin_token, "unlisted #Testing", Some("unlisted"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let followed = json_body(
+            context
+                .authenticated_get("/api/v1/followed_tags", &bob_token)
+                .await,
+        )
+        .await;
+        assert_eq!(followed.as_array().unwrap().len(), 1);
+        assert_eq!(followed[0]["name"], "testing");
+        assert_eq!(followed[0]["following"], true);
+
+        let tag = json_body(
+            context
+                .authenticated_get("/api/v1/tags/testing", &bob_token)
+                .await,
+        )
+        .await;
+        assert_eq!(tag["following"], true);
+
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home", &bob_token)
+                .await,
+        )
+        .await;
+        assert_eq!(status_ids(&home), [status_id.to_owned()]);
+
+        let unfollow = context
+            .authenticated_empty("POST", "/api/v1/tags/testing/unfollow", &bob_token)
+            .await;
+        assert_eq!(unfollow.status(), StatusCode::OK);
+        assert_eq!(json_body(unfollow).await["following"], false);
+        assert_eq!(
+            json_body(
+                context
+                    .authenticated_get("/api/v1/followed_tags", &bob_token)
+                    .await
+            )
+            .await,
+            serde_json::json!([])
+        );
+        assert_eq!(
+            json_body(
+                context
+                    .authenticated_get("/api/v1/timelines/home", &bob_token)
+                    .await
+            )
+            .await,
+            serde_json::json!([])
+        );
     }
 
     #[test_context(StatusContext)]
@@ -3518,6 +4096,10 @@ mod tests {
             mention_usernames("@alice test x@y @bo_b"),
             ["alice", "bo_b"]
         );
+        assert_eq!(
+            hashtag_names("#Rust text##ignored word#skip #web_dev"),
+            ["rust", "ignored", "web_dev"]
+        );
     }
 
     /// Build a small valid image fixture for media upload compatibility tests.
@@ -3545,6 +4127,16 @@ mod tests {
             .unwrap()
             .iter()
             .map(|status| status["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Extract hashtag names from a Mastodon status response.
+    fn status_tag_names(status: &Value) -> Vec<String> {
+        status["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag["name"].as_str().unwrap().to_owned())
             .collect()
     }
 

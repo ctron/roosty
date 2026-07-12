@@ -18,6 +18,8 @@ mod m20260701_000013_create_local_notification_table;
 mod m20260701_000014_create_local_status_reblog_table;
 mod m20260701_000015_allow_reblog_notifications;
 mod m20260701_000016_create_local_conversation_tables;
+mod m20260701_000017_create_local_tag_tables;
+mod m20260701_000018_create_local_tag_follow_table;
 
 pub struct Migrator;
 
@@ -41,6 +43,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000014_create_local_status_reblog_table::Migration),
             Box::new(m20260701_000015_allow_reblog_notifications::Migration),
             Box::new(m20260701_000016_create_local_conversation_tables::Migration),
+            Box::new(m20260701_000017_create_local_tag_tables::Migration),
+            Box::new(m20260701_000018_create_local_tag_follow_table::Migration),
         ]
     }
 }

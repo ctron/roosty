@@ -25,8 +25,8 @@ mod entity;
 use entity::{
     local_account, local_conversation, local_conversation_account, local_follow,
     local_media_attachment, local_notification, local_status, local_status_bookmark,
-    local_status_favourite, local_status_reblog, oauth_access_token, oauth_application,
-    oauth_authorization_code,
+    local_status_favourite, local_status_reblog, local_status_tag, local_tag, local_tag_follow,
+    oauth_access_token, oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -238,6 +238,30 @@ pub struct LocalStatus {
     pub updated_at: OffsetDateTime,
     /// Soft-delete timestamp.
     pub deleted_at: Option<OffsetDateTime>,
+}
+
+/// Stored local hashtag metadata.
+#[derive(Clone, Debug)]
+pub struct LocalTag {
+    /// Internal hashtag identifier.
+    pub id: Uuid,
+    /// Normalized hashtag name without the leading `#`.
+    pub name: String,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Last update timestamp.
+    pub updated_at: OffsetDateTime,
+}
+
+/// One Mastodon tag history bucket.
+#[derive(Clone, Debug)]
+pub struct LocalTagHistory {
+    /// Midnight UTC Unix timestamp for this history bucket.
+    pub day: u64,
+    /// Number of local status uses on this day.
+    pub uses: u64,
+    /// Number of distinct local accounts using the tag on this day.
+    pub accounts: u64,
 }
 
 /// Data accepted when creating a local status.
@@ -471,10 +495,25 @@ pub struct TimelinePage<T> {
 }
 
 /// Filters supported by Mastodon account status timeline requests.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AccountStatusTimelineOptions {
     /// Exclude statuses that reply to another local status.
     pub exclude_replies: bool,
+    /// Return only statuses with at least one media attachment.
+    pub only_media: bool,
+    /// Return only statuses carrying the normalized hashtag.
+    pub tagged: Option<String>,
+}
+
+/// Filters supported by Mastodon's local hashtag timeline request.
+#[derive(Clone, Debug, Default)]
+pub struct LocalTagTimelineOptions {
+    /// Return statuses that include at least one of these additional tags.
+    pub any: Vec<String>,
+    /// Return statuses that include every one of these additional tags.
+    pub all: Vec<String>,
+    /// Exclude statuses that include any of these tags.
+    pub none: Vec<String>,
     /// Return only statuses with at least one media attachment.
     pub only_media: bool,
 }
@@ -1137,6 +1176,365 @@ pub async fn create_local_status_with_media(
 
     txn.commit().await?;
     Ok(local_status_from_model(status))
+}
+
+/// Replace all local hashtag links for one status, creating tag rows as needed.
+pub async fn replace_local_status_tags(
+    db: &DbConnection,
+    status_id: StatusId,
+    tag_names: &[String],
+) -> Result<()> {
+    let txn = db.begin().await?;
+    local_status_tag::Entity::delete_many()
+        .filter(local_status_tag::Column::StatusId.eq(status_id.0))
+        .exec(&txn)
+        .await?;
+
+    let now = OffsetDateTime::now_utc();
+    let mut names = tag_names.to_vec();
+    names.sort();
+    names.dedup();
+
+    for name in names {
+        let tag = find_or_create_local_tag(&txn, &name, now).await?;
+        local_status_tag::ActiveModel {
+            status_id: Set(status_id.0),
+            tag_id: Set(tag.id),
+            created_at: Set(now),
+        }
+        .insert(&txn)
+        .await?;
+    }
+
+    txn.commit().await?;
+    Ok(())
+}
+
+/// List tags attached to a local status in normalized name order.
+pub async fn local_tags_for_status(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Vec<LocalTag>> {
+    let rows = local_status_tag::Entity::find()
+        .filter(local_status_tag::Column::StatusId.eq(status_id.0))
+        .all(db)
+        .await?;
+    let mut tags = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(tag) = local_tag::Entity::find_by_id(row.tag_id).one(db).await? {
+            tags.push(local_tag_from_model(tag));
+        }
+    }
+    tags.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(tags)
+}
+
+/// Search local tags by normalized prefix with offset pagination.
+pub async fn search_local_tags(
+    db: &DbConnection,
+    query: &str,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<LocalTag>> {
+    let query = normalize_tag_name(query);
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tags = local_tag::Entity::find()
+        .filter(local_tag::Column::Name.starts_with(&query))
+        .order_by_asc(local_tag::Column::Name)
+        .offset(offset)
+        .limit(limit)
+        .all(db)
+        .await?;
+
+    Ok(tags.into_iter().map(local_tag_from_model).collect())
+}
+
+/// Find a local tag by normalized name.
+pub async fn find_local_tag_by_name(db: &DbConnection, name: &str) -> Result<Option<LocalTag>> {
+    let name = normalize_tag_name(name);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let tag = local_tag::Entity::find()
+        .filter(local_tag::Column::Name.eq(name))
+        .one(db)
+        .await?;
+
+    Ok(tag.map(local_tag_from_model))
+}
+
+/// Follow a local hashtag for one account, creating the tag row when necessary.
+pub async fn follow_local_tag(
+    db: &DbConnection,
+    account_id: AccountId,
+    name: &str,
+) -> Result<LocalTag> {
+    let txn = db.begin().await?;
+    let now = OffsetDateTime::now_utc();
+    let tag = find_or_create_local_tag(&txn, name, now).await?;
+
+    let existing = local_tag_follow::Entity::find()
+        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .filter(local_tag_follow::Column::TagId.eq(tag.id))
+        .one(&txn)
+        .await?;
+    match existing {
+        Some(follow) => {
+            let mut active = follow.into_active_model();
+            active.updated_at = Set(now);
+            active.update(&txn).await?;
+        }
+        None => {
+            local_tag_follow::ActiveModel {
+                account_id: Set(account_id.0),
+                tag_id: Set(tag.id),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&txn)
+            .await?;
+        }
+    }
+
+    txn.commit().await?;
+    Ok(local_tag_from_model(tag))
+}
+
+/// Stop following a local hashtag for one account and return the local tag when it exists.
+pub async fn unfollow_local_tag(
+    db: &DbConnection,
+    account_id: AccountId,
+    name: &str,
+) -> Result<Option<LocalTag>> {
+    let Some(tag) = find_local_tag_by_name(db, name).await? else {
+        return Ok(None);
+    };
+    local_tag_follow::Entity::delete_many()
+        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .filter(local_tag_follow::Column::TagId.eq(tag.id))
+        .exec(db)
+        .await?;
+
+    Ok(Some(tag))
+}
+
+/// Return hashtags followed by a local account in name order.
+pub async fn followed_local_tags(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<Vec<LocalTag>> {
+    let follows = local_tag_follow::Entity::find()
+        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .all(db)
+        .await?;
+    let mut tags = Vec::with_capacity(follows.len());
+    for follow in follows {
+        if let Some(tag) = local_tag::Entity::find_by_id(follow.tag_id).one(db).await? {
+            tags.push(local_tag_from_model(tag));
+        }
+    }
+    tags.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(tags)
+}
+
+/// Return whether a local account follows the tag.
+pub async fn is_local_tag_followed(
+    db: &DbConnection,
+    account_id: AccountId,
+    tag_id: Uuid,
+) -> Result<bool> {
+    Ok(local_tag_follow::Entity::find()
+        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .filter(local_tag_follow::Column::TagId.eq(tag_id))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Return recent local usage history for a tag.
+pub async fn local_tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTagHistory>> {
+    let rows = local_status_tag::Entity::find()
+        .filter(local_status_tag::Column::TagId.eq(tag_id))
+        .all(db)
+        .await?;
+    let mut buckets = std::collections::BTreeMap::<u64, (u64, Vec<Uuid>)>::new();
+
+    for row in rows {
+        let Some(status) = local_status::Entity::find_by_id(row.status_id)
+            .filter(local_status::Column::DeletedAt.is_null())
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        let day = (status.created_at.unix_timestamp() / 86_400 * 86_400).max(0) as u64;
+        let (uses, accounts) = buckets.entry(day).or_default();
+        *uses += 1;
+        accounts.push(status.account_id);
+    }
+
+    let mut history = buckets
+        .into_iter()
+        .rev()
+        .take(7)
+        .map(|(day, (uses, mut accounts))| {
+            accounts.sort();
+            accounts.dedup();
+            LocalTagHistory {
+                day,
+                uses,
+                accounts: accounts.len() as u64,
+            }
+        })
+        .collect::<Vec<_>>();
+    history.sort_by_key(|bucket| std::cmp::Reverse(bucket.day));
+
+    Ok(history)
+}
+
+/// List public local statuses containing a tag and optional tag filters.
+pub async fn local_tag_timeline(
+    db: &DbConnection,
+    tag: &str,
+    options: LocalTagTimelineOptions,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<TimelinePage<LocalStatus>> {
+    let Some(primary) = find_local_tag_by_name(db, tag).await? else {
+        return Ok(TimelinePage {
+            items: Vec::new(),
+            first_cursor: None,
+            last_cursor: None,
+            has_more: false,
+        });
+    };
+    let mut query = local_status::Entity::find()
+        .filter(local_status::Column::Visibility.eq("public"))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .filter(local_status::Column::Id.in_subquery(status_tag_subquery(primary.id)));
+
+    for tag in &options.all {
+        if let Some(tag) = find_local_tag_by_name(db, tag).await? {
+            query = query.filter(local_status::Column::Id.in_subquery(status_tag_subquery(tag.id)));
+        } else {
+            return Ok(TimelinePage {
+                items: Vec::new(),
+                first_cursor: None,
+                last_cursor: None,
+                has_more: false,
+            });
+        }
+    }
+
+    let any_tags = local_tags_by_names(db, &options.any).await?;
+    if !options.any.is_empty() {
+        if any_tags.is_empty() {
+            return Ok(TimelinePage {
+                items: Vec::new(),
+                first_cursor: None,
+                last_cursor: None,
+                has_more: false,
+            });
+        }
+        query = query.filter(local_status::Column::Id.in_subquery(status_tags_subquery(
+            any_tags.iter().map(|tag| tag.id).collect(),
+        )));
+    }
+
+    let none_tags = local_tags_by_names(db, &options.none).await?;
+    if !none_tags.is_empty() {
+        query = query.filter(
+            local_status::Column::Id.not_in_subquery(status_tags_subquery(
+                none_tags.iter().map(|tag| tag.id).collect(),
+            )),
+        );
+    }
+
+    if options.only_media {
+        query = query.filter(local_status::Column::Id.in_subquery(media_status_subquery()));
+    }
+
+    let statuses = apply_timeline_cursor(query, cursor)
+        .order_by_desc(local_status::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (statuses, has_more) = trim_to_page(statuses, limit);
+    let first_cursor = statuses.first().map(|status| status.id);
+    let last_cursor = statuses.last().map(|status| status.id);
+
+    Ok(TimelinePage {
+        items: statuses.into_iter().map(local_status_from_model).collect(),
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+async fn find_or_create_local_tag<C>(
+    db: &C,
+    name: &str,
+    now: OffsetDateTime,
+) -> Result<local_tag::Model>
+where
+    C: ConnectionTrait,
+{
+    let name = normalize_tag_name(name);
+    if let Some(tag) = local_tag::Entity::find()
+        .filter(local_tag::Column::Name.eq(&name))
+        .one(db)
+        .await?
+    {
+        return Ok(tag);
+    }
+
+    Ok(local_tag::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        name: Set(name),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?)
+}
+
+async fn local_tags_by_names(db: &DbConnection, names: &[String]) -> Result<Vec<LocalTag>> {
+    let mut tags = Vec::new();
+    for name in names {
+        if let Some(tag) = find_local_tag_by_name(db, name).await? {
+            tags.push(tag);
+        }
+    }
+
+    Ok(tags)
+}
+
+fn status_tag_subquery(tag_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+    status_tags_subquery(vec![tag_id])
+}
+
+fn status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::SelectStatement {
+    Query::select()
+        .column(local_status_tag::Column::StatusId)
+        .from(local_status_tag::Entity)
+        .and_where(local_status_tag::Column::TagId.is_in(tag_ids))
+        .to_owned()
+}
+
+fn media_status_subquery() -> sea_orm::sea_query::SelectStatement {
+    Query::select()
+        .column(local_media_attachment::Column::StatusId)
+        .from(local_media_attachment::Entity)
+        .and_where(local_media_attachment::Column::StatusId.is_not_null())
+        .to_owned()
+}
+
+fn normalize_tag_name(name: &str) -> String {
+    name.trim().trim_start_matches('#').to_lowercase()
 }
 
 /// Update an owned local status and its attached media metadata.
@@ -2155,12 +2553,18 @@ pub async fn local_statuses_by_account(
         query = query.filter(local_status::Column::InReplyToId.is_null());
     }
     if options.only_media {
-        let media_status_ids = Query::select()
-            .column(local_media_attachment::Column::StatusId)
-            .from(local_media_attachment::Entity)
-            .and_where(local_media_attachment::Column::StatusId.is_not_null())
-            .to_owned();
-        query = query.filter(local_status::Column::Id.in_subquery(media_status_ids));
+        query = query.filter(local_status::Column::Id.in_subquery(media_status_subquery()));
+    }
+    if let Some(tag) = options.tagged.as_deref() {
+        let Some(tag) = find_local_tag_by_name(db, tag).await? else {
+            return Ok(TimelinePage {
+                items: Vec::new(),
+                first_cursor: None,
+                last_cursor: None,
+                has_more: false,
+            });
+        };
+        query = query.filter(local_status::Column::Id.in_subquery(status_tag_subquery(tag.id)));
     }
 
     let statuses = apply_timeline_cursor(query, cursor)
@@ -2200,18 +2604,31 @@ pub async fn home_timeline_for_account(
         .filter(|follow| follow.show_reblogs)
         .map(|follow| follow.followed_account_id)
         .collect::<Vec<_>>();
+    let followed_tag_ids = local_tag_follow::Entity::find()
+        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|follow| follow.tag_id)
+        .collect::<Vec<_>>();
 
+    let mut status_condition = Condition::any()
+        .add(local_status::Column::AccountId.eq(account_id.0))
+        .add(
+            Condition::all()
+                .add(local_status::Column::AccountId.is_in(followed_ids.clone()))
+                .add(local_status::Column::Visibility.is_in(["public", "unlisted"])),
+        );
+    if !followed_tag_ids.is_empty() {
+        status_condition = status_condition.add(
+            Condition::all()
+                .add(local_status::Column::Visibility.eq("public"))
+                .add(local_status::Column::Id.in_subquery(status_tags_subquery(followed_tag_ids))),
+        );
+    }
     let statuses = apply_timeline_cursor(
         local_status::Entity::find()
-            .filter(
-                Condition::any()
-                    .add(local_status::Column::AccountId.eq(account_id.0))
-                    .add(
-                        Condition::all()
-                            .add(local_status::Column::AccountId.is_in(followed_ids.clone()))
-                            .add(local_status::Column::Visibility.is_in(["public", "unlisted"])),
-                    ),
-            )
+            .filter(status_condition)
             .filter(local_status::Column::DeletedAt.is_null()),
         cursor,
     )
@@ -2692,6 +3109,15 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
+    }
+}
+
+fn local_tag_from_model(tag: local_tag::Model) -> LocalTag {
+    LocalTag {
+        id: tag.id,
+        name: tag.name,
+        created_at: tag.created_at,
+        updated_at: tag.updated_at,
     }
 }
 

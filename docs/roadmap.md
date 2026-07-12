@@ -24,6 +24,6 @@
 - Add cursor pagination for account status collections.
 - Expand local direct conversations toward remote conversation support.
 - Add remote ActivityPub `Announce` support for boosts.
+- Add remote hashtag discovery and featured/profile tags.
 - Extend media support with video/audio validation, async processing, and object storage.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.
-- Check why the conversations feed doesn't automatically update

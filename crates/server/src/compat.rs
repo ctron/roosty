@@ -33,22 +33,37 @@ pub fn router() -> Router<AppState> {
 }
 
 #[derive(Serialize)]
-struct ErrorResponse<'a> {
-    error: &'a str,
+struct ErrorResponse {
+    error: String,
 }
 
 async fn push_subscription(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
-            error: "Record not found",
+            error: "Record not found".to_owned(),
         }),
     )
         .into_response()
 }
 
-async fn followed_tags(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
-    Json(Vec::<Value>::new()).into_response()
+async fn followed_tags(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+) -> Response {
+    match roost_db::followed_local_tags(&state.db, account.id).await {
+        Ok(tags) => {
+            let mut response = Vec::with_capacity(tags.len());
+            for tag in tags {
+                match crate::statuses::tag_response_model(&state, tag, Some(true)).await {
+                    Ok(tag) => response.push(tag),
+                    Err(error) => return server_error(error),
+                }
+            }
+            Json(response).into_response()
+        }
+        Err(error) => server_error(error),
+    }
 }
 
 async fn markers(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
@@ -222,13 +237,23 @@ fn websocket_protocol_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn unauthorized() -> (StatusCode, Json<ErrorResponse<'static>>) {
+fn unauthorized() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::UNAUTHORIZED,
         Json(ErrorResponse {
-            error: "The access token is invalid",
+            error: "The access token is invalid".to_owned(),
         }),
     )
+}
+
+fn server_error(error: roost_core::RoostError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

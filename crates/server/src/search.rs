@@ -38,7 +38,7 @@ struct SearchParams {
 struct SearchResponse {
     accounts: Vec<crate::auth::AccountResponse>,
     statuses: Vec<Value>,
-    hashtags: Vec<Value>,
+    hashtags: Vec<crate::statuses::TagResponse>,
 }
 
 #[derive(Serialize)]
@@ -57,15 +57,20 @@ async fn search(
     } else {
         Ok(Vec::new())
     };
+    let hashtags = if matches!(params.search_type.as_deref(), None | Some("hashtags")) {
+        search_hashtags(&state, &params).await
+    } else {
+        Ok(Vec::new())
+    };
 
-    match accounts {
-        Ok(accounts) => Json(SearchResponse {
+    match (accounts, hashtags) {
+        (Ok(accounts), Ok(hashtags)) => Json(SearchResponse {
             accounts,
             statuses: Vec::new(),
-            hashtags: Vec::new(),
+            hashtags,
         })
         .into_response(),
-        Err(error) => server_error(error),
+        (Err(error), _) | (_, Err(error)) => server_error(error),
     }
 }
 
@@ -106,6 +111,29 @@ async fn search_accounts(
     Ok(responses)
 }
 
+/// Search local hashtags and include recent usage history in Mastodon tag responses.
+async fn search_hashtags(
+    state: &AppState,
+    params: &SearchParams,
+) -> roost_core::Result<Vec<crate::statuses::TagResponse>> {
+    let Some(query) = normalized_tag_query(params.q.as_deref()) else {
+        return Ok(Vec::new());
+    };
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+    let tags = roost_db::search_local_tags(&state.db, &query, limit, offset).await?;
+    let mut responses = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let history = roost_db::local_tag_history(&state.db, tag.id).await?;
+        responses.push(crate::statuses::TagResponse::new(state, tag, history, None));
+    }
+
+    Ok(responses)
+}
+
 /// Normalize local mention-style search terms and reject remote account queries.
 fn normalized_local_query(state: &AppState, query: Option<&str>) -> Option<String> {
     let trimmed = query?.trim().trim_start_matches('@');
@@ -122,6 +150,12 @@ fn normalized_local_query(state: &AppState, query: Option<&str>) -> Option<Strin
     }
 
     non_empty(trimmed)
+}
+
+/// Normalize hashtag search terms accepted by Mastodon search.
+fn normalized_tag_query(query: Option<&str>) -> Option<String> {
+    let trimmed = query?.trim().trim_start_matches('#').to_lowercase();
+    non_empty(&trimmed)
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -184,6 +218,52 @@ mod tests {
         assert_eq!(body["accounts"][0]["username"], "alice");
         assert_eq!(body["statuses"], serde_json::json!([]));
         assert_eq!(body["hashtags"], serde_json::json!([]));
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
+    /// Given stored local hashtags, when v2 search requests hashtags, then Mastodon tag results include usage history.
+    async fn search_returns_local_hashtags(context: &mut SearchContext) {
+        let token = context.access_token().await;
+        let status = roost_db::create_local_status(
+            &context.db,
+            roost_db::NewLocalStatus {
+                account_id: context.account_id,
+                content: "searchable #RoostTag".to_owned(),
+                visibility: "public".to_owned(),
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        roost_db::replace_local_status_tags(&context.db, status.id, &["roosttag".to_owned()])
+            .await
+            .unwrap();
+
+        let response = context
+            .authenticated_get("/api/v2/search?type=hashtags&q=%23roost", &token)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["accounts"], serde_json::json!([]));
+        assert_eq!(body["statuses"], serde_json::json!([]));
+        assert_eq!(
+            body["hashtags"],
+            serde_json::json!([{
+                "id": body["hashtags"][0]["id"],
+                "name": "roosttag",
+                "url": "https://roost.localhost:4000/tags/roosttag",
+                "history": [{
+                    "day": body["hashtags"][0]["history"][0]["day"],
+                    "uses": "1",
+                    "accounts": "1"
+                }]
+            }])
+        );
     }
 
     #[test_context(SearchContext)]

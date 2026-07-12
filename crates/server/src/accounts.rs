@@ -145,8 +145,7 @@ async fn account_statuses(
     Query(params): Query<AccountStatusesParams>,
 ) -> Response {
     let account_id = AccountId(path.account_id);
-    if params.pinned.unwrap_or(false) || params.tagged.as_deref().is_some_and(|tag| !tag.is_empty())
-    {
+    if params.pinned.unwrap_or(false) {
         return Json(Vec::<serde_json::Value>::new()).into_response();
     }
 
@@ -170,6 +169,7 @@ async fn account_statuses(
         roost_db::AccountStatusTimelineOptions {
             exclude_replies: params.exclude_replies.unwrap_or(false),
             only_media: params.only_media.unwrap_or(false),
+            tagged: params.tagged.clone().filter(|tag| !tag.trim().is_empty()),
         },
     )
     .await

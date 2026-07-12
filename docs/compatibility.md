@@ -67,14 +67,14 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | Status metadata | Local `statuses_count` and `last_status_at` are populated. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
-| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses; media/tag/pin filters are empty until those features exist. |
+| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses with media and hashtag filters; pinned statuses are missing. |
 | 🟡 | Follow graph | Local follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote follows are missing. |
 
 ### Search
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v2/search` | Local account results for `type=accounts`; statuses and hashtags are empty. |
+| 🟡 | `GET /api/v2/search` | Local account results and local hashtag prefix results; status search and remote resolution are missing. |
 | 🔴 | Remote account resolution | `resolve=true` does not fetch remote accounts until WebFinger exists. |
 
 ### Statuses
@@ -88,6 +88,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local `@username` mentions render as links, populate `mentions`, and create local notifications; remote mentions are missing. |
+| 🟡 | Hashtags | Local `#tag` text is stored, linked in rendered status HTML, and returned in status `tags`; followed tags and remote tags are missing. |
 | 🟡 | Conversations | Local direct-message conversations list/read/delete and direct stream events work for direct statuses with local participants; remote conversations are missing. |
 | 🟡 | Visibility semantics | Public/unlisted URL reads work; direct reads work for local conversation participants; private remains owner-only until follow graph support exists. |
 | 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local favourites with cursor pagination. |
@@ -102,7 +103,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed local public/unlisted statuses, and followed local boosts when enabled. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
-| 🔴 | `GET /api/v1/timelines/tag/:tag` | Hashtag timeline is missing. |
+| 🟡 | `GET /api/v1/timelines/tag/:tag` | Local public hashtag timeline with `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, and `Link` headers; remote hashtag timelines are missing. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
 
 ### Notifications and Markers
@@ -118,7 +119,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🔴 | `GET /api/v1/followed_tags` | Placeholder currently returns an empty list. |
+| 🟡 | `GET /api/v1/tags/:name` | Public lookup for locally observed hashtags with local history and authenticated `following` state; featured tag state is missing. |
+| 🟡 | `GET /api/v1/followed_tags` | Lists locally followed hashtags for the authenticated account. |
+| 🟡 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local posts enter the home timeline; remote tag delivery is missing. |
 | 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
 | 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
 | 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
@@ -144,6 +147,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add remote follow graph and full private-status home timeline semantics.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote ActivityPub `Announce` support.
+- [ ] Add followed tags and remote hashtag support.
 - [ ] Add notification markers, grouped notifications, push integration, and remote notification events.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.
