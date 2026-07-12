@@ -2,6 +2,7 @@
 
 pub mod local_account;
 pub mod local_status;
+pub mod local_status_bookmark;
 pub mod local_status_favourite;
 pub mod oauth_access_token;
 pub mod oauth_application;

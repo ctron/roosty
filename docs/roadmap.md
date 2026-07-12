@@ -11,7 +11,7 @@
 ## Medium Term
 
 - Social graph APIs: follow, unfollow, mute, unmute, block, and unblock for local accounts.
-- Status interactions: replies, favourites, boosts, bookmarks, and delete streaming events.
+- Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
 - Notifications: persisted notification records, read markers, and streaming `notification` events.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: `public`, `public:local`, `user`, `user:notification`, and bounded slow-client handling.
@@ -21,5 +21,5 @@
 - Fill Mastodon client startup gaps found by Elk and browser logs.
 - Add cursor pagination for account status collections.
 - Add a conversation endpoint for replies.
-- Add boosts and bookmarks.
+- Add boosts.
 - Keep compatibility documentation updated with every implemented or intentionally deferred API.

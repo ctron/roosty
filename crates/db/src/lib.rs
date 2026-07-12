@@ -19,8 +19,8 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_status, local_status_favourite, oauth_access_token, oauth_application,
-    oauth_authorization_code,
+    local_account, local_status, local_status_bookmark, local_status_favourite, oauth_access_token,
+    oauth_application, oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -401,18 +401,16 @@ pub async fn favourite_local_status(
     if local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
         .one(db)
         .await?
-        .is_some()
+        .is_none()
     {
-        return Ok(());
+        local_status_favourite::ActiveModel {
+            account_id: Set(account_id.0),
+            status_id: Set(status_id.0),
+            created_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await?;
     }
-
-    local_status_favourite::ActiveModel {
-        account_id: Set(account_id.0),
-        status_id: Set(status_id.0),
-        created_at: Set(OffsetDateTime::now_utc()),
-    }
-    .insert(db)
-    .await?;
 
     Ok(())
 }
@@ -423,11 +421,11 @@ pub async fn unfavourite_local_status(
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
-    if let Some(favourite) = local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
+    if let Some(model) = local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
         .one(db)
         .await?
     {
-        favourite.into_active_model().delete(db).await?;
+        model.into_active_model().delete(db).await?;
     }
 
     Ok(())
@@ -461,16 +459,99 @@ pub async fn local_favourites_for_account(
     account_id: AccountId,
     limit: u64,
 ) -> Result<Vec<LocalStatus>> {
-    let favourites = local_status_favourite::Entity::find()
+    let status_ids = local_status_favourite::Entity::find()
         .filter(local_status_favourite::Column::AccountId.eq(account_id.0))
         .order_by_desc(local_status_favourite::Column::CreatedAt)
         .limit(limit)
         .all(db)
-        .await?;
-    let mut statuses = Vec::with_capacity(favourites.len());
+        .await?
+        .into_iter()
+        .map(|model| StatusId(model.status_id))
+        .collect::<Vec<_>>();
 
-    for favourite in favourites {
-        if let Some(status) = find_local_status_by_id(db, StatusId(favourite.status_id)).await? {
+    active_statuses_by_id(db, status_ids).await
+}
+
+/// Mark a local status as bookmarked by an account.
+pub async fn bookmark_local_status(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<()> {
+    if local_status_bookmark::Entity::find_by_id((account_id.0, status_id.0))
+        .one(db)
+        .await?
+        .is_none()
+    {
+        local_status_bookmark::ActiveModel {
+            account_id: Set(account_id.0),
+            status_id: Set(status_id.0),
+            created_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Remove a local account's bookmark from a status when it exists.
+pub async fn unbookmark_local_status(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<()> {
+    if let Some(model) = local_status_bookmark::Entity::find_by_id((account_id.0, status_id.0))
+        .one(db)
+        .await?
+    {
+        model.into_active_model().delete(db).await?;
+    }
+
+    Ok(())
+}
+
+/// Return whether a local account has bookmarked a status.
+pub async fn is_local_status_bookmarked(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<bool> {
+    Ok(
+        local_status_bookmark::Entity::find_by_id((account_id.0, status_id.0))
+            .one(db)
+            .await?
+            .is_some(),
+    )
+}
+
+/// List local statuses bookmarked by an account, newest bookmark first.
+pub async fn local_bookmarks_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<Vec<LocalStatus>> {
+    let status_ids = local_status_bookmark::Entity::find()
+        .filter(local_status_bookmark::Column::AccountId.eq(account_id.0))
+        .order_by_desc(local_status_bookmark::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| StatusId(model.status_id))
+        .collect::<Vec<_>>();
+
+    active_statuses_by_id(db, status_ids).await
+}
+
+/// Load active local statuses for ordered status identifiers.
+async fn active_statuses_by_id(
+    db: &DbConnection,
+    status_ids: Vec<StatusId>,
+) -> Result<Vec<LocalStatus>> {
+    let mut statuses = Vec::with_capacity(status_ids.len());
+    for status_id in status_ids {
+        if let Some(status) = find_local_status_by_id(db, status_id).await? {
             statuses.push(status);
         }
     }

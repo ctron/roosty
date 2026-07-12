@@ -40,7 +40,16 @@ pub fn router() -> Router<AppState> {
             "/api/v1/statuses/{status_id}/unfavourite",
             post(unfavourite_status),
         )
+        .route(
+            "/api/v1/statuses/{status_id}/bookmark",
+            post(bookmark_status),
+        )
+        .route(
+            "/api/v1/statuses/{status_id}/unbookmark",
+            post(unbookmark_status),
+        )
         .route("/api/v1/favourites", get(favourites))
+        .route("/api/v1/bookmarks", get(bookmarks))
         .route("/api/v1/timelines/home", get(home_timeline))
         .route("/api/v1/timelines/public", get(public_timeline))
 }
@@ -81,7 +90,7 @@ struct TimelineParams {
 }
 
 #[derive(Deserialize)]
-struct FavouritesParams {
+struct CollectionParams {
     limit: Option<u64>,
 }
 
@@ -155,6 +164,20 @@ impl MentionResponse {
 struct ErrorResponse<'a> {
     error: &'a str,
     error_description: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum StatusCollectionAction {
+    Favourite,
+    Unfavourite,
+    Bookmark,
+    Unbookmark,
+}
+
+#[derive(Clone, Copy)]
+enum StatusCollectionList {
+    Favourites,
+    Bookmarks,
 }
 
 struct ReplyTarget {
@@ -287,17 +310,7 @@ async fn favourite_status(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
 ) -> Response {
-    let status_id = StatusId(path.status_id);
-    let status = match visible_status_for_account(&state, status_id, account.id).await {
-        Ok(Some(status)) => status,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-
-    match roost_db::favourite_local_status(&state.db, account.id, status_id).await {
-        Ok(()) => status_with_author_response(&state, status, Some(account.id)).await,
-        Err(error) => server_error(error),
-    }
+    status_collection_action(&state, account.id, path, StatusCollectionAction::Favourite).await
 }
 
 async fn unfavourite_status(
@@ -305,30 +318,45 @@ async fn unfavourite_status(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
 ) -> Response {
-    let status_id = StatusId(path.status_id);
-    let status = match visible_status_for_account(&state, status_id, account.id).await {
-        Ok(Some(status)) => status,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
+    status_collection_action(
+        &state,
+        account.id,
+        path,
+        StatusCollectionAction::Unfavourite,
+    )
+    .await
+}
 
-    match roost_db::unfavourite_local_status(&state.db, account.id, status_id).await {
-        Ok(()) => status_with_author_response(&state, status, Some(account.id)).await,
-        Err(error) => server_error(error),
-    }
+async fn bookmark_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    status_collection_action(&state, account.id, path, StatusCollectionAction::Bookmark).await
+}
+
+async fn unbookmark_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    status_collection_action(&state, account.id, path, StatusCollectionAction::Unbookmark).await
 }
 
 async fn favourites(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-    Query(params): Query<FavouritesParams>,
+    Query(params): Query<CollectionParams>,
 ) -> Response {
-    let limit = timeline_limit(params.limit);
+    status_collection_list(&state, account.id, params, StatusCollectionList::Favourites).await
+}
 
-    match roost_db::local_favourites_for_account(&state.db, account.id, limit).await {
-        Ok(statuses) => statuses_response(&state, statuses, Some(account.id)).await,
-        Err(error) => server_error(error),
-    }
+async fn bookmarks(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Query(params): Query<CollectionParams>,
+) -> Response {
+    status_collection_list(&state, account.id, params, StatusCollectionList::Bookmarks).await
 }
 
 async fn home_timeline(
@@ -450,6 +478,64 @@ async fn statuses_response(
     }
 }
 
+/// Apply a local status collection mutation and return the updated status.
+async fn status_collection_action(
+    state: &AppState,
+    account_id: AccountId,
+    path: StatusPath,
+    action: StatusCollectionAction,
+) -> Response {
+    let status_id = StatusId(path.status_id);
+    let status = match visible_status_for_account(state, status_id, account_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+
+    let result = match action {
+        StatusCollectionAction::Favourite => {
+            roost_db::favourite_local_status(&state.db, account_id, status_id).await
+        }
+        StatusCollectionAction::Unfavourite => {
+            roost_db::unfavourite_local_status(&state.db, account_id, status_id).await
+        }
+        StatusCollectionAction::Bookmark => {
+            roost_db::bookmark_local_status(&state.db, account_id, status_id).await
+        }
+        StatusCollectionAction::Unbookmark => {
+            roost_db::unbookmark_local_status(&state.db, account_id, status_id).await
+        }
+    };
+
+    match result {
+        Ok(()) => status_with_author_response(state, status, Some(account_id)).await,
+        Err(error) => server_error(error),
+    }
+}
+
+/// Return a local status collection for an authenticated account.
+async fn status_collection_list(
+    state: &AppState,
+    account_id: AccountId,
+    params: CollectionParams,
+    collection: StatusCollectionList,
+) -> Response {
+    let limit = timeline_limit(params.limit);
+    let result = match collection {
+        StatusCollectionList::Favourites => {
+            roost_db::local_favourites_for_account(&state.db, account_id, limit).await
+        }
+        StatusCollectionList::Bookmarks => {
+            roost_db::local_bookmarks_for_account(&state.db, account_id, limit).await
+        }
+    };
+
+    match result {
+        Ok(statuses) => statuses_response(state, statuses, Some(account_id)).await,
+        Err(error) => server_error(error),
+    }
+}
+
 async fn status_models(
     state: &AppState,
     statuses: Vec<roost_db::LocalStatus>,
@@ -533,6 +619,12 @@ async fn status_response_for_viewer(
         }
         None => false,
     };
+    let bookmarked = match viewer {
+        Some(account_id) => {
+            roost_db::is_local_status_bookmarked(&state.db, account_id, status.id).await?
+        }
+        None => false,
+    };
 
     Ok(StatusResponse {
         id: status.id.0.to_string(),
@@ -557,7 +649,7 @@ async fn status_response_for_viewer(
         favourited,
         reblogged: false,
         muted: false,
-        bookmarked: false,
+        bookmarked,
         pinned: false,
         reblog: None,
         application: None,
@@ -1215,6 +1307,96 @@ mod tests {
             .await;
         assert_eq!(owner.status(), StatusCode::OK);
         assert_eq!(json_body(owner).await["favourited"], true);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies bookmark toggles and collection listing follow Mastodon shapes.
+    async fn bookmarks_are_idempotent_and_update_status_fields(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "bookmark me", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let first = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/bookmark"),
+                &token,
+            )
+            .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = json_body(first).await;
+        assert_eq!(first["bookmarked"], true);
+
+        let second = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/bookmark"),
+                &token,
+            )
+            .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(json_body(second).await["bookmarked"], true);
+
+        let bookmarks = json_body(
+            context
+                .authenticated_get("/api/v1/bookmarks?limit=30", &token)
+                .await,
+        )
+        .await;
+        assert_eq!(bookmarks.as_array().unwrap().len(), 1);
+        assert_eq!(bookmarks[0]["id"], status_id);
+        assert_eq!(bookmarks[0]["bookmarked"], true);
+
+        let anonymous =
+            json_body(context.get(&format!("/api/v1/statuses/{status_id}")).await).await;
+        assert_eq!(anonymous["bookmarked"], false);
+
+        let unbookmark = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/unbookmark"),
+                &token,
+            )
+            .await;
+        assert_eq!(unbookmark.status(), StatusCode::OK);
+        assert_eq!(json_body(unbookmark).await["bookmarked"], false);
+        let bookmarks =
+            json_body(context.authenticated_get("/api/v1/bookmarks", &token).await).await;
+        assert_eq!(bookmarks, serde_json::json!([]));
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Verifies bookmark permissions use the same policy as status reads.
+    async fn bookmarks_follow_status_visibility(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let other_token = context.access_token_for("other", "other@example.com").await;
+        let status = context
+            .create_status(&owner_token, "private", Some("private"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let forbidden = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/bookmark"),
+                &other_token,
+            )
+            .await;
+        assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+
+        let owner = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/bookmark"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(owner.status(), StatusCode::OK);
+        assert_eq!(json_body(owner).await["bookmarked"], true);
     }
 
     #[test]
