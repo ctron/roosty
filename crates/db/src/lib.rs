@@ -11,6 +11,8 @@ use sea_orm::{
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
+use strum::{EnumString, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -19,8 +21,9 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_follow, local_media_attachment, local_status, local_status_bookmark,
-    local_status_favourite, oauth_access_token, oauth_application, oauth_authorization_code,
+    local_account, local_follow, local_media_attachment, local_notification, local_status,
+    local_status_bookmark, local_status_favourite, oauth_access_token, oauth_application,
+    oauth_authorization_code,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -404,6 +407,55 @@ pub struct CollectionPage<T> {
     pub last_cursor: Option<Uuid>,
 }
 
+/// Supported local Mastodon notification kinds.
+#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum LocalNotificationType {
+    /// A local status mentioned the recipient.
+    Mention,
+    /// A local account favourited one of the recipient's statuses.
+    Favourite,
+    /// A local account followed the recipient.
+    Follow,
+}
+
+impl LocalNotificationType {
+    /// Return the Mastodon wire value for this notification type.
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// Stored local notification event.
+#[derive(Clone, Debug)]
+pub struct LocalNotification {
+    /// Opaque Mastodon notification identifier.
+    pub id: Uuid,
+    /// Account receiving the notification.
+    pub account_id: AccountId,
+    /// Mastodon notification type.
+    pub notification_type: LocalNotificationType,
+    /// Account that caused the notification.
+    pub actor_account_id: AccountId,
+    /// Related local status for mention and favourite notifications.
+    pub status_id: Option<StatusId>,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Soft-dismiss timestamp.
+    pub dismissed_at: Option<OffsetDateTime>,
+}
+
+/// Filters accepted by local notification collection queries.
+#[derive(Clone, Debug, Default)]
+pub struct NotificationFilter {
+    /// Only include these notification types when present.
+    pub include_types: Vec<LocalNotificationType>,
+    /// Exclude these notification types.
+    pub exclude_types: Vec<LocalNotificationType>,
+    /// Only include notifications caused by this account.
+    pub account_id: Option<AccountId>,
+}
+
 /// Stored local follow relationship between two accounts.
 #[derive(Clone, Debug)]
 pub struct LocalFollow {
@@ -613,6 +665,148 @@ pub async fn unfollow_local_account(
         model.into_active_model().delete(db).await?;
     }
 
+    Ok(())
+}
+
+/// Create or return an existing local notification for one logical event.
+pub async fn notify_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    notification_type: LocalNotificationType,
+    actor_account_id: AccountId,
+    status_id: Option<StatusId>,
+) -> Result<LocalNotification> {
+    if account_id == actor_account_id {
+        return Err(RoostError::InvalidInput(
+            "accounts cannot notify themselves".to_owned(),
+        ));
+    }
+    let type_value = notification_type.as_str();
+    let status_uuid = status_id.map(|id| id.0);
+    if let Some(existing) = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq(type_value))
+        .filter(local_notification::Column::ActorAccountId.eq(actor_account_id.0))
+        .filter(match status_uuid {
+            Some(status_id) => local_notification::Column::StatusId.eq(status_id),
+            None => local_notification::Column::StatusId.is_null(),
+        })
+        .one(db)
+        .await?
+    {
+        return Ok(local_notification_from_model(existing));
+    }
+
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set(type_value.to_owned()),
+        actor_account_id: Set(actor_account_id.0),
+        status_id: Set(status_uuid),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+
+    Ok(local_notification_from_model(model))
+}
+
+/// List visible local notifications for one recipient with Mastodon cursor filters.
+pub async fn local_notifications_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+    filter: NotificationFilter,
+) -> Result<CollectionPage<LocalNotification>> {
+    let mut query = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_notification::Column::Id)
+        .limit(limit);
+
+    if !filter.include_types.is_empty() {
+        query = query.filter(
+            local_notification::Column::NotificationType
+                .is_in(filter.include_types.iter().map(|value| value.as_str())),
+        );
+    }
+    if !filter.exclude_types.is_empty() {
+        query = query.filter(
+            local_notification::Column::NotificationType
+                .is_not_in(filter.exclude_types.iter().map(|value| value.as_str())),
+        );
+    }
+    if let Some(actor_id) = filter.account_id {
+        query = query.filter(local_notification::Column::ActorAccountId.eq(actor_id.0));
+    }
+
+    let rows = query.all(db).await?;
+    let first_cursor = rows.first().map(|model| model.id);
+    let last_cursor = rows.last().map(|model| model.id);
+    let items = rows
+        .into_iter()
+        .map(local_notification_from_model)
+        .collect();
+
+    Ok(CollectionPage {
+        items,
+        first_cursor,
+        last_cursor,
+    })
+}
+
+/// Find one visible local notification belonging to a recipient.
+pub async fn find_local_notification_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    notification_id: Uuid,
+) -> Result<Option<LocalNotification>> {
+    let notification = local_notification::Entity::find_by_id(notification_id)
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .one(db)
+        .await?;
+
+    Ok(notification.map(local_notification_from_model))
+}
+
+/// Dismiss one visible local notification for a recipient.
+pub async fn dismiss_local_notification(
+    db: &DbConnection,
+    account_id: AccountId,
+    notification_id: Uuid,
+) -> Result<bool> {
+    let Some(model) = local_notification::Entity::find_by_id(notification_id)
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+
+    let mut active = model.into_active_model();
+    active.dismissed_at = Set(Some(OffsetDateTime::now_utc()));
+    active.update(db).await?;
+    Ok(true)
+}
+
+/// Dismiss every visible local notification for a recipient.
+pub async fn clear_local_notifications(db: &DbConnection, account_id: AccountId) -> Result<()> {
+    let notifications = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .all(db)
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    for notification in notifications {
+        let mut active = notification.into_active_model();
+        active.dismissed_at = Set(Some(now));
+        active.update(db).await?;
+    }
     Ok(())
 }
 
@@ -1514,6 +1708,21 @@ impl ApplyCollectionCursor for Select<local_follow::Entity> {
     }
 }
 
+impl ApplyCollectionCursor for Select<local_notification::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_notification::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_notification::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_notification::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
 /// Mark an active model field as changed only when an update value is present.
 fn set_if_some<T>(active_value: &mut ActiveValue<T>, value: Option<T>)
 where
@@ -1800,6 +2009,19 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
+    }
+}
+
+fn local_notification_from_model(notification: local_notification::Model) -> LocalNotification {
+    LocalNotification {
+        id: notification.id,
+        account_id: AccountId(notification.account_id),
+        notification_type: LocalNotificationType::from_str(&notification.notification_type)
+            .unwrap_or(LocalNotificationType::Mention),
+        actor_account_id: AccountId(notification.actor_account_id),
+        status_id: notification.status_id.map(StatusId),
+        created_at: notification.created_at,
+        dismissed_at: notification.dismissed_at,
     }
 }
 

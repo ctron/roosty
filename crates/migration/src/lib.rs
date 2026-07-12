@@ -14,6 +14,7 @@ mod m20260701_000009_add_collection_cursor_ids;
 mod m20260701_000010_create_local_media_attachment_table;
 mod m20260701_000011_add_local_media_preview_metadata;
 mod m20260701_000012_add_local_account_profile_images;
+mod m20260701_000013_create_local_notification_table;
 
 pub struct Migrator;
 
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000010_create_local_media_attachment_table::Migration),
             Box::new(m20260701_000011_add_local_media_preview_metadata::Migration),
             Box::new(m20260701_000012_add_local_account_profile_images::Migration),
+            Box::new(m20260701_000013_create_local_notification_table::Migration),
         ]
     }
 }

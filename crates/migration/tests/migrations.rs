@@ -27,6 +27,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_status_bookmark").await);
     assert!(table_exists(database.connection(), "local_follow").await);
     assert!(table_exists(database.connection(), "local_media_attachment").await);
+    assert!(table_exists(database.connection(), "local_notification").await);
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
@@ -72,6 +73,26 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
         )
         .await
     );
+    assert!(column_exists(database.connection(), "local_notification", "id").await);
+    assert!(column_exists(database.connection(), "local_notification", "account_id").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_notification",
+            "notification_type"
+        )
+        .await
+    );
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_notification",
+            "actor_account_id"
+        )
+        .await
+    );
+    assert!(column_exists(database.connection(), "local_notification", "status_id").await);
+    assert!(column_exists(database.connection(), "local_notification", "dismissed_at").await);
 }
 
 #[test_context(EmbeddedDatabase)]
@@ -88,6 +109,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_status_bookmark").await);
     assert!(table_exists(database.connection(), "local_follow").await);
     assert!(table_exists(database.connection(), "local_media_attachment").await);
+    assert!(table_exists(database.connection(), "local_notification").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
@@ -98,6 +120,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_status_bookmark").await);
     assert!(!table_exists(database.connection(), "local_follow").await);
     assert!(!table_exists(database.connection(), "local_media_attachment").await);
+    assert!(!table_exists(database.connection(), "local_notification").await);
 }
 
 struct EmbeddedDatabase {

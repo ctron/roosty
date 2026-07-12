@@ -1,0 +1,328 @@
+use axum::{
+    Json, Router,
+    extract::{Path, RawQuery, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use roost_core::{AccountId, RoostError, StatusId};
+use roost_db::{
+    CollectionCursor, CollectionPage, LocalNotification, LocalNotificationType, NotificationFilter,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::str::FromStr;
+use uuid::Uuid;
+
+use crate::{
+    auth::{AuthenticatedAccount, account_response},
+    http::AppState,
+};
+
+const DEFAULT_NOTIFICATION_LIMIT: u64 = 40;
+const MAX_NOTIFICATION_LIMIT: u64 = 80;
+
+/// Build routes for Mastodon-compatible notification collections.
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/notifications", get(notifications))
+        .route("/api/v1/notifications/clear", post(clear_notifications))
+        .route(
+            "/api/v1/notifications/{notification_id}",
+            get(show_notification),
+        )
+        .route(
+            "/api/v1/notifications/{notification_id}/dismiss",
+            post(dismiss_notification),
+        )
+}
+
+#[derive(Deserialize)]
+struct NotificationPath {
+    notification_id: Uuid,
+}
+
+#[derive(Deserialize, Default)]
+struct NotificationParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
+    #[serde(default)]
+    types: Option<Vec<String>>,
+    #[serde(default)]
+    exclude_types: Option<Vec<String>>,
+    account_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NotificationResponse {
+    id: String,
+    #[serde(rename = "type")]
+    notification_type: String,
+    group_key: String,
+    created_at: String,
+    account: crate::auth::AccountResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<crate::statuses::StatusResponse>,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+/// Return local notifications for the authenticated account.
+async fn notifications(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let params = match notification_params(query.as_deref()) {
+        Ok(params) => params,
+        Err(()) => return bad_request("notification query is invalid"),
+    };
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_NOTIFICATION_LIMIT)
+        .clamp(1, MAX_NOTIFICATION_LIMIT);
+    let cursor = match collection_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("notification cursor is invalid"),
+    };
+    let filter = match notification_filter(&params) {
+        Ok(filter) => filter,
+        Err(()) => return bad_request("notification account id is invalid"),
+    };
+    if only_unsupported_types_requested(&params, &filter) {
+        return Json(Vec::<NotificationResponse>::new()).into_response();
+    }
+
+    match roost_db::local_notifications_for_account(&state.db, account.id, limit, cursor, filter)
+        .await
+    {
+        Ok(page) => notification_page_response(&state, account.id, page, limit).await,
+        Err(error) => server_error(error),
+    }
+}
+
+/// Return one local notification owned by the authenticated account.
+async fn show_notification(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<NotificationPath>,
+) -> Response {
+    match roost_db::find_local_notification_for_account(&state.db, account.id, path.notification_id)
+        .await
+    {
+        Ok(Some(notification)) => {
+            match notification_response(&state, account.id, notification).await {
+                Ok(Some(notification)) => Json(notification).into_response(),
+                Ok(None) => not_found(),
+                Err(error) => server_error(error),
+            }
+        }
+        Ok(None) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Dismiss a local notification owned by the authenticated account.
+async fn dismiss_notification(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<NotificationPath>,
+) -> Response {
+    match roost_db::dismiss_local_notification(&state.db, account.id, path.notification_id).await {
+        Ok(true) => Json(json!({})).into_response(),
+        Ok(false) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Dismiss every local notification owned by the authenticated account.
+async fn clear_notifications(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+) -> Response {
+    match roost_db::clear_local_notifications(&state.db, account.id).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Create a local notification and publish it to the recipient's user stream.
+pub(crate) async fn create_and_stream_notification(
+    state: &AppState,
+    account_id: AccountId,
+    notification_type: LocalNotificationType,
+    actor_account_id: AccountId,
+    status_id: Option<StatusId>,
+) -> Result<(), RoostError> {
+    if account_id == actor_account_id {
+        return Ok(());
+    }
+    let notification = roost_db::notify_local_account(
+        &state.db,
+        account_id,
+        notification_type,
+        actor_account_id,
+        status_id,
+    )
+    .await?;
+    if let Some(response) = notification_response(state, account_id, notification).await? {
+        state
+            .streaming_events
+            .publish_notification(&response, account_id);
+    }
+    Ok(())
+}
+
+async fn notification_page_response(
+    state: &AppState,
+    account_id: AccountId,
+    page: CollectionPage<LocalNotification>,
+    limit: u64,
+) -> Response {
+    let link_header = crate::statuses::CollectionLink::new(
+        page.items.len(),
+        limit,
+        page.first_cursor,
+        page.last_cursor,
+        "/api/v1/notifications",
+    )
+    .header_value();
+    let mut notifications = Vec::with_capacity(page.items.len());
+    for notification in page.items {
+        match notification_response(state, account_id, notification).await {
+            Ok(Some(notification)) => notifications.push(notification),
+            Ok(None) => {}
+            Err(error) => return server_error(error),
+        }
+    }
+    let mut response = Json(notifications).into_response();
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
+}
+
+/// Build the Mastodon notification entity for a local notification row.
+async fn notification_response(
+    state: &AppState,
+    viewer_id: AccountId,
+    notification: LocalNotification,
+) -> Result<Option<NotificationResponse>, RoostError> {
+    let Some(actor) =
+        roost_db::find_local_account_by_id(&state.db, notification.actor_account_id).await?
+    else {
+        return Ok(None);
+    };
+    let status = match notification.status_id {
+        Some(status_id) => {
+            let Some(status) = roost_db::find_local_status_by_id(&state.db, status_id).await?
+            else {
+                return Ok(None);
+            };
+            Some(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?)
+        }
+        None => None,
+    };
+
+    Ok(Some(NotificationResponse {
+        id: notification.id.to_string(),
+        notification_type: notification.notification_type.as_str().to_owned(),
+        group_key: format!("ungrouped-{}", notification.id),
+        created_at: crate::statuses::format_timestamp(notification.created_at),
+        account: account_response(state, actor).await?,
+        status,
+    }))
+}
+
+fn notification_params(query: Option<&str>) -> Result<NotificationParams, ()> {
+    let Some(query) = query else {
+        return Ok(NotificationParams::default());
+    };
+
+    serde_qs::Config::new()
+        .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+        .use_form_encoding(true)
+        .deserialize_str(query)
+        .map_err(|_| ())
+}
+
+fn collection_cursor(params: &NotificationParams) -> Result<CollectionCursor, ()> {
+    Ok(CollectionCursor {
+        max_id: parse_optional_uuid(params.max_id.as_deref())?,
+        since_id: parse_optional_uuid(params.since_id.as_deref())?,
+        min_id: parse_optional_uuid(params.min_id.as_deref())?,
+    })
+}
+
+fn notification_filter(params: &NotificationParams) -> Result<NotificationFilter, ()> {
+    Ok(NotificationFilter {
+        include_types: parse_notification_types(params.types.as_deref()),
+        exclude_types: parse_notification_types(params.exclude_types.as_deref()),
+        account_id: parse_optional_account_id(params.account_id.as_deref())?,
+    })
+}
+
+fn only_unsupported_types_requested(
+    params: &NotificationParams,
+    filter: &NotificationFilter,
+) -> bool {
+    params
+        .types
+        .as_ref()
+        .is_some_and(|types| !types.is_empty() && filter.include_types.is_empty())
+}
+
+fn parse_notification_types(values: Option<&[String]>) -> Vec<LocalNotificationType> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| LocalNotificationType::from_str(value).ok())
+        .collect()
+}
+
+fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().map_err(|_| ()))
+        .transpose()
+}
+
+fn parse_optional_account_id(value: Option<&str>) -> Result<Option<AccountId>, ()> {
+    parse_optional_uuid(value).map(|id| id.map(AccountId))
+}
+
+fn bad_request(description: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: description.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "Record not found".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn server_error(error: RoostError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}

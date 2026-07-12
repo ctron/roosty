@@ -18,6 +18,7 @@ mod config;
 mod http;
 mod instance;
 mod media;
+mod notifications;
 mod password;
 mod search;
 mod statuses;

@@ -87,7 +87,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `PUT /api/v1/statuses/:id` | Owner-only local text, sensitivity, spoiler, language, media IDs, and media alt/focus edits; polls and edit history are missing. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
-| 🟡 | Mentions | Local `@username` mentions render as links and populate `mentions`; no notifications yet. |
+| 🟡 | Mentions | Local `@username` mentions render as links, populate `mentions`, and create local notifications; remote mentions are missing. |
 | 🟡 | Visibility semantics | Public/unlisted URL reads work; private/direct are owner-only until follow graph support exists. |
 | 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local favourites with cursor pagination. |
 | 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
@@ -108,9 +108,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🔴 | `GET /api/v1/notifications` | Placeholder currently returns an empty list. |
+| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, and `follow` notifications with cursor pagination and basic filters. |
 | 🔴 | `GET /api/v1/markers` | Placeholder currently returns an empty object. |
-| 🔴 | Persisted notifications | No notification records yet. |
+| 🟡 | Persisted notifications | Local notifications are stored and can be dismissed or cleared; remote, grouped, policy, and request flows are missing. |
 | 🔴 | Notification read state | Marker updates are missing. |
 
 ### Tags, Push, and Media
@@ -131,7 +131,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
 | 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
-| 🔴 | `notification` and `delete` events | Not emitted yet. |
+| 🟡 | `notification` events | Local `mention`, `favourite`, and `follow` notifications are emitted to recipient user streams. |
+| 🔴 | `delete` events | Not emitted yet. |
 | 🔴 | Multi-process fan-out | No Redis/Postgres pub-sub backend yet. |
 
 ## TODO
@@ -142,6 +143,6 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Tighten timeline pagination by fetching one extra row before emitting `Link` headers.
 - [ ] Add conversation endpoint support for replies.
 - [ ] Add boosts.
-- [ ] Add persisted notifications and notification streaming.
+- [ ] Add notification markers, grouped notifications, push integration, and remote notification events.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.

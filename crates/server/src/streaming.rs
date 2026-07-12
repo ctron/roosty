@@ -1,4 +1,5 @@
 use serde::Serialize;
+use strum::IntoStaticStr;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -35,14 +36,28 @@ impl StreamingEvents {
             Err(error) => warn!(%error, "failed to serialize streaming update"),
         }
     }
+
+    /// Publish a Mastodon `notification` event to the recipient's user stream.
+    pub fn publish_notification<T>(&self, notification: &T, recipient_id: AccountId)
+    where
+        T: Serialize,
+    {
+        match streaming_notification_message(notification, recipient_id) {
+            Ok(event) => match self.sender.send(event) {
+                Ok(_) => {}
+                Err(error) => debug!(%error, "streaming notification had no active receivers"),
+            },
+            Err(error) => warn!(%error, "failed to serialize streaming notification"),
+        }
+    }
 }
 
 /// Event payload shared with connected WebSocket subscribers.
 #[derive(Clone, Debug)]
 pub struct StreamingEvent {
-    event: &'static str,
+    event: StreamingEventType,
     payload: String,
-    author_id: AccountId,
+    account_id: AccountId,
     visibility: String,
 }
 
@@ -60,7 +75,7 @@ impl StreamingEvent {
 
         serde_json::to_string(&SocketMessage {
             stream: &matching_streams,
-            event: self.event,
+            event: self.event.as_str(),
             payload: &self.payload,
         })
         .map(Some)
@@ -78,7 +93,7 @@ impl StreamingEvent {
     /// Return whether one subscribed stream should receive this event.
     fn is_visible_to_stream(&self, account_id: AccountId, stream: &str) -> bool {
         match stream {
-            "user" => self.author_id == account_id,
+            "user" => self.account_id == account_id,
             "public" | "public:local" => self.visibility == "public",
             _ => false,
         }
@@ -92,6 +107,21 @@ struct SocketMessage<'a> {
     payload: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, IntoStaticStr)]
+enum StreamingEventType {
+    #[strum(serialize = "update")]
+    Update,
+    #[strum(serialize = "notification")]
+    Notification,
+}
+
+impl StreamingEventType {
+    /// Return the Mastodon streaming event name.
+    fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
 /// Build the update event stored in the in-process broadcast channel.
 fn streaming_update_message<T>(
     status: &T,
@@ -103,10 +133,27 @@ where
 {
     let payload = serde_json::to_string(status)?;
     Ok(StreamingEvent {
-        event: "update",
+        event: StreamingEventType::Update,
         payload,
-        author_id,
+        account_id: author_id,
         visibility: visibility.to_owned(),
+    })
+}
+
+/// Build the notification event stored in the in-process broadcast channel.
+fn streaming_notification_message<T>(
+    notification: &T,
+    recipient_id: AccountId,
+) -> Result<StreamingEvent, serde_json::Error>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_string(notification)?;
+    Ok(StreamingEvent {
+        event: StreamingEventType::Notification,
+        payload,
+        account_id: recipient_id,
+        visibility: "direct".to_owned(),
     })
 }
 
@@ -116,7 +163,7 @@ mod tests {
     use serde_json::Value;
     use uuid::Uuid;
 
-    use super::streaming_update_message;
+    use super::{streaming_notification_message, streaming_update_message};
 
     #[test]
     /// Verifies streaming status payloads stay JSON-encoded strings.
@@ -132,9 +179,14 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_str(&message).unwrap();
 
-        assert_eq!(value["stream"], serde_json::json!(["user"]));
-        assert_eq!(value["event"], "update");
-        assert_eq!(value["payload"], "{\"id\":\"1\"}");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stream": ["user"],
+                "event": "update",
+                "payload": "{\"id\":\"1\"}"
+            })
+        );
     }
 
     #[test]
@@ -160,8 +212,44 @@ mod tests {
         assert!(user_message.is_none());
         assert!(public_message.is_some());
         assert_eq!(
-            mixed_value["stream"],
-            serde_json::json!(["user", "public:local"])
+            mixed_value,
+            serde_json::json!({
+                "stream": ["user", "public:local"],
+                "event": "update",
+                "payload": "{\"id\":\"1\"}"
+            })
         );
+    }
+
+    #[test]
+    /// Given a recipient-only notification, when serialized for streams, then only that user's stream receives it.
+    fn notification_messages_are_scoped_to_the_recipient_user_stream() {
+        let recipient_id = AccountId(Uuid::now_v7());
+        let viewer_id = AccountId(Uuid::now_v7());
+        let event =
+            streaming_notification_message(&serde_json::json!({"id": "1"}), recipient_id).unwrap();
+
+        let recipient_message = event
+            .to_socket_message(recipient_id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let viewer_message = event
+            .to_socket_message(viewer_id, &["user".to_owned()])
+            .unwrap();
+        let public_message = event
+            .to_socket_message(recipient_id, &["public".to_owned()])
+            .unwrap();
+        let recipient_value: Value = serde_json::from_str(&recipient_message).unwrap();
+
+        assert_eq!(
+            recipient_value,
+            serde_json::json!({
+                "stream": ["user"],
+                "event": "notification",
+                "payload": "{\"id\":\"1\"}"
+            })
+        );
+        assert!(viewer_message.is_none());
+        assert!(public_message.is_none());
     }
 }

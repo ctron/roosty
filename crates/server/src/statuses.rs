@@ -9,9 +9,11 @@ use axum::{
     routing::{get, post},
 };
 use roost_core::{AccountId, RoostError, StatusId};
+use roost_db::LocalNotificationType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -128,7 +130,7 @@ struct MediaAttributeInput {
 }
 
 #[derive(Serialize)]
-struct StatusResponse {
+pub(crate) struct StatusResponse {
     id: String,
     created_at: String,
     edited_at: Option<String>,
@@ -259,8 +261,11 @@ async fn create_status(
 
     let author_id = account.id;
     match roost_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
-        Ok(status) => match status_response(&state, status, account).await {
+        Ok(status) => match status_response(&state, status.clone(), account).await {
             Ok(response) => {
+                if let Err(error) = notify_mentioned_accounts(&state, &status, author_id).await {
+                    warn!(%error, "failed to create mention notifications");
+                }
                 state.streaming_events.publish_status_update(
                     &response,
                     author_id,
@@ -698,9 +703,43 @@ async fn status_collection_action(
     };
 
     match result {
-        Ok(()) => status_with_author_response(state, status, Some(account_id)).await,
+        Ok(()) => {
+            if matches!(action, StatusCollectionAction::Favourite)
+                && status.account_id != account_id
+                && let Err(error) = crate::notifications::create_and_stream_notification(
+                    state,
+                    status.account_id,
+                    LocalNotificationType::Favourite,
+                    account_id,
+                    Some(status.id),
+                )
+                .await
+            {
+                warn!(%error, "failed to create favourite notification");
+            }
+            status_with_author_response(state, status, Some(account_id)).await
+        }
         Err(error) => server_error(error),
     }
+}
+
+/// Notify local accounts mentioned in a newly created status.
+async fn notify_mentioned_accounts(
+    state: &AppState,
+    status: &roost_db::LocalStatus,
+    author_id: AccountId,
+) -> Result<(), RoostError> {
+    for mention in local_text_mentions(state, &status.content).await? {
+        crate::notifications::create_and_stream_notification(
+            state,
+            mention.id,
+            LocalNotificationType::Mention,
+            author_id,
+            Some(status.id),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Return a local status collection for an authenticated account.
@@ -788,7 +827,7 @@ async fn status_with_author_response(
     }
 }
 
-async fn status_with_author(
+pub(crate) async fn status_with_author(
     state: &AppState,
     status: roost_db::LocalStatus,
     viewer: Option<AccountId>,
@@ -1235,7 +1274,7 @@ fn escape_html(value: &str) -> String {
     escaped
 }
 
-fn format_timestamp(timestamp: OffsetDateTime) -> String {
+pub(crate) fn format_timestamp(timestamp: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         timestamp.year(),
@@ -2104,6 +2143,134 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given a local mention, when the mentioned user lists notifications, then the mention appears with actor and status data.
+    async fn mentions_create_local_notifications(context: &mut StatusContext) {
+        let admin_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-notifications@example.com")
+            .await;
+        let status = context
+            .create_status(&bob_token, "hello @admin", None, None)
+            .await;
+
+        let response = context
+            .authenticated_get("/api/v1/notifications?limit=30", &admin_token)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let notifications = json_body(response).await;
+
+        assert_eq!(
+            notification_projection(&notifications[0]),
+            serde_json::json!({
+                "type": "mention",
+                "account": "bob",
+                "status": status["id"],
+            })
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a local favourite, when the status owner lists notifications, then the favourite is persisted once.
+    async fn favourites_create_local_notifications(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-favourite-notifications@example.com")
+            .await;
+        let status = context
+            .create_status(&owner_token, "favourite target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        for _ in 0..2 {
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/favourite"),
+                    &bob_token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = context
+            .authenticated_get("/api/v1/notifications?types[]=favourite", &owner_token)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let notifications = json_body(response).await;
+
+        assert_eq!(
+            notifications
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(notification_projection)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap(),
+            vec![serde_json::json!({
+                "type": "favourite",
+                "account": "bob",
+                "status": status["id"],
+            })]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a follow notification, when it is dismissed, then it disappears from the recipient's collection.
+    async fn follow_notifications_can_be_dismissed(context: &mut StatusContext) {
+        let admin_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-follow-notifications@example.com")
+            .await;
+        let admin = roost_db::find_local_account_by_username(&context.db, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let follow = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", admin.id.0),
+                &bob_token,
+            )
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+
+        let response = context
+            .authenticated_get("/api/v1/notifications?types[]=follow", &admin_token)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let notifications = json_body(response).await;
+        let notification_id = notifications[0]["id"].as_str().unwrap();
+        assert_eq!(
+            notification_projection(&notifications[0]),
+            serde_json::json!({
+                "type": "follow",
+                "account": "bob",
+                "status": null,
+            })
+        );
+
+        let dismiss = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/notifications/{notification_id}/dismiss"),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(dismiss.status(), StatusCode::OK);
+        let response = context
+            .authenticated_get("/api/v1/notifications?types[]=follow", &admin_token)
+            .await;
+
+        assert_eq!(json_body(response).await, serde_json::json!([]));
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Verifies favourites expose Mastodon cursor pagination through Link headers.
     async fn favourites_collection_uses_cursor_pagination(context: &mut StatusContext) {
         let token = context.access_token().await;
@@ -2432,6 +2599,14 @@ mod tests {
             .next()
             .unwrap()
             .to_owned()
+    }
+
+    fn notification_projection(notification: &Value) -> Value {
+        serde_json::json!({
+            "type": notification["type"],
+            "account": notification["account"]["username"],
+            "status": notification.get("status").map(|status| status["id"].clone()),
+        })
     }
 
     enum MultipartPart<'a> {

@@ -7,7 +7,9 @@ use axum::{
     routing::{get, post},
 };
 use roost_core::{AccountId, RoostError, StatusId};
+use roost_db::LocalNotificationType;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -221,7 +223,20 @@ async fn follow(
     )
     .await
     {
-        Ok(_) => relationship_response(&state, account.id, target_id).await,
+        Ok(_) => {
+            if let Err(error) = crate::notifications::create_and_stream_notification(
+                &state,
+                target_id,
+                LocalNotificationType::Follow,
+                account.id,
+                None,
+            )
+            .await
+            {
+                warn!(%error, "failed to create follow notification");
+            }
+            relationship_response(&state, account.id, target_id).await
+        }
         Err(RoostError::InvalidInput(error)) if error == "followed account does not exist" => {
             not_found()
         }

@@ -12,7 +12,7 @@
 
 - Social graph APIs beyond local follows: remote follow delivery, follow requests, mute, unmute, block, and unblock.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: persisted notification records, read markers, and streaming `notification` events.
+- Notifications: read markers, grouped notifications, push integration, and remote notification events.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: `public`, `public:local`, `user`, `user:notification`, and bounded slow-client handling.
 

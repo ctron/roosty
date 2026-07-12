@@ -27,7 +27,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/push/subscription", get(push_subscription))
         .route("/api/v1/followed_tags", get(followed_tags))
         .route("/api/v1/markers", get(markers))
-        .route("/api/v1/notifications", get(notifications))
         .route("/api/v1/streaming", get(streaming))
         .route("/api/v1/streaming/health", get(streaming_health))
 }
@@ -53,10 +52,6 @@ async fn followed_tags(AuthenticatedAccount(_account): AuthenticatedAccount) -> 
 
 async fn markers(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
     Json(json!({})).into_response()
-}
-
-async fn notifications(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
-    Json(Vec::<Value>::new()).into_response()
 }
 
 async fn streaming_health() -> &'static str {
