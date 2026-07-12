@@ -131,7 +131,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
 | 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
-| 🟡 | `notification` events | Local `mention`, `favourite`, and `follow` notifications are emitted to recipient user streams. |
+| 🟡 | `notification` events | Local `mention`, `favourite`, and `follow` notifications are emitted to recipient `user` and `user:notification` streams. |
 | 🔴 | `delete` events | Not emitted yet. |
 | 🔴 | Multi-process fan-out | No Redis/Postgres pub-sub backend yet. |
 

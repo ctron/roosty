@@ -94,6 +94,9 @@ impl StreamingEvent {
     fn is_visible_to_stream(&self, account_id: AccountId, stream: &str) -> bool {
         match stream {
             "user" => self.account_id == account_id,
+            "user:notification" => {
+                self.event == StreamingEventType::Notification && self.account_id == account_id
+            }
             "public" | "public:local" => self.visibility == "public",
             _ => false,
         }
@@ -107,7 +110,7 @@ struct SocketMessage<'a> {
     payload: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, IntoStaticStr)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
 enum StreamingEventType {
     #[strum(serialize = "update")]
     Update,
@@ -222,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    /// Given a recipient-only notification, when serialized for streams, then only that user's stream receives it.
+    /// Given a recipient-only notification, when serialized for streams, then the user's notification streams receive it.
     fn notification_messages_are_scoped_to_the_recipient_user_stream() {
         let recipient_id = AccountId(Uuid::now_v7());
         let viewer_id = AccountId(Uuid::now_v7());
@@ -233,13 +236,19 @@ mod tests {
             .to_socket_message(recipient_id, &["user".to_owned()])
             .unwrap()
             .unwrap();
+        let notification_stream_message = event
+            .to_socket_message(recipient_id, &["user:notification".to_owned()])
+            .unwrap()
+            .unwrap();
         let viewer_message = event
-            .to_socket_message(viewer_id, &["user".to_owned()])
+            .to_socket_message(viewer_id, &["user:notification".to_owned()])
             .unwrap();
         let public_message = event
             .to_socket_message(recipient_id, &["public".to_owned()])
             .unwrap();
         let recipient_value: Value = serde_json::from_str(&recipient_message).unwrap();
+        let notification_stream_value: Value =
+            serde_json::from_str(&notification_stream_message).unwrap();
 
         assert_eq!(
             recipient_value,
@@ -249,7 +258,29 @@ mod tests {
                 "payload": "{\"id\":\"1\"}"
             })
         );
+        assert_eq!(
+            notification_stream_value,
+            serde_json::json!({
+                "stream": ["user:notification"],
+                "event": "notification",
+                "payload": "{\"id\":\"1\"}"
+            })
+        );
         assert!(viewer_message.is_none());
         assert!(public_message.is_none());
+    }
+
+    #[test]
+    /// Given a status update, when serialized for notification-only streams, then it is not delivered there.
+    fn update_messages_do_not_go_to_notification_only_streams() {
+        let account_id = AccountId(Uuid::now_v7());
+        let event = streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public")
+            .unwrap();
+
+        let message = event
+            .to_socket_message(account_id, &["user:notification".to_owned()])
+            .unwrap();
+
+        assert!(message.is_none());
     }
 }
