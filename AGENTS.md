@@ -22,6 +22,7 @@ Keep this as the default verification command for changes in this repository.
 ## Documentation
 
 - Document exported Rust functions, types, and modules with rustdoc comments (`///` or `//!`).
+- Document all non-trivial Rust functions, even when private. Trivial glue, accessors, and one-line helpers do not need comments.
 - For larger or non-obvious function bodies, add concise internal comments that explain the major steps or invariants.
 
 ## Git

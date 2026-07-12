@@ -9,10 +9,12 @@ use roost_migration::Migrator;
 use sea_orm_migration::MigratorTrait;
 use tokio::sync::watch;
 use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 mod auth;
 mod config;
 mod http;
+mod instance;
 mod password;
 
 use crate::{
@@ -71,9 +73,7 @@ enum AdminCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
 
@@ -89,6 +89,13 @@ async fn main() -> Result<()> {
             AdminCommand::Bootstrap { username, email } => bootstrap_admin(&username, &email).await,
         },
     }
+}
+
+/// Initialize tracing with the default formatter and a RUST_LOG override.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("roost=info,tower_http=info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 async fn migrate() -> Result<()> {
