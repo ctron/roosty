@@ -21,6 +21,12 @@ pub struct Config {
     pub media_root: String,
     pub registration_mode: String,
     pub federation_enabled: bool,
+    /// Secret used to encrypt persisted local actor private keys.
+    pub federation_key_encryption_secret: Option<String>,
+    /// Exact remote domains permitted for discovery and delivery.
+    pub federation_allowed_domains: Vec<String>,
+    /// Exact remote domains prohibited for discovery and delivery.
+    pub federation_blocked_domains: Vec<String>,
     pub instance_name: String,
     pub instance_description: Option<String>,
 }
@@ -32,13 +38,44 @@ impl Config {
             None => parse_env("ROOST_LISTEN_ADDR", DEFAULT_LISTEN_ADDR)?,
         };
 
-        Ok(Self {
-            database_url: required_env("ROOST_DATABASE_URL")?,
-            public_base_url: required_env("ROOST_PUBLIC_BASE_URL")?
+        let public_base_url: Url =
+            required_env("ROOST_PUBLIC_BASE_URL")?
                 .parse()
                 .map_err(|error| {
                     RoostError::Configuration(format!("ROOST_PUBLIC_BASE_URL is invalid: {error}"))
-                })?,
+                })?;
+        let federation_enabled = optional_bool_env("ROOST_FEDERATION_ENABLED")?.unwrap_or(false);
+        let federation_key_encryption_secret =
+            optional_env("ROOST_FEDERATION_KEY_ENCRYPTION_SECRET");
+        let federation_allowed_domains = optional_domain_list("ROOST_FEDERATION_ALLOWED_DOMAINS")?;
+        let federation_blocked_domains = optional_domain_list("ROOST_FEDERATION_BLOCKED_DOMAINS")?;
+        if federation_enabled {
+            if public_base_url.scheme() != "https" || public_base_url.host_str().is_none() {
+                return Err(RoostError::Configuration(
+                    "ROOST_PUBLIC_BASE_URL must be an absolute HTTPS URL when federation is enabled".to_owned(),
+                ));
+            }
+            let Some(secret) = federation_key_encryption_secret.as_deref() else {
+                return Err(RoostError::Configuration(
+                    "ROOST_FEDERATION_KEY_ENCRYPTION_SECRET is required when federation is enabled"
+                        .to_owned(),
+                ));
+            };
+            if secret.len() < 32 {
+                return Err(RoostError::Configuration(
+                    "ROOST_FEDERATION_KEY_ENCRYPTION_SECRET must be at least 32 bytes".to_owned(),
+                ));
+            }
+            if federation_allowed_domains.is_empty() {
+                return Err(RoostError::Configuration(
+                    "ROOST_FEDERATION_ALLOWED_DOMAINS must contain at least one domain when federation is enabled".to_owned(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            database_url: required_env("ROOST_DATABASE_URL")?,
+            public_base_url,
             listen_addr,
             infra_listen_addr: optional_parse_env("ROOST_INFRA_LISTEN_ADDR")?,
             session_secret: required_secret("ROOST_SESSION_SECRET")?,
@@ -49,11 +86,39 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_owned()),
             registration_mode: optional_env("ROOST_REGISTRATION_MODE")
                 .unwrap_or_else(|| DEFAULT_REGISTRATION_MODE.to_owned()),
-            federation_enabled: optional_bool_env("ROOST_FEDERATION_ENABLED")?.unwrap_or(false),
+            federation_enabled,
+            federation_key_encryption_secret,
+            federation_allowed_domains,
+            federation_blocked_domains,
             instance_name: required_env("ROOST_INSTANCE_NAME")?,
             instance_description: optional_env("ROOST_INSTANCE_DESCRIPTION"),
         })
     }
+}
+
+/// Parse a comma-separated list of exact DNS host names for federation policy.
+fn optional_domain_list(name: &str) -> Result<Vec<String>> {
+    optional_env(name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map(|domain| {
+                    if domain.contains('/')
+                        || domain.contains('@')
+                        || domain.parse::<std::net::IpAddr>().is_ok()
+                    {
+                        return Err(RoostError::Configuration(format!(
+                            "{name} contains an invalid domain"
+                        )));
+                    }
+                    Ok(domain.to_ascii_lowercase())
+                })
+                .collect()
+        })
+        .transpose()
+        .map(|domains: Option<Vec<String>>| domains.unwrap_or_default())
 }
 
 pub fn database_url_from_env() -> Result<String> {

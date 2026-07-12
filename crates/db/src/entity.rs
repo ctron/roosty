@@ -3,6 +3,7 @@
 pub mod local_account;
 pub mod local_account_block;
 pub mod local_account_mute;
+pub mod local_actor_key;
 pub mod local_conversation;
 pub mod local_conversation_account;
 pub mod local_follow;
@@ -19,3 +20,4 @@ pub mod local_timeline_marker;
 pub mod oauth_access_token;
 pub mod oauth_application;
 pub mod oauth_authorization_code;
+pub mod remote_actor;

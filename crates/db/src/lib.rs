@@ -23,11 +23,11 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_account_block, local_account_mute, local_conversation,
+    local_account, local_account_block, local_account_mute, local_actor_key, local_conversation,
     local_conversation_account, local_follow, local_media_attachment, local_notification,
     local_status, local_status_bookmark, local_status_favourite, local_status_reblog,
     local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
-    oauth_application, oauth_authorization_code,
+    oauth_application, oauth_authorization_code, remote_actor,
 };
 
 /// Shared database connection type used across Roost crates.
@@ -181,6 +181,146 @@ pub struct LocalAccount {
     pub avatar_file_path: Option<String>,
     /// Optional local header image path relative to the media root.
     pub header_file_path: Option<String>,
+}
+
+/// Encrypted ActivityPub signing key material for a local actor.
+#[derive(Clone, Debug)]
+pub struct LocalActorKey {
+    /// Actor's public key in PEM SubjectPublicKeyInfo encoding.
+    pub public_key_pem: String,
+    /// Authenticated-encrypted PKCS#8 private key bytes.
+    pub private_key_ciphertext: Vec<u8>,
+    /// AES-GCM nonce used to encrypt the private material.
+    pub private_key_nonce: Vec<u8>,
+}
+
+/// Validated cached data for a remote ActivityPub actor.
+#[derive(Clone, Debug)]
+pub struct RemoteActor {
+    /// UUID-backed identifier exposed through Mastodon account APIs.
+    pub id: AccountId,
+    /// Canonical HTTPS ActivityPub actor ID.
+    pub activitypub_id: String,
+    /// Remote username without domain.
+    pub username: String,
+    /// Remote actor's DNS domain.
+    pub domain: String,
+    /// Display name from the actor document.
+    pub display_name: String,
+    /// Profile summary from the actor document.
+    pub summary: String,
+    /// Direct inbox URL.
+    pub inbox_url: String,
+    /// Optional shared inbox URL.
+    pub shared_inbox_url: Option<String>,
+    /// Public key identity URL.
+    pub public_key_id: String,
+    /// Public signing key PEM.
+    pub public_key_pem: String,
+    /// Cache expiry instant.
+    pub expires_at: OffsetDateTime,
+}
+
+/// Find a remote actor by its canonical ActivityPub ID.
+pub async fn find_remote_actor_by_activitypub_id(
+    db: &DbConnection,
+    activitypub_id: &str,
+) -> Result<Option<RemoteActor>> {
+    Ok(remote_actor::Entity::find()
+        .filter(remote_actor::Column::ActivitypubId.eq(activitypub_id))
+        .one(db)
+        .await?
+        .map(remote_actor_from_model))
+}
+
+/// Find a remote actor by its canonical WebFinger handle.
+pub async fn find_remote_actor_by_handle(
+    db: &DbConnection,
+    username: &str,
+    domain: &str,
+) -> Result<Option<RemoteActor>> {
+    Ok(remote_actor::Entity::find()
+        .filter(remote_actor::Column::Username.eq(username))
+        .filter(remote_actor::Column::Domain.eq(domain))
+        .one(db)
+        .await?
+        .map(remote_actor_from_model))
+}
+
+/// Insert or refresh a remote actor cache entry by canonical actor ID.
+pub async fn upsert_remote_actor(db: &DbConnection, actor: &RemoteActor) -> Result<RemoteActor> {
+    let now = OffsetDateTime::now_utc();
+    let existing = remote_actor::Entity::find()
+        .filter(remote_actor::Column::ActivitypubId.eq(&actor.activitypub_id))
+        .one(db)
+        .await?;
+    let model = if let Some(existing) = existing {
+        let mut active = existing.into_active_model();
+        active.username = Set(actor.username.clone());
+        active.domain = Set(actor.domain.clone());
+        active.display_name = Set(actor.display_name.clone());
+        active.summary = Set(actor.summary.clone());
+        active.inbox_url = Set(actor.inbox_url.clone());
+        active.shared_inbox_url = Set(actor.shared_inbox_url.clone());
+        active.public_key_id = Set(actor.public_key_id.clone());
+        active.public_key_pem = Set(actor.public_key_pem.clone());
+        active.fetched_at = Set(now);
+        active.expires_at = Set(actor.expires_at);
+        active.updated_at = Set(now);
+        active.update(db).await?
+    } else {
+        remote_actor::ActiveModel {
+            id: Set(actor.id.0),
+            activitypub_id: Set(actor.activitypub_id.clone()),
+            username: Set(actor.username.clone()),
+            domain: Set(actor.domain.clone()),
+            display_name: Set(actor.display_name.clone()),
+            summary: Set(actor.summary.clone()),
+            inbox_url: Set(actor.inbox_url.clone()),
+            shared_inbox_url: Set(actor.shared_inbox_url.clone()),
+            public_key_id: Set(actor.public_key_id.clone()),
+            public_key_pem: Set(actor.public_key_pem.clone()),
+            fetched_at: Set(now),
+            expires_at: Set(actor.expires_at),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?
+    };
+    Ok(remote_actor_from_model(model))
+}
+
+/// Look up the persisted ActivityPub signing key for a local account.
+pub async fn find_local_actor_key(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<Option<LocalActorKey>> {
+    let key = local_actor_key::Entity::find_by_id(account_id.0)
+        .one(db)
+        .await?;
+    Ok(key.map(|key| LocalActorKey {
+        public_key_pem: key.public_key_pem,
+        private_key_ciphertext: key.private_key_ciphertext,
+        private_key_nonce: key.private_key_nonce,
+    }))
+}
+
+/// Persist a newly generated ActivityPub signing key.
+pub async fn create_local_actor_key(
+    db: &DbConnection,
+    account_id: AccountId,
+    key: &LocalActorKey,
+) -> Result<()> {
+    local_actor_key::ActiveModel {
+        account_id: Set(account_id.0),
+        public_key_pem: Set(key.public_key_pem.clone()),
+        private_key_ciphertext: Set(key.private_key_ciphertext.clone()),
+        private_key_nonce: Set(key.private_key_nonce.clone()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+    Ok(())
 }
 
 /// Mutable local account settings accepted from account update APIs.
@@ -2264,6 +2404,36 @@ pub async fn find_local_status_by_id(
     Ok(status.map(local_status_from_model))
 }
 
+/// List an actor's public statuses for its ActivityPub outbox.
+pub async fn public_local_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<Vec<LocalStatus>> {
+    let statuses = local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::Visibility.eq("public"))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .order_by_desc(local_status::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await?;
+    Ok(statuses.into_iter().map(local_status_from_model).collect())
+}
+
+/// Count an actor's public statuses for its ActivityPub outbox metadata.
+pub async fn count_public_local_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<u64> {
+    Ok(local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::Visibility.eq("public"))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .count(db)
+        .await?)
+}
+
 /// Count active statuses authored by a local account.
 pub async fn count_local_statuses_by_account(
     db: &DbConnection,
@@ -3591,6 +3761,23 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         profile_fields: account.profile_fields,
         avatar_file_path: account.avatar_file_path,
         header_file_path: account.header_file_path,
+    }
+}
+
+/// Convert a persisted remote actor cache model into the shared projection.
+fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
+    RemoteActor {
+        id: AccountId(actor.id),
+        activitypub_id: actor.activitypub_id,
+        username: actor.username,
+        domain: actor.domain,
+        display_name: actor.display_name,
+        summary: actor.summary,
+        inbox_url: actor.inbox_url,
+        shared_inbox_url: actor.shared_inbox_url,
+        public_key_id: actor.public_key_id,
+        public_key_pem: actor.public_key_pem,
+        expires_at: actor.expires_at,
     }
 }
 

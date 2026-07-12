@@ -22,6 +22,8 @@ mod m20260701_000017_create_local_tag_tables;
 mod m20260701_000018_create_local_tag_follow_table;
 mod m20260701_000019_create_local_timeline_marker_table;
 mod m20260701_000020_create_local_account_moderation_tables;
+mod m20260701_000021_create_local_actor_key_table;
+mod m20260701_000022_create_remote_actor_table;
 
 pub struct Migrator;
 
@@ -49,6 +51,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000018_create_local_tag_follow_table::Migration),
             Box::new(m20260701_000019_create_local_timeline_marker_table::Migration),
             Box::new(m20260701_000020_create_local_account_moderation_tables::Migration),
+            Box::new(m20260701_000021_create_local_actor_key_table::Migration),
+            Box::new(m20260701_000022_create_remote_actor_table::Migration),
         ]
     }
 }

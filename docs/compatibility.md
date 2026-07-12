@@ -141,11 +141,26 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `delete` events | Emitted for local status deletes and removed local boost timeline entries. |
 | 🔴 | Multi-process fan-out | No Redis/Postgres pub-sub backend yet. |
 
+## Federation
+
+| Support | Area | Details |
+| --- | --- | --- |
+| 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
+| 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs allow-listed WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections. Search integration and refresh jobs are missing. |
+| 🔴 | Follow graph federation | Inbound/outbound Follow, Undo, Accept, Reject, locked requests, and remote relationship state are missing. |
+| 🔴 | Remote timeline fan-out | Remote home-timeline delivery, repair, and remote visibility semantics are missing. |
+| 🔴 | Remote social interactions | Replies, mentions, favourites, boosts, deletes, notifications, mutes, and blocks are missing. |
+| 🔴 | Remote conversations and moderation | Direct conversations, account migration, signed inbox processing, domain-policy moderation, and delivery are missing. |
+
 ## TODO
 
-- [ ] Add WebFinger, actor documents, inbox, and outbox.
-- [ ] Add federation delivery and inbound activity processing.
-- [ ] Add remote follow graph, remote mutes/blocks, and full private-status home timeline semantics.
+- [x] Add opt-in WebFinger, actor documents, public Notes, outbox, and public follower/following collection metadata.
+- [ ] Add safe remote actor discovery/cache refresh and remote profile projections.
+- [ ] Add signed inbound Follow, Undo, Accept, Reject, and locked-account follow-request processing.
+- [ ] Add signed outbound Follow, Undo, Accept, Reject, Create, Update, and Delete delivery with retries.
+- [ ] Add remote follower home-timeline fan-out, repair jobs, and visibility semantics.
+- [ ] Add remote replies, mentions, favourites, boosts, deletes, notifications, mutes, and blocks.
+- [ ] Add remote direct conversations, account migration, and domain-policy moderation.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote ActivityPub `Announce` support.
 - [ ] Add remote hashtag support.

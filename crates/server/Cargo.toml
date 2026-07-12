@@ -20,6 +20,9 @@ clap = { workspace = true }
 hmac = { workspace = true }
 image = { workspace = true }
 rand_core = { workspace = true }
+reqwest = { workspace = true }
+ring = { workspace = true }
+rsa = { workspace = true }
 sea-orm-migration = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

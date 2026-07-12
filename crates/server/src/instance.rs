@@ -331,6 +331,9 @@ mod tests {
             media_root: "./media".to_owned(),
             registration_mode: registration_mode.to_owned(),
             federation_enabled: false,
+            federation_key_encryption_secret: None,
+            federation_allowed_domains: Vec::new(),
+            federation_blocked_domains: Vec::new(),
             instance_name: "Roost Test".to_owned(),
             instance_description: Some("Endpoint test instance".to_owned()),
         })

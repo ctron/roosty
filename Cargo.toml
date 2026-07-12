@@ -29,6 +29,8 @@ clap = { version = "4.5.40", features = ["derive", "env"] }
 hmac = "0.12.1"
 image = "0.25.10"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+ring = "0.17.14"
+rsa = "0.9.10"
 postgresql_embedded = { version = "0.20.4", default-features = false, features = ["rustls", "theseus", "tokio"] }
 reqwest = { version = "0.12.20", default-features = false, features = ["json", "rustls-tls"] }
 sea-orm = { version = "1.1.14", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
@@ -44,7 +46,7 @@ test-context = "0.5.8"
 tempfile = "3.27.0"
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["serde"] }
-tokio = { version = "1.45.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.45.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
 tower = { version = "0.5.2", features = ["util"] }
 tower-http = { version = "0.6.11", features = ["cors", "trace"] }
 tracing = "0.1.41"

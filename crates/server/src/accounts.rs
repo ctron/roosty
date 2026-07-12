@@ -71,6 +71,32 @@ struct AccountCollectionParams {
 #[derive(Deserialize)]
 struct LookupParams {
     acct: Option<String>,
+    resolve: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct RemoteAccountResponse {
+    id: String,
+    username: String,
+    acct: String,
+    display_name: String,
+    locked: bool,
+    bot: bool,
+    discoverable: Option<bool>,
+    group: bool,
+    created_at: String,
+    note: String,
+    url: String,
+    avatar: String,
+    avatar_static: String,
+    header: String,
+    header_static: String,
+    fields: Vec<serde_json::Value>,
+    emojis: Vec<serde_json::Value>,
+    followers_count: u64,
+    following_count: u64,
+    statuses_count: u64,
+    last_status_at: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -128,17 +154,54 @@ async fn lookup_account(
     State(state): State<AppState>,
     Query(params): Query<LookupParams>,
 ) -> Response {
-    let Some(username) = local_lookup_username(&state, params.acct.as_deref()) else {
+    if let Some(username) = local_lookup_username(&state, params.acct.as_deref()) {
+        return match roost_db::find_local_account_by_username(&state.db, &username).await {
+            Ok(Some(account)) => match account_response(&state, account).await {
+                Ok(response) => Json(response).into_response(),
+                Err(error) => server_error(error),
+            },
+            Ok(None) => not_found(),
+            Err(error) => server_error(error),
+        };
+    }
+
+    if !params.resolve.unwrap_or(false) || !state.config.federation_enabled {
+        return not_found();
+    }
+    let Some(acct) = params.acct.as_deref() else {
         return not_found();
     };
-
-    match roost_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) => match account_response(&state, account).await {
-            Ok(response) => Json(response).into_response(),
-            Err(error) => server_error(error),
-        },
-        Ok(None) => not_found(),
+    match crate::federation::discovery::resolve_remote_actor(&state, acct).await {
+        Ok(actor) => Json(remote_account_response(actor)).into_response(),
+        Err(RoostError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
+    }
+}
+
+/// Convert a cached remote actor to the public Mastodon account projection.
+fn remote_account_response(actor: roost_db::RemoteActor) -> RemoteAccountResponse {
+    RemoteAccountResponse {
+        id: actor.id.0.to_string(),
+        username: actor.username.clone(),
+        acct: format!("{}@{}", actor.username, actor.domain),
+        display_name: actor.display_name,
+        locked: false,
+        bot: false,
+        discoverable: None,
+        group: false,
+        created_at: actor.expires_at.to_string(),
+        note: actor.summary,
+        url: actor.activitypub_id,
+        avatar: String::new(),
+        avatar_static: String::new(),
+        header: String::new(),
+        header_static: String::new(),
+        fields: Vec::new(),
+        emojis: Vec::new(),
+        followers_count: 0,
+        following_count: 0,
+        statuses_count: 0,
+        last_status_at: None,
     }
 }
 
@@ -1281,6 +1344,9 @@ mod tests {
                 media_root: "./media".to_owned(),
                 registration_mode: "closed".to_owned(),
                 federation_enabled: false,
+                federation_key_encryption_secret: None,
+                federation_allowed_domains: Vec::new(),
+                federation_blocked_domains: Vec::new(),
                 instance_name: "Roost Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };

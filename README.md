@@ -102,3 +102,18 @@ After Rust code or manifest changes, run:
 cargo fmt --all
 cargo clippy --all-targets
 ```
+
+## Federation
+
+Federation is disabled by default. To expose local ActivityPub identities, set
+`ROOST_FEDERATION_ENABLED=true`, use an absolute HTTPS `ROOST_PUBLIC_BASE_URL`,
+and provide a distinct `ROOST_FEDERATION_KEY_ENCRYPTION_SECRET` of at least 32
+bytes. Roost uses this secret to encrypt per-account signing keys at rest. Set
+`ROOST_FEDERATION_ALLOWED_DOMAINS` to a comma-separated exact list of remote
+DNS domains permitted for discovery; `ROOST_FEDERATION_BLOCKED_DOMAINS` can
+exclude domains from that list.
+
+This initial surface provides WebFinger, local actor documents, public Notes,
+outboxes, follower/following collection metadata, and safe allow-listed remote
+`resolve=true` lookup. Inbound inbox processing, signed delivery, and remote
+follows are deliberately not yet enabled.

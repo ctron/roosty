@@ -16,6 +16,7 @@ mod auth;
 mod compat;
 mod config;
 mod conversations;
+mod federation;
 mod http;
 mod instance;
 mod markers;
