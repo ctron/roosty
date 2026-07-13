@@ -11,8 +11,11 @@
 phanpy.{$ROOSTY_DOMAIN} {
 	encode zstd gzip
 	route {
-		@phanpy_root path /
-		redir @phanpy_root /#/login?instance={$ROOSTY_DOMAIN} 302
+		@phanpy_root {
+			path /
+			not query default=1
+		}
+		redir @phanpy_root /?default=1#/login?instance={$ROOSTY_DOMAIN} 302
 		reverse_proxy https://phanpy.social {
 			header_up Host phanpy.social
 		}
