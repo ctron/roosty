@@ -42,6 +42,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Caddy.Containerfile
+      args:
+        PHANPY_VERSION: ${ROOSTY_PHANPY_VERSION:-2026.06.23.05dcc55}
     networks:
       default:
         aliases:
@@ -51,6 +53,7 @@ services:
       - "4001:4001"
       - "4002:4002"
     volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     depends_on:

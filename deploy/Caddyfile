@@ -14,12 +14,17 @@ https://localhost:4001 {
 	reverse_proxy elk:5314
 }
 
-# Reuse Caddy to expose Phanpy without adding another local container. The
-# upstream is a static web application; API and OAuth requests still go directly
-# to the selected Roosty instance.
+# Phanpy is baked into the local Caddy image from a pinned upstream release.
 https://localhost:4002 {
 	tls internal
-	reverse_proxy https://phanpy.social {
-		header_up Host phanpy.social
+	route {
+		@phanpy_root {
+			path /
+			not query default=1
+		}
+		redir @phanpy_root /?default=1#/login?instance=roosty.localhost:4000 302
+		root * /srv/phanpy
+		try_files {path} /index.html
+		file_server
 	}
 }

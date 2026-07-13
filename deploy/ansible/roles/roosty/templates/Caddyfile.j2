@@ -16,9 +16,9 @@ phanpy.{$ROOSTY_DOMAIN} {
 			not query default=1
 		}
 		redir @phanpy_root /?default=1#/login?instance={$ROOSTY_DOMAIN} 302
-		reverse_proxy https://phanpy.social {
-			header_up Host phanpy.social
-		}
+		root * /srv/phanpy
+		try_files {path} /index.html
+		file_server
 	}
 }
 {% endif %}

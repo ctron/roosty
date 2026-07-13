@@ -43,6 +43,14 @@
     mode: '0644'
   notify: Restart Caddy
 
+- name: Copy Caddy image definition
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../Caddy.Containerfile"
+    dest: "{{ roosty_deploy_dir }}/Caddy.Containerfile"
+    owner: root
+    group: root
+    mode: '0644'
+
 - name: Generate persistent deployment secrets on first deployment
   ansible.builtin.shell:
     cmd: |
@@ -86,9 +94,16 @@
 
 - name: Apply Roosty Compose deployment
   ansible.builtin.command:
-    cmd: "docker compose {% if roosty_elk_enabled %}--profile elk {% endif %}up -d --remove-orphans"
+    cmd: "docker compose {% if roosty_elk_enabled %}--profile elk {% endif %}up -d --build --remove-orphans"
     chdir: "{{ roosty_deploy_dir }}"
   changed_when: true
+
+- name: Give Elk ownership of its application storage
+  ansible.builtin.command:
+    cmd: "docker compose --profile elk exec -T -u 0 elk chown -R {{ roosty_elk_storage_uid }}:{{ roosty_elk_storage_uid }} /elk/data"
+    chdir: "{{ roosty_deploy_dir }}"
+  when: roosty_elk_enabled
+  changed_when: false
 
 - name: Stop disabled Elk deployment
   ansible.builtin.command:

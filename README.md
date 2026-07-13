@@ -92,10 +92,10 @@ If Elk keeps trying an old saved instance, open this URL once to clear its local
 https://localhost:4001/reset
 ```
 
-Phanpy is proxied through the existing Caddy container, so it adds no local
-service or image. It fetches its static application from `phanpy.social`, which
-means this local client route requires network access. Open it preselected for
-the local instance with:
+Phanpy is served by the existing Caddy container, so it adds no separate local
+service. Its pinned release is baked into that image at build time, rather than
+being proxied through `phanpy.social`. Open it preselected for the local
+instance with:
 
 ```text
 https://localhost:4002/#/login?instance=roosty.localhost:4000
@@ -150,9 +150,10 @@ is retained.
 Set `roosty_phanpy_enabled: true` to make the existing Caddy container serve
 Phanpy at `https://phanpy.roosty.example.com`. Add a DNS A/AAAA record for that
 subdomain before deployment so Caddy can obtain its certificate. This remains
-disabled by default and proxies Phanpy's static client from `phanpy.social`; it
-does not add another container. Its root URL redirects to Phanpy's login route
-with the Roosty base domain preselected.
+disabled by default and does not add another container. The Ansible role pins
+the release with `roosty_phanpy_version`; override that role default in
+inventory to upgrade it. Its root URL redirects to Phanpy's login route with
+the Roosty base domain preselected.
 
 ## Verification
 

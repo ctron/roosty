@@ -1,7 +1,9 @@
 ---
 roosty_deploy_dir: /opt/roosty
 roosty_elk_enabled: true
+roosty_elk_storage_uid: 911
 roosty_phanpy_enabled: false
+roosty_phanpy_version: 2026.06.23.05dcc55
 roosty_docker_packages:
   - docker.io
   - docker-compose-v2
