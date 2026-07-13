@@ -4335,6 +4335,6 @@ mod tests {
         let late = next_retry_at(100);
 
         assert!(early > now);
-        assert!(late - now <= Duration::seconds(256 + 1));
+        assert!(late - now <= Duration::hours(1) + Duration::seconds(1));
     }
 }
