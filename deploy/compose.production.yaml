@@ -30,6 +30,21 @@ services:
       - roosty
     restart: unless-stopped
 
+  elk:
+    image: ghcr.io/elk-zone/elk:v1.0.0
+    profiles: ["elk"]
+    env_file: .env
+    environment:
+      NUXT_PUBLIC_DEFAULT_SERVER: ${ROOSTY_DOMAIN}
+      NUXT_PUBLIC_SINGLE_INSTANCE: "true"
+      NUXT_STORAGE_DRIVER: fs
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    volumes:
+      - elk-data:/elk/data
+    depends_on:
+      - roosty
+    restart: unless-stopped
+
   postgres:
     image: postgres:18
     env_file: secrets.env
@@ -48,5 +63,6 @@ services:
 volumes:
   caddy-config:
   caddy-data:
+  elk-data:
   postgres-data:
   roosty-media:

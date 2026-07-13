@@ -1,5 +1,6 @@
 ---
 roosty_deploy_dir: /opt/roosty
+roosty_elk_enabled: true
 roosty_phanpy_enabled: false
 roosty_docker_packages:
   - docker.io

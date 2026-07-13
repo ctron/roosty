@@ -15,3 +15,10 @@ phanpy.{$ROOSTY_DOMAIN} {
 	}
 }
 {% endif %}
+
+{% if roosty_elk_enabled %}
+elk.{$ROOSTY_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy elk:5314
+}
+{% endif %}

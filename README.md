@@ -142,6 +142,11 @@ and 443 before Caddy obtains its certificate. Set
 `roosty_federation_enabled: true` only after configuring its allow-list and key
 encryption secret.
 
+Elk is enabled by default at `https://elk.roosty.example.com`. Add a DNS A/AAAA
+record for that subdomain before deployment. Set `roosty_elk_enabled: false` to
+omit the Elk service and Caddy route; its persistent local browser state volume
+is retained.
+
 Set `roosty_phanpy_enabled: true` to make the existing Caddy container serve
 Phanpy at `https://phanpy.roosty.example.com`. Add a DNS A/AAAA record for that
 subdomain before deployment so Caddy can obtain its certificate. This remains
