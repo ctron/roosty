@@ -1,0 +1,17 @@
+{
+	email {$ROOSTY_ACME_EMAIL}
+}
+
+{$ROOSTY_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy roosty:4000
+}
+
+{% if roosty_phanpy_enabled %}
+phanpy.{$ROOSTY_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy https://phanpy.social {
+		header_up Host phanpy.social
+	}
+}
+{% endif %}

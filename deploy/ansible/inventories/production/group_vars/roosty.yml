@@ -5,6 +5,7 @@ roosty_image_tag: main
 roosty_instance_name: Roosty
 roosty_instance_description: A Roosty instance
 roosty_registration_mode: closed
+roosty_phanpy_enabled: false
 roosty_federation_enabled: false
 roosty_federation_allowed_domains: []
 roosty_federation_blocked_domains: []

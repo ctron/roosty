@@ -1,8 +1,0 @@
-{
-	email {$ROOSTY_ACME_EMAIL}
-}
-
-{$ROOSTY_DOMAIN} {
-	encode zstd gzip
-	reverse_proxy roosty:4000
-}

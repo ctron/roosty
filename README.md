@@ -142,6 +142,12 @@ and 443 before Caddy obtains its certificate. Set
 `roosty_federation_enabled: true` only after configuring its allow-list and key
 encryption secret.
 
+Set `roosty_phanpy_enabled: true` to make the existing Caddy container serve
+Phanpy at `https://phanpy.roosty.example.com`. Add a DNS A/AAAA record for that
+subdomain before deployment so Caddy can obtain its certificate. This remains
+disabled by default and proxies Phanpy's static client from `phanpy.social`; it
+does not add another container.
+
 ## Verification
 
 After Rust code or manifest changes, run:

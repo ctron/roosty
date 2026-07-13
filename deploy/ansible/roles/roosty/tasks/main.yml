@@ -34,9 +34,9 @@
     group: root
     mode: '0644'
 
-- name: Copy production Caddyfile
-  ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../../Caddyfile.production"
+- name: Render production Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
     dest: "{{ roosty_deploy_dir }}/Caddyfile"
     owner: root
     group: root
