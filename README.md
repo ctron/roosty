@@ -6,7 +6,7 @@ The project is early. The current local setup brings up the Rust server, Postgre
 
 ## Builds and Releases
 
-Every commit pushed to `main` publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/jreimann/mastodon-rs`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
+Every commit pushed to `main` publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
 
 ## Local Development
 
@@ -30,7 +30,19 @@ This starts:
 - Roosty API server through Caddy: `https://roosty.localhost:4000`
 - Roosty infrastructure endpoints: `http://localhost:3001`
 - Elk web client through Caddy: `https://localhost:4001`
+- Phanpy web client through Caddy: `https://localhost:4002`
 - PostgreSQL 18
+
+The local PostgreSQL development credentials are `roosty` for the role,
+database, and password. Connect from the container with:
+
+```sh
+podman compose -f deploy/compose.yaml exec postgres psql -U roosty -d roosty
+```
+
+Fresh local volumes are initialized with these values. If you have a volume
+created before the Roosty rename, migrate its role and database before starting
+the application.
 
 To run migrations manually instead:
 
@@ -78,6 +90,15 @@ If Elk keeps trying an old saved instance, open this URL once to clear its local
 
 ```text
 https://localhost:4001/reset
+```
+
+Phanpy is proxied through the existing Caddy container, so it adds no local
+service or image. It fetches its static application from `phanpy.social`, which
+means this local client route requires network access. Open it preselected for
+the local instance with:
+
+```text
+https://localhost:4002/#/login?instance=roosty.localhost:4000
 ```
 
 Useful local endpoints:

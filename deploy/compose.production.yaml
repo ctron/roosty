@@ -1,6 +1,6 @@
 services:
   roosty:
-    image: ghcr.io/jreimann/mastodon-rs:${ROOSTY_IMAGE_TAG:-main}
+    image: ghcr.io/ctron/roosty:${ROOSTY_IMAGE_TAG:-main}
     command: ["serve", "--with-migrations", "--with-worker"]
     env_file:
       - .env
