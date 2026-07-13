@@ -151,7 +151,8 @@ Set `roosty_phanpy_enabled: true` to make the existing Caddy container serve
 Phanpy at `https://phanpy.roosty.example.com`. Add a DNS A/AAAA record for that
 subdomain before deployment so Caddy can obtain its certificate. This remains
 disabled by default and proxies Phanpy's static client from `phanpy.social`; it
-does not add another container.
+does not add another container. Its root URL redirects to Phanpy's login route
+with the Roosty base domain preselected.
 
 ## Verification
 

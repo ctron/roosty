@@ -10,8 +10,12 @@
 {% if roosty_phanpy_enabled %}
 phanpy.{$ROOSTY_DOMAIN} {
 	encode zstd gzip
-	reverse_proxy https://phanpy.social {
-		header_up Host phanpy.social
+	route {
+		@phanpy_root path /
+		redir @phanpy_root /#/login?instance={$ROOSTY_DOMAIN} 302
+		reverse_proxy https://phanpy.social {
+			header_up Host phanpy.social
+		}
 	}
 }
 {% endif %}

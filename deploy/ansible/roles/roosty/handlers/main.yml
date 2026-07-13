@@ -1,0 +1,6 @@
+---
+- name: Restart Caddy
+  ansible.builtin.command:
+    cmd: docker compose restart caddy
+    chdir: "{{ roosty_deploy_dir }}"
+  changed_when: true

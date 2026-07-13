@@ -41,6 +41,7 @@
     owner: root
     group: root
     mode: '0644'
+  notify: Restart Caddy
 
 - name: Generate persistent deployment secrets on first deployment
   ansible.builtin.shell:
