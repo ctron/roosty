@@ -28,6 +28,7 @@ Keep this as the default verification command for changes in this repository.
 - Keep SQLx available for explicit query paths where direct SQL is the clearer fit.
 - Prefer file-backed Rust modules over nested inline modules. Use nested inline modules only when they are very small
   and local to their parent.
+- Before adding a new dependency, check for its most recent version.
 
 ## Documentation
 
