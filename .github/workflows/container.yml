@@ -24,13 +24,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check Rust workspace
         run: cargo check --workspace --all-targets --locked
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --locked
 
   build:
     needs: validate
