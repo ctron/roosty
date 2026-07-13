@@ -3,12 +3,32 @@
 }
 
 {$ROOSTY_DOMAIN} {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				resp_headers delete
+			}
+		}
+	}
 	encode zstd gzip
 	reverse_proxy roosty:4000
 }
 
 {% if roosty_phanpy_enabled %}
 phanpy.{$ROOSTY_DOMAIN} {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				resp_headers delete
+			}
+		}
+	}
 	encode zstd gzip
 	route {
 		@phanpy_root {
@@ -25,6 +45,16 @@ phanpy.{$ROOSTY_DOMAIN} {
 
 {% if roosty_elk_enabled %}
 elk.{$ROOSTY_DOMAIN} {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				resp_headers delete
+			}
+		}
+	}
 	encode zstd gzip
 	reverse_proxy elk:5314
 }
