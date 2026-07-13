@@ -82,6 +82,7 @@ struct Actor {
     id: String,
     #[serde(rename = "type")]
     actor_type: &'static str,
+    #[serde(rename = "preferredUsername")]
     preferred_username: String,
     name: String,
     summary: String,
@@ -102,6 +103,7 @@ struct Note {
     id: String,
     #[serde(rename = "type")]
     note_type: &'static str,
+    #[serde(rename = "attributedTo")]
     attributed_to: String,
     content: String,
     published: String,
@@ -126,7 +128,9 @@ struct OrderedCollection {
     context: &'static str,
     #[serde(rename = "type")]
     collection_type: &'static str,
+    #[serde(rename = "totalItems")]
     total_items: u64,
+    #[serde(rename = "orderedItems")]
     ordered_items: Vec<Create>,
 }
 
@@ -826,7 +830,7 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::parse_acct;
+    use super::{Actor, Create, Note, OrderedCollection, PublicKey, parse_acct};
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
     #[test]
@@ -839,5 +843,70 @@ mod tests {
         assert_eq!(parse_acct("acct:@example.test"), None);
         assert_eq!(parse_acct("acct:alice@"), None);
         assert_eq!(parse_acct("acct:alice@example.test/path"), None);
+    }
+
+    /// Given public ActivityStreams payloads, when serialized, then their property names use the
+    /// ActivityStreams camelCase spelling required by Mastodon.
+    #[test]
+    fn serializes_activitystreams_property_names() {
+        let actor = Actor {
+            context: "https://www.w3.org/ns/activitystreams",
+            id: "https://example.test/users/alice".to_owned(),
+            actor_type: "Person",
+            preferred_username: "alice".to_owned(),
+            name: "Alice".to_owned(),
+            summary: String::new(),
+            inbox: "https://example.test/users/alice/inbox".to_owned(),
+            outbox: "https://example.test/users/alice/outbox".to_owned(),
+            followers: "https://example.test/users/alice/followers".to_owned(),
+            following: "https://example.test/users/alice/following".to_owned(),
+            manually_approves_followers: false,
+            public_key: PublicKey {
+                id: "https://example.test/users/alice#main-key".to_owned(),
+                owner: "https://example.test/users/alice".to_owned(),
+                public_key_pem: "public-key".to_owned(),
+            },
+        };
+        let note = Note {
+            context: "https://www.w3.org/ns/activitystreams",
+            id: "https://example.test/users/alice/statuses/1".to_owned(),
+            note_type: "Note",
+            attributed_to: "https://example.test/users/alice".to_owned(),
+            content: "Hello".to_owned(),
+            published: "2026-07-13T00:00:00Z".to_owned(),
+            updated: "2026-07-13T00:00:00Z".to_owned(),
+            to: vec!["https://www.w3.org/ns/activitystreams#Public"],
+        };
+        let collection = OrderedCollection {
+            context: "https://www.w3.org/ns/activitystreams",
+            collection_type: "OrderedCollection",
+            total_items: 1,
+            ordered_items: vec![Create {
+                activity_type: "Create",
+                id: "https://example.test/users/alice/statuses/1#create".to_owned(),
+                actor: "https://example.test/users/alice".to_owned(),
+                published: "2026-07-13T00:00:00Z".to_owned(),
+                to: vec!["https://www.w3.org/ns/activitystreams#Public"],
+                object: note,
+            }],
+        };
+
+        let actor = serde_json::to_value(actor).unwrap();
+        let collection = serde_json::to_value(collection).unwrap();
+
+        assert_eq!(actor["preferredUsername"], "alice");
+        assert!(actor.get("preferred_username").is_none());
+        assert_eq!(collection["totalItems"], 1);
+        assert!(collection.get("total_items").is_none());
+        assert!(collection.get("ordered_items").is_none());
+        assert_eq!(
+            collection["orderedItems"][0]["object"]["attributedTo"],
+            "https://example.test/users/alice"
+        );
+        assert!(
+            collection["orderedItems"][0]["object"]
+                .get("attributed_to")
+                .is_none()
+        );
     }
 }
