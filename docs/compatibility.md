@@ -34,7 +34,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🔴 | Domain policy | No allow/block policy yet. |
+| 🟡 | Domain policy | Remote discovery and delivery use an operator allow/block policy. It supports exact domains or `*` for all public domains, with blocks taking precedence. |
 | 🔴 | SSRF protections | Required before remote fetches. |
 | 🔴 | Federation moderation | No remote report, reject, or suspend flow yet. |
 
@@ -147,7 +147,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
-| 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs allow-listed WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections. Search integration and refresh jobs are missing. |
+| 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs policy-controlled WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections. Search integration and refresh jobs are missing. |
 | 🔴 | Follow graph federation | Inbound/outbound Follow, Undo, Accept, Reject, locked requests, and remote relationship state are missing. |
 | 🔴 | Remote timeline fan-out | Remote home-timeline delivery, repair, and remote visibility semantics are missing. |
 | 🔴 | Remote social interactions | Replies, mentions, favourites, boosts, deletes, notifications, mutes, and blocks are missing. |

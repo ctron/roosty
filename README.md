@@ -140,7 +140,10 @@ certificate. Set `roosty_acme_email` to an operator contact address, ensure the
 host's public DNS A/AAAA records point to the target, and allow inbound ports 80
 and 443 before Caddy obtains its certificate. Set
 `roosty_federation_enabled: true` only after configuring its allow-list and key
-encryption secret.
+encryption secret. The allow-list accepts exact domains or `"*"` to permit all
+public domains; entries in `roosty_federation_blocked_domains` always take
+precedence. HTTPS, public-DNS, redirect, timeout, and response-size checks still
+apply in wildcard mode.
 
 Elk is enabled by default at `https://elk.roosty.example.com`. Add a DNS A/AAAA
 record for that subdomain before deployment. Set `roosty_elk_enabled: false` to
@@ -177,6 +180,6 @@ with a human-readable duration such as `7d`, `12h`, or `30m`; failed delivery
 jobs retry with exponential backoff until this age is exceeded.
 
 This initial surface provides WebFinger, local actor documents, public Notes,
-outboxes, follower/following collection metadata, and safe allow-listed remote
-`resolve=true` lookup. Inbound inbox processing, signed delivery, and remote
-follows are deliberately not yet enabled.
+outboxes, follower/following collection metadata, and safe policy-controlled
+remote `resolve=true` lookup. Inbound inbox processing, signed delivery, and
+remote follows are deliberately not yet enabled.

@@ -228,7 +228,7 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&bytes).map_err(|_| invalid("remote response is invalid JSON"))
 }
 
-/// Enforce HTTPS, exact domain policy, and public DNS resolution before connecting.
+/// Enforce HTTPS, domain policy, and public DNS resolution before connecting.
 pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<SocketAddr> {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return Err(invalid("remote URL must be an unauthenticated HTTPS URL"));
@@ -237,17 +237,7 @@ pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<S
         .host_str()
         .ok_or_else(|| invalid("remote URL has no host"))?
         .to_ascii_lowercase();
-    if !state
-        .config
-        .federation_allowed_domains
-        .iter()
-        .any(|domain| domain == &host)
-        || state
-            .config
-            .federation_blocked_domains
-            .iter()
-            .any(|domain| domain == &host)
-    {
+    if !state.config.federation_domain_is_allowed(&host) {
         return Err(invalid("remote domain is disallowed by federation policy"));
     }
     if host.parse::<IpAddr>().is_ok() {

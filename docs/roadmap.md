@@ -7,7 +7,7 @@
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
 - Local public/unlisted home-timeline fan-out, replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Opt-in local ActivityPub identity: WebFinger, actor documents, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
-- Safe allow-listed remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching.
+- Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 
 ### Federation gaps
 
@@ -53,7 +53,7 @@
 - Add remote replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Fill Mastodon client startup gaps found by Elk and browser logs.
 - Improve local account administration now that multiple local users can be operator-created.
-- Extend the safe, allow-listed WebFinger remote-account lookup to account search and controlled cache refresh.
+- Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - Add cursor pagination for account status collections.
 - Expand local direct conversations toward remote conversation support.
 - Add remote ActivityPub `Announce` support for boosts.

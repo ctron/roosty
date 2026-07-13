@@ -23,9 +23,9 @@ pub struct Config {
     pub federation_enabled: bool,
     /// Secret used to encrypt persisted local actor private keys.
     pub federation_key_encryption_secret: Option<String>,
-    /// Exact remote domains permitted for discovery and delivery.
+    /// Remote domains permitted for discovery and delivery. The `*` entry permits all domains.
     pub federation_allowed_domains: Vec<String>,
-    /// Exact remote domains prohibited for discovery and delivery.
+    /// Exact remote domains prohibited for discovery and delivery, including when `*` is allowed.
     pub federation_blocked_domains: Vec<String>,
     /// Maximum age for retrying a failed federation delivery job.
     pub federation_delivery_max_age: time::Duration,
@@ -101,6 +101,20 @@ impl Config {
             instance_description: optional_env("ROOSTY_INSTANCE_DESCRIPTION"),
         })
     }
+
+    /// Return whether the configured federation policy permits a remote DNS domain.
+    ///
+    /// A wildcard allow-list entry permits every domain, but an explicit block always wins.
+    pub fn federation_domain_is_allowed(&self, domain: &str) -> bool {
+        let domain = domain.to_ascii_lowercase();
+        self.federation_allowed_domains
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == &domain)
+            && !self
+                .federation_blocked_domains
+                .iter()
+                .any(|blocked| blocked == &domain)
+    }
 }
 
 fn optional_humantime_duration_env(name: &str, default: &str) -> Result<time::Duration> {
@@ -119,7 +133,7 @@ fn optional_humantime_duration_env(name: &str, default: &str) -> Result<time::Du
         .map_err(|_| RoostyError::Configuration(format!("{name} is too large")))
 }
 
-/// Parse a comma-separated list of exact DNS host names for federation policy.
+/// Parse a comma-separated list of DNS host names or the `*` federation wildcard.
 fn optional_domain_list(name: &str) -> Result<Vec<String>> {
     optional_env(name)
         .map(|value| {
@@ -223,6 +237,32 @@ mod tests {
         assert!(optional_bool_value("true").unwrap());
         assert!(!optional_bool_value("0").unwrap());
         assert!(optional_bool_value("sometimes").is_err());
+    }
+
+    #[test]
+    fn federation_wildcard_allows_domains_unless_explicitly_blocked() {
+        let config = Config {
+            database_url: "postgres://unused".to_owned(),
+            public_base_url: "https://roosty.example".parse().unwrap(),
+            listen_addr: "127.0.0.1:4000".parse().unwrap(),
+            infra_listen_addr: None,
+            session_secret: "test-session-secret".to_owned(),
+            token_pepper: "test-token-pepper".to_owned(),
+            object_storage_backend: "local".to_owned(),
+            media_root: "./media".to_owned(),
+            registration_mode: "closed".to_owned(),
+            federation_enabled: true,
+            federation_key_encryption_secret: Some("test-federation-secret".to_owned()),
+            federation_allowed_domains: vec!["*".to_owned()],
+            federation_blocked_domains: vec!["blocked.example".to_owned()],
+            federation_delivery_max_age: time::Duration::days(7),
+            instance_name: "Roosty Test".to_owned(),
+            instance_description: None,
+        };
+
+        assert!(config.federation_domain_is_allowed("remote.example"));
+        assert!(config.federation_domain_is_allowed("REMOTE.EXAMPLE"));
+        assert!(!config.federation_domain_is_allowed("blocked.example"));
     }
 
     fn optional_bool_value(value: &str) -> Result<bool> {
