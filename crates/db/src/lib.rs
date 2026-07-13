@@ -1836,6 +1836,23 @@ pub async fn update_local_account_password_hash(
     Ok(Some(local_account_from_model(active.update(db).await?)))
 }
 
+/// Replace a local account password hash by its stable account identifier.
+pub async fn update_local_account_password_hash_by_id(
+    db: &DbConnection,
+    account_id: AccountId,
+    password_hash: &str,
+) -> Result<LocalAccount> {
+    let account = local_account::Entity::find_by_id(account_id.0)
+        .one(db)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local account does not exist".to_owned()))?;
+    let mut active = account.into_active_model();
+    active.password_hash = Set(password_hash.to_owned());
+    active.updated_at = Set(OffsetDateTime::now_utc());
+
+    Ok(local_account_from_model(active.update(db).await?))
+}
+
 /// Create a local status authored by an account on this instance.
 pub async fn create_local_status(
     db: &DbConnection,

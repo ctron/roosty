@@ -113,6 +113,13 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/login", get(login_form).post(login))
         .route("/logout", post(logout))
+        .route("/auth/edit", get(edit_password_form))
+        .route(
+            "/auth",
+            post(change_password)
+                .put(change_password)
+                .patch(change_password),
+        )
         .route("/api/v1/apps", post(register_app))
         .route("/oauth/authorize", get(authorize_form).post(authorize))
         .route("/oauth/token", post(token))
@@ -140,6 +147,17 @@ struct LoginForm {
     next: Option<String>,
 }
 
+/// Password-change fields accepted by Mastodon's account settings form.
+#[derive(Deserialize)]
+struct ChangePasswordForm {
+    #[serde(alias = "user[current_password]")]
+    current_password: String,
+    #[serde(alias = "user[password]")]
+    password: String,
+    #[serde(alias = "user[password_confirmation]")]
+    password_confirmation: String,
+}
+
 #[derive(Template)]
 #[template(
     source = r#"<!doctype html>
@@ -150,6 +168,7 @@ struct LoginForm {
 <h1>Sign in</h1>
 {% if let Some(message) = error %}<p>{{ message }}</p>{% endif %}
 <form method="post" action="{{ action }}">
+<input type="hidden" name="_method" value="put">
 <input type="hidden" name="next" value="{{ next }}">
 <label>Username or email <input name="login" autocomplete="username" required></label>
 <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
@@ -164,6 +183,31 @@ struct LoginTemplate<'a> {
     action: &'a str,
     next: &'a str,
     error: Option<&'a str>,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Change password</title></head>
+<body>
+<main>
+<h1>Change password</h1>
+{% if let Some(message) = message %}<p>{{ message }}</p>{% endif %}
+<form method="post" action="{{ action }}">
+<label>Current password <input name="user[current_password]" type="password" autocomplete="current-password" required></label>
+<label>New password <input name="user[password]" type="password" autocomplete="new-password" required></label>
+<label>Confirm new password <input name="user[password_confirmation]" type="password" autocomplete="new-password" required></label>
+<button type="submit">Change password</button>
+</form>
+</main>
+</body>
+</html>"#,
+    ext = "html"
+)]
+struct ChangePasswordTemplate<'a> {
+    action: &'a str,
+    message: Option<&'a str>,
 }
 
 async fn login_form(State(state): State<AppState>, Query(query): Query<LoginQuery>) -> Response {
@@ -206,6 +250,53 @@ async fn logout(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// Render Mastodon's account password settings page for the signed-in user.
+async fn edit_password_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match account_id_from_session(&state, &headers) {
+        Ok(Some(_)) => render_change_password(&state, None),
+        Ok(None) => Redirect::to(&public_url(&state, "/login?next=%2Fauth%2Fedit")).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Change the signed-in user's password after verifying their current password.
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ChangePasswordForm>,
+) -> Response {
+    let account_id = match account_id_from_session(&state, &headers) {
+        Ok(Some(account_id)) => account_id,
+        Ok(None) => {
+            return Redirect::to(&public_url(&state, "/login?next=%2Fauth%2Fedit")).into_response();
+        }
+        Err(error) => return server_error(error),
+    };
+    let account = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
+        Err(error) => return server_error(error),
+    };
+
+    let password_hash = match validated_password_hash(
+        &account.password_hash,
+        &form.current_password,
+        &form.password,
+        &form.password_confirmation,
+    ) {
+        Ok(password_hash) => password_hash,
+        Err(message) => return render_change_password(&state, Some(message)),
+    };
+    if let Err(error) =
+        roosty_db::update_local_account_password_hash_by_id(&state.db, account_id, &password_hash)
+            .await
+    {
+        return server_error(error);
+    }
+
+    render_change_password(&state, Some("Password changed."))
+}
+
 fn render_login(state: &AppState, next: &str, error: Option<&str>) -> Response {
     let action = public_url(state, "/login");
     match (LoginTemplate {
@@ -217,6 +308,40 @@ fn render_login(state: &AppState, next: &str, error: Option<&str>) -> Response {
     {
         Ok(html) => Html(html).into_response(),
         Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
+    }
+}
+
+fn render_change_password(state: &AppState, message: Option<&str>) -> Response {
+    let action = public_url(state, "/auth");
+    match (ChangePasswordTemplate {
+        action: &action,
+        message,
+    })
+    .render()
+    {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
+    }
+}
+
+/// Verify a password-change request and return the Argon2 hash to persist.
+fn validated_password_hash(
+    current_password_hash: &str,
+    current_password: &str,
+    password_value: &str,
+    password_confirmation: &str,
+) -> Result<String, &'static str> {
+    if password_value != password_confirmation {
+        return Err("New password confirmation does not match.");
+    }
+    if password_value.chars().count() < 8 {
+        return Err("New password must be at least 8 characters.");
+    }
+    match password::verify_password(current_password, current_password_hash) {
+        Ok(true) => password::hash_password(password_value)
+            .map_err(|_| "Unable to change password. Please try again."),
+        Ok(false) => Err("Current password is incorrect."),
+        Err(_) => Err("Unable to verify the current password."),
     }
 }
 
@@ -1532,6 +1657,71 @@ mod tests {
             "https://localhost:4000/oauth/authorize"
         );
         assert!(session_cookie(&response).starts_with("roosty_session="));
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given a signed-in account, changing its password requires the current password and replaces the old one.
+    async fn signed_in_user_can_change_password(context: &mut EndpointContext) {
+        let cookie = context.login().await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("user[current_password]", "password"),
+                ("user[password]", "new-password"),
+                ("user[password_confirmation]", "new-password"),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/auth")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let account = roosty_db::find_local_account_by_login(&context.db, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(password::verify_password("new-password", &account.password_hash).unwrap());
+        assert!(!password::verify_password("password", &account.password_hash).unwrap());
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given an incorrect current password, preserves the existing credential hash.
+    async fn password_change_rejects_incorrect_current_password(context: &mut EndpointContext) {
+        let cookie = context.login().await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("user[current_password]", "incorrect"),
+                ("user[password]", "new-password"),
+                ("user[password_confirmation]", "new-password"),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let account = roosty_db::find_local_account_by_login(&context.db, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(password::verify_password("password", &account.password_hash).unwrap());
     }
 
     #[test_context(EndpointContext)]

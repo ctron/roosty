@@ -56,7 +56,13 @@ Create another local administrator:
 podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin create-user --username moderator --email moderator@example.com --admin
 ```
 
-Reset a local user's password and print a temporary replacement:
+Users can change their own password through the instance's account settings page:
+
+```text
+https://roosty.localhost:4000/auth/edit
+```
+
+An operator can also reset a local user's password and print a temporary replacement:
 
 ```sh
 podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin reset-password --username alice
