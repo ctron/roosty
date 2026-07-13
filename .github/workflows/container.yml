@@ -27,6 +27,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Restore Cargo build cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/cargo-build-cache
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Inject Cargo build cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@4b2444fec0c0fb9dbf175a96c094720a692ef810 # v2.1.4
+        with:
+          cache-source: ${{ runner.temp }}/cargo-build-cache
+
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -44,5 +57,5 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:main
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=roosty-container
+          cache-to: type=gha,mode=max,scope=roosty-container

@@ -2,12 +2,14 @@
 
 FROM docker.io/library/rust:1.96-bookworm AS builder
 
+ARG TARGETPLATFORM
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/cargo-target \
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-${TARGETPLATFORM},target=/cargo-target,sharing=locked \
     CARGO_TARGET_DIR=/cargo-target cargo build --release --locked -p roosty \
     && cp /cargo-target/release/roosty /usr/local/bin/roosty
 
