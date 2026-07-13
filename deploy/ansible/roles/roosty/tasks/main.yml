@@ -2,7 +2,7 @@
 - name: Validate deployment configuration
   ansible.builtin.assert:
     that:
-      - roosty_acme_email is match('^[^@[:space:]]+@[^@[:space:]]+$')
+      - roosty_acme_email is match('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
       - not roosty_federation_enabled or roosty_federation_allowed_domains | length > 0
     fail_msg: Configure a valid ACME email and federation allow-list before deploying.
 
@@ -28,7 +28,7 @@
 
 - name: Copy production Compose definition
   ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../../compose.production.yaml"
+    src: "{{ playbook_dir }}/../compose.production.yaml"
     dest: "{{ roosty_deploy_dir }}/compose.yaml"
     owner: root
     group: root
