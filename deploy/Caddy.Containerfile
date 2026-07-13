@@ -12,4 +12,6 @@ RUN apk add --no-cache ca-certificates curl tar \
 
 FROM docker.io/library/caddy:2
 
+RUN apk add --no-cache curl
+
 COPY --from=phanpy /srv/phanpy /srv/phanpy

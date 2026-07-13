@@ -14,6 +14,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--output", "/dev/null", "http://127.0.0.1:3001/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 1m
     restart: unless-stopped
 
   caddy:
@@ -31,7 +37,14 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     depends_on:
-      - roosty
+      roosty:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--output", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
   elk:
@@ -45,7 +58,19 @@ services:
     volumes:
       - elk-data:/elk/data
     depends_on:
-      - roosty
+      roosty:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          require('http').get('http://127.0.0.1:5314/', response => { response.resume(); response.on('end', () => process.exit(response.statusCode === 200 ? 0 : 1)); }).on('error', () => process.exit(1));
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   postgres:
