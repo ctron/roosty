@@ -348,6 +348,15 @@ async fn create_status(
     let author_id = account.id;
     match roosty_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
         Ok(mut status) => {
+            if let Err(error) = crate::federation::enqueue_status_activity(
+                &state,
+                &status,
+                crate::federation::StatusActivityKind::Create,
+            )
+            .await
+            {
+                return server_error(error);
+            }
             if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
                 return server_error(error);
             }
@@ -455,6 +464,15 @@ async fn update_status(
     .await
     {
         Ok(Some(status)) => {
+            if let Err(error) = crate::federation::enqueue_status_activity(
+                &state,
+                &status,
+                crate::federation::StatusActivityKind::Update,
+            )
+            .await
+            {
+                return server_error(error);
+            }
             if let Err(error) = sync_status_tags(&state, status.id, &status.content).await {
                 return server_error(error);
             }
@@ -478,6 +496,15 @@ async fn delete_status(
     match roosty_db::delete_owned_local_status(&state.db, status_id, account.id).await {
         Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
             Ok(response) => {
+                if let Err(error) = crate::federation::enqueue_status_activity(
+                    &state,
+                    &status,
+                    crate::federation::StatusActivityKind::Delete,
+                )
+                .await
+                {
+                    return server_error(error);
+                }
                 let reblogs = match roosty_db::local_reblogs_for_status(&state.db, status_id).await
                 {
                     Ok(reblogs) => reblogs,

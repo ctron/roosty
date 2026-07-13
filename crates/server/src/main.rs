@@ -325,9 +325,16 @@ async fn worker_loop(
                     info!(released, "released expired job claims");
                 }
                 for job in roosty_db::claim_due_jobs(&db, "roosty-worker", 20, claim_ttl).await? {
-                    let result = if job.kind == "federation_follow_response" {
-                        crate::federation::deliver_follow_response(&AppState::new(config.clone(), db.clone()), job.payload).await
-                    } else { Ok(()) };
+                    let state = AppState::new(config.clone(), db.clone());
+                    let result = match job.kind.as_str() {
+                        "federation_follow_response" => {
+                            crate::federation::deliver_follow_response(&state, job.payload).await
+                        }
+                        "federation_status_delivery" => {
+                            crate::federation::deliver_status_activity(&state, job.payload).await
+                        }
+                        _ => Ok(()),
+                    };
                     match result {
                         Ok(()) => roosty_db::mark_job_completed(&db, job.id).await?,
                         Err(error) => {

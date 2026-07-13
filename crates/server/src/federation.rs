@@ -34,6 +34,7 @@ const JRD_CONTENT_TYPE: &str = "application/jrd+json";
 const ACTIVITYSTREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
 const DELIVERY_JOB_KIND: &str = "federation_follow_response";
+const STATUS_DELIVERY_JOB_KIND: &str = "federation_status_delivery";
 
 /// ActivityStreams actor types accepted and emitted by Roosty.
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -51,6 +52,18 @@ enum NoteType {
 #[derive(Serialize)]
 enum CreateType {
     Create,
+}
+
+/// ActivityStreams activity types emitted when an existing status changes.
+#[derive(Serialize)]
+enum UpdateType {
+    Update,
+}
+
+/// ActivityStreams activity types emitted when a status is removed.
+#[derive(Serialize)]
+enum DeleteType {
+    Delete,
 }
 
 /// ActivityStreams collection types exposed by local actor endpoints.
@@ -128,18 +141,52 @@ struct Note {
     content: String,
     published: String,
     updated: String,
-    to: Vec<&'static str>,
+    to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cc: Vec<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Create {
+    #[serde(rename = "@context")]
+    context: &'static str,
     r#type: CreateType,
     id: String,
     actor: String,
     published: String,
-    to: Vec<&'static str>,
+    to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cc: Vec<String>,
     object: Note,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Update {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: UpdateType,
+    actor: String,
+    to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cc: Vec<String>,
+    object: Note,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Delete {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: DeleteType,
+    actor: String,
+    to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cc: Vec<String>,
+    object: String,
 }
 
 #[derive(Serialize)]
@@ -565,6 +612,60 @@ struct FollowResponseDelivery {
     response_type: String,
 }
 
+/// Durable payload for one activity delivery to one accepted remote follower.
+#[derive(Deserialize, Serialize)]
+struct StatusDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+}
+
+/// Queue a public or unlisted local status activity for every accepted remote follower.
+pub(crate) async fn enqueue_status_activity(
+    state: &AppState,
+    status: &roosty_db::LocalStatus,
+    kind: StatusActivityKind,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled
+        || !matches!(status.visibility.as_str(), "public" | "unlisted")
+    {
+        return Ok(());
+    }
+    let local = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local status actor does not exist".to_owned()))?;
+    let activity = status_activity(state, &local.username, status, kind)?;
+    let activity_id = activity
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
+    for remote in roosty_db::accepted_remote_followers(&state.db, local.id).await? {
+        let payload = serde_json::to_value(StatusDelivery {
+            local_account_id: local.id,
+            remote_actor_id: remote.id,
+            activity: activity.clone(),
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job(
+            &state.db,
+            STATUS_DELIVERY_JOB_KIND,
+            payload,
+            Some(&format!("{activity_id}:{}", remote.id.0)),
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Kinds of status lifecycle activities emitted to remote followers.
+#[derive(Clone, Copy)]
+pub(crate) enum StatusActivityKind {
+    Create,
+    Update,
+    Delete,
+}
+
 /// Queue a signed Accept or Reject response after a local follow decision.
 pub(crate) async fn enqueue_follow_response(
     state: &AppState,
@@ -627,6 +728,58 @@ pub(crate) async fn deliver_follow_response(
         &private_key,
         &format!("{}#main-key", actor_url(state, &local.username)),
         &activity,
+    )
+    .await
+}
+
+/// Dispatch one durable local status activity delivery job.
+pub(crate) async fn deliver_status_activity(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: StatusDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid status delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+    )
+    .await
+}
+
+/// Sign and deliver one already-persisted activity to a remote actor's inbox.
+async fn deliver_activity(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: &JsonValue,
+) -> Result<(), RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local delivery actor does not exist".to_owned())
+        })?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote delivery actor does not exist".to_owned())
+        })?;
+    let key = roosty_db::find_local_actor_key(&state.db, local.id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local delivery actor has no signing key".to_owned())
+        })?;
+    let private_key = decrypt_private_key(state, &key)?;
+    signed_post(
+        state,
+        remote
+            .shared_inbox_url
+            .as_deref()
+            .unwrap_or(&remote.inbox_url),
+        &private_key,
+        &format!("{}#main-key", actor_url(state, &local.username)),
+        activity,
     )
     .await
 }
@@ -737,16 +890,61 @@ async fn signed_post(
 fn create(state: &AppState, username: &str, status: roosty_db::LocalStatus) -> Create {
     let object = note_object(state, username, status);
     Create {
+        context: ACTIVITYSTREAMS_CONTEXT,
         r#type: CreateType::Create,
         id: format!("{}#create", object.id),
         actor: object.attributed_to.clone(),
         published: object.published.clone(),
-        to: vec![PUBLIC_AUDIENCE],
+        to: object.to.clone(),
+        cc: object.cc.clone(),
         object,
     }
 }
+
+fn status_activity(
+    state: &AppState,
+    username: &str,
+    status: &roosty_db::LocalStatus,
+    kind: StatusActivityKind,
+) -> Result<JsonValue, RoostyError> {
+    let note = note_object(state, username, status.clone());
+    let actor = note.attributed_to.clone();
+    let activity = match kind {
+        StatusActivityKind::Create => serde_json::to_value(Create {
+            context: ACTIVITYSTREAMS_CONTEXT,
+            r#type: CreateType::Create,
+            id: format!("{}#create-{}", note.id, Uuid::now_v7()),
+            actor,
+            published: note.published.clone(),
+            to: note.to.clone(),
+            cc: note.cc.clone(),
+            object: note,
+        }),
+        StatusActivityKind::Update => serde_json::to_value(Update {
+            context: ACTIVITYSTREAMS_CONTEXT,
+            id: format!("{}#update-{}", note.id, Uuid::now_v7()),
+            r#type: UpdateType::Update,
+            actor,
+            to: note.to.clone(),
+            cc: note.cc.clone(),
+            object: note,
+        }),
+        StatusActivityKind::Delete => serde_json::to_value(Delete {
+            context: ACTIVITYSTREAMS_CONTEXT,
+            id: format!("{}#delete-{}", note.id, Uuid::now_v7()),
+            r#type: DeleteType::Delete,
+            actor,
+            to: note.to,
+            cc: note.cc,
+            object: note.id,
+        }),
+    };
+    activity.map_err(|error| RoostyError::InvalidInput(error.to_string()))
+}
+
 fn note_object(state: &AppState, username: &str, status: roosty_db::LocalStatus) -> Note {
     let id = status_url(state, username, status.id);
+    let (to, cc) = status_audience(state, username, &status.visibility);
     Note {
         context: ACTIVITYSTREAMS_CONTEXT,
         id,
@@ -755,7 +953,20 @@ fn note_object(state: &AppState, username: &str, status: roosty_db::LocalStatus)
         content: status.content,
         published: crate::statuses::format_timestamp(status.created_at),
         updated: crate::statuses::format_timestamp(status.updated_at),
-        to: vec![PUBLIC_AUDIENCE],
+        to,
+        cc,
+    }
+}
+
+fn status_audience(
+    state: &AppState,
+    username: &str,
+    visibility: &str,
+) -> (Vec<String>, Vec<String>) {
+    let followers = format!("{}/followers", actor_url(state, username));
+    match visibility {
+        "unlisted" => (vec![followers], vec![PUBLIC_AUDIENCE.to_owned()]),
+        _ => (vec![PUBLIC_AUDIENCE.to_owned()], vec![followers]),
     }
 }
 fn activity_response<T: Serialize>(value: T) -> Response {
@@ -895,18 +1106,21 @@ mod tests {
             content: "Hello".to_owned(),
             published: "2026-07-13T00:00:00Z".to_owned(),
             updated: "2026-07-13T00:00:00Z".to_owned(),
-            to: vec!["https://www.w3.org/ns/activitystreams#Public"],
+            to: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
+            cc: Vec::new(),
         };
         let collection = OrderedCollection {
             context: "https://www.w3.org/ns/activitystreams",
             r#type: CollectionType::OrderedCollection,
             total_items: 1,
             ordered_items: vec![Create {
+                context: "https://www.w3.org/ns/activitystreams",
                 r#type: CreateType::Create,
                 id: "https://example.test/users/alice/statuses/1#create".to_owned(),
                 actor: "https://example.test/users/alice".to_owned(),
                 published: "2026-07-13T00:00:00Z".to_owned(),
-                to: vec!["https://www.w3.org/ns/activitystreams#Public"],
+                to: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
+                cc: Vec::new(),
                 object: note,
             }],
         };

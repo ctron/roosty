@@ -1052,6 +1052,28 @@ pub async fn count_remote_followers(db: &DbConnection, account_id: AccountId) ->
     Ok(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT count(*) AS count FROM remote_follow WHERE local_account_id = $1 AND state = 'accepted'", vec![account_id.0.into()])).await?.map(|row| row.try_get::<i64>("", "count")).transpose()?.unwrap_or(0) as u64)
 }
 
+/// List accepted remote followers that must receive activities from a local actor.
+pub async fn accepted_remote_followers(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<Vec<RemoteActor>> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT remote_actor_id FROM remote_follow WHERE local_account_id = $1 AND state = 'accepted'",
+            vec![account_id.0.into()],
+        ))
+        .await?;
+    let mut actors = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: Uuid = row.try_get("", "remote_actor_id")?;
+        if let Some(actor) = find_remote_actor_by_id(db, AccountId(id)).await? {
+            actors.push(actor);
+        }
+    }
+    Ok(actors)
+}
+
 /// Count local accounts this account follows.
 pub async fn count_local_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
     Ok(local_follow::Entity::find()

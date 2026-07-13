@@ -15,7 +15,7 @@
 - [ ] Add signed outbound `Follow` and `Undo(Follow)` delivery, including durable delivery jobs, destination deduplication, retries, and permanent-failure diagnostics.
 - [ ] Add signed inbound `Follow`, `Undo(Follow)`, `Accept`, and `Reject` processing, including idempotency and locked-account follow requests.
 - [ ] Persist remote follow/relationship state and expose it through Mastodon follow, unfollow, relationship, follower, and following APIs.
-- [ ] Deliver local public `Create`, `Update`, and `Delete` activities to remote followers.
+- [x] Deliver local public and unlisted `Create`, `Update`, and `Delete` activities to accepted remote followers.
 - [ ] Verify signed inbound `Create`, `Update`, and `Delete`, cache remote public Notes, and fan them into local home timelines.
 - [ ] Add remote home-timeline repair, visibility semantics, and remote follower collection contents.
 - [ ] Add remote replies, mentions, favourites, boosts, deletes, and notifications.
@@ -49,7 +49,8 @@
 - Apply local mute/block policy to remote follow requests and remote follow notifications.
 - Enrich remote account projections with profile media and remote relationship/status counts as those data become available.
 - Implement local-to-remote Follow and Undo(Follow) initiation and relationship state.
-- Add remote public status Create/Update/Delete delivery, caching, and home-timeline fan-out.
+- [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
+- Add inbound remote status caching and home-timeline fan-out.
 - Add remote replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Fill Mastodon client startup gaps found by Elk and browser logs.
 - Improve local account administration now that multiple local users can be operator-created.
