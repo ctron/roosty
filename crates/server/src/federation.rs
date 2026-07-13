@@ -35,6 +35,31 @@ const ACTIVITYSTREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
 const DELIVERY_JOB_KIND: &str = "federation_follow_response";
 
+/// ActivityStreams actor types accepted and emitted by Roosty.
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+enum ActorType {
+    Person,
+}
+
+/// ActivityStreams object types emitted for local statuses.
+#[derive(Serialize)]
+enum NoteType {
+    Note,
+}
+
+/// ActivityStreams activity types emitted for local status publication.
+#[derive(Serialize)]
+enum CreateType {
+    Create,
+}
+
+/// ActivityStreams collection types exposed by local actor endpoints.
+#[derive(Serialize)]
+enum CollectionType {
+    Collection,
+    OrderedCollection,
+}
+
 /// Build opt-in ActivityPub discovery and local actor routes.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -62,27 +87,25 @@ struct WebFinger {
 #[derive(Serialize)]
 struct WebFingerLink {
     rel: &'static str,
-    #[serde(rename = "type")]
-    media_type: &'static str,
+    r#type: &'static str,
     href: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PublicKey {
     id: String,
     owner: String,
-    #[serde(rename = "publicKeyPem")]
     public_key_pem: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Actor {
     #[serde(rename = "@context")]
     context: &'static str,
     id: String,
-    #[serde(rename = "type")]
-    actor_type: &'static str,
-    #[serde(rename = "preferredUsername")]
+    r#type: ActorType,
     preferred_username: String,
     name: String,
     summary: String,
@@ -90,20 +113,17 @@ struct Actor {
     outbox: String,
     followers: String,
     following: String,
-    #[serde(rename = "manuallyApprovesFollowers")]
     manually_approves_followers: bool,
-    #[serde(rename = "publicKey")]
     public_key: PublicKey,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Note {
     #[serde(rename = "@context")]
     context: &'static str,
     id: String,
-    #[serde(rename = "type")]
-    note_type: &'static str,
-    #[serde(rename = "attributedTo")]
+    r#type: NoteType,
     attributed_to: String,
     content: String,
     published: String,
@@ -112,9 +132,9 @@ struct Note {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Create {
-    #[serde(rename = "type")]
-    activity_type: &'static str,
+    r#type: CreateType,
     id: String,
     actor: String,
     published: String,
@@ -123,25 +143,22 @@ struct Create {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct OrderedCollection {
     #[serde(rename = "@context")]
     context: &'static str,
-    #[serde(rename = "type")]
-    collection_type: &'static str,
-    #[serde(rename = "totalItems")]
+    r#type: CollectionType,
     total_items: u64,
-    #[serde(rename = "orderedItems")]
     ordered_items: Vec<Create>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Collection {
     #[serde(rename = "@context")]
     context: &'static str,
     id: String,
-    #[serde(rename = "type")]
-    collection_type: &'static str,
-    #[serde(rename = "totalItems")]
+    r#type: CollectionType,
     total_items: u64,
 }
 
@@ -165,7 +182,7 @@ async fn webfinger(State(state): State<AppState>, Query(query): Query<WebFingerQ
                     subject,
                     links: vec![WebFingerLink {
                         rel: "self",
-                        media_type: ACTIVITYSTREAMS_CONTENT_TYPE,
+                        r#type: ACTIVITYSTREAMS_CONTENT_TYPE,
                         href: actor_url(&state, username),
                     }],
                 }),
@@ -195,7 +212,7 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> R
     activity_response(Actor {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: id.clone(),
-        actor_type: "Person",
+        r#type: ActorType::Person,
         preferred_username: account.username.clone(),
         name: if account.display_name.is_empty() {
             account.username.clone()
@@ -235,7 +252,7 @@ async fn outbox(State(state): State<AppState>, Path(username): Path<String>) -> 
             match roosty_db::count_public_local_statuses_by_account(&state.db, account.id).await {
                 Ok(total_items) => activity_response(OrderedCollection {
                     context: ACTIVITYSTREAMS_CONTEXT,
-                    collection_type: "OrderedCollection",
+                    r#type: CollectionType::OrderedCollection,
                     total_items,
                     ordered_items: items,
                 }),
@@ -284,7 +301,7 @@ async fn followers(State(state): State<AppState>, Path(username): Path<String>) 
         (Ok(local), Ok(remote)) => activity_response(Collection {
             context: ACTIVITYSTREAMS_CONTEXT,
             id: format!("{}/followers", actor_url(&state, &username)),
-            collection_type: "Collection",
+            r#type: CollectionType::Collection,
             total_items: local + remote,
         }),
         (Err(error), _) | (_, Err(error)) => internal_error(error),
@@ -300,7 +317,7 @@ async fn following(State(state): State<AppState>, Path(username): Path<String>) 
         Ok(total_items) => activity_response(Collection {
             context: ACTIVITYSTREAMS_CONTEXT,
             id: format!("{}/following", actor_url(&state, &username)),
-            collection_type: "Collection",
+            r#type: CollectionType::Collection,
             total_items,
         }),
         Err(error) => internal_error(error),
@@ -720,7 +737,7 @@ async fn signed_post(
 fn create(state: &AppState, username: &str, status: roosty_db::LocalStatus) -> Create {
     let object = note_object(state, username, status);
     Create {
-        activity_type: "Create",
+        r#type: CreateType::Create,
         id: format!("{}#create", object.id),
         actor: object.attributed_to.clone(),
         published: object.published.clone(),
@@ -733,7 +750,7 @@ fn note_object(state: &AppState, username: &str, status: roosty_db::LocalStatus)
     Note {
         context: ACTIVITYSTREAMS_CONTEXT,
         id,
-        note_type: "Note",
+        r#type: NoteType::Note,
         attributed_to: actor_url(state, username),
         content: status.content,
         published: crate::statuses::format_timestamp(status.created_at),
@@ -830,7 +847,10 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{Actor, Create, Note, OrderedCollection, PublicKey, parse_acct};
+    use super::{
+        Actor, ActorType, CollectionType, Create, CreateType, Note, NoteType, OrderedCollection,
+        PublicKey, parse_acct,
+    };
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
     #[test]
@@ -852,7 +872,7 @@ mod tests {
         let actor = Actor {
             context: "https://www.w3.org/ns/activitystreams",
             id: "https://example.test/users/alice".to_owned(),
-            actor_type: "Person",
+            r#type: ActorType::Person,
             preferred_username: "alice".to_owned(),
             name: "Alice".to_owned(),
             summary: String::new(),
@@ -870,7 +890,7 @@ mod tests {
         let note = Note {
             context: "https://www.w3.org/ns/activitystreams",
             id: "https://example.test/users/alice/statuses/1".to_owned(),
-            note_type: "Note",
+            r#type: NoteType::Note,
             attributed_to: "https://example.test/users/alice".to_owned(),
             content: "Hello".to_owned(),
             published: "2026-07-13T00:00:00Z".to_owned(),
@@ -879,10 +899,10 @@ mod tests {
         };
         let collection = OrderedCollection {
             context: "https://www.w3.org/ns/activitystreams",
-            collection_type: "OrderedCollection",
+            r#type: CollectionType::OrderedCollection,
             total_items: 1,
             ordered_items: vec![Create {
-                activity_type: "Create",
+                r#type: CreateType::Create,
                 id: "https://example.test/users/alice/statuses/1#create".to_owned(),
                 actor: "https://example.test/users/alice".to_owned(),
                 published: "2026-07-13T00:00:00Z".to_owned(),

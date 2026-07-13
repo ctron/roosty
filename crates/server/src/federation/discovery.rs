@@ -15,7 +15,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use url::Url;
 use uuid::Uuid;
 
-use crate::http::AppState;
+use crate::{federation::ActorType, http::AppState};
 
 const MAX_FEDERATION_RESPONSE_BYTES: usize = 1_048_576;
 
@@ -28,16 +28,15 @@ struct WebFingerResponse {
 #[derive(Deserialize)]
 struct WebFingerLink {
     rel: String,
-    #[serde(rename = "type")]
-    media_type: Option<String>,
+    r#type: Option<String>,
     href: String,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoteActorDocument {
     id: String,
-    #[serde(rename = "type")]
-    actor_type: String,
+    r#type: ActorType,
     #[serde(default)]
     preferred_username: String,
     #[serde(default)]
@@ -47,21 +46,20 @@ struct RemoteActorDocument {
     inbox: String,
     #[serde(default)]
     endpoints: RemoteEndpoints,
-    #[serde(rename = "publicKey")]
     public_key: RemotePublicKey,
 }
 
 #[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoteEndpoints {
-    #[serde(rename = "sharedInbox")]
     shared_inbox: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemotePublicKey {
     id: String,
     owner: String,
-    #[serde(rename = "publicKeyPem")]
     public_key_pem: String,
 }
 
@@ -92,10 +90,7 @@ pub async fn resolve_remote_actor(
         .links
         .into_iter()
         .find(|link| {
-            link.rel == "self"
-                && link.media_type.as_deref().is_none_or(|media_type| {
-                    media_type == "application/activity+json" || media_type == "application/ld+json"
-                })
+            link.rel == "self" && link.r#type.as_deref().is_none_or(is_activitypub_media_type)
         })
         .map(|link| link.href)
         .ok_or_else(|| invalid("WebFinger response does not include an ActivityPub actor link"))?;
@@ -137,7 +132,7 @@ pub async fn resolve_remote_actor_by_id(
         .ok_or_else(|| invalid("remote actor ID has no host"))?
         .to_ascii_lowercase();
     let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
-    if document.actor_type != "Person"
+    if document.r#type != ActorType::Person
         || document.id != activitypub_id
         || document.preferred_username.is_empty()
         || document.public_key.owner != document.id
@@ -271,7 +266,7 @@ fn validate_actor_document(
     username: &str,
     domain: &str,
 ) -> Result<()> {
-    if document.actor_type != "Person"
+    if document.r#type != ActorType::Person
         || document.preferred_username.is_empty()
         || !document.preferred_username.eq_ignore_ascii_case(username)
     {
@@ -341,6 +336,15 @@ fn is_json_content_type(content_type: &str) -> bool {
     })
 }
 
+fn is_activitypub_media_type(media_type: &str) -> bool {
+    media_type.split(';').next().is_some_and(|value| {
+        value
+            .trim()
+            .eq_ignore_ascii_case("application/activity+json")
+            || value.trim().eq_ignore_ascii_case("application/ld+json")
+    })
+}
+
 fn is_unsafe_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
@@ -373,7 +377,10 @@ fn invalid(message: &str) -> RoostyError {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use super::{is_json_content_type, is_unsafe_address, parse_remote_handle};
+    use super::{
+        RemoteActorDocument, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
+        parse_remote_handle,
+    };
 
     #[test]
     fn remote_handles_require_a_nonempty_dns_domain() {
@@ -401,5 +408,38 @@ mod tests {
         ));
         assert!(is_json_content_type("application/jrd+json"));
         assert!(!is_json_content_type("text/html"));
+    }
+
+    /// Given a Mastodon-style actor document, when deserialized, then its canonical
+    /// `preferredUsername` becomes the remote actor's local username.
+    #[test]
+    fn deserializes_activitystreams_preferred_username() {
+        let actor: RemoteActorDocument = serde_json::from_str(
+            r#"{
+                "id": "https://social.example/users/alice",
+                "type": "Person",
+                "preferredUsername": "alice",
+                "inbox": "https://social.example/users/alice/inbox",
+                "publicKey": {
+                    "id": "https://social.example/users/alice#main-key",
+                    "owner": "https://social.example/users/alice",
+                    "publicKeyPem": "public-key"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(actor.preferred_username, "alice");
+    }
+
+    /// Given profiled JSON-LD WebFinger metadata, when selecting an actor link, then the
+    /// ActivityStreams media type is accepted.
+    #[test]
+    fn accepts_profiled_activitystreams_media_type() {
+        assert!(is_activitypub_media_type("application/activity+json"));
+        assert!(is_activitypub_media_type(
+            "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\""
+        ));
+        assert!(!is_activitypub_media_type("application/jrd+json"));
     }
 }
