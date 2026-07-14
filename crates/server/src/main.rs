@@ -383,25 +383,25 @@ async fn worker_iteration(
     let state = AppState::new(config.clone(), db.clone());
     let result = match job.kind.as_str() {
         "federation_follow_response" => {
-            crate::federation::deliver_follow_response(&state, job.payload.clone()).await
+            federation::deliver_follow_response(&state, job.payload.clone()).await
         }
         "federation_status_delivery" => {
-            crate::federation::deliver_status_activity(&state, job.payload.clone()).await
+            federation::deliver_status_activity(&state, job.payload.clone()).await
         }
         "federation_follow_delivery" => {
-            crate::federation::deliver_follow_activity(&state, job.payload.clone()).await
+            federation::deliver_follow_activity(&state, job.payload.clone()).await
         }
         "federation_favourite_delivery" => {
-            crate::federation::deliver_favourite_activity(&state, job.payload.clone()).await
+            federation::deliver_favourite_activity(&state, job.payload.clone()).await
         }
         "federation_reblog_delivery" => {
-            crate::federation::deliver_reblog_activity(&state, job.payload.clone()).await
+            federation::deliver_reblog_activity(&state, job.payload.clone()).await
         }
         "federation_actor_update_delivery" => {
-            crate::federation::deliver_actor_update(&state, job.payload.clone()).await
+            federation::deliver_actor_update(&state, job.payload.clone()).await
         }
         "federation_remote_media_fetch" => {
-            crate::media::fetch_remote_media(&state, job.payload.clone()).await
+            media::fetch_remote_media(&state, job.payload.clone()).await
         }
         _ => Ok(()),
     };
