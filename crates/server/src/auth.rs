@@ -1209,6 +1209,9 @@ async fn profile_image_upload(
     let mut file = upload.open().await?;
     let mut bytes = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(ProfileImageUpload {
         content_type: upload.content_type,
         bytes,
@@ -2203,6 +2206,71 @@ mod tests {
 
     #[test_context(EndpointContext)]
     #[tokio::test]
+    /// Given Phanpy's empty unselected avatar part, stores the selected header without changing
+    /// the avatar.
+    async fn update_credentials_ignores_empty_profile_image_parts(context: &mut EndpointContext) {
+        let token = context.authenticated_token().await;
+        let initial_response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let initial_avatar = json_body(initial_response).await["avatar"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let boundary = "geckoformboundaryemptyprofileimage";
+        let header = encoded_test_image();
+        let mut body = Vec::new();
+        append_multipart_file(&mut body, boundary, "header", "", "image/png", &header);
+        append_multipart_file(
+            &mut body,
+            boundary,
+            "avatar",
+            "",
+            "application/octet-stream",
+            &[],
+        );
+        append_multipart_text(&mut body, boundary, "display_name", "Phanpy admin");
+        append_multipart_text(&mut body, boundary, "note", "Header updated");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let update_response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_body = json_body(update_response).await;
+        assert_eq!(update_body["avatar"], initial_avatar);
+        assert!(
+            update_body["header"]
+                .as_str()
+                .unwrap()
+                .contains("/media_attachments/files/accounts/")
+        );
+        assert_eq!(update_body["display_name"], "Phanpy admin");
+        assert_eq!(update_body["note"], "Header updated");
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
     /// Given JSON profile metadata arrays, stores fields for later credential reads.
     async fn update_credentials_persists_json_profile_fields(context: &mut EndpointContext) {
         let token = context.authenticated_token().await;
@@ -2349,6 +2417,16 @@ mod tests {
         );
         body.extend_from_slice(bytes);
         body.extend_from_slice(b"\r\n");
+    }
+
+    /// Append one multipart text part to a test request body.
+    fn append_multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
     }
 
     struct EndpointContext {
