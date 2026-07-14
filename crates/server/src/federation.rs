@@ -1,6 +1,8 @@
 //! ActivityPub discovery and public-object endpoints for local actors.
 
 pub(crate) mod discovery;
+#[cfg(test)]
+mod test_transport;
 
 use axum::{
     Json, Router,
@@ -1601,7 +1603,6 @@ async fn signed_post(
 ) -> Result<(), RoostyError> {
     let url = url::Url::parse(inbox)
         .map_err(|_| RoostyError::InvalidInput("remote inbox URL is invalid".to_owned()))?;
-    let address = discovery::validate_remote_url(state, &url).await?;
     let host = url
         .host_str()
         .ok_or_else(|| RoostyError::InvalidInput("remote inbox has no host".to_owned()))?
@@ -1621,6 +1622,14 @@ async fn signed_post(
         "keyId=\"{key_id}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{}\"",
         STANDARD.encode(signature.to_vec())
     );
+    #[cfg(test)]
+    if let Some(result) =
+        test_transport::deliver_if_registered(&url, &host, &date, &digest, &signature, body.clone())
+            .await
+    {
+        return result;
+    }
+    let address = discovery::validate_remote_url(state, &url).await?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -1892,11 +1901,27 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::LazyLock,
+    };
+
+    use postgresql_embedded::PostgreSQL;
+    use roosty_core::AccountId;
+    use roosty_migration::Migrator;
+    use sea_orm_migration::MigratorTrait;
+    use tempfile::TempDir;
+
     use super::{
         Actor, ActorType, CollectionType, Create, CreateType, InboundFollowActivity, InboundNote,
         InboundUndoFollowActivity, MentionTag, MentionType, Note, NoteType, OrderedCollection,
         PublicKey, parse_acct, remote_status_visibility,
     };
+    use crate::{config::Config, federation::test_transport, http::AppState};
+
+    /// Serializes scenarios which share the in-process recipient registry.
+    static FEDERATION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
     #[test]
@@ -1947,6 +1972,234 @@ mod tests {
             Some("https://remote.test/follows/1")
         );
         assert_eq!(invalid.object.follow_id(), None);
+    }
+
+    /// Given isolated instances, when a remote account follows then unfollows, signed status
+    /// delivery reaches it only while the accepted relationship exists.
+    #[tokio::test]
+    async fn remote_follow_handshake_delivers_then_stops_statuses() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        test_transport::register_inbox("alpha.test", context.alpha.clone());
+        test_transport::register_inbox("beta.test", context.beta.clone());
+
+        let author = create_test_account(&context.alpha, "author").await;
+        let follower = create_test_account(&context.beta, "follower").await;
+        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+            .await
+            .unwrap();
+        let beta_key = super::ensure_actor_key(&context.beta, follower.id)
+            .await
+            .unwrap();
+        let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
+        let beta_remote = cache_test_actor(&context.alpha, "follower", "beta.test", beta_key).await;
+
+        let follow_id = super::enqueue_remote_follow(&context.beta, follower.id, alpha_remote.id)
+            .await
+            .unwrap();
+        roosty_db::create_remote_following(
+            &context.beta.db,
+            follower.id,
+            alpha_remote.id,
+            &follow_id,
+        )
+        .await
+        .unwrap();
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
+        assert!(
+            roosty_db::remote_actor_follows_local_account(
+                &context.alpha.db,
+                beta_remote.id,
+                author.id,
+            )
+            .await
+            .unwrap()
+        );
+
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationFollowResponse).await;
+        assert_eq!(
+            roosty_db::find_remote_following(&context.beta.db, follower.id, alpha_remote.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "accepted"
+        );
+
+        let first = create_public_test_status(&context.alpha, author.id, "first delivery").await;
+        super::enqueue_status_activity(&context.alpha, &first, super::StatusActivityKind::Create)
+            .await
+            .unwrap();
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
+        assert!(
+            roosty_db::find_remote_status_by_activitypub_id(
+                &context.beta.db,
+                &super::status_url(&context.alpha, "author", first.id),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        let following =
+            roosty_db::delete_remote_following(&context.beta.db, follower.id, alpha_remote.id)
+                .await
+                .unwrap()
+                .unwrap();
+        super::enqueue_remote_unfollow(&context.beta, following)
+            .await
+            .unwrap();
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
+        assert!(
+            !roosty_db::remote_actor_follows_local_account(
+                &context.alpha.db,
+                beta_remote.id,
+                author.id,
+            )
+            .await
+            .unwrap()
+        );
+
+        let second = create_public_test_status(&context.alpha, author.id, "not delivered").await;
+        super::enqueue_status_activity(&context.alpha, &second, super::StatusActivityKind::Create)
+            .await
+            .unwrap();
+        assert!(
+            roosty_db::claim_due_jobs(
+                &context.alpha.db,
+                "federation-test",
+                10,
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        test_transport::clear_inboxes();
+        context.teardown().await;
+    }
+
+    /// Given locked local accounts, when remote requests are approved or rejected, then exactly
+    /// the corresponding signed response is delivered and the remote relationship agrees.
+    #[tokio::test]
+    async fn locked_remote_follow_requests_deliver_accept_or_reject() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        test_transport::register_inbox("alpha.test", context.alpha.clone());
+        test_transport::register_inbox("beta.test", context.beta.clone());
+
+        let approved = create_test_account(&context.alpha, "approved").await;
+        let rejected = create_test_account(&context.alpha, "rejected").await;
+        lock_test_account(&context.alpha, approved.id).await;
+        lock_test_account(&context.alpha, rejected.id).await;
+        let follower = create_test_account(&context.beta, "follower").await;
+        let alpha_key = super::ensure_actor_key(&context.alpha, approved.id)
+            .await
+            .unwrap();
+        let rejected_key = super::ensure_actor_key(&context.alpha, rejected.id)
+            .await
+            .unwrap();
+        let beta_key = super::ensure_actor_key(&context.beta, follower.id)
+            .await
+            .unwrap();
+        let approved_remote =
+            cache_test_actor(&context.beta, "approved", "alpha.test", alpha_key.clone()).await;
+        let rejected_remote =
+            cache_test_actor(&context.beta, "rejected", "alpha.test", rejected_key).await;
+        let beta_remote = cache_test_actor(&context.alpha, "follower", "beta.test", beta_key).await;
+
+        follow_test_actor(&context.beta, follower.id, approved_remote.id).await;
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
+        assert!(
+            !roosty_db::remote_actor_follows_local_account(
+                &context.alpha.db,
+                beta_remote.id,
+                approved.id,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            super::accept_remote_follow_request(&context.alpha, approved.id, beta_remote.id)
+                .await
+                .unwrap()
+        );
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationFollowResponse).await;
+        assert_eq!(
+            roosty_db::find_remote_following(&context.beta.db, follower.id, approved_remote.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "accepted"
+        );
+
+        follow_test_actor(&context.beta, follower.id, rejected_remote.id).await;
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
+        assert!(
+            super::reject_remote_follow_request(&context.alpha, rejected.id, beta_remote.id)
+                .await
+                .unwrap()
+        );
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationFollowResponse).await;
+        assert!(
+            roosty_db::find_remote_following(&context.beta.db, follower.id, rejected_remote.id,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        test_transport::clear_inboxes();
+        context.teardown().await;
+    }
+
+    /// Given an unreachable inbox, when a delivery fails, then the durable job is released and
+    /// rescheduled with exponential backoff instead of being delivered twice immediately.
+    #[tokio::test]
+    async fn failed_delivery_is_rescheduled_for_retry() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        let follower = create_test_account(&context.beta, "follower").await;
+        let actor_key = super::ensure_actor_key(&context.beta, follower.id)
+            .await
+            .unwrap();
+        let unreachable =
+            cache_test_actor(&context.beta, "unreachable", "unreachable.test", actor_key).await;
+
+        follow_test_actor(&context.beta, follower.id, unreachable.id).await;
+        let mut jobs = roosty_db::claim_due_jobs(
+            &context.beta.db,
+            "federation-test",
+            10,
+            time::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.remove(0);
+        let error = super::deliver_follow_activity(&context.beta, job.payload)
+            .await
+            .unwrap_err();
+        let retried_at =
+            roosty_db::mark_job_failed(&context.beta.db, job.id, &error.to_string(), job.attempts)
+                .await
+                .unwrap();
+
+        assert!(retried_at > time::OffsetDateTime::now_utc());
+        assert!(
+            roosty_db::claim_due_jobs(
+                &context.beta.db,
+                "federation-test",
+                10,
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        context.teardown().await;
     }
 
     /// Public is addressed in `to`, while unlisted retains the public audience in `cc`.
@@ -2053,5 +2306,211 @@ mod tests {
                 .get("attributed_to")
                 .is_none()
         );
+    }
+
+    struct FederationTestContext {
+        postgresql: PostgreSQL,
+        alpha: AppState,
+        beta: AppState,
+        alpha_database: String,
+        beta_database: String,
+        _temp_dir: TempDir,
+    }
+
+    impl FederationTestContext {
+        /// Start two migrated databases with distinct public federation identities.
+        async fn setup() -> Self {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("roosty-federation-")
+                .tempdir()
+                .unwrap();
+            let alpha_database = format!("alpha_{}", uuid::Uuid::now_v7().simple());
+            let beta_database = format!("beta_{}", uuid::Uuid::now_v7().simple());
+            let data_dir = temp_dir.path().join("data");
+            let password_file = temp_dir.path().join("passwords").join("pgpass");
+            std::fs::create_dir_all(password_file.parent().unwrap()).unwrap();
+
+            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let mut postgresql = PostgreSQL::new(settings);
+            postgresql.setup().await.unwrap();
+            postgresql.start().await.unwrap();
+            postgresql.create_database(&alpha_database).await.unwrap();
+            postgresql.create_database(&beta_database).await.unwrap();
+            let alpha_url = postgresql.settings().url(&alpha_database);
+            let beta_url = postgresql.settings().url(&beta_database);
+            let alpha_db = roosty_db::connect(&alpha_url).await.unwrap();
+            let beta_db = roosty_db::connect(&beta_url).await.unwrap();
+            Migrator::up(&alpha_db, None).await.unwrap();
+            Migrator::up(&beta_db, None).await.unwrap();
+
+            Self {
+                postgresql,
+                alpha: AppState::new(test_config(alpha_url, "https://alpha.test"), alpha_db),
+                beta: AppState::new(test_config(beta_url, "https://beta.test"), beta_db),
+                alpha_database,
+                beta_database,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        /// Stop both databases after the transport registry has been cleared.
+        async fn teardown(self) {
+            self.alpha.db.close().await.unwrap();
+            self.beta.db.close().await.unwrap();
+            self.postgresql
+                .drop_database(&self.alpha_database)
+                .await
+                .unwrap();
+            self.postgresql
+                .drop_database(&self.beta_database)
+                .await
+                .unwrap();
+            self.postgresql.stop().await.unwrap();
+        }
+    }
+
+    fn test_config(database_url: String, public_base_url: &str) -> Config {
+        Config {
+            database_url,
+            public_base_url: public_base_url.parse().unwrap(),
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            infra_listen_addr: None,
+            session_secret: "test-session-secret-change-me-000".to_owned(),
+            token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+            object_storage_backend: "local".to_owned(),
+            media_root: "./media".to_owned(),
+            registration_mode: "closed".to_owned(),
+            federation_enabled: true,
+            federation_key_encryption_secret: Some(
+                "test-federation-key-encryption-secret-000".to_owned(),
+            ),
+            federation_allowed_domains: vec!["*".to_owned()],
+            federation_blocked_domains: Vec::new(),
+            federation_delivery_max_age: time::Duration::days(7),
+            instance_name: "Federation test".to_owned(),
+            instance_description: None,
+        }
+    }
+
+    async fn create_test_account(state: &AppState, username: &str) -> roosty_db::LocalAccount {
+        roosty_db::create_local_account(
+            &state.db,
+            username,
+            &format!("{username}@example.test"),
+            "not-a-login-password",
+        )
+        .await
+        .unwrap();
+        roosty_db::find_local_account_by_username(&state.db, username)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn lock_test_account(state: &AppState, account_id: AccountId) {
+        roosty_db::update_local_account_settings(
+            &state.db,
+            account_id,
+            roosty_db::LocalAccountSettingsUpdate {
+                locked: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn follow_test_actor(
+        state: &AppState,
+        local_account_id: AccountId,
+        remote_actor_id: AccountId,
+    ) {
+        let activity_id = super::enqueue_remote_follow(state, local_account_id, remote_actor_id)
+            .await
+            .unwrap();
+        roosty_db::create_remote_following(
+            &state.db,
+            local_account_id,
+            remote_actor_id,
+            &activity_id,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn cache_test_actor(
+        state: &AppState,
+        username: &str,
+        domain: &str,
+        public_key_pem: String,
+    ) -> roosty_db::RemoteActor {
+        let actor = roosty_db::RemoteActor {
+            id: AccountId(uuid::Uuid::now_v7()),
+            activitypub_id: format!("https://{domain}/users/{username}"),
+            username: username.to_owned(),
+            domain: domain.to_owned(),
+            display_name: username.to_owned(),
+            summary: String::new(),
+            inbox_url: format!("https://{domain}/inbox"),
+            shared_inbox_url: None,
+            public_key_id: format!("https://{domain}/users/{username}#main-key"),
+            public_key_pem,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+        roosty_db::upsert_remote_actor(&state.db, &actor)
+            .await
+            .unwrap()
+    }
+
+    async fn create_public_test_status(
+        state: &AppState,
+        account_id: AccountId,
+        content: &str,
+    ) -> roosty_db::LocalStatus {
+        roosty_db::create_local_status(
+            &state.db,
+            roosty_db::NewLocalStatus {
+                account_id,
+                content: content.to_owned(),
+                visibility: "public".to_owned(),
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn deliver_test_job(state: &AppState, kind: roosty_db::JobKind) {
+        let mut jobs =
+            roosty_db::claim_due_jobs(&state.db, "federation-test", 10, time::Duration::minutes(1))
+                .await
+                .unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.remove(0);
+        assert_eq!(job.kind, kind.as_str());
+        match kind {
+            roosty_db::JobKind::FederationFollowResponse => {
+                super::deliver_follow_response(state, job.payload)
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationStatusDelivery => {
+                super::deliver_status_activity(state, job.payload)
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationFollowDelivery => {
+                super::deliver_follow_activity(state, job.payload)
+                    .await
+                    .unwrap();
+            }
+        }
+        roosty_db::mark_job_completed(&state.db, job.id)
+            .await
+            .unwrap();
     }
 }
