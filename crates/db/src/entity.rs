@@ -21,3 +21,5 @@ pub mod oauth_access_token;
 pub mod oauth_application;
 pub mod oauth_authorization_code;
 pub mod remote_actor;
+pub mod remote_following;
+pub mod remote_status;

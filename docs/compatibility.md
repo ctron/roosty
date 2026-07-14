@@ -8,7 +8,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🔴 | WebFinger | Needed for remote account discovery. |
+| 🟢 | WebFinger | Opt-in `/.well-known/webfinger` serves local `acct:` identities. |
 | 🟢 | `/.well-known/nodeinfo` | Advertises NodeInfo 2.1. |
 | 🟡 | `/nodeinfo/2.0`, `/nodeinfo/2.1` | Static local instance metadata; counts are placeholders. |
 
@@ -16,26 +16,26 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🔴 | Actor document | `GET /users/:username` is missing. |
-| 🔴 | Outbox | `GET /users/:username/outbox` is missing. |
-| 🔴 | Status object pages | ActivityPub object endpoints are missing. |
-| 🔴 | Actor keys | No public signing keys yet. |
+| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors and public keys. |
+| 🟡 | Outbox | `GET /users/:username/outbox` exposes local public activities. |
+| 🟢 | Status object pages | Public local Notes are available at `/users/:username/statuses/:id`. |
+| 🟢 | Actor keys | RSA signing keys are encrypted at rest and the public key is published in actor documents. |
 
 ### Inbox and Delivery
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🔴 | Inbox | `POST /users/:username/inbox` is missing. |
-| 🔴 | Signed HTTP requests | No signature verification or signing yet. |
-| 🔴 | Outbound delivery | No remote delivery jobs yet. |
-| 🔴 | Remote fetch/cache | Remote actors and objects are not fetched. |
+| 🟡 | Inbox | Signed inbox handling supports follows and public/unlisted status lifecycle activities. |
+| 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
+| 🟡 | Outbound delivery | Durable jobs deliver follow responses and public/unlisted local status lifecycle activities, with retry until the configured maximum age. |
+| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; refresh and client projections remain incomplete. |
 
 ### Moderation and Safety
 
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | Domain policy | Remote discovery and delivery use an operator allow/block policy. It supports exact domains or `*` for all public domains, with blocks taking precedence. |
-| 🔴 | SSRF protections | Required before remote fetches. |
+| 🟢 | SSRF protections | Remote discovery and delivery require HTTPS, reject unsafe resolved addresses, disable redirects, and enforce timeouts and response limits. |
 | 🔴 | Federation moderation | No remote report, reject, or suspend flow yet. |
 
 ## Mastodon API
@@ -148,8 +148,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
 | 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs policy-controlled WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections. Search integration and refresh jobs are missing. |
-| 🟡 | Outbound public status lifecycle | Public and unlisted local status creates, edits, and deletes are queued as signed ActivityPub deliveries to accepted remote followers. Inbound remote status caching and home-timeline fan-out are missing. |
-| 🔴 | Follow graph federation | Inbound/outbound Follow, Undo, Accept, Reject, locked requests, and remote relationship state are missing. |
+| 🟡 | Outbound public status lifecycle | Public and unlisted local status creates, edits, and deletes are queued as signed ActivityPub deliveries to accepted remote followers. |
+| 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs and author ownership checks. Cached Notes from accepted remote follows appear in home timelines and are streamed to those followers; media, interactions, and reply graphs are missing. |
+| 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. The Mastodon follow, unfollow, and relationship APIs support remote actors; remote follower/following collection projections are still missing. |
 | 🔴 | Remote timeline fan-out | Remote home-timeline delivery, repair, and remote visibility semantics are missing. |
 | 🔴 | Remote social interactions | Replies, mentions, favourites, boosts, deletes, notifications, mutes, and blocks are missing. |
 | 🔴 | Remote conversations and moderation | Direct conversations, account migration, signed inbox processing, domain-policy moderation, and delivery are missing. |

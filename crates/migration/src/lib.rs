@@ -27,6 +27,8 @@ mod m20260701_000022_create_remote_actor_table;
 mod m20260701_000023_create_remote_follow_tables;
 mod m20260701_000024_allow_remote_notification_actors;
 mod m20260701_000025_constrain_job_attempts_nonnegative;
+mod m20260701_000026_create_remote_status_table;
+mod m20260701_000027_create_remote_following_table;
 
 pub struct Migrator;
 
@@ -59,6 +61,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000023_create_remote_follow_tables::Migration),
             Box::new(m20260701_000024_allow_remote_notification_actors::Migration),
             Box::new(m20260701_000025_constrain_job_attempts_nonnegative::Migration),
+            Box::new(m20260701_000026_create_remote_status_table::Migration),
+            Box::new(m20260701_000027_create_remote_following_table::Migration),
         ]
     }
 }

@@ -27,7 +27,7 @@ use entity::{
     local_conversation_account, local_follow, local_media_attachment, local_notification,
     local_status, local_status_bookmark, local_status_favourite, local_status_reblog,
     local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
-    oauth_application, oauth_authorization_code, remote_actor,
+    oauth_application, oauth_authorization_code, remote_actor, remote_following, remote_status,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -219,6 +219,231 @@ pub struct RemoteActor {
     pub public_key_pem: String,
     /// Cache expiry instant.
     pub expires_at: OffsetDateTime,
+}
+
+/// Public or unlisted Note cached from a remote ActivityPub actor.
+#[derive(Clone, Debug)]
+pub struct RemoteStatus {
+    /// UUID-backed internal status identifier.
+    pub id: StatusId,
+    /// Canonical ActivityPub object ID.
+    pub activitypub_id: String,
+    /// Cached author.
+    pub remote_actor_id: AccountId,
+    /// Sanitized-at-render-time remote HTML content.
+    pub content: String,
+    /// Mastodon-compatible public or unlisted visibility.
+    pub visibility: String,
+    /// Remote publication timestamp.
+    pub published_at: OffsetDateTime,
+    /// Remote edit timestamp.
+    pub updated_at: OffsetDateTime,
+    /// Soft-delete timestamp, if a signed Delete was received.
+    pub deleted_at: Option<OffsetDateTime>,
+    /// Original Note object retained for future projection fields.
+    pub object: JsonValue,
+}
+
+/// Fields accepted when caching a verified remote Note.
+#[derive(Clone, Debug)]
+pub struct NewRemoteStatus {
+    /// Canonical ActivityPub object ID.
+    pub activitypub_id: String,
+    /// Verified author.
+    pub remote_actor_id: AccountId,
+    /// Remote HTML content.
+    pub content: String,
+    /// Public or unlisted visibility.
+    pub visibility: String,
+    /// Remote publication timestamp.
+    pub published_at: OffsetDateTime,
+    /// Remote edit timestamp.
+    pub updated_at: OffsetDateTime,
+    /// Original Note object.
+    pub object: JsonValue,
+}
+
+/// A local actor's relationship to a remote actor.
+#[derive(Clone, Debug)]
+pub struct RemoteFollowing {
+    /// Local follower.
+    pub local_account_id: AccountId,
+    /// Remote followed actor.
+    pub remote_actor_id: AccountId,
+    /// Canonical outbound Follow activity ID.
+    pub activity_id: String,
+    /// `pending` or `accepted`.
+    pub state: String,
+}
+
+/// Insert a pending local-to-remote follow relationship.
+pub async fn create_remote_following(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<RemoteFollowing> {
+    let row = remote_following::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        local_account_id: Set(local_account_id.0),
+        remote_actor_id: Set(remote_actor_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        state: Set("pending".to_owned()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+    Ok(remote_following_from_model(row))
+}
+
+/// Find one local-to-remote follow relationship.
+pub async fn find_remote_following(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<Option<RemoteFollowing>> {
+    Ok(remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .one(db)
+        .await?
+        .map(remote_following_from_model))
+}
+
+/// List local accounts whose accepted remote follow targets the supplied actor.
+pub async fn accepted_local_followers_of_remote_actor(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    Ok(remote_following::Entity::find()
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::State.eq("accepted"))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|follow| AccountId(follow.local_account_id))
+        .collect())
+}
+
+/// Find one cached remote Note by its canonical ActivityPub ID.
+pub async fn find_remote_status_by_activitypub_id(
+    db: &DbConnection,
+    activitypub_id: &str,
+) -> Result<Option<RemoteStatus>> {
+    Ok(remote_status::Entity::find()
+        .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+        .map(remote_status_from_model))
+}
+
+/// Mark the locally initiated Follow identified by its activity ID as accepted.
+pub async fn accept_remote_following(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<bool> {
+    let result = db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, "UPDATE remote_following SET state = 'accepted', updated_at = now() WHERE remote_actor_id = $1 AND activity_id = $2", vec![remote_actor_id.0.into(), activity_id.to_owned().into()])).await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Remove a rejected local-to-remote Follow by the original activity identity.
+pub async fn reject_remote_following(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<bool> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM remote_following WHERE remote_actor_id = $1 AND activity_id = $2",
+            vec![remote_actor_id.0.into(), activity_id.to_owned().into()],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Remove a local-to-remote follow relationship and return it for Undo delivery.
+pub async fn delete_remote_following(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<Option<RemoteFollowing>> {
+    let row = remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .one(db)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let relationship = remote_following_from_model(row.clone());
+    row.into_active_model().delete(db).await?;
+    Ok(Some(relationship))
+}
+
+/// Insert or refresh a verified remote Note by its canonical ActivityPub object ID.
+pub async fn upsert_remote_status(
+    db: &DbConnection,
+    status: NewRemoteStatus,
+) -> Result<RemoteStatus> {
+    let existing = remote_status::Entity::find()
+        .filter(remote_status::Column::ActivitypubId.eq(&status.activitypub_id))
+        .one(db)
+        .await?;
+    let model = if let Some(existing) = existing {
+        if existing.remote_actor_id != status.remote_actor_id.0 {
+            return Err(RoostyError::InvalidInput(
+                "remote status author does not match cached author".to_owned(),
+            ));
+        }
+        let mut active = existing.into_active_model();
+        active.content = Set(status.content);
+        active.visibility = Set(status.visibility);
+        active.published_at = Set(status.published_at);
+        active.updated_at = Set(status.updated_at);
+        active.deleted_at = Set(None);
+        active.object = Set(status.object);
+        active.update(db).await?
+    } else {
+        remote_status::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            activitypub_id: Set(status.activitypub_id),
+            remote_actor_id: Set(status.remote_actor_id.0),
+            content: Set(status.content),
+            visibility: Set(status.visibility),
+            published_at: Set(status.published_at),
+            updated_at: Set(status.updated_at),
+            deleted_at: Set(None),
+            object: Set(status.object),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?
+    };
+    Ok(remote_status_from_model(model))
+}
+
+/// Soft-delete a remote Note only when its verified author owns it.
+pub async fn delete_remote_status(
+    db: &DbConnection,
+    activitypub_id: &str,
+    remote_actor_id: AccountId,
+) -> Result<bool> {
+    let Some(status) = remote_status::Entity::find()
+        .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
+        .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut active = status.into_active_model();
+    active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
+    active.update(db).await?;
+    Ok(true)
 }
 
 /// Find a remote actor by its canonical ActivityPub ID.
@@ -704,6 +929,8 @@ pub enum HomeTimelineItem {
     Status(LocalStatus),
     /// Local boost of an authored status.
     Reblog(LocalStatusReblog),
+    /// Cached status from an accepted remote follow.
+    RemoteStatus(RemoteStatus),
 }
 
 impl LocalNotificationType {
@@ -3486,6 +3713,32 @@ pub async fn home_timeline_for_account(
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let mut remote_query = remote_status::Entity::find()
+        .filter(
+            remote_status::Column::RemoteActorId.in_subquery(
+                Query::select()
+                    .column(remote_following::Column::RemoteActorId)
+                    .from(remote_following::Entity)
+                    .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
+                    .and_where(remote_following::Column::State.eq("accepted"))
+                    .to_owned(),
+            ),
+        )
+        .filter(remote_status::Column::DeletedAt.is_null());
+    if let Some(max_id) = cursor.max_id {
+        remote_query = remote_query.filter(remote_status::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        remote_query = remote_query.filter(remote_status::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        remote_query = remote_query.filter(remote_status::Column::Id.gt(min_id.0));
+    }
+    let remote_statuses = remote_query
+        .order_by_desc(remote_status::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
     let mut items = statuses
         .into_iter()
         .map(local_status_from_model)
@@ -3495,6 +3748,12 @@ pub async fn home_timeline_for_account(
                 .into_iter()
                 .map(local_status_reblog_from_model)
                 .map(HomeTimelineItem::Reblog),
+        )
+        .chain(
+            remote_statuses
+                .into_iter()
+                .map(remote_status_from_model)
+                .map(HomeTimelineItem::RemoteStatus),
         )
         .collect::<Vec<_>>();
     items.sort_by_key(|item| Reverse(timeline_item_id(item)));
@@ -3561,6 +3820,7 @@ fn timeline_item_id(item: &HomeTimelineItem) -> Uuid {
     match item {
         HomeTimelineItem::Status(status) => status.id.0,
         HomeTimelineItem::Reblog(reblog) => reblog.id,
+        HomeTimelineItem::RemoteStatus(status) => status.id.0,
     }
 }
 
@@ -3967,6 +4227,30 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         public_key_id: actor.public_key_id,
         public_key_pem: actor.public_key_pem,
         expires_at: actor.expires_at,
+    }
+}
+
+/// Convert a persisted remote Note cache model into the shared projection.
+fn remote_status_from_model(status: remote_status::Model) -> RemoteStatus {
+    RemoteStatus {
+        id: StatusId(status.id),
+        activitypub_id: status.activitypub_id,
+        remote_actor_id: AccountId(status.remote_actor_id),
+        content: status.content,
+        visibility: status.visibility,
+        published_at: status.published_at,
+        updated_at: status.updated_at,
+        deleted_at: status.deleted_at,
+        object: status.object,
+    }
+}
+
+fn remote_following_from_model(follow: remote_following::Model) -> RemoteFollowing {
+    RemoteFollowing {
+        local_account_id: AccountId(follow.local_account_id),
+        remote_actor_id: AccountId(follow.remote_actor_id),
+        activity_id: follow.activity_id,
+        state: follow.state,
     }
 }
 

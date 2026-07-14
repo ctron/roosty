@@ -333,6 +333,9 @@ async fn worker_loop(
                         "federation_status_delivery" => {
                             crate::federation::deliver_status_activity(&state, job.payload).await
                         }
+                        "federation_follow_delivery" => {
+                            crate::federation::deliver_follow_activity(&state, job.payload).await
+                        }
                         _ => Ok(()),
                     };
                     match result {

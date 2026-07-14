@@ -178,7 +178,7 @@ pub(crate) struct StatusResponse {
     uri: String,
     url: String,
     content: String,
-    account: crate::auth::AccountResponse,
+    account: StatusAccountResponse,
     media_attachments: Vec<crate::media::MediaAttachmentResponse>,
     mentions: Vec<MentionResponse>,
     tags: Vec<TagResponse>,
@@ -193,6 +193,14 @@ pub(crate) struct StatusResponse {
     pinned: bool,
     reblog: Option<Box<StatusResponse>>,
     application: Option<Value>,
+}
+
+/// Mastodon account projection for either a local or cached remote status author.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum StatusAccountResponse {
+    Local(Box<crate::auth::AccountResponse>),
+    Remote(Box<crate::accounts::RemoteAccountResponse>),
 }
 
 /// Mastodon-compatible hashtag response.
@@ -1369,6 +1377,9 @@ async fn home_timeline_models(
                     response.push(reblog);
                 }
             }
+            roosty_db::HomeTimelineItem::RemoteStatus(status) => {
+                response.push(remote_status_response(state, status).await?);
+            }
         }
     }
 
@@ -1441,6 +1452,50 @@ async fn status_response(
     status_response_for_viewer(state, status, account.clone(), Some(account.id)).await
 }
 
+/// Build the limited Mastodon status projection supported for a cached remote Note.
+pub(crate) async fn remote_status_response(
+    state: &AppState,
+    status: roosty_db::RemoteStatus,
+) -> Result<StatusResponse, RoostyError> {
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote status author does not exist".to_owned())
+        })?;
+    Ok(StatusResponse {
+        id: status.id.0.to_string(),
+        created_at: format_timestamp(status.published_at),
+        edited_at: (status.updated_at != status.published_at)
+            .then(|| format_timestamp(status.updated_at)),
+        in_reply_to_id: None,
+        in_reply_to_account_id: None,
+        sensitive: false,
+        spoiler_text: String::new(),
+        visibility: status.visibility,
+        language: None,
+        uri: status.activitypub_id.clone(),
+        url: status.activitypub_id,
+        content: status.content,
+        account: StatusAccountResponse::Remote(Box::new(crate::accounts::remote_account_response(
+            actor,
+        ))),
+        media_attachments: Vec::new(),
+        mentions: Vec::new(),
+        tags: Vec::new(),
+        emojis: Vec::new(),
+        reblogs_count: 0,
+        favourites_count: 0,
+        replies_count: 0,
+        favourited: false,
+        reblogged: false,
+        muted: false,
+        bookmarked: false,
+        pinned: false,
+        reblog: None,
+        application: None,
+    })
+}
+
 async fn reblog_response(
     state: &AppState,
     reblog: roosty_db::LocalStatusReblog,
@@ -1484,7 +1539,7 @@ async fn reblog_response(
         uri: url.clone(),
         url,
         content: String::new(),
-        account: account_response(state, account).await?,
+        account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
         media_attachments: Vec::new(),
         mentions: Vec::new(),
         tags: Vec::new(),
@@ -1569,7 +1624,7 @@ async fn status_response_for_viewer(
             &text_mentions,
             &tags,
         ),
-        account: account_response(state, account).await?,
+        account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
         media_attachments,
         mentions,
         tags,

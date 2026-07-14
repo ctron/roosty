@@ -293,6 +293,30 @@ async fn follow(
     };
     let target_id = AccountId(path.account_id);
 
+    if roosty_db::find_remote_actor_by_id(&state.db, target_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let activity_id =
+            match crate::federation::enqueue_remote_follow(&state, account.id, target_id).await {
+                Ok(id) => id,
+                Err(error) => return server_error(error),
+            };
+        return match roosty_db::create_remote_following(
+            &state.db,
+            account.id,
+            target_id,
+            &activity_id,
+        )
+        .await
+        {
+            Ok(_) => relationship_response(&state, account.id, target_id).await,
+            Err(error) => server_error(error),
+        };
+    }
+
     match roosty_db::follow_local_account(
         &state.db,
         account.id,
@@ -409,6 +433,17 @@ async fn unfollow(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let target_id = AccountId(path.account_id);
+    match roosty_db::delete_remote_following(&state.db, account.id, target_id).await {
+        Ok(Some(following)) => {
+            if let Err(error) = crate::federation::enqueue_remote_unfollow(&state, following).await
+            {
+                return server_error(error);
+            }
+            return relationship_response(&state, account.id, target_id).await;
+        }
+        Ok(None) => {}
+        Err(error) => return server_error(error),
+    }
     match roosty_db::unfollow_local_account(&state.db, account.id, target_id).await {
         Ok(()) => relationship_response(&state, account.id, target_id).await,
         Err(error) => server_error(error),
@@ -672,6 +707,8 @@ async fn relationship_model(
     target_id: AccountId,
 ) -> roosty_core::Result<RelationshipResponse> {
     let following = roosty_db::local_follow_relationship(&state.db, source_id, target_id).await?;
+    let remote_following =
+        roosty_db::find_remote_following(&state.db, source_id, target_id).await?;
     let followed_by = roosty_db::local_follow_relationship(&state.db, target_id, source_id).await?;
     let remote_followed_by =
         roosty_db::remote_actor_follows_local_account(&state.db, target_id, source_id).await?;
@@ -681,7 +718,10 @@ async fn relationship_model(
 
     Ok(RelationshipResponse {
         id: target_id.0.to_string(),
-        following: following.is_some(),
+        following: following.is_some()
+            || remote_following
+                .as_ref()
+                .is_some_and(|follow| follow.state == "accepted"),
         showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs),
         notifying: following.as_ref().is_some_and(|follow| follow.notify),
         followed_by: followed_by.is_some() || remote_followed_by,
@@ -692,7 +732,9 @@ async fn relationship_model(
         muting_expires_at: mute
             .and_then(|mute| mute.expires_at)
             .map(crate::statuses::format_timestamp),
-        requested: false,
+        requested: remote_following
+            .as_ref()
+            .is_some_and(|follow| follow.state == "pending"),
         domain_blocking: false,
         endorsed: false,
     })

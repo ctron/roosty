@@ -24,7 +24,7 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::http::AppState;
@@ -35,6 +35,7 @@ const ACTIVITYSTREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
 const DELIVERY_JOB_KIND: &str = "federation_follow_response";
 const STATUS_DELIVERY_JOB_KIND: &str = "federation_status_delivery";
+const FOLLOW_DELIVERY_JOB_KIND: &str = "federation_follow_delivery";
 
 /// ActivityStreams actor types accepted and emitted by Roosty.
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -64,6 +65,54 @@ enum UpdateType {
 #[derive(Serialize)]
 enum DeleteType {
     Delete,
+}
+
+/// Activity types that carry a remote Note object in an inbox request.
+#[derive(Deserialize)]
+enum InboundStatusType {
+    Create,
+    Update,
+}
+
+/// Signed remote Create or Update activity containing a Note.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundStatusActivity {
+    r#type: InboundStatusType,
+    actor: String,
+    object: InboundNote,
+}
+
+/// Remote Note fields needed for the first cache projection.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundNote {
+    id: String,
+    r#type: String,
+    attributed_to: String,
+    content: String,
+    published: String,
+    updated: Option<String>,
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+}
+
+/// Signed remote Delete activity, whose object may be an object ID or a Tombstone.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundDeleteActivity {
+    actor: String,
+    object: InboundDeleteObject,
+}
+
+/// ActivityPub Delete object forms accepted by the first remote-status cache.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundDeleteObject {
+    Id(String),
+    Tombstone { id: String },
 }
 
 /// ActivityStreams collection types exposed by local actor endpoints.
@@ -429,6 +478,57 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     if !activity_id.starts_with("https://") {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if matches!(
+        activity.get("type").and_then(JsonValue::as_str),
+        Some("Create") | Some("Update") | Some("Delete")
+    ) {
+        return match process_remote_status_activity(&state.db, &activity, &remote_actor).await {
+            Ok(change) => {
+                // Record only after validation and persistence so malformed activities leave no trace.
+                if let Err(error) = roosty_db::record_processed_inbox_activity(
+                    &state.db,
+                    &activity_id,
+                    remote_actor.id,
+                )
+                .await
+                {
+                    tracing::warn!(%error, activity_id, "could not record remote status activity");
+                }
+                if let Err(error) =
+                    publish_remote_status_change(state, remote_actor.id, change).await
+                {
+                    tracing::warn!(%error, activity_id, "could not stream remote status activity");
+                }
+                StatusCode::ACCEPTED.into_response()
+            }
+            Err(error) => {
+                tracing::warn!(%error, activity_id, "rejected remote status activity");
+                StatusCode::ACCEPTED.into_response()
+            }
+        };
+    }
+    if matches!(
+        activity.get("type").and_then(JsonValue::as_str),
+        Some("Accept") | Some("Reject")
+    ) {
+        let Some(object_id) = activity
+            .get("object")
+            .and_then(JsonValue::as_object)
+            .and_then(|object| object.get("id"))
+            .and_then(JsonValue::as_str)
+        else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let result = if activity.get("type").and_then(JsonValue::as_str) == Some("Accept") {
+            roosty_db::accept_remote_following(&state.db, remote_actor.id, object_id).await
+        } else {
+            roosty_db::reject_remote_following(&state.db, remote_actor.id, object_id).await
+        };
+        return match result {
+            Ok(_) => StatusCode::ACCEPTED.into_response(),
+            Err(error) => internal_error(error),
+        };
+    }
     if !matches!(
         activity.get("type").and_then(JsonValue::as_str),
         Some("Follow") | Some("Undo")
@@ -505,6 +605,148 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             StatusCode::ACCEPTED.into_response()
         }
         Err(error) => internal_error(error),
+    }
+}
+
+/// Cached remote status change that can be published to accepted local followers.
+enum RemoteStatusChange {
+    /// A newly created or edited Note.
+    Upsert(roosty_db::RemoteStatus),
+    /// A removed Note with its internal API ID.
+    Delete(String),
+}
+
+/// Validate and cache one signed public or unlisted remote status lifecycle activity.
+async fn process_remote_status_activity(
+    db: &roosty_db::DbConnection,
+    activity: &JsonValue,
+    remote_actor: &roosty_db::RemoteActor,
+) -> Result<RemoteStatusChange, RoostyError> {
+    match activity.get("type").and_then(JsonValue::as_str) {
+        Some("Create") | Some("Update") => {
+            let activity_type = activity.get("type").and_then(JsonValue::as_str);
+            let activity: InboundStatusActivity = serde_json::from_value(activity.clone())
+                .map_err(|_| {
+                    RoostyError::InvalidInput("remote status activity is invalid".to_owned())
+                })?;
+            if !matches!(
+                (activity_type, activity.r#type),
+                (Some("Create"), InboundStatusType::Create)
+                    | (Some("Update"), InboundStatusType::Update)
+            ) {
+                return Err(RoostyError::InvalidInput(
+                    "remote status activity type is invalid".to_owned(),
+                ));
+            }
+            let object = serde_json::to_value(&activity.object)
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+            let note = activity.object;
+            if activity.actor != remote_actor.activitypub_id
+                || note.attributed_to != remote_actor.activitypub_id
+                || note.r#type != "Note"
+                || !note.id.starts_with("https://")
+            {
+                return Err(RoostyError::InvalidInput(
+                    "remote status activity has an invalid actor or object".to_owned(),
+                ));
+            }
+            let visibility = remote_status_visibility(&note)
+                .ok_or_else(|| RoostyError::InvalidInput("remote Note is not public".to_owned()))?;
+            let published_at = OffsetDateTime::parse(&note.published, &Rfc3339).map_err(|_| {
+                RoostyError::InvalidInput("remote Note published timestamp is invalid".to_owned())
+            })?;
+            let updated_at = note
+                .updated
+                .as_deref()
+                .map(|updated| OffsetDateTime::parse(updated, &Rfc3339))
+                .transpose()
+                .map_err(|_| {
+                    RoostyError::InvalidInput("remote Note updated timestamp is invalid".to_owned())
+                })?
+                .unwrap_or(published_at);
+            let status = roosty_db::upsert_remote_status(
+                db,
+                roosty_db::NewRemoteStatus {
+                    activitypub_id: note.id,
+                    remote_actor_id: remote_actor.id,
+                    content: note.content,
+                    visibility: visibility.to_owned(),
+                    published_at,
+                    updated_at,
+                    object,
+                },
+            )
+            .await?;
+            Ok(RemoteStatusChange::Upsert(status))
+        }
+        Some("Delete") => {
+            let activity: InboundDeleteActivity = serde_json::from_value(activity.clone())
+                .map_err(|_| {
+                    RoostyError::InvalidInput("remote Delete activity is invalid".to_owned())
+                })?;
+            if activity.actor != remote_actor.activitypub_id {
+                return Err(RoostyError::InvalidInput(
+                    "remote Delete actor does not match signer".to_owned(),
+                ));
+            }
+            let object_id = match activity.object {
+                InboundDeleteObject::Id(id) | InboundDeleteObject::Tombstone { id } => id,
+            };
+            if !object_id.starts_with("https://") {
+                return Err(RoostyError::InvalidInput(
+                    "remote Delete object is invalid".to_owned(),
+                ));
+            }
+            let status = roosty_db::find_remote_status_by_activitypub_id(db, &object_id).await?;
+            roosty_db::delete_remote_status(db, &object_id, remote_actor.id).await?;
+            Ok(RemoteStatusChange::Delete(
+                status
+                    .map(|status| status.id.0.to_string())
+                    .unwrap_or_default(),
+            ))
+        }
+        _ => Err(RoostyError::InvalidInput(
+            "unsupported remote status activity".to_owned(),
+        )),
+    }
+}
+
+/// Publish a cached remote Note lifecycle event only to local accounts following its author.
+async fn publish_remote_status_change(
+    state: &AppState,
+    remote_actor_id: AccountId,
+    change: RemoteStatusChange,
+) -> Result<(), RoostyError> {
+    let recipients =
+        roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    match change {
+        RemoteStatusChange::Upsert(status) => {
+            let response = crate::statuses::remote_status_response(state, status).await?;
+            state
+                .streaming_events
+                .publish_home_update(&response, remote_actor_id, &recipients);
+        }
+        RemoteStatusChange::Delete(status_id) if !status_id.is_empty() => {
+            state
+                .streaming_events
+                .publish_home_delete(&status_id, remote_actor_id, &recipients);
+        }
+        RemoteStatusChange::Delete(_) => {}
+    }
+    Ok(())
+}
+
+/// Return a Mastodon visibility only for ActivityPub's public and unlisted audiences.
+fn remote_status_visibility(note: &InboundNote) -> Option<&'static str> {
+    if note.to.iter().any(|audience| audience == PUBLIC_AUDIENCE) {
+        Some("public")
+    } else if note.cc.iter().any(|audience| audience == PUBLIC_AUDIENCE) {
+        Some("unlisted")
+    } else {
+        None
     }
 }
 
@@ -618,6 +860,109 @@ struct StatusDelivery {
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity: JsonValue,
+}
+
+/// Durable payload for a local Follow or Undo(Follow) delivery.
+#[derive(Deserialize, Serialize)]
+struct FollowDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+}
+
+/// Queue a signed Follow activity for a remote actor and return its stable activity ID.
+pub(crate) async fn enqueue_remote_follow(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<String, RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local follow actor does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote follow actor does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#follow-{}", Uuid::now_v7());
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Follow", "actor": actor, "object": remote.activitypub_id});
+    enqueue_follow_delivery(
+        state,
+        local_account_id,
+        remote_actor_id,
+        activity.clone(),
+        &id,
+    )
+    .await?;
+    Ok(id)
+}
+
+/// Queue an Undo(Follow) activity for a relationship removed locally.
+pub(crate) async fn enqueue_remote_unfollow(
+    state: &AppState,
+    following: roosty_db::RemoteFollowing,
+) -> Result<(), RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, following.local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local follow actor does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, following.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote follow actor does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#undo-follow-{}", Uuid::now_v7());
+    let follow = serde_json::json!({"id": following.activity_id, "type": "Follow", "actor": actor, "object": remote.activitypub_id});
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": follow});
+    enqueue_follow_delivery(
+        state,
+        following.local_account_id,
+        following.remote_actor_id,
+        activity,
+        &id,
+    )
+    .await
+}
+
+async fn enqueue_follow_delivery(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+    activity_id: &str,
+) -> Result<(), RoostyError> {
+    let payload = serde_json::to_value(FollowDelivery {
+        local_account_id,
+        remote_actor_id,
+        activity,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::enqueue_job(
+        &state.db,
+        FOLLOW_DELIVERY_JOB_KIND,
+        payload,
+        Some(activity_id),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Dispatch a durable local Follow or Undo(Follow) delivery job.
+pub(crate) async fn deliver_follow_activity(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: FollowDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid follow delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+    )
+    .await
 }
 
 /// Queue a public or unlisted local status activity for every accepted remote follower.
@@ -1059,8 +1404,8 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        Actor, ActorType, CollectionType, Create, CreateType, Note, NoteType, OrderedCollection,
-        PublicKey, parse_acct,
+        Actor, ActorType, CollectionType, Create, CreateType, InboundNote, Note, NoteType,
+        OrderedCollection, PublicKey, parse_acct, remote_status_visibility,
     };
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
@@ -1074,6 +1419,32 @@ mod tests {
         assert_eq!(parse_acct("acct:@example.test"), None);
         assert_eq!(parse_acct("acct:alice@"), None);
         assert_eq!(parse_acct("acct:alice@example.test/path"), None);
+    }
+
+    /// Public is addressed in `to`, while unlisted retains the public audience in `cc`.
+    #[test]
+    fn classifies_only_public_and_unlisted_remote_notes() {
+        let note = |to: Vec<&str>, cc: Vec<&str>| InboundNote {
+            id: "https://remote.example/notes/1".to_owned(),
+            r#type: "Note".to_owned(),
+            attributed_to: "https://remote.example/users/alice".to_owned(),
+            content: "hello".to_owned(),
+            published: "2026-07-13T12:00:00Z".to_owned(),
+            updated: None,
+            to: to.into_iter().map(str::to_owned).collect(),
+            cc: cc.into_iter().map(str::to_owned).collect(),
+        };
+        let public = "https://www.w3.org/ns/activitystreams#Public";
+
+        assert_eq!(
+            remote_status_visibility(&note(vec![public], vec![])),
+            Some("public")
+        );
+        assert_eq!(
+            remote_status_visibility(&note(vec![], vec![public])),
+            Some("unlisted")
+        );
+        assert_eq!(remote_status_visibility(&note(vec![], vec![])), None);
     }
 
     /// Given public ActivityStreams payloads, when serialized, then their property names use the

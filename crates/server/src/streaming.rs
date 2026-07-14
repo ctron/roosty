@@ -84,6 +84,24 @@ impl StreamingEvents {
             Err(error) => debug!(%error, "streaming delete had no active receivers"),
         }
     }
+
+    /// Publish a status update exclusively to selected users' home-capable streams.
+    pub fn publish_home_update<T>(&self, status: &T, author_id: AccountId, recipients: &[AccountId])
+    where
+        T: Serialize,
+    {
+        self.publish_status_update(status, author_id, "unlisted", recipients);
+    }
+
+    /// Publish a status deletion exclusively to selected users' home-capable streams.
+    pub fn publish_home_delete(
+        &self,
+        status_id: &str,
+        author_id: AccountId,
+        recipients: &[AccountId],
+    ) {
+        self.publish_delete(status_id, author_id, "unlisted", recipients);
+    }
 }
 
 /// Event payload shared with connected WebSocket subscribers.
