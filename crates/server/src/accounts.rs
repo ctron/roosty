@@ -8,6 +8,7 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::LocalNotificationType;
+use sea_orm::TransactionTrait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::warn;
 use uuid::Uuid;
@@ -307,20 +308,28 @@ async fn follow(
         .flatten()
         .is_some()
     {
-        let activity_id =
-            match crate::federation::enqueue_remote_follow(&state, account.id, target_id).await {
-                Ok(id) => id,
+        let (activity_id, job) =
+            match crate::federation::prepare_remote_follow(&state, account.id, target_id).await {
+                Ok(prepared) => prepared,
                 Err(error) => return server_error(error),
             };
-        return match roosty_db::create_remote_following(
-            &state.db,
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(error) => return server_error(error.into()),
+        };
+        return match roosty_db::create_remote_following_with_job(
+            &txn,
             account.id,
             target_id,
             &activity_id,
+            job,
         )
         .await
         {
-            Ok(_) => relationship_response(&state, account.id, target_id).await,
+            Ok(_) => match txn.commit().await {
+                Ok(()) => relationship_response(&state, account.id, target_id).await,
+                Err(error) => server_error(error.into()),
+            },
             Err(error) => server_error(error),
         };
     }
@@ -368,8 +377,15 @@ async fn block(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let target_id = AccountId(path.account_id);
-    match roosty_db::block_local_account(&state.db, account.id, target_id).await {
-        Ok(()) => relationship_response(&state, account.id, target_id).await,
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::block_local_account(&txn, account.id, target_id).await {
+        Ok(()) => match txn.commit().await {
+            Ok(()) => relationship_response(&state, account.id, target_id).await,
+            Err(error) => server_error(error.into()),
+        },
         Err(RoostyError::InvalidInput(error)) if error == "target account does not exist" => {
             not_found()
         }
@@ -441,16 +457,29 @@ async fn unfollow(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let target_id = AccountId(path.account_id);
-    match roosty_db::delete_remote_following(&state.db, account.id, target_id).await {
-        Ok(Some(following)) => {
-            if let Err(error) = crate::federation::enqueue_remote_unfollow(&state, following).await
-            {
-                return server_error(error);
-            }
-            return relationship_response(&state, account.id, target_id).await;
-        }
-        Ok(None) => {}
-        Err(error) => return server_error(error),
+    let remote_following =
+        match roosty_db::find_remote_following(&state.db, account.id, target_id).await {
+            Ok(following) => following,
+            Err(error) => return server_error(error),
+        };
+    if let Some(following) = remote_following {
+        let job = match crate::federation::prepare_remote_unfollow(&state, following).await {
+            Ok(job) => job,
+            Err(error) => return server_error(error),
+        };
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(error) => return server_error(error.into()),
+        };
+        return match roosty_db::delete_remote_following_with_job(&txn, account.id, target_id, job)
+            .await
+        {
+            Ok(_) => match txn.commit().await {
+                Ok(()) => relationship_response(&state, account.id, target_id).await,
+                Err(error) => server_error(error.into()),
+            },
+            Err(error) => server_error(error),
+        };
     }
     match roosty_db::unfollow_local_account(&state.db, account.id, target_id).await {
         Ok(()) => relationship_response(&state, account.id, target_id).await,

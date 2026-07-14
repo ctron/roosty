@@ -3075,6 +3075,7 @@ dependencies = [
  "roosty-db",
  "roosty-migration",
  "rsa",
+ "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",

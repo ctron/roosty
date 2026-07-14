@@ -37,6 +37,31 @@ use entity::{
 /// Shared database connection type used across Roosty crates.
 pub type DbConnection = DatabaseConnection;
 
+/// A durable job to be inserted as part of a larger database operation.
+///
+/// Callers use this to implement the transactional-outbox pattern: the state
+/// change and its eventual side effect become visible together.
+#[derive(Clone, Debug)]
+pub struct NewJob {
+    /// Worker dispatch kind.
+    pub kind: JobKind,
+    /// Serialized worker input.
+    pub payload: JsonValue,
+    /// Optional active-job deduplication identity.
+    pub deduplication_key: Option<String>,
+    /// Earliest time at which a worker may claim the job.
+    pub run_after: OffsetDateTime,
+}
+
+/// Derived status links persisted with a local status mutation.
+#[derive(Clone, Debug, Default)]
+pub struct LocalStatusMetadata {
+    /// Normalized hashtag names linked to the status.
+    pub tag_names: Vec<String>,
+    /// Resolved remote actors explicitly mentioned by the status.
+    pub remote_actor_ids: Vec<AccountId>,
+}
+
 /// Open a database connection using SeaORM's PostgreSQL driver.
 pub async fn connect(database_url: &str) -> Result<DbConnection> {
     Ok(Database::connect(database_url).await?)
@@ -330,6 +355,31 @@ pub async fn create_remote_following(
     Ok(remote_following_from_model(row))
 }
 
+/// Create a pending local-to-remote follow and its durable Follow job.
+///
+/// The caller owns and commits `txn`, so the relationship and job become
+/// visible together with any surrounding handler work.
+pub async fn create_remote_following_with_job(
+    txn: &sea_orm::DatabaseTransaction,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+    job: NewJob,
+) -> Result<RemoteFollowing> {
+    let row = remote_following::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        local_account_id: Set(local_account_id.0),
+        remote_actor_id: Set(remote_actor_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        state: Set("pending".to_owned()),
+        ..Default::default()
+    }
+    .insert(txn)
+    .await?;
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(remote_following_from_model(row))
+}
+
 /// Find one local-to-remote follow relationship.
 pub async fn find_remote_following(
     db: &DbConnection,
@@ -541,11 +591,42 @@ pub async fn delete_remote_following(
     Ok(Some(relationship))
 }
 
+/// Remove a local-to-remote follow and insert its Undo delivery job.
+///
+/// The caller owns and commits `txn`.
+pub async fn delete_remote_following_with_job(
+    txn: &sea_orm::DatabaseTransaction,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    job: NewJob,
+) -> Result<Option<RemoteFollowing>> {
+    let row = remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .one(txn)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let relationship = remote_following_from_model(row.clone());
+    row.into_active_model().delete(txn).await?;
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(Some(relationship))
+}
+
 /// Insert or refresh a verified remote Note by its canonical ActivityPub object ID.
 pub async fn upsert_remote_status(
     db: &DbConnection,
     status: NewRemoteStatus,
 ) -> Result<RemoteStatus> {
+    upsert_remote_status_on(db, status).await
+}
+
+/// Persist a remote Note through either a pool connection or a transaction.
+async fn upsert_remote_status_on<C>(db: &C, status: NewRemoteStatus) -> Result<RemoteStatus>
+where
+    C: ConnectionTrait,
+{
     let existing = remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(&status.activitypub_id))
         .one(db)
@@ -590,6 +671,29 @@ pub async fn upsert_remote_status(
     Ok(remote_status_from_model(model))
 }
 
+/// Record an inbound Create or Update and cache its Note atomically.
+pub async fn process_remote_status_upsert(
+    txn: &sea_orm::DatabaseTransaction,
+    activity_id: &str,
+    remote_actor_id: AccountId,
+    status: NewRemoteStatus,
+) -> Result<Option<RemoteStatus>> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(None);
+    }
+    let status = upsert_remote_status_on(txn, status).await?;
+    Ok(Some(status))
+}
+
 /// Soft-delete a remote Note only when its verified author owns it.
 pub async fn delete_remote_status(
     db: &DbConnection,
@@ -609,6 +713,40 @@ pub async fn delete_remote_status(
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(db).await?;
     Ok(true)
+}
+
+/// Record an inbound Delete and soft-delete its cached Note atomically.
+pub async fn process_remote_status_delete(
+    txn: &sea_orm::DatabaseTransaction,
+    activity_id: &str,
+    remote_actor_id: AccountId,
+    activitypub_id: &str,
+) -> Result<Option<StatusId>> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(None);
+    }
+    let status = remote_status::Entity::find()
+        .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
+        .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .one(txn)
+        .await?;
+    let result = status.as_ref().map(|status| StatusId(status.id));
+    if let Some(status) = status {
+        let mut active = status.into_active_model();
+        active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
+        active.update(txn).await?;
+    }
+    Ok(result)
 }
 
 /// Find a remote actor by its canonical ActivityPub ID.
@@ -1281,14 +1419,13 @@ pub async fn upsert_remote_follow(
 
 /// Persist one newly validated automatic remote Follow and its durable Accept job atomically.
 pub async fn upsert_processed_remote_follow_with_response_job(
-    db: &DbConnection,
+    txn: &sea_orm::DatabaseTransaction,
     remote_actor_id: AccountId,
     local_account_id: AccountId,
     activity_id: &str,
     activity: JsonValue,
     response_job: RemoteFollowResponseJob,
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let processed =
         processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
             activity_id: Set(activity_id.to_owned()),
@@ -1296,10 +1433,9 @@ pub async fn upsert_processed_remote_follow_with_response_job(
             processed_at: Set(OffsetDateTime::now_utc()),
         })
         .on_conflict_do_nothing()
-        .exec(&txn)
+        .exec(txn)
         .await?;
     if matches!(processed, TryInsertResult::Conflicted) {
-        txn.commit().await?;
         return Ok(false);
     }
 
@@ -1326,10 +1462,57 @@ pub async fn upsert_processed_remote_follow_with_response_job(
         ])
         .to_owned(),
     )
-    .exec(&txn)
+    .exec(txn)
     .await?;
-    insert_response_job(&txn, response_job).await?;
-    txn.commit().await?;
+    insert_response_job(txn, response_job).await?;
+    Ok(true)
+}
+
+/// Persist an inbox idempotency marker and a pending remote Follow together.
+pub async fn upsert_processed_pending_remote_follow(
+    txn: &sea_orm::DatabaseTransaction,
+    remote_actor_id: AccountId,
+    local_account_id: AccountId,
+    activity_id: &str,
+    activity: JsonValue,
+) -> Result<bool> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(false);
+    }
+    remote_follow::Entity::insert(remote_follow::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        remote_actor_id: Set(remote_actor_id.0),
+        local_account_id: Set(local_account_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        activity: Set(activity),
+        state: Set("pending".to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+        updated_at: Set(OffsetDateTime::now_utc()),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            remote_follow::Column::RemoteActorId,
+            remote_follow::Column::LocalAccountId,
+        ])
+        .update_columns([
+            remote_follow::Column::ActivityId,
+            remote_follow::Column::Activity,
+            remote_follow::Column::State,
+            remote_follow::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec(txn)
+    .await?;
     Ok(true)
 }
 
@@ -1359,30 +1542,27 @@ async fn insert_response_job(
 
 /// Accept a pending remote Follow and create its Accept delivery job atomically.
 pub async fn accept_remote_follow_with_response_job(
-    db: &DbConnection,
+    txn: &sea_orm::DatabaseTransaction,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity_id: &str,
     response_job: RemoteFollowResponseJob,
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let follow = remote_follow::Entity::find()
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_follow::Column::ActivityId.eq(activity_id))
         .filter(remote_follow::Column::State.eq("pending"))
-        .one(&txn)
+        .one(txn)
         .await?;
     let Some(follow) = follow else {
-        txn.commit().await?;
         return Ok(false);
     };
     let mut follow = follow.into_active_model();
     follow.state = Set("accepted".to_owned());
     follow.updated_at = Set(OffsetDateTime::now_utc());
-    follow.update(&txn).await?;
-    insert_response_job(&txn, response_job).await?;
-    txn.commit().await?;
+    follow.update(txn).await?;
+    insert_response_job(txn, response_job).await?;
     Ok(true)
 }
 
@@ -1400,29 +1580,53 @@ pub async fn delete_remote_follow_by_activity(
     Ok(())
 }
 
+/// Record an inbound Undo(Follow) and remove its original relationship atomically.
+pub async fn process_remote_undo_follow(
+    txn: &sea_orm::DatabaseTransaction,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+    original_activity_id: &str,
+) -> Result<bool> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(false);
+    }
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::ActivityId.eq(original_activity_id))
+        .exec(txn)
+        .await?;
+    Ok(true)
+}
+
 /// Reject a pending remote Follow and create its Reject delivery job atomically.
 pub async fn delete_remote_follow_with_response_job(
-    db: &DbConnection,
+    txn: &sea_orm::DatabaseTransaction,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity_id: &str,
     response_job: RemoteFollowResponseJob,
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let follow = remote_follow::Entity::find()
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_follow::Column::ActivityId.eq(activity_id))
         .filter(remote_follow::Column::State.eq("pending"))
-        .one(&txn)
+        .one(txn)
         .await?;
     let Some(follow) = follow else {
-        txn.commit().await?;
         return Ok(false);
     };
-    follow.into_active_model().delete(&txn).await?;
-    insert_response_job(&txn, response_job).await?;
-    txn.commit().await?;
+    follow.into_active_model().delete(txn).await?;
+    insert_response_job(txn, response_job).await?;
     Ok(true)
 }
 
@@ -1490,7 +1694,7 @@ pub async fn remote_actor_follows_local_account(
 
 /// Record a successfully validated inbox activity, returning false for duplicates.
 pub async fn record_processed_inbox_activity(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     activity_id: &str,
     remote_actor_id: AccountId,
 ) -> Result<bool> {
@@ -1521,12 +1725,15 @@ pub async fn notify_remote_actor_follow(
 }
 
 /// Create an idempotent favourite notification caused by a remote actor.
-pub async fn notify_remote_actor_favourite(
-    db: &DbConnection,
+pub async fn notify_remote_actor_favourite<C>(
+    db: &C,
     account_id: AccountId,
     remote_actor_id: AccountId,
     status_id: StatusId,
-) -> Result<LocalNotification> {
+) -> Result<LocalNotification>
+where
+    C: ConnectionTrait,
+{
     if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq("favourite"))
@@ -1935,14 +2142,14 @@ pub async fn unfollow_local_account(
 
 /// Block a local account and sever any follow relationships between the accounts.
 pub async fn block_local_account(
-    db: &DbConnection,
+    txn: &sea_orm::DatabaseTransaction,
     account_id: AccountId,
     target_account_id: AccountId,
 ) -> Result<()> {
-    ensure_local_relation_target(db, account_id, target_account_id).await?;
+    ensure_local_relation_target(txn, account_id, target_account_id).await?;
 
     if local_account_block::Entity::find_by_id((account_id.0, target_account_id.0))
-        .one(db)
+        .one(txn)
         .await?
         .is_none()
     {
@@ -1954,12 +2161,21 @@ pub async fn block_local_account(
             created_at: Set(now),
             updated_at: Set(now),
         }
-        .insert(db)
+        .insert(txn)
         .await?;
     }
 
-    unfollow_local_account(db, account_id, target_account_id).await?;
-    unfollow_local_account(db, target_account_id, account_id).await
+    local_follow::Entity::delete_many()
+        .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
+        .filter(local_follow::Column::FollowedAccountId.eq(target_account_id.0))
+        .exec(txn)
+        .await?;
+    local_follow::Entity::delete_many()
+        .filter(local_follow::Column::FollowerAccountId.eq(target_account_id.0))
+        .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
+        .exec(txn)
+        .await?;
+    Ok(())
 }
 
 /// Remove a local account block when it exists.
@@ -2255,7 +2471,7 @@ pub async fn blocked_local_accounts_for_account(
 
 /// Validate that a local relation has an existing, distinct target account.
 async fn ensure_local_relation_target(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     target_account_id: AccountId,
 ) -> Result<()> {
@@ -2264,7 +2480,8 @@ async fn ensure_local_relation_target(
             "accounts cannot moderate themselves".to_owned(),
         ));
     }
-    if find_local_account_by_id(db, target_account_id)
+    if local_account::Entity::find_by_id(target_account_id.0)
+        .one(db)
         .await?
         .is_none()
     {
@@ -2649,24 +2866,20 @@ pub async fn create_local_status(
     Ok(local_status_from_model(status))
 }
 
-/// Create a local status and attach pre-uploaded local media in one transaction.
+/// Create a local status with media, tags, and remote mentions in one transaction.
 pub async fn create_local_status_with_media(
-    db: &DbConnection,
+    txn: &sea_orm::DatabaseTransaction,
     new_status: NewLocalStatus,
     media_ids: &[Uuid],
+    metadata: LocalStatusMetadata,
 ) -> Result<LocalStatus> {
-    if media_ids.is_empty() {
-        return create_local_status(db, new_status).await;
-    }
-
-    let txn = db.begin().await?;
     let status_id = Uuid::now_v7();
     let created_at = OffsetDateTime::now_utc();
     let account_id = new_status.account_id;
 
     for media_id in media_ids {
         let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
-            .one(&txn)
+            .one(txn)
             .await?
         else {
             return Err(RoostyError::InvalidInput(
@@ -2695,12 +2908,12 @@ pub async fn create_local_status_with_media(
         updated_at: Set(created_at),
         deleted_at: Set(None),
     }
-    .insert(&txn)
+    .insert(txn)
     .await?;
 
     for (index, media_id) in media_ids.iter().enumerate() {
         let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
-            .one(&txn)
+            .one(txn)
             .await?
         else {
             return Err(RoostyError::InvalidInput(
@@ -2711,10 +2924,40 @@ pub async fn create_local_status_with_media(
         active.status_id = Set(Some(status_id));
         active.status_order = Set(index as i32);
         active.updated_at = Set(OffsetDateTime::now_utc());
-        active.update(&txn).await?;
+        active.update(txn).await?;
     }
 
-    txn.commit().await?;
+    let now = OffsetDateTime::now_utc();
+    let mut tag_names = metadata.tag_names;
+    tag_names.sort();
+    tag_names.dedup();
+    for name in tag_names {
+        let tag = find_or_create_local_tag(txn, &name, now).await?;
+        local_status_tag::ActiveModel {
+            status_id: Set(status_id),
+            tag_id: Set(tag.id),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    let mut remote_actor_ids = metadata
+        .remote_actor_ids
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<Vec<_>>();
+    remote_actor_ids.sort();
+    remote_actor_ids.dedup();
+    for remote_actor_id in remote_actor_ids {
+        local_status_remote_mention::ActiveModel {
+            status_id: Set(status_id),
+            remote_actor_id: Set(remote_actor_id),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+
     Ok(local_status_from_model(status))
 }
 
@@ -2781,7 +3024,7 @@ pub async fn replace_local_status_remote_mentions(
 
 /// List remote actors explicitly mentioned by one local status.
 pub async fn remote_mentions_for_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Vec<RemoteActor>> {
     let rows = local_status_remote_mention::Entity::find()
@@ -3129,18 +3372,18 @@ fn normalize_tag_name(name: &str) -> String {
 
 /// Update an owned local status and its attached media metadata.
 pub async fn update_owned_local_status(
-    db: &DbConnection,
+    txn: &sea_orm::DatabaseTransaction,
     status_id: StatusId,
     account_id: AccountId,
     update: LocalStatusUpdate,
     media_ids: Option<&[Uuid]>,
     media_attributes: &[LocalStatusMediaAttributeUpdate],
+    metadata: LocalStatusMetadata,
 ) -> Result<Option<LocalStatus>> {
-    let txn = db.begin().await?;
     let Some(status) = local_status::Entity::find_by_id(status_id.0)
         .filter(local_status::Column::AccountId.eq(account_id.0))
         .filter(local_status::Column::DeletedAt.is_null())
-        .one(&txn)
+        .one(txn)
         .await?
     else {
         return Ok(None);
@@ -3149,7 +3392,7 @@ pub async fn update_owned_local_status(
     if let Some(media_ids) = media_ids {
         for media_id in media_ids {
             let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
-                .one(&txn)
+                .one(txn)
                 .await?
             else {
                 return Err(RoostyError::InvalidInput(
@@ -3169,7 +3412,7 @@ pub async fn update_owned_local_status(
         let keep = media_ids.to_vec();
         let current = local_media_attachment::Entity::find()
             .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
-            .all(&txn)
+            .all(txn)
             .await?;
         for media in current {
             if !keep.contains(&media.id) {
@@ -3177,13 +3420,13 @@ pub async fn update_owned_local_status(
                 active.status_id = Set(None);
                 active.status_order = Set(0);
                 active.updated_at = Set(OffsetDateTime::now_utc());
-                active.update(&txn).await?;
+                active.update(txn).await?;
             }
         }
 
         for (index, media_id) in media_ids.iter().enumerate() {
             let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
-                .one(&txn)
+                .one(txn)
                 .await?
             else {
                 return Err(RoostyError::InvalidInput(
@@ -3194,7 +3437,7 @@ pub async fn update_owned_local_status(
             active.status_id = Set(Some(status_id.0));
             active.status_order = Set(index as i32);
             active.updated_at = Set(OffsetDateTime::now_utc());
-            active.update(&txn).await?;
+            active.update(txn).await?;
         }
     }
 
@@ -3202,7 +3445,7 @@ pub async fn update_owned_local_status(
         let Some(media) = local_media_attachment::Entity::find_by_id(attribute.media_id)
             .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
             .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
-            .one(&txn)
+            .one(txn)
             .await?
         else {
             return Err(RoostyError::InvalidInput(
@@ -3218,7 +3461,7 @@ pub async fn update_owned_local_status(
             active.focus_y = Set(Some(focus_y));
         }
         active.updated_at = Set(OffsetDateTime::now_utc());
-        active.update(&txn).await?;
+        active.update(txn).await?;
     }
 
     let mut active = status.into_active_model();
@@ -3227,9 +3470,47 @@ pub async fn update_owned_local_status(
     set_if_some(&mut active.spoiler_text, update.spoiler_text);
     set_if_some(&mut active.language, update.language);
     active.updated_at = Set(OffsetDateTime::now_utc());
-    let status = active.update(&txn).await?;
+    let status = active.update(txn).await?;
 
-    txn.commit().await?;
+    local_status_tag::Entity::delete_many()
+        .filter(local_status_tag::Column::StatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    let mut tag_names = metadata.tag_names;
+    tag_names.sort();
+    tag_names.dedup();
+    let now = OffsetDateTime::now_utc();
+    for name in tag_names {
+        let tag = find_or_create_local_tag(txn, &name, now).await?;
+        local_status_tag::ActiveModel {
+            status_id: Set(status_id.0),
+            tag_id: Set(tag.id),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    local_status_remote_mention::Entity::delete_many()
+        .filter(local_status_remote_mention::Column::StatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    let mut remote_actor_ids = metadata
+        .remote_actor_ids
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<Vec<_>>();
+    remote_actor_ids.sort();
+    remote_actor_ids.dedup();
+    for remote_actor_id in remote_actor_ids {
+        local_status_remote_mention::ActiveModel {
+            status_id: Set(status_id.0),
+            remote_actor_id: Set(remote_actor_id),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+
     Ok(Some(local_status_from_model(status)))
 }
 
@@ -3820,6 +4101,50 @@ pub async fn favourite_local_status_by_remote_actor(
     Ok(true)
 }
 
+/// Apply an inbound Like and its idempotency record in one transaction.
+///
+/// When the Like is newly applied, the returned notification has been
+/// committed with it and may safely be streamed by the caller.
+pub async fn process_remote_like(
+    txn: &sea_orm::DatabaseTransaction,
+    remote_actor_id: AccountId,
+    status_id: StatusId,
+    activity_id: &str,
+    recipient_account_id: AccountId,
+) -> Result<Option<LocalNotification>> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(None);
+    }
+    let inserted = remote_status_favourite::Entity::insert(remote_status_favourite::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        remote_actor_id: Set(remote_actor_id.0),
+        local_status_id: Set(status_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+    })
+    .on_conflict_do_nothing()
+    .exec(txn)
+    .await?;
+    let notification = if matches!(inserted, TryInsertResult::Inserted(_)) {
+        Some(
+            notify_remote_actor_favourite(txn, recipient_account_id, remote_actor_id, status_id)
+                .await?,
+        )
+    } else {
+        None
+    };
+    Ok(notification)
+}
+
 /// Remove a remote actor's favourite identified by its original Like activity.
 pub async fn unfavourite_local_status_by_remote_actor(
     db: &DbConnection,
@@ -3832,6 +4157,33 @@ pub async fn unfavourite_local_status_by_remote_actor(
         .exec(db)
         .await?;
     Ok(result.rows_affected > 0)
+}
+
+/// Record an inbound Undo(Like) and remove its original Like atomically.
+pub async fn process_remote_undo_like(
+    txn: &sea_orm::DatabaseTransaction,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+    original_activity_id: &str,
+) -> Result<bool> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(false);
+    }
+    remote_status_favourite::Entity::delete_many()
+        .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_favourite::Column::ActivityId.eq(original_activity_id))
+        .exec(txn)
+        .await?;
+    Ok(true)
 }
 
 /// Store one local account's favourite of a cached remote Note.
@@ -3861,6 +4213,35 @@ pub async fn favourite_remote_status(
     Ok(())
 }
 
+/// Store a remote-status favourite and its Like delivery job in `txn`.
+pub async fn favourite_remote_status_with_job(
+    txn: &sea_orm::DatabaseTransaction,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+    activity_id: &str,
+    job: NewJob,
+) -> Result<()> {
+    local_remote_status_favourite::Entity::insert(local_remote_status_favourite::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        local_account_id: Set(local_account_id.0),
+        remote_status_id: Set(remote_status_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            local_remote_status_favourite::Column::LocalAccountId,
+            local_remote_status_favourite::Column::RemoteStatusId,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .exec(txn)
+    .await?;
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(())
+}
+
 /// Remove and return a local favourite of a cached remote Note for Undo delivery.
 pub async fn unfavourite_remote_status(
     db: &DbConnection,
@@ -3881,6 +4262,49 @@ pub async fn unfavourite_remote_status(
         activity_id: favourite.activity_id.clone(),
     };
     favourite.into_active_model().delete(db).await?;
+    Ok(Some(result))
+}
+
+/// Find a local favourite of a cached remote Note without changing it.
+pub async fn find_remote_status_favourite(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<Option<LocalRemoteStatusFavourite>> {
+    Ok(local_remote_status_favourite::Entity::find()
+        .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(db)
+        .await?
+        .map(|favourite| LocalRemoteStatusFavourite {
+            local_account_id: AccountId(favourite.local_account_id),
+            remote_status_id: StatusId(favourite.remote_status_id),
+            activity_id: favourite.activity_id,
+        }))
+}
+
+/// Remove a remote-status favourite and insert its Undo delivery job in `txn`.
+pub async fn unfavourite_remote_status_with_job(
+    txn: &sea_orm::DatabaseTransaction,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+    job: NewJob,
+) -> Result<Option<LocalRemoteStatusFavourite>> {
+    let favourite = local_remote_status_favourite::Entity::find()
+        .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(txn)
+        .await?;
+    let Some(favourite) = favourite else {
+        return Ok(None);
+    };
+    let result = LocalRemoteStatusFavourite {
+        local_account_id: AccountId(favourite.local_account_id),
+        remote_status_id: StatusId(favourite.remote_status_id),
+        activity_id: favourite.activity_id.clone(),
+    };
+    favourite.into_active_model().delete(txn).await?;
+    enqueue_job_in_transaction(txn, job).await?;
     Ok(Some(result))
 }
 
@@ -4169,6 +4593,37 @@ pub async fn reblog_remote_status(
     Ok(local_remote_status_reblog_from_model(model))
 }
 
+/// Store a remote-status boost and its Announce delivery job in `txn`.
+pub async fn reblog_remote_status_with_job(
+    txn: &sea_orm::DatabaseTransaction,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+    activity_id: &str,
+    job: NewJob,
+) -> Result<LocalRemoteStatusReblog> {
+    let existing = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(txn)
+        .await?;
+    let model = match existing {
+        Some(model) => model,
+        None => {
+            local_remote_status_reblog::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                local_account_id: Set(local_account_id.0),
+                remote_status_id: Set(remote_status_id.0),
+                activity_id: Set(activity_id.to_owned()),
+                created_at: Set(OffsetDateTime::now_utc()),
+            }
+            .insert(txn)
+            .await?
+        }
+    };
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(local_remote_status_reblog_from_model(model))
+}
+
 /// Remove a local account's Announce of a cached remote Note.
 pub async fn unreblog_remote_status(
     db: &DbConnection,
@@ -4188,6 +4643,41 @@ pub async fn unreblog_remote_status(
     Ok(Some(reblog))
 }
 
+/// Find a local Announce of a cached remote Note without changing it.
+pub async fn find_remote_status_reblog(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<Option<LocalRemoteStatusReblog>> {
+    Ok(local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(db)
+        .await?
+        .map(local_remote_status_reblog_from_model))
+}
+
+/// Remove a remote-status boost and insert its Undo delivery job in `txn`.
+pub async fn unreblog_remote_status_with_job(
+    txn: &sea_orm::DatabaseTransaction,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+    job: NewJob,
+) -> Result<Option<LocalRemoteStatusReblog>> {
+    let model = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(txn)
+        .await?;
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let reblog = local_remote_status_reblog_from_model(model.clone());
+    model.into_active_model().delete(txn).await?;
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(Some(reblog))
+}
+
 /// Return whether a local account announced a cached remote Note.
 pub async fn is_remote_status_reblogged(
     db: &DbConnection,
@@ -4204,7 +4694,7 @@ pub async fn is_remote_status_reblogged(
 
 /// Store a validated inbound Announce, returning false when it already exists.
 pub async fn reblog_status_by_remote_actor(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
     target: RemoteStatusReblogTarget,
     activity_id: &str,
@@ -4255,6 +4745,37 @@ pub async fn unreblog_status_by_remote_actor(
     };
     model.into_active_model().delete(db).await?;
     Ok(Some(reblog))
+}
+
+/// Record an inbound Undo(Announce) and remove its original Announce atomically.
+pub async fn process_remote_undo_reblog(
+    txn: &sea_orm::DatabaseTransaction,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+    original_activity_id: &str,
+) -> Result<Option<RemoteStatusReblog>> {
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        return Ok(None);
+    }
+    let model = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_reblog::Column::ActivityId.eq(original_activity_id))
+        .one(txn)
+        .await?;
+    let reblog = model.clone().and_then(remote_status_reblog_from_model);
+    if let Some(model) = model {
+        model.into_active_model().delete(txn).await?;
+    }
+    Ok(reblog)
 }
 
 /// Find a remote Announce by actor and ActivityPub identity.
@@ -4435,7 +4956,7 @@ async fn local_accounts_by_id(
 
 /// Soft-delete a local status when the authenticated account owns it.
 pub async fn delete_owned_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
     account_id: AccountId,
 ) -> Result<Option<LocalStatus>> {
@@ -5485,6 +6006,34 @@ pub async fn enqueue_job(
     deduplication_key: Option<&str>,
     run_after: OffsetDateTime,
 ) -> Result<JobId> {
+    enqueue_job_on_connection(
+        db,
+        NewJob {
+            kind,
+            payload,
+            deduplication_key: deduplication_key.map(str::to_owned),
+            run_after,
+        },
+    )
+    .await
+}
+
+/// Insert a durable job through a caller-owned transaction.
+///
+/// The job is rolled back with the enclosing domain mutation, preventing a
+/// delivery from observing state that was never committed.
+pub async fn enqueue_job_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    job: NewJob,
+) -> Result<JobId> {
+    enqueue_job_on_connection(txn, job).await
+}
+
+/// Insert or reuse a job through either the pool or a database transaction.
+async fn enqueue_job_on_connection<C>(db: &C, job: NewJob) -> Result<JobId>
+where
+    C: ConnectionTrait,
+{
     let job_id = JobId(Uuid::now_v7());
     let row = db
         .query_one(Statement::from_sql_and_values(
@@ -5508,10 +6057,10 @@ pub async fn enqueue_job(
             "#,
             vec![
                 job_id.0.into(),
-                kind.as_str().to_owned().into(),
-                payload.into(),
-                deduplication_key.map(str::to_owned).into(),
-                run_after.into(),
+                job.kind.as_str().to_owned().into(),
+                job.payload.into(),
+                job.deduplication_key.into(),
+                job.run_after.into(),
             ],
         ))
         .await?

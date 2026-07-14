@@ -30,6 +30,7 @@
 - [ ] Support remote reply delivery and addressing for non-public visibility, including follower-only replies.
 - [x] Deliver and process public/unlisted favourites (`Like`/`Undo`), including remote counters, local notifications, and mixed favourites collections.
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
+- [x] Commit supported inbox side effects, idempotency markers, and durable follow/favourite/boost delivery jobs atomically; publish streams only after commit.
 - [ ] Repair cached-status timelines and notification references after signed remote Deletes.
 - [ ] Process Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle and account migration.
 - [ ] Safely fetch, validate, cache, expire, and render remote media attachments.

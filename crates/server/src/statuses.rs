@@ -10,6 +10,7 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::LocalNotificationType;
+use sea_orm::TransactionTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -380,22 +381,30 @@ async fn create_status(
     } else {
         Vec::new()
     };
-    match roosty_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
+    let tag_names = hashtag_names(&new_status.content);
+    let remote_mention_ids = remote_mentions
+        .iter()
+        .map(|actor| actor.id)
+        .collect::<Vec<_>>();
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::create_local_status_with_media(
+        &txn,
+        new_status,
+        &media_ids,
+        roosty_db::LocalStatusMetadata {
+            tag_names,
+            remote_actor_ids: remote_mention_ids,
+        },
+    )
+    .await
+    {
         Ok(mut status) => {
-            if let Err(error) = roosty_db::replace_local_status_remote_mentions(
-                &state.db,
-                status.id,
-                &remote_mentions
-                    .iter()
-                    .map(|actor| actor.id)
-                    .collect::<Vec<_>>(),
-            )
-            .await
-            {
-                return server_error(error);
-            }
-            if let Err(error) = crate::federation::enqueue_status_activity(
+            if let Err(error) = crate::federation::enqueue_status_activity_in_transaction(
                 &state,
+                &txn,
                 &status,
                 crate::federation::StatusActivityKind::Create,
             )
@@ -403,10 +412,10 @@ async fn create_status(
             {
                 return server_error(error);
             }
-            if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
-                return server_error(error);
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
             }
-            if let Err(error) = sync_status_tags(&state, status.id, &status.content).await {
+            if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
                 return server_error(error);
             }
             if let Some(conversation_id) = status.conversation_id
@@ -462,11 +471,13 @@ async fn update_status(
     request: axum::extract::Request,
 ) -> Response {
     let status_id = StatusId(path.status_id);
-    match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) if status.account_id == account.id && status.deleted_at.is_none() => {}
+    let existing = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) if status.account_id == account.id && status.deleted_at.is_none() => {
+            status
+        }
         Ok(Some(_)) | Ok(None) => return not_found(),
         Err(error) => return server_error(error),
-    }
+    };
     let input = match parse_status_input(request).await {
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
@@ -499,38 +510,43 @@ async fn update_status(
         spoiler_text: input.spoiler_text,
         language: input.language.map(Some),
     };
+    let final_content = update
+        .content
+        .clone()
+        .unwrap_or_else(|| existing.content.clone());
+    let remote_mentions = if state.config.federation_enabled
+        && matches!(existing.visibility.as_str(), "public" | "unlisted")
+    {
+        crate::federation::resolve_remote_mentions(&state, &final_content).await
+    } else {
+        Vec::new()
+    };
+    let remote_mention_ids = remote_mentions
+        .iter()
+        .map(|actor| actor.id)
+        .collect::<Vec<_>>();
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
     match roosty_db::update_owned_local_status(
-        &state.db,
+        &txn,
         status_id,
         account.id,
         update,
         media_ids.as_deref(),
         &media_attributes,
+        roosty_db::LocalStatusMetadata {
+            tag_names: hashtag_names(&final_content),
+            remote_actor_ids: remote_mention_ids,
+        },
     )
     .await
     {
         Ok(Some(status)) => {
-            let remote_mentions = if state.config.federation_enabled
-                && matches!(status.visibility.as_str(), "public" | "unlisted")
-            {
-                crate::federation::resolve_remote_mentions(&state, &status.content).await
-            } else {
-                Vec::new()
-            };
-            if let Err(error) = roosty_db::replace_local_status_remote_mentions(
-                &state.db,
-                status.id,
-                &remote_mentions
-                    .iter()
-                    .map(|actor| actor.id)
-                    .collect::<Vec<_>>(),
-            )
-            .await
-            {
-                return server_error(error);
-            }
-            if let Err(error) = crate::federation::enqueue_status_activity(
+            if let Err(error) = crate::federation::enqueue_status_activity_in_transaction(
                 &state,
+                &txn,
                 &status,
                 crate::federation::StatusActivityKind::Update,
             )
@@ -538,8 +554,8 @@ async fn update_status(
             {
                 return server_error(error);
             }
-            if let Err(error) = sync_status_tags(&state, status.id, &status.content).await {
-                return server_error(error);
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
             }
             match status_response(&state, status.clone(), account).await {
                 Ok(status) => Json(status).into_response(),
@@ -558,17 +574,25 @@ async fn delete_status(
     Path(path): Path<StatusPath>,
 ) -> Response {
     let status_id = StatusId(path.status_id);
-    match roosty_db::delete_owned_local_status(&state.db, status_id, account.id).await {
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::delete_owned_local_status(&txn, status_id, account.id).await {
         Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
             Ok(response) => {
-                if let Err(error) = crate::federation::enqueue_status_activity(
+                if let Err(error) = crate::federation::enqueue_status_activity_in_transaction(
                     &state,
+                    &txn,
                     &status,
                     crate::federation::StatusActivityKind::Delete,
                 )
                 .await
                 {
                     return server_error(error);
+                }
+                if let Err(error) = txn.commit().await {
+                    return server_error(error.into());
                 }
                 let reblogs = match roosty_db::local_reblogs_for_status(&state.db, status_id).await
                 {
@@ -1184,7 +1208,7 @@ async fn status_collection_action(
                     let result = if already_favourited {
                         Ok(())
                     } else {
-                        let activity_id = match crate::federation::enqueue_remote_favourite(
+                        let (activity_id, job) = match crate::federation::prepare_remote_favourite(
                             state, account_id, &remote,
                         )
                         .await
@@ -1192,13 +1216,25 @@ async fn status_collection_action(
                             Ok(id) => id,
                             Err(error) => return server_error(error),
                         };
-                        roosty_db::favourite_remote_status(
-                            &state.db,
+                        let txn = match state.db.begin().await {
+                            Ok(txn) => txn,
+                            Err(error) => return server_error(error.into()),
+                        };
+                        match roosty_db::favourite_remote_status_with_job(
+                            &txn,
                             account_id,
                             remote.id,
                             &activity_id,
+                            job,
                         )
                         .await
+                        {
+                            Ok(()) => match txn.commit().await {
+                                Ok(()) => Ok(()),
+                                Err(error) => Err(error.into()),
+                            },
+                            Err(error) => Err(error),
+                        }
                     };
                     match result {
                         Ok(()) => {
@@ -1213,15 +1249,38 @@ async fn status_collection_action(
                     }
                 }
                 StatusCollectionAction::Unfavourite => {
-                    match roosty_db::unfavourite_remote_status(&state.db, account_id, remote.id)
-                        .await
+                    let favourite = match roosty_db::find_remote_status_favourite(
+                        &state.db, account_id, remote.id,
+                    )
+                    .await
                     {
-                        Ok(Some(favourite)) => {
-                            if let Err(error) =
-                                crate::federation::enqueue_remote_unfavourite(state, favourite)
-                                    .await
+                        Ok(favourite) => favourite,
+                        Err(error) => return server_error(error),
+                    };
+                    match favourite {
+                        Some(favourite) => {
+                            let job = match crate::federation::prepare_remote_unfavourite(
+                                state, favourite,
+                            )
+                            .await
                             {
-                                return server_error(error);
+                                Ok(job) => job,
+                                Err(error) => return server_error(error),
+                            };
+                            let txn = match state.db.begin().await {
+                                Ok(txn) => txn,
+                                Err(error) => return server_error(error.into()),
+                            };
+                            match roosty_db::unfavourite_remote_status_with_job(
+                                &txn, account_id, remote.id, job,
+                            )
+                            .await
+                            {
+                                Ok(Some(_)) | Ok(None) => match txn.commit().await {
+                                    Ok(()) => {}
+                                    Err(error) => return server_error(error.into()),
+                                },
+                                Err(error) => return server_error(error),
                             }
                             match remote_status_response_for_viewer(state, remote, Some(account_id))
                                 .await
@@ -1230,7 +1289,7 @@ async fn status_collection_action(
                                 Err(error) => server_error(error),
                             }
                         }
-                        Ok(None) => {
+                        None => {
                             match remote_status_response_for_viewer(state, remote, Some(account_id))
                                 .await
                             {
@@ -1238,7 +1297,6 @@ async fn status_collection_action(
                                 Err(error) => server_error(error),
                             }
                         }
-                        Err(error) => server_error(error),
                     }
                 }
                 StatusCollectionAction::Reblog => {
@@ -1258,7 +1316,7 @@ async fn status_collection_action(
                             Err(error) => return server_error(error),
                         }
                     } else {
-                        let activity_id = match crate::federation::enqueue_remote_reblog(
+                        let (activity_id, job) = match crate::federation::prepare_remote_reblog(
                             state, account_id, &remote,
                         )
                         .await
@@ -1266,15 +1324,23 @@ async fn status_collection_action(
                             Ok(id) => id,
                             Err(error) => return server_error(error),
                         };
-                        match roosty_db::reblog_remote_status(
-                            &state.db,
+                        let txn = match state.db.begin().await {
+                            Ok(txn) => txn,
+                            Err(error) => return server_error(error.into()),
+                        };
+                        match roosty_db::reblog_remote_status_with_job(
+                            &txn,
                             account_id,
                             remote.id,
                             &activity_id,
+                            job,
                         )
                         .await
                         {
-                            Ok(reblog) => reblog,
+                            Ok(reblog) => match txn.commit().await {
+                                Ok(()) => reblog,
+                                Err(error) => return server_error(error.into()),
+                            },
                             Err(error) => return server_error(error),
                         }
                     };
@@ -1294,25 +1360,43 @@ async fn status_collection_action(
                     }
                 }
                 StatusCollectionAction::Unreblog => {
-                    match roosty_db::unreblog_remote_status(&state.db, account_id, remote.id).await
+                    let reblog = match roosty_db::find_remote_status_reblog(
+                        &state.db, account_id, remote.id,
+                    )
+                    .await
                     {
-                        Ok(Some(reblog)) => {
-                            let reblog_id = reblog.id;
-                            if let Err(error) =
-                                crate::federation::enqueue_remote_unreblog(state, reblog).await
-                            {
-                                return server_error(error);
-                            }
-                            let recipients = reblog_stream_recipients(state, account_id).await;
-                            state.streaming_events.publish_delete(
-                                &reblog_id.to_string(),
-                                account_id,
-                                "unlisted",
-                                &recipients,
-                            );
-                        }
-                        Ok(None) => {}
+                        Ok(reblog) => reblog,
                         Err(error) => return server_error(error),
+                    };
+                    if let Some(reblog) = reblog {
+                        let reblog_id = reblog.id;
+                        let job =
+                            match crate::federation::prepare_remote_unreblog(state, reblog).await {
+                                Ok(job) => job,
+                                Err(error) => return server_error(error),
+                            };
+                        let txn = match state.db.begin().await {
+                            Ok(txn) => txn,
+                            Err(error) => return server_error(error.into()),
+                        };
+                        match roosty_db::unreblog_remote_status_with_job(
+                            &txn, account_id, remote.id, job,
+                        )
+                        .await
+                        {
+                            Ok(Some(_)) | Ok(None) => match txn.commit().await {
+                                Ok(()) => {}
+                                Err(error) => return server_error(error.into()),
+                            },
+                            Err(error) => return server_error(error),
+                        }
+                        let recipients = reblog_stream_recipients(state, account_id).await;
+                        state.streaming_events.publish_delete(
+                            &reblog_id.to_string(),
+                            account_id,
+                            "unlisted",
+                            &recipients,
+                        );
                     }
                     match remote_status_response_for_viewer(state, remote, Some(account_id)).await {
                         Ok(response) => Json(response).into_response(),
@@ -2187,14 +2271,6 @@ async fn status_response_for_viewer(
 }
 
 /// Replace stored hashtag links for a local status based on its plain text content.
-async fn sync_status_tags(
-    state: &AppState,
-    status_id: StatusId,
-    content: &str,
-) -> Result<(), RoostyError> {
-    roosty_db::replace_local_status_tags(&state.db, status_id, &hashtag_names(content)).await
-}
-
 /// Load Mastodon tag responses attached to a local status.
 async fn status_tags(
     state: &AppState,
