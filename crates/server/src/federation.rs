@@ -256,6 +256,25 @@ struct Collection {
     id: String,
     r#type: CollectionType,
     total_items: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OrderedCollectionPage {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: CollectionType,
+    ordered_items: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CollectionQuery {
+    page: Option<bool>,
+    max_id: Option<Uuid>,
 }
 
 /// Serve a local WebFinger identity. Remote and malformed resources are never resolved here.
@@ -386,7 +405,11 @@ async fn note(
 }
 
 /// Serve the actor's follower collection metadata without leaking local-only details.
-async fn followers(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+async fn followers(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Query(query): Query<CollectionQuery>,
+) -> Response {
     let Some(account) = account_for_collection(&state, &username).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -394,28 +417,101 @@ async fn followers(State(state): State<AppState>, Path(username): Path<String>) 
         roosty_db::count_local_followers(&state.db, account.id).await,
         roosty_db::count_remote_followers(&state.db, account.id).await,
     ) {
-        (Ok(local), Ok(remote)) => activity_response(Collection {
+        (Ok(local), Ok(remote)) if query.page != Some(true) => activity_response(Collection {
             context: ACTIVITYSTREAMS_CONTEXT,
             id: format!("{}/followers", actor_url(&state, &username)),
             r#type: CollectionType::Collection,
             total_items: local + remote,
+            first: Some(format!(
+                "{}/followers?page=true",
+                actor_url(&state, &username)
+            )),
         }),
+        (Ok(_), Ok(_)) => {
+            activity_collection_page(&state, &username, account.id, query.max_id, true).await
+        }
         (Err(error), _) | (_, Err(error)) => internal_error(error),
     }
 }
 
 /// Serve the actor's following collection metadata without leaking local-only details.
-async fn following(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+async fn following(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Query(query): Query<CollectionQuery>,
+) -> Response {
     let Some(account) = account_for_collection(&state, &username).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match roosty_db::count_local_following(&state.db, account.id).await {
-        Ok(total_items) => activity_response(Collection {
+    match (
+        roosty_db::count_local_following(&state.db, account.id).await,
+        roosty_db::count_remote_following(&state.db, account.id).await,
+    ) {
+        (Ok(local), Ok(remote)) if query.page != Some(true) => activity_response(Collection {
             context: ACTIVITYSTREAMS_CONTEXT,
             id: format!("{}/following", actor_url(&state, &username)),
             r#type: CollectionType::Collection,
-            total_items,
+            total_items: local + remote,
+            first: Some(format!(
+                "{}/following?page=true",
+                actor_url(&state, &username)
+            )),
         }),
+        (Ok(_), Ok(_)) => {
+            activity_collection_page(&state, &username, account.id, query.max_id, false).await
+        }
+        (Err(error), _) | (_, Err(error)) => internal_error(error),
+    }
+}
+
+/// Render one public ordered page of a local actor's mixed follow collection.
+async fn activity_collection_page(
+    state: &AppState,
+    username: &str,
+    account_id: AccountId,
+    max_id: Option<Uuid>,
+    followers: bool,
+) -> Response {
+    let cursor = roosty_db::CollectionCursor {
+        max_id,
+        ..Default::default()
+    };
+    let page = if followers {
+        roosty_db::followers_for_local_account(&state.db, account_id, 20, cursor).await
+    } else {
+        roosty_db::following_for_local_account(&state.db, account_id, 20, cursor).await
+    };
+    match page {
+        Ok(page) => {
+            let ordered_items = page
+                .items
+                .into_iter()
+                .map(|entry| match entry.account {
+                    roosty_db::FollowCollectionAccount::Local(account) => {
+                        actor_url(state, &account.username)
+                    }
+                    roosty_db::FollowCollectionAccount::Remote(actor) => actor.activitypub_id,
+                })
+                .collect();
+            let name = if followers { "followers" } else { "following" };
+            let next = page
+                .has_more
+                .then_some(page.last_cursor)
+                .flatten()
+                .map(|cursor| {
+                    format!(
+                        "{}/{name}?page=true&max_id={cursor}",
+                        actor_url(state, username),
+                    )
+                });
+            activity_response(OrderedCollectionPage {
+                context: ACTIVITYSTREAMS_CONTEXT,
+                id: format!("{}/{name}?page=true", actor_url(state, username)),
+                r#type: CollectionType::OrderedCollection,
+                ordered_items,
+                next,
+            })
+        }
         Err(error) => internal_error(error),
     }
 }

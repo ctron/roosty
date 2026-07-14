@@ -108,6 +108,14 @@ pub(crate) struct RemoteAccountResponse {
     last_status_at: Option<String>,
 }
 
+/// Mastodon account projection used by collections containing local and remote actors.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CollectionAccountResponse {
+    Local(Box<crate::auth::AccountResponse>),
+    Remote(Box<RemoteAccountResponse>),
+}
+
 #[derive(Default, Deserialize)]
 struct FollowInput {
     reblogs: Option<bool>,
@@ -630,17 +638,52 @@ async fn account_collection(
     };
     let accounts = match collection {
         AccountCollection::Followers => {
-            roosty_db::local_followers_for_account(&state.db, account_id, limit, cursor).await
+            roosty_db::followers_for_local_account(&state.db, account_id, limit, cursor)
+                .await
+                .map(|page| roosty_db::CollectionPage {
+                    items: page.items.into_iter().map(|entry| entry.account).collect(),
+                    first_cursor: page.first_cursor,
+                    last_cursor: page.last_cursor,
+                    has_more: page.has_more,
+                })
         }
         AccountCollection::Following => {
-            roosty_db::local_following_for_account(&state.db, account_id, limit, cursor).await
+            roosty_db::following_for_local_account(&state.db, account_id, limit, cursor)
+                .await
+                .map(|page| roosty_db::CollectionPage {
+                    items: page.items.into_iter().map(|entry| entry.account).collect(),
+                    first_cursor: page.first_cursor,
+                    last_cursor: page.last_cursor,
+                    has_more: page.has_more,
+                })
         }
         AccountCollection::Blocks => {
             roosty_db::blocked_local_accounts_for_account(&state.db, account_id, limit, cursor)
                 .await
+                .map(|page| roosty_db::CollectionPage {
+                    items: page
+                        .items
+                        .into_iter()
+                        .map(roosty_db::FollowCollectionAccount::Local)
+                        .collect(),
+                    first_cursor: page.first_cursor,
+                    last_cursor: page.last_cursor,
+                    has_more: page.has_more,
+                })
         }
         AccountCollection::Mutes => {
-            roosty_db::muted_local_accounts_for_account(&state.db, account_id, limit, cursor).await
+            roosty_db::muted_local_accounts_for_account(&state.db, account_id, limit, cursor)
+                .await
+                .map(|page| roosty_db::CollectionPage {
+                    items: page
+                        .items
+                        .into_iter()
+                        .map(roosty_db::FollowCollectionAccount::Local)
+                        .collect(),
+                    first_cursor: page.first_cursor,
+                    last_cursor: page.last_cursor,
+                    has_more: page.has_more,
+                })
         }
     };
     match accounts {
@@ -679,11 +722,18 @@ async fn account_collection(
 /// Convert local account records into Mastodon account responses.
 async fn account_responses(
     state: &AppState,
-    accounts: Vec<roosty_db::LocalAccount>,
-) -> roosty_core::Result<Vec<crate::auth::AccountResponse>> {
+    accounts: Vec<roosty_db::FollowCollectionAccount>,
+) -> roosty_core::Result<Vec<CollectionAccountResponse>> {
     let mut responses = Vec::with_capacity(accounts.len());
     for account in accounts {
-        responses.push(account_response(state, account).await?);
+        responses.push(match account {
+            roosty_db::FollowCollectionAccount::Local(account) => {
+                CollectionAccountResponse::Local(Box::new(account_response(state, account).await?))
+            }
+            roosty_db::FollowCollectionAccount::Remote(actor) => {
+                CollectionAccountResponse::Remote(Box::new(remote_account_response(actor)))
+            }
+        });
     }
 
     Ok(responses)

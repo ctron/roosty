@@ -27,7 +27,8 @@ use entity::{
     local_conversation_account, local_follow, local_media_attachment, local_notification,
     local_status, local_status_bookmark, local_status_favourite, local_status_reblog,
     local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
-    oauth_application, oauth_authorization_code, remote_actor, remote_following, remote_status,
+    oauth_application, oauth_authorization_code, remote_actor, remote_follow, remote_following,
+    remote_status,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -276,6 +277,24 @@ pub struct RemoteFollowing {
     pub state: String,
 }
 
+/// A local or cached remote account returned from a follow collection.
+#[derive(Clone, Debug)]
+pub enum FollowCollectionAccount {
+    /// Local account projection.
+    Local(LocalAccount),
+    /// Cached remote actor projection.
+    Remote(RemoteActor),
+}
+
+/// One cursor-addressable account in a mixed follow collection.
+#[derive(Clone, Debug)]
+pub struct FollowCollectionEntry {
+    /// Relationship row identifier used as the collection cursor.
+    pub id: Uuid,
+    /// Account represented by the relationship.
+    pub account: FollowCollectionAccount,
+}
+
 /// Insert a pending local-to-remote follow relationship.
 pub async fn create_remote_following(
     db: &DbConnection,
@@ -323,6 +342,118 @@ pub async fn accepted_local_followers_of_remote_actor(
         .into_iter()
         .map(|follow| AccountId(follow.local_account_id))
         .collect())
+}
+
+/// Return a page of local and remote accounts following one local account.
+pub async fn followers_for_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    follow_collection_page(
+        db,
+        local_follow::Entity::find()
+            .filter(local_follow::Column::FollowedAccountId.eq(account_id.0)),
+        remote_follow::Entity::find()
+            .filter(remote_follow::Column::LocalAccountId.eq(account_id.0))
+            .filter(remote_follow::Column::State.eq("accepted")),
+        limit,
+        cursor,
+        |follow| (follow.id, AccountId(follow.follower_account_id)),
+        |follow| (follow.id, AccountId(follow.remote_actor_id)),
+    )
+    .await
+}
+
+/// Return a page of local and accepted remote accounts followed by one local account.
+pub async fn following_for_local_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    follow_collection_page(
+        db,
+        local_follow::Entity::find()
+            .filter(local_follow::Column::FollowerAccountId.eq(account_id.0)),
+        remote_following::Entity::find()
+            .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
+            .filter(remote_following::Column::State.eq("accepted")),
+        limit,
+        cursor,
+        |follow| (follow.id, AccountId(follow.followed_account_id)),
+        |follow| (follow.id, AccountId(follow.remote_actor_id)),
+    )
+    .await
+}
+
+/// Merge UUIDv7-ordered local and remote relationship rows into one cursor page.
+async fn follow_collection_page<L, R, FL, FR>(
+    db: &DbConnection,
+    local: Select<L>,
+    remote: Select<R>,
+    limit: u64,
+    cursor: CollectionCursor,
+    local_id: FL,
+    remote_id: FR,
+) -> Result<CollectionPage<FollowCollectionEntry>>
+where
+    L: EntityTrait,
+    R: EntityTrait,
+    L::Model: Clone,
+    R::Model: Clone,
+    FL: Fn(L::Model) -> (Uuid, AccountId),
+    FR: Fn(R::Model) -> (Uuid, AccountId),
+{
+    let local = local.all(db).await?;
+    let remote = remote.all(db).await?;
+    let mut entries = Vec::new();
+    for follow in local {
+        let (id, account_id) = local_id(follow);
+        if collection_cursor_matches(id, cursor)
+            && let Some(account) = find_local_account_by_id(db, account_id).await?
+        {
+            entries.push(FollowCollectionEntry {
+                id,
+                account: FollowCollectionAccount::Local(account),
+            });
+        }
+    }
+    for follow in remote {
+        let (id, actor_id) = remote_id(follow);
+        if collection_cursor_matches(id, cursor)
+            && let Some(actor) = find_remote_actor_by_id(db, actor_id).await?
+        {
+            entries.push(FollowCollectionEntry {
+                id,
+                account: FollowCollectionAccount::Remote(actor),
+            });
+        }
+    }
+    entries.sort_by_key(|entry| Reverse(entry.id));
+    let (items, has_more) = trim_to_page(entries, limit);
+    Ok(CollectionPage {
+        first_cursor: items.first().map(|entry| entry.id),
+        last_cursor: items.last().map(|entry| entry.id),
+        items,
+        has_more,
+    })
+}
+
+fn collection_cursor_matches(id: Uuid, cursor: CollectionCursor) -> bool {
+    cursor.max_id.is_none_or(|max_id| id < max_id)
+        && cursor.since_id.is_none_or(|since_id| id > since_id)
+        && cursor.min_id.is_none_or(|min_id| id > min_id)
+}
+
+/// Count accepted remote actors followed by this local account.
+pub async fn count_remote_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+    Ok(remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
+        .filter(remote_following::Column::State.eq("accepted"))
+        .count(db)
+        .await?)
 }
 
 /// Find one cached remote Note by its canonical ActivityPub ID.

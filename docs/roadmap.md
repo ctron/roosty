@@ -16,7 +16,7 @@
 - [ ] Add controlled remote actor cache refresh and remote account search projections.
 - [x] Add signed outbound `Follow` and `Undo(Follow)` delivery, including durable delivery jobs, destination deduplication, retries, and permanent-failure diagnostics.
 - [x] Process inbound `Accept` and `Reject` for locally initiated remote follows; signed inbound `Follow`/`Undo(Follow)` and locked-account requests are available.
-- [ ] Persist local-to-remote follow/relationship state and expose it through Mastodon follower and following collection APIs; Mastodon follow/unfollow/relationship APIs and inbound remote follower state are available.
+- [x] Persist local-to-remote follow/relationship state and expose accepted local and remote relationships through Mastodon and ActivityPub follower/following collections.
 - [x] Deliver local public and unlisted `Create`, `Update`, and `Delete` activities to accepted remote followers.
 - [x] Verify signed inbound public/unlisted `Create`, `Update`, and `Delete` activities and cache remote Notes by canonical object ID.
 - [x] Project cached remote Notes into local home timelines.
