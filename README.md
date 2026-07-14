@@ -179,7 +179,29 @@ exclude domains from that list. Configure `ROOSTY_FEDERATION_DELIVERY_MAX_AGE`
 with a human-readable duration such as `7d`, `12h`, or `30m`; failed delivery
 jobs retry with exponential backoff until this age is exceeded.
 
-This initial surface provides WebFinger, local actor documents, public Notes,
-outboxes, follower/following collection metadata, and safe policy-controlled
-remote `resolve=true` lookup. Inbound inbox processing, signed delivery, and
-remote follows are deliberately not yet enabled.
+This surface provides WebFinger, local actor documents, public Notes, outboxes,
+follower/following collections, policy-controlled remote `resolve=true` lookup,
+signed inbox processing, and signed follow delivery. With a public HTTPS base
+URL and an allow-list containing the follower's domain (or `*`), a
+Mastodon-compatible account can follow `@user@your-domain`; Roosty verifies the
+Follow, queues an Accept response, and delivers later public/unlisted posts.
+
+### Federation subscription readiness
+
+Before inviting remote followers, verify that the public base domain has DNS
+and a valid HTTPS certificate, Roosty (rather than a web client) serves the
+base domain, and the worker is healthy. For a local account named `admin`:
+
+```sh
+curl --fail --header 'Accept: application/jrd+json' \
+  'https://your-domain/.well-known/webfinger?resource=acct%3Aadmin%40your-domain'
+curl --fail --header 'Accept: application/activity+json' \
+  https://your-domain/users/admin
+```
+
+Both requests must return `200`; the WebFinger self link must name the actor
+URL from the second request. To allow followers from any public instance, set
+`ROOSTY_FEDERATION_ALLOWED_DOMAINS=*`. Explicit blocked domains still take
+precedence. Keep the federation key-encryption secret and PostgreSQL data
+persistent across deployments so Roosty can continue signing Accept and status
+delivery activities.

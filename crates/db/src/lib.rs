@@ -8,7 +8,8 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, FromQueryResult, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
-    sea_query::Query,
+    TryInsertResult,
+    sea_query::{OnConflict, Query},
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -23,12 +24,13 @@ type HmacSha256 = Hmac<Sha256>;
 mod entity;
 
 use entity::{
-    local_account, local_account_block, local_account_mute, local_actor_key, local_conversation,
-    local_conversation_account, local_follow, local_media_attachment, local_notification,
-    local_status, local_status_bookmark, local_status_favourite, local_status_reblog,
-    local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
-    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    remote_actor, remote_follow, remote_following, remote_status,
+    job, local_account, local_account_block, local_account_mute, local_actor_key,
+    local_conversation, local_conversation_account, local_follow, local_media_attachment,
+    local_notification, local_status, local_status_bookmark, local_status_favourite,
+    local_status_reblog, local_status_remote_mention, local_status_tag, local_tag,
+    local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
+    oauth_authorization_code, processed_inbox_activity, remote_actor, remote_follow,
+    remote_following, remote_status,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -1140,6 +1142,36 @@ pub struct RemoteFollow {
     pub state: String,
 }
 
+/// Durable delivery work to create together with an automatically accepted Follow.
+#[derive(Clone, Debug)]
+pub struct RemoteFollowResponseJob {
+    /// Worker job kind.
+    pub kind: JobKind,
+    /// Serialized delivery payload.
+    pub payload: JsonValue,
+    /// Active-job deduplication key.
+    pub deduplication_key: String,
+}
+
+/// Known durable job kinds dispatched by Roosty's worker.
+#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum JobKind {
+    /// Deliver an Accept or Reject response for an inbound remote Follow.
+    FederationFollowResponse,
+    /// Deliver a public or unlisted local status lifecycle activity.
+    FederationStatusDelivery,
+    /// Deliver a locally initiated Follow or Undo(Follow).
+    FederationFollowDelivery,
+}
+
+impl JobKind {
+    /// Return the persisted worker kind name.
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
 #[derive(FromQueryResult)]
 struct RemoteFollowRow {
     id: Uuid,
@@ -1170,45 +1202,151 @@ pub async fn upsert_remote_follow(
     Ok(remote_follow_from_row(row))
 }
 
-/// Mark a remote follow as accepted and return its original Follow activity.
-pub async fn accept_remote_follow(
+/// Persist one newly validated automatic remote Follow and its durable Accept job atomically.
+pub async fn upsert_processed_remote_follow_with_response_job(
     db: &DbConnection,
-    local_account_id: AccountId,
     remote_actor_id: AccountId,
-) -> Result<Option<RemoteFollow>> {
-    let row = RemoteFollowRow::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        r#"
-        UPDATE remote_follow SET state = 'accepted', updated_at = now()
-        WHERE local_account_id = $1 AND remote_actor_id = $2 AND state = 'pending'
-        RETURNING id, remote_actor_id, local_account_id, activity_id, activity, state
-    "#,
-        vec![local_account_id.0.into(), remote_actor_id.0.into()],
-    ))
-    .one(db)
+    local_account_id: AccountId,
+    activity_id: &str,
+    activity: JsonValue,
+    response_job: RemoteFollowResponseJob,
+) -> Result<bool> {
+    let txn = db.begin().await?;
+    let processed =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(activity_id.to_owned()),
+            remote_actor_id: Set(remote_actor_id.0),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(&txn)
+        .await?;
+    if matches!(processed, TryInsertResult::Conflicted) {
+        txn.commit().await?;
+        return Ok(false);
+    }
+
+    remote_follow::Entity::insert(remote_follow::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        remote_actor_id: Set(remote_actor_id.0),
+        local_account_id: Set(local_account_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        activity: Set(activity),
+        state: Set("accepted".to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+        updated_at: Set(OffsetDateTime::now_utc()),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            remote_follow::Column::RemoteActorId,
+            remote_follow::Column::LocalAccountId,
+        ])
+        .update_columns([
+            remote_follow::Column::ActivityId,
+            remote_follow::Column::Activity,
+            remote_follow::Column::State,
+            remote_follow::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec(&txn)
     .await?;
-    Ok(row.map(remote_follow_from_row))
+    insert_response_job(&txn, response_job).await?;
+    txn.commit().await?;
+    Ok(true)
 }
 
-/// Remove an incoming remote follow by its original activity identity.
-pub async fn delete_remote_follow_by_activity(db: &DbConnection, activity_id: &str) -> Result<()> {
-    db.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        "DELETE FROM remote_follow WHERE activity_id = $1",
-        vec![activity_id.to_owned().into()],
-    ))
+/// Insert a deduplicated follow-response job within a caller-owned transaction.
+async fn insert_response_job(
+    txn: &sea_orm::DatabaseTransaction,
+    response_job: RemoteFollowResponseJob,
+) -> Result<()> {
+    let _ = job::Entity::insert(job::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        kind: Set(response_job.kind.as_str().to_owned()),
+        payload: Set(response_job.payload),
+        deduplication_key: Set(Some(response_job.deduplication_key)),
+        run_after: Set(OffsetDateTime::now_utc()),
+        attempts: Set(0),
+        locked_at: Set(None),
+        locked_by: Set(None),
+        last_error: Set(None),
+        created_at: Set(OffsetDateTime::now_utc()),
+        completed_at: Set(None),
+    })
+    .on_conflict_do_nothing()
+    .exec(txn)
     .await?;
     Ok(())
 }
 
-/// Reject or remove a remote follow owned by a local account.
-pub async fn delete_remote_follow(
+/// Accept a pending remote Follow and create its Accept delivery job atomically.
+pub async fn accept_remote_follow_with_response_job(
     db: &DbConnection,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
+    activity_id: &str,
+    response_job: RemoteFollowResponseJob,
 ) -> Result<bool> {
-    let result = db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, "DELETE FROM remote_follow WHERE local_account_id = $1 AND remote_actor_id = $2 AND state = 'pending'", vec![local_account_id.0.into(), remote_actor_id.0.into()])).await?;
-    Ok(result.rows_affected() == 1)
+    let txn = db.begin().await?;
+    let follow = remote_follow::Entity::find()
+        .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::ActivityId.eq(activity_id))
+        .filter(remote_follow::Column::State.eq("pending"))
+        .one(&txn)
+        .await?;
+    let Some(follow) = follow else {
+        txn.commit().await?;
+        return Ok(false);
+    };
+    let mut follow = follow.into_active_model();
+    follow.state = Set("accepted".to_owned());
+    follow.updated_at = Set(OffsetDateTime::now_utc());
+    follow.update(&txn).await?;
+    insert_response_job(&txn, response_job).await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// Remove an incoming remote follow by its original activity identity.
+pub async fn delete_remote_follow_by_activity(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<()> {
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::ActivityId.eq(activity_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Reject a pending remote Follow and create its Reject delivery job atomically.
+pub async fn delete_remote_follow_with_response_job(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+    response_job: RemoteFollowResponseJob,
+) -> Result<bool> {
+    let txn = db.begin().await?;
+    let follow = remote_follow::Entity::find()
+        .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::ActivityId.eq(activity_id))
+        .filter(remote_follow::Column::State.eq("pending"))
+        .one(&txn)
+        .await?;
+    let Some(follow) = follow else {
+        txn.commit().await?;
+        return Ok(false);
+    };
+    follow.into_active_model().delete(&txn).await?;
+    insert_response_job(&txn, response_job).await?;
+    txn.commit().await?;
+    Ok(true)
 }
 
 /// List pending remote follow requests for a local account.
@@ -4674,7 +4812,7 @@ pub struct ClaimedJob {
 /// Enqueue a durable job, reusing an active deduplicated job when present.
 pub async fn enqueue_job(
     db: &DbConnection,
-    kind: &str,
+    kind: JobKind,
     payload: JsonValue,
     deduplication_key: Option<&str>,
     run_after: OffsetDateTime,
@@ -4702,7 +4840,7 @@ pub async fn enqueue_job(
             "#,
             vec![
                 job_id.0.into(),
-                kind.to_owned().into(),
+                kind.as_str().to_owned().into(),
                 payload.into(),
                 deduplication_key.map(str::to_owned).into(),
                 run_after.into(),
@@ -4892,5 +5030,22 @@ mod tests {
 
         assert!(early > now);
         assert!(late - now <= Duration::hours(1) + Duration::seconds(1));
+    }
+
+    /// Worker job identifiers retain stable persisted spellings through the typed API.
+    #[test]
+    fn job_kinds_use_stable_persisted_values() {
+        assert_eq!(
+            JobKind::FederationFollowResponse.as_str(),
+            "federation_follow_response"
+        );
+        assert_eq!(
+            JobKind::FederationStatusDelivery.as_str(),
+            "federation_status_delivery"
+        );
+        assert_eq!(
+            JobKind::FederationFollowDelivery.as_str(),
+            "federation_follow_delivery"
+        );
     }
 }

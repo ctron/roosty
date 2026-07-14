@@ -26,7 +26,10 @@ Keep this as the default verification command for changes in this repository.
   and license.
 - Current license: `Apache-2.0`.
 - Use SeaORM migrations as the canonical migration system from the start.
-- Keep SQLx available for explicit query paths where direct SQL is the clearer fit.
+- Prefer SeaORM entities and query builders for database reads and writes. Use raw SQL only when it is materially clearer
+  or required for a database-specific operation such as row locking, partial-index conflict inference, or a complex CTE.
+- Model closed `kind`, `type`, `state`, and similar discriminator fields as Rust enums. Convert them to strings only at
+  persistence or wire-format boundaries.
 - Prefer file-backed Rust modules over nested inline modules. Use nested inline modules only when they are very small
   and local to their parent.
 - Before adding a new dependency, check for its most recent version.

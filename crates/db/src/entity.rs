@@ -1,5 +1,6 @@
 //! SeaORM entity modules for Roosty database tables.
 
+pub mod job;
 pub mod local_account;
 pub mod local_account_block;
 pub mod local_account_mute;
@@ -21,6 +22,7 @@ pub mod local_timeline_marker;
 pub mod oauth_access_token;
 pub mod oauth_application;
 pub mod oauth_authorization_code;
+pub mod processed_inbox_activity;
 pub mod remote_actor;
 pub mod remote_follow;
 pub mod remote_following;

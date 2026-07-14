@@ -33,9 +33,6 @@ const ACTIVITYSTREAMS_CONTENT_TYPE: &str = "application/activity+json";
 const JRD_CONTENT_TYPE: &str = "application/jrd+json";
 const ACTIVITYSTREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
-const DELIVERY_JOB_KIND: &str = "federation_follow_response";
-const STATUS_DELIVERY_JOB_KIND: &str = "federation_status_delivery";
-const FOLLOW_DELIVERY_JOB_KIND: &str = "federation_follow_delivery";
 
 /// ActivityStreams actor types accepted and emitted by Roosty.
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -81,6 +78,54 @@ struct InboundStatusActivity {
     r#type: InboundStatusType,
     actor: String,
     object: InboundNote,
+}
+
+/// ActivityPub reference forms accepted for a Follow target.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundActorReference {
+    Id(String),
+    Object { id: String },
+}
+
+impl InboundActorReference {
+    /// Return the canonical actor identity carried by this reference.
+    fn id(self) -> String {
+        match self {
+            Self::Id(id) | Self::Object { id } => id,
+        }
+    }
+}
+
+/// ActivityPub Follow fields needed for a local subscription request.
+#[derive(Deserialize)]
+struct InboundFollowActivity {
+    object: InboundActorReference,
+}
+
+/// ActivityPub Undo object forms accepted for a prior Follow activity.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundUndoFollowObject {
+    Id(String),
+    Follow { id: String, r#type: String },
+}
+
+impl InboundUndoFollowObject {
+    /// Return the original Follow activity ID only for an embedded Follow object.
+    fn follow_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Follow { id, r#type } if r#type == "Follow" => Some(id),
+            Self::Follow { .. } => None,
+        }
+    }
+}
+
+/// ActivityPub Undo fields needed to revoke a remote subscription.
+#[derive(Deserialize)]
+struct InboundUndoFollowActivity {
+    object: InboundUndoFollowObject,
 }
 
 /// Remote Note fields needed for the first cache projection.
@@ -668,21 +713,33 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     ) {
         return StatusCode::ACCEPTED.into_response();
     }
-    if !roosty_db::record_processed_inbox_activity(&state.db, &activity_id, remote_actor.id)
-        .await
-        .unwrap_or(false)
-    {
-        return StatusCode::ACCEPTED.into_response();
-    }
     if activity.get("type").and_then(JsonValue::as_str) == Some("Undo") {
-        if let Some(original_id) = activity.get("object").and_then(JsonValue::as_str) {
-            let _ = roosty_db::delete_remote_follow_by_activity(&state.db, original_id).await;
+        let undo: InboundUndoFollowActivity = match serde_json::from_value(activity.clone()) {
+            Ok(undo) => undo,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        let Some(original_id) = undo.object.follow_id() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if !roosty_db::record_processed_inbox_activity(&state.db, &activity_id, remote_actor.id)
+            .await
+            .unwrap_or(false)
+        {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        if let Err(error) =
+            roosty_db::delete_remote_follow_by_activity(&state.db, remote_actor.id, &original_id)
+                .await
+        {
+            tracing::warn!(%error, activity_id, "could not remove remote follow");
         }
         return StatusCode::ACCEPTED.into_response();
     }
-    let Some(target_url) = activity.get("object").and_then(JsonValue::as_str) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let follow: InboundFollowActivity = match serde_json::from_value(activity.clone()) {
+        Ok(follow) => follow,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    let target_url = follow.object.id();
     let Some(username) = target_url
         .rsplit('/')
         .next()
@@ -698,22 +755,61 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         Ok(None) => return StatusCode::ACCEPTED.into_response(),
         Err(error) => return internal_error(error),
     };
-    let state_name = if local_account.locked {
-        "pending"
+    let follow_state = if local_account.locked {
+        InboundFollowState::Pending
     } else {
-        "accepted"
+        InboundFollowState::Accepted
     };
-    match roosty_db::upsert_remote_follow(
-        &state.db,
-        remote_actor.id,
-        local_account.id,
-        &activity_id,
-        activity.clone(),
-        state_name,
-    )
-    .await
-    {
-        Ok(_) => {
+    let persisted = if matches!(follow_state, InboundFollowState::Accepted) {
+        let payload = match serde_json::to_value(FollowResponseDelivery {
+            local_account_id: local_account.id,
+            remote_actor_id: remote_actor.id,
+            follow: activity.clone(),
+            response_type: FollowResponseType::Accept,
+        }) {
+            Ok(payload) => payload,
+            Err(error) => return internal_error(error),
+        };
+        roosty_db::upsert_processed_remote_follow_with_response_job(
+            &state.db,
+            remote_actor.id,
+            local_account.id,
+            &activity_id,
+            activity.clone(),
+            roosty_db::RemoteFollowResponseJob {
+                kind: roosty_db::JobKind::FederationFollowResponse,
+                payload,
+                deduplication_key: format!("{}:{activity_id}", FollowResponseType::Accept.as_str()),
+            },
+        )
+        .await
+    } else {
+        match roosty_db::record_processed_inbox_activity(&state.db, &activity_id, remote_actor.id)
+            .await
+        {
+            Ok(true) => roosty_db::upsert_remote_follow(
+                &state.db,
+                remote_actor.id,
+                local_account.id,
+                &activity_id,
+                activity.clone(),
+                follow_state.as_str(),
+            )
+            .await
+            .map(|_| true),
+            Ok(false) => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+    match persisted {
+        Ok(true) => {
+            tracing::info!(
+                activity_id,
+                remote_actor_id = %remote_actor.id.0,
+                local_account_id = %local_account.id.0,
+                state = follow_state.as_str(),
+                "processed remote follow"
+            );
             if let Err(error) = crate::notifications::create_and_stream_remote_follow_notification(
                 state,
                 local_account.id,
@@ -723,20 +819,9 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             {
                 tracing::warn!(%error, "failed to create remote follow notification");
             }
-            if state_name == "accepted"
-                && let Err(error) = enqueue_follow_response(
-                    state,
-                    local_account.id,
-                    remote_actor.id,
-                    activity.clone(),
-                    "Accept",
-                )
-                .await
-            {
-                tracing::warn!(%error, "failed to enqueue follow Accept");
-            }
             StatusCode::ACCEPTED.into_response()
         }
+        Ok(false) => StatusCode::ACCEPTED.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -1070,7 +1155,41 @@ struct FollowResponseDelivery {
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     follow: JsonValue,
-    response_type: String,
+    response_type: FollowResponseType,
+}
+
+/// ActivityPub response types emitted for an inbound Follow request.
+#[derive(Deserialize, Serialize)]
+enum FollowResponseType {
+    Accept,
+    Reject,
+}
+
+/// Local state assigned to an inbound Follow before a manual approval decision.
+#[derive(Clone, Copy)]
+enum InboundFollowState {
+    Pending,
+    Accepted,
+}
+
+impl InboundFollowState {
+    /// Return the persisted remote-follow state.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
+impl FollowResponseType {
+    /// Return the ActivityStreams spelling used for identifiers and payloads.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accept => "Accept",
+            Self::Reject => "Reject",
+        }
+    }
 }
 
 /// Durable payload for one activity delivery to one accepted remote follower.
@@ -1159,7 +1278,7 @@ async fn enqueue_follow_delivery(
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     roosty_db::enqueue_job(
         &state.db,
-        FOLLOW_DELIVERY_JOB_KIND,
+        roosty_db::JobKind::FederationFollowDelivery,
         payload,
         Some(activity_id),
         OffsetDateTime::now_utc(),
@@ -1226,7 +1345,7 @@ pub(crate) async fn enqueue_status_activity(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job(
             &state.db,
-            STATUS_DELIVERY_JOB_KIND,
+            roosty_db::JobKind::FederationStatusDelivery,
             payload,
             Some(&format!("{activity_id}:{}", remote.id.0)),
             OffsetDateTime::now_utc(),
@@ -1271,35 +1390,80 @@ pub(crate) enum StatusActivityKind {
     Delete,
 }
 
-/// Queue a signed Accept or Reject response after a local follow decision.
-pub(crate) async fn enqueue_follow_response(
+/// Accept a pending remote Follow while atomically creating its durable Accept job.
+pub(crate) async fn accept_remote_follow_request(
     state: &AppState,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
-    follow: JsonValue,
-    response_type: &str,
-) -> Result<(), RoostyError> {
-    let follow_id = follow
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| RoostyError::InvalidInput("follow activity has no ID".to_owned()))?;
+) -> Result<bool, RoostyError> {
+    let follow = roosty_db::pending_remote_follows(&state.db, local_account_id)
+        .await?
+        .into_iter()
+        .find(|follow| follow.remote_actor_id == remote_actor_id);
+    let Some(follow) = follow else {
+        return Ok(false);
+    };
     let payload = serde_json::to_value(FollowResponseDelivery {
         local_account_id,
         remote_actor_id,
-        follow,
-        response_type: response_type.to_owned(),
+        follow: follow.activity.clone(),
+        response_type: FollowResponseType::Accept,
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    roosty_db::enqueue_job(
+    roosty_db::accept_remote_follow_with_response_job(
         &state.db,
-        DELIVERY_JOB_KIND,
-        payload,
-        Some(&format!("{response_type}:{follow_id}")),
-        OffsetDateTime::now_utc(),
+        local_account_id,
+        remote_actor_id,
+        &follow.activity_id,
+        roosty_db::RemoteFollowResponseJob {
+            kind: roosty_db::JobKind::FederationFollowResponse,
+            payload,
+            deduplication_key: format!(
+                "{}:{}",
+                FollowResponseType::Accept.as_str(),
+                follow.activity_id
+            ),
+        },
     )
-    .await?;
-    Ok(())
+    .await
+}
+
+/// Reject a pending remote Follow while atomically creating its durable Reject job.
+pub(crate) async fn reject_remote_follow_request(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<bool, RoostyError> {
+    let follow = roosty_db::pending_remote_follows(&state.db, local_account_id)
+        .await?
+        .into_iter()
+        .find(|follow| follow.remote_actor_id == remote_actor_id);
+    let Some(follow) = follow else {
+        return Ok(false);
+    };
+    let payload = serde_json::to_value(FollowResponseDelivery {
+        local_account_id,
+        remote_actor_id,
+        follow: follow.activity.clone(),
+        response_type: FollowResponseType::Reject,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::delete_remote_follow_with_response_job(
+        &state.db,
+        local_account_id,
+        remote_actor_id,
+        &follow.activity_id,
+        roosty_db::RemoteFollowResponseJob {
+            kind: roosty_db::JobKind::FederationFollowResponse,
+            payload,
+            deduplication_key: format!(
+                "{}:{}",
+                FollowResponseType::Reject.as_str(),
+                follow.activity_id
+            ),
+        },
+    )
+    .await
 }
 
 /// Dispatch one durable follow-response delivery job.
@@ -1326,7 +1490,8 @@ pub(crate) async fn deliver_follow_response(
         })?;
     let private_key = decrypt_private_key(state, &key)?;
     let actor = actor_url(state, &local.username);
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": format!("{actor}#{}-{}", payload.response_type.to_ascii_lowercase(), Uuid::now_v7()), "type": payload.response_type, "actor": actor, "object": payload.follow});
+    let response_type = payload.response_type.as_str();
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": format!("{actor}#{}-{}", response_type.to_ascii_lowercase(), Uuid::now_v7()), "type": response_type, "actor": actor, "object": payload.follow});
     signed_post(
         state,
         &remote.inbox_url,
@@ -1728,8 +1893,9 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        Actor, ActorType, CollectionType, Create, CreateType, InboundNote, MentionTag, MentionType,
-        Note, NoteType, OrderedCollection, PublicKey, parse_acct, remote_status_visibility,
+        Actor, ActorType, CollectionType, Create, CreateType, InboundFollowActivity, InboundNote,
+        InboundUndoFollowActivity, MentionTag, MentionType, Note, NoteType, OrderedCollection,
+        PublicKey, parse_acct, remote_status_visibility,
     };
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
@@ -1743,6 +1909,44 @@ mod tests {
         assert_eq!(parse_acct("acct:@example.test"), None);
         assert_eq!(parse_acct("acct:alice@"), None);
         assert_eq!(parse_acct("acct:alice@example.test/path"), None);
+    }
+
+    /// Both ActivityPub link forms identify the same Follow target.
+    #[test]
+    fn parses_follow_actor_reference_forms() {
+        let string: InboundFollowActivity =
+            serde_json::from_str(r#"{"object":"https://roosty.test/users/alice"}"#).unwrap();
+        let object: InboundFollowActivity =
+            serde_json::from_str(r#"{"object":{"id":"https://roosty.test/users/alice"}}"#).unwrap();
+
+        assert_eq!(string.object.id(), "https://roosty.test/users/alice");
+        assert_eq!(object.object.id(), "https://roosty.test/users/alice");
+        assert!(serde_json::from_str::<InboundFollowActivity>(r#"{"object":{}}"#).is_err());
+    }
+
+    /// Undo may reference the original Follow directly or embed its typed activity object.
+    #[test]
+    fn parses_follow_undo_reference_forms() {
+        let string: InboundUndoFollowActivity =
+            serde_json::from_str(r#"{"object":"https://remote.test/follows/1"}"#).unwrap();
+        let embedded: InboundUndoFollowActivity = serde_json::from_str(
+            r#"{"object":{"id":"https://remote.test/follows/1","type":"Follow"}}"#,
+        )
+        .unwrap();
+        let invalid: InboundUndoFollowActivity = serde_json::from_str(
+            r#"{"object":{"id":"https://remote.test/follows/1","type":"Like"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            string.object.follow_id().as_deref(),
+            Some("https://remote.test/follows/1")
+        );
+        assert_eq!(
+            embedded.object.follow_id().as_deref(),
+            Some("https://remote.test/follows/1")
+        );
+        assert_eq!(invalid.object.follow_id(), None);
     }
 
     /// Public is addressed in `to`, while unlisted retains the public audience in `cc`.

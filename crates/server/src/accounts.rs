@@ -506,22 +506,15 @@ async fn authorize_follow_request(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
 ) -> Response {
-    match roosty_db::accept_remote_follow(&state.db, account.id, AccountId(path.account_id)).await {
-        Ok(Some(follow)) => {
-            if let Err(error) = crate::federation::enqueue_follow_response(
-                &state,
-                account.id,
-                AccountId(path.account_id),
-                follow.activity,
-                "Accept",
-            )
-            .await
-            {
-                return server_error(error);
-            }
-            relationship_response(&state, account.id, AccountId(path.account_id)).await
-        }
-        Ok(None) => not_found(),
+    match crate::federation::accept_remote_follow_request(
+        &state,
+        account.id,
+        AccountId(path.account_id),
+    )
+    .await
+    {
+        Ok(true) => relationship_response(&state, account.id, AccountId(path.account_id)).await,
+        Ok(false) => not_found(),
         Err(error) => server_error(error),
     }
 }
@@ -533,30 +526,8 @@ async fn reject_follow_request(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let remote_id = AccountId(path.account_id);
-    let follow = roosty_db::pending_remote_follows(&state.db, account.id)
-        .await
-        .ok()
-        .and_then(|follows| {
-            follows
-                .into_iter()
-                .find(|follow| follow.remote_actor_id == remote_id)
-        });
-    match roosty_db::delete_remote_follow(&state.db, account.id, remote_id).await {
-        Ok(true) => {
-            if let Some(follow) = follow
-                && let Err(error) = crate::federation::enqueue_follow_response(
-                    &state,
-                    account.id,
-                    remote_id,
-                    follow.activity,
-                    "Reject",
-                )
-                .await
-            {
-                return server_error(error);
-            }
-            relationship_response(&state, account.id, remote_id).await
-        }
+    match crate::federation::reject_remote_follow_request(&state, account.id, remote_id).await {
+        Ok(true) => relationship_response(&state, account.id, remote_id).await,
         Ok(false) => not_found(),
         Err(error) => server_error(error),
     }
