@@ -4,6 +4,7 @@
 
 - Roosty targets compatibility with the ActivityPub specification and Mastodon-compatible client APIs.
 - The focus is on the backend, allowing integration with UIs
+- APIs should align with the ActivityPub spec and Mastodon APIs.
 
 ## Verification
 
