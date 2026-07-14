@@ -67,7 +67,7 @@
 - [x] Add cursor pagination and `Link` headers to remote follow-request listing.
 - [x] Retry federation deliveries with exponential backoff until the operator-configured `ROOSTY_FEDERATION_DELIVERY_MAX_AGE` horizon, then record permanent failures and emit diagnostics.
 - [x] Add signed two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, Undo, public-status fan-out, and failed-delivery retry scheduling.
-- [ ] Add end-to-end worker tests for permanent-failure classification and expired-claim recovery.
+- [x] Add end-to-end worker tests for permanent-failure classification and expired-claim recovery.
 - [ ] Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
 - [ ] Apply local mute/block policy to remote follow requests and remote follow notifications.
 - [ ] Enrich remote account projections with profile media and remote relationship/status counts as those data become available.

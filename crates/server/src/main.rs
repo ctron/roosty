@@ -309,8 +309,6 @@ async fn worker_loop(
     config: Config,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let claim_ttl = time::Duration::minutes(5);
-
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -320,50 +318,64 @@ async fn worker_loop(
                 }
             }
             () = tokio::time::sleep(Duration::from_secs(5)) => {
-                let released = roosty_db::release_expired_claims(&db, claim_ttl).await?;
-                if released > 0 {
-                    info!(released, "released expired job claims");
-                }
-                for job in roosty_db::claim_due_jobs(&db, "roosty-worker", 20, claim_ttl).await? {
-                    let state = AppState::new(config.clone(), db.clone());
-                    let result = match job.kind.as_str() {
-                        "federation_follow_response" => {
-                            crate::federation::deliver_follow_response(&state, job.payload).await
-                        }
-                        "federation_status_delivery" => {
-                            crate::federation::deliver_status_activity(&state, job.payload).await
-                        }
-                        "federation_follow_delivery" => {
-                            crate::federation::deliver_follow_activity(&state, job.payload).await
-                        }
-                        "federation_favourite_delivery" => {
-                            crate::federation::deliver_favourite_activity(&state, job.payload).await
-                        }
-                        "federation_reblog_delivery" => {
-                            crate::federation::deliver_reblog_activity(&state, job.payload).await
-                        }
-                        "federation_remote_media_fetch" => {
-                            crate::media::fetch_remote_media(&state, job.payload).await
-                        }
-                        _ => Ok(()),
-                    };
-                    match result {
-                        Ok(()) => roosty_db::mark_job_completed(&db, job.id).await?,
-                        Err(error) => {
-                            let permanent = roosty_db::job_has_exceeded_max_age(job.created_at, config.federation_delivery_max_age)
-                                || error.to_string().starts_with("permanent federation delivery failure:");
-                            if permanent {
-                                roosty_db::mark_job_permanently_failed(&db, job.id, &error.to_string()).await?;
-                                warn!(job_id = %job.id.0, %error, "federation delivery failed permanently");
-                            } else {
-                                roosty_db::mark_job_failed(&db, job.id, &error.to_string(), job.attempts).await?;
-                            }
-                        }
-                    }
+                worker_iteration(&db, &config).await?;
+            }
+        }
+    }
+}
+
+/// Release abandoned claims, process due work, and persist each delivery outcome.
+async fn worker_iteration(db: &roosty_db::DbConnection, config: &Config) -> Result<()> {
+    let claim_ttl = time::Duration::minutes(5);
+    let released = roosty_db::release_expired_claims(db, claim_ttl).await?;
+    if released > 0 {
+        info!(released, "released expired job claims");
+    }
+
+    for job in roosty_db::claim_due_jobs(db, "roosty-worker", 20, claim_ttl).await? {
+        let state = AppState::new(config.clone(), db.clone());
+        let result = match job.kind.as_str() {
+            "federation_follow_response" => {
+                crate::federation::deliver_follow_response(&state, job.payload).await
+            }
+            "federation_status_delivery" => {
+                crate::federation::deliver_status_activity(&state, job.payload).await
+            }
+            "federation_follow_delivery" => {
+                crate::federation::deliver_follow_activity(&state, job.payload).await
+            }
+            "federation_favourite_delivery" => {
+                crate::federation::deliver_favourite_activity(&state, job.payload).await
+            }
+            "federation_reblog_delivery" => {
+                crate::federation::deliver_reblog_activity(&state, job.payload).await
+            }
+            "federation_remote_media_fetch" => {
+                crate::media::fetch_remote_media(&state, job.payload).await
+            }
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => roosty_db::mark_job_completed(db, job.id).await?,
+            Err(error) => {
+                let permanent = roosty_db::job_has_exceeded_max_age(
+                    job.created_at,
+                    config.federation_delivery_max_age,
+                ) || error
+                    .to_string()
+                    .starts_with("permanent federation delivery failure:");
+                if permanent {
+                    roosty_db::mark_job_permanently_failed(db, job.id, &error.to_string()).await?;
+                    warn!(job_id = %job.id.0, %error, "federation delivery failed permanently");
+                } else {
+                    roosty_db::mark_job_failed(db, job.id, &error.to_string(), job.attempts)
+                        .await?;
                 }
             }
         }
     }
+
+    Ok(())
 }
 
 fn validate_username(username: &str) -> Result<()> {
@@ -399,6 +411,7 @@ mod tests {
 
     use postgresql_embedded::PostgreSQL;
     use roosty_migration::Migrator;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
 
@@ -544,6 +557,133 @@ mod tests {
         db.close().await.unwrap();
         postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
+    }
+
+    /// Given a failed delivery beyond its retry horizon, when the worker polls, then it records a
+    /// permanent diagnostic and never makes that job claimable again.
+    #[tokio::test]
+    async fn permanently_fails_expired_delivery_jobs() {
+        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let job_id = roosty_db::enqueue_job(
+            &db,
+            roosty_db::JobKind::FederationFollowDelivery,
+            serde_json::json!({}),
+            None,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE job SET created_at = now() - interval '8 days' WHERE id = $1",
+            vec![job_id.0.into()],
+        ))
+        .await
+        .unwrap();
+
+        worker_iteration(&db, &test_worker_config()).await.unwrap();
+
+        let job = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT completed_at, locked_at, locked_by, last_error FROM job WHERE id = $1",
+                vec![job_id.0.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let completed_at: Option<time::OffsetDateTime> = job.try_get("", "completed_at").unwrap();
+        let locked_at: Option<time::OffsetDateTime> = job.try_get("", "locked_at").unwrap();
+        let locked_by: Option<String> = job.try_get("", "locked_by").unwrap();
+        let last_error: Option<String> = job.try_get("", "last_error").unwrap();
+
+        assert!(completed_at.is_some());
+        assert!(locked_at.is_none());
+        assert!(locked_by.is_none());
+        assert_eq!(
+            last_error.as_deref(),
+            Some("invalid input: invalid follow delivery payload")
+        );
+        assert!(
+            roosty_db::claim_due_jobs(&db, "verification-worker", 10, time::Duration::minutes(5),)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        db.close().await.unwrap();
+        postgresql.drop_database(&database_name).await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given a job claimed by a worker that stopped, when its claim expires, then the next poll
+    /// reclaims and completes it.
+    #[tokio::test]
+    async fn recovers_expired_job_claims() {
+        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let job_id = uuid::Uuid::now_v7();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO job (id, kind, payload, run_after, locked_at, locked_by)
+            VALUES ($1, 'unknown_worker_job', '{}'::jsonb, now() - interval '10 minutes',
+                    now() - interval '10 minutes', 'stopped-worker')
+            "#,
+            vec![job_id.into()],
+        ))
+        .await
+        .unwrap();
+
+        worker_iteration(&db, &test_worker_config()).await.unwrap();
+
+        let job = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT completed_at, locked_at, locked_by, last_error FROM job WHERE id = $1",
+                vec![job_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let completed_at: Option<time::OffsetDateTime> = job.try_get("", "completed_at").unwrap();
+        let locked_at: Option<time::OffsetDateTime> = job.try_get("", "locked_at").unwrap();
+        let locked_by: Option<String> = job.try_get("", "locked_by").unwrap();
+        let last_error: Option<String> = job.try_get("", "last_error").unwrap();
+
+        assert!(completed_at.is_some());
+        assert!(locked_at.is_none());
+        assert!(locked_by.is_none());
+        assert!(last_error.is_none());
+
+        db.close().await.unwrap();
+        postgresql.drop_database(&database_name).await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    fn test_worker_config() -> Config {
+        Config {
+            database_url: "postgres://unused".to_owned(),
+            public_base_url: "https://worker.test".parse().unwrap(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            infra_listen_addr: None,
+            session_secret: "test-session-secret-change-me-000".to_owned(),
+            token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+            object_storage_backend: "local".to_owned(),
+            media_root: "./media".to_owned(),
+            registration_mode: "closed".to_owned(),
+            federation_enabled: true,
+            federation_key_encryption_secret: Some(
+                "test-federation-key-encryption-secret-000".to_owned(),
+            ),
+            federation_allowed_domains: vec!["*".to_owned()],
+            federation_blocked_domains: Vec::new(),
+            federation_delivery_max_age: time::Duration::days(7),
+            remote_media_cache_ttl: time::Duration::days(30),
+            remote_media_max_bytes: 40 * 1024 * 1024,
+            remote_media_fetch_concurrency: 5,
+            instance_name: "Worker test".to_owned(),
+            instance_description: None,
+        }
     }
 
     /// Starts a migrated temporary PostgreSQL database for CLI-adjacent DB tests.
