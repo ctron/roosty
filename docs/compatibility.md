@@ -69,7 +69,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses with media and hashtag filters; pinned statuses are missing. |
-| 🟡 | Follow graph | Local follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote follows are missing. |
+| 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote graph fetching remains missing. |
+| 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
 | 🟡 | Mutes and blocks | Local mute/unmute, block/unblock, relationship state, mute duration, and paginated collections work; remote and domain policy are missing. |
 
 ### Search

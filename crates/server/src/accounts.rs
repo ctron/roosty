@@ -483,18 +483,36 @@ async fn relationships(
 async fn follow_requests(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
+    Query(params): Query<AccountCollectionParams>,
 ) -> Response {
-    match roosty_db::pending_remote_follows(&state.db, account.id).await {
-        Ok(requests) => {
-            let mut actors = Vec::with_capacity(requests.len());
-            for request in requests {
-                match roosty_db::find_remote_actor_by_id(&state.db, request.remote_actor_id).await {
-                    Ok(Some(actor)) => actors.push(remote_account_response(actor)),
-                    Ok(None) => {}
-                    Err(error) => return server_error(error),
-                }
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
+        .clamp(1, MAX_ACCOUNT_LIMIT);
+    let cursor = match collection_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("collection cursor is invalid"),
+    };
+    match roosty_db::pending_remote_follow_requests(&state.db, account.id, limit, cursor).await {
+        Ok(page) => {
+            let actors = page
+                .items
+                .into_iter()
+                .map(remote_account_response)
+                .collect::<Vec<_>>();
+            let link_header = crate::statuses::CollectionLink::new(
+                limit,
+                page.first_cursor,
+                page.last_cursor,
+                page.has_more,
+                "/api/v1/follow_requests",
+            )
+            .header_value();
+            let mut response = Json(actors).into_response();
+            if let Some(link_header) = link_header {
+                response.headers_mut().insert(header::LINK, link_header);
             }
-            Json(actors).into_response()
+            response
         }
         Err(error) => server_error(error),
     }
@@ -1200,6 +1218,53 @@ mod tests {
         assert_eq!(account_usernames(&body), ["one"]);
     }
 
+    /// Given pending remote follows, when the owner pages follow requests, then only pending
+    /// requests for that owner are returned with Mastodon cursor links.
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    async fn follow_requests_use_cursor_pagination(context: &mut AccountContext) {
+        let (owner_id, owner_token) = context.create_account("owner", "owner@example.com").await;
+        let (other_id, _other_token) = context.create_account("other", "other@example.com").await;
+        context
+            .create_remote_follow_request(owner_id, "first", "pending")
+            .await;
+        context
+            .create_remote_follow_request(owner_id, "second", "pending")
+            .await;
+        context
+            .create_remote_follow_request(owner_id, "third", "pending")
+            .await;
+        context
+            .create_remote_follow_request(owner_id, "accepted", "accepted")
+            .await;
+        context
+            .create_remote_follow_request(other_id, "other-request", "pending")
+            .await;
+
+        let page = context
+            .authenticated_get("/api/v1/follow_requests?limit=2", &owner_token)
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let body = json_body(page).await;
+        assert_eq!(account_usernames(&body), ["third", "second"]);
+
+        let next = context
+            .authenticated_get(
+                &format!("/api/v1/follow_requests?limit=2&max_id={next_cursor}"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
+        assert_eq!(account_usernames(&json_body(next).await), ["first"]);
+
+        let invalid = context
+            .authenticated_get("/api/v1/follow_requests?max_id=not-a-uuid", &owner_token)
+            .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test_context(AccountContext)]
     #[tokio::test]
     /// Verifies malformed account collection cursors are rejected.
@@ -1632,6 +1697,41 @@ mod tests {
             .token;
 
             (account_id, token)
+        }
+
+        /// Cache a remote actor and create an inbound follow relationship for endpoint tests.
+        async fn create_remote_follow_request(
+            &self,
+            local_account_id: AccountId,
+            username: &str,
+            state: &str,
+        ) {
+            let actor = roosty_db::RemoteActor {
+                id: AccountId(uuid::Uuid::now_v7()),
+                activitypub_id: format!("https://remote.test/users/{username}"),
+                username: username.to_owned(),
+                domain: "remote.test".to_owned(),
+                display_name: username.to_owned(),
+                summary: String::new(),
+                inbox_url: format!("https://remote.test/users/{username}/inbox"),
+                shared_inbox_url: None,
+                public_key_id: format!("https://remote.test/users/{username}#main-key"),
+                public_key_pem: "test-public-key".to_owned(),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            };
+            let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
+                .await
+                .unwrap();
+            roosty_db::upsert_remote_follow(
+                &self.db,
+                actor.id,
+                local_account_id,
+                &format!("https://remote.test/follows/{username}"),
+                serde_json::json!({ "id": format!("https://remote.test/follows/{username}") }),
+                state,
+            )
+            .await
+            .unwrap();
         }
 
         /// Create a local status through the HTTP API and return its JSON response.

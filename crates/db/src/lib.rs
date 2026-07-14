@@ -1349,13 +1349,57 @@ pub async fn delete_remote_follow_with_response_job(
     Ok(true)
 }
 
-/// List pending remote follow requests for a local account.
+/// List pending remote follows for internal approval and rejection lookup.
 pub async fn pending_remote_follows(
     db: &DbConnection,
     local_account_id: AccountId,
 ) -> Result<Vec<RemoteFollow>> {
-    let rows = RemoteFollowRow::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT id, remote_actor_id, local_account_id, activity_id, activity, state FROM remote_follow WHERE local_account_id = $1 AND state = 'pending' ORDER BY id DESC", vec![local_account_id.0.into()])).all(db).await?;
-    Ok(rows.into_iter().map(remote_follow_from_row).collect())
+    Ok(remote_follow::Entity::find()
+        .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_follow::Column::State.eq("pending"))
+        .order_by_desc(remote_follow::Column::Id)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_follow_from_model)
+        .collect())
+}
+
+/// List pending remote follow-request actors for a local account with Mastodon cursor pagination.
+pub async fn pending_remote_follow_requests(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<RemoteActor>> {
+    let rows = remote_follow::Entity::find()
+        .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_follow::Column::State.eq("pending"))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(remote_follow::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let first_cursor = rows.first().map(|row| row.id);
+    let last_cursor = rows.last().map(|row| row.id);
+    let mut actors = Vec::with_capacity(rows.len());
+    for row in rows {
+        let actor = remote_actor::Entity::find_by_id(row.remote_actor_id)
+            .one(db)
+            .await?
+            .ok_or_else(|| {
+                RoostyError::InvalidInput("remote follow actor is missing".to_owned())
+            })?;
+        actors.push(remote_actor_from_model(actor));
+    }
+
+    Ok(CollectionPage {
+        items: actors,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
 }
 
 /// Return whether an accepted remote actor follows a local account.
@@ -4333,6 +4377,21 @@ impl ApplyCollectionCursor for Select<local_conversation_account::Entity> {
     }
 }
 
+impl ApplyCollectionCursor for Select<remote_follow::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(remote_follow::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(remote_follow::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(remote_follow::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
 /// Mark an active model field as changed only when an update value is present.
 fn set_if_some<T>(active_value: &mut ActiveValue<T>, value: Option<T>)
 where
@@ -4636,6 +4695,17 @@ fn remote_following_from_model(follow: remote_following::Model) -> RemoteFollowi
         local_account_id: AccountId(follow.local_account_id),
         remote_actor_id: AccountId(follow.remote_actor_id),
         activity_id: follow.activity_id,
+        state: follow.state,
+    }
+}
+
+fn remote_follow_from_model(follow: remote_follow::Model) -> RemoteFollow {
+    RemoteFollow {
+        id: follow.id,
+        remote_actor_id: AccountId(follow.remote_actor_id),
+        local_account_id: AccountId(follow.local_account_id),
+        activity_id: follow.activity_id,
+        activity: follow.activity,
         state: follow.state,
     }
 }
