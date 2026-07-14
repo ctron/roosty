@@ -38,6 +38,8 @@ Keep this as the default verification command for changes in this repository.
 - Prefer importing types over repeatedly using fully qualified type paths, except where importing would make the code
   ambiguous or less clear.
 - Avoid unnecessary cloning; prefer borrowing, moving, or restructuring ownership when it keeps the code clear.
+- Prefer `?` with `From`/`Into` error conversions over manual error mapping; map errors explicitly only when adding
+  useful context or translating an error at a boundary.
 - Prefer file-backed Rust modules over nested inline modules. Use nested inline modules only when they are very small
   and local to their parent.
 - Before adding a new dependency, check for its most recent version.
