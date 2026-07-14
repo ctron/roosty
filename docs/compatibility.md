@@ -16,7 +16,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors and public keys. |
+| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors, public keys, and configured avatar/header image URLs. |
 | 🟡 | Outbox | `GET /users/:username/outbox` exposes local public activities. |
 | 🟢 | Status object pages | Public local Notes are available at `/users/:username/statuses/:id`. |
 | 🟢 | Actor keys | RSA signing keys are encrypted at rest and the public key is published in actor documents. |

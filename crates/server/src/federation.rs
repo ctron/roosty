@@ -344,7 +344,24 @@ struct Actor {
     followers: String,
     following: String,
     manually_approves_followers: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<ActorImage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<ActorImage>,
     public_key: PublicKey,
+}
+
+/// ActivityStreams image reference used for actor avatars and headers.
+#[derive(Serialize)]
+struct ActorImage {
+    r#type: ActorImageType,
+    url: String,
+}
+
+/// Closed ActivityStreams type emitted for actor images.
+#[derive(Serialize)]
+enum ActorImageType {
+    Image,
 }
 
 #[derive(Serialize)]
@@ -526,6 +543,14 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> R
         followers: format!("{id}/followers"),
         following: format!("{id}/following"),
         manually_approves_followers: account.locked,
+        icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
+            r#type: ActorImageType::Image,
+            url: crate::media::media_url(&state, path),
+        }),
+        image: account.header_file_path.as_deref().map(|path| ActorImage {
+            r#type: ActorImageType::Image,
+            url: crate::media::media_url(&state, path),
+        }),
         public_key: PublicKey {
             id: format!("{id}#main-key"),
             owner: id,
@@ -2644,9 +2669,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Actor, ActorType, CollectionType, Create, CreateType, InboundFollowActivity, InboundNote,
-        InboundUndoAnnounceActivity, InboundUndoFollowActivity, MentionTag, MentionType, Note,
-        NoteType, OrderedCollection, PublicKey, parse_acct, remote_status_visibility,
+        Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
+        InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
+        MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, parse_acct,
+        remote_status_visibility,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -3142,6 +3168,16 @@ mod tests {
             followers: "https://example.test/users/alice/followers".to_owned(),
             following: "https://example.test/users/alice/following".to_owned(),
             manually_approves_followers: false,
+            icon: Some(ActorImage {
+                r#type: ActorImageType::Image,
+                url: "https://example.test/media_attachments/files/accounts/alice-avatar.png"
+                    .to_owned(),
+            }),
+            image: Some(ActorImage {
+                r#type: ActorImageType::Image,
+                url: "https://example.test/media_attachments/files/accounts/alice-header.png"
+                    .to_owned(),
+            }),
             public_key: PublicKey {
                 id: "https://example.test/users/alice#main-key".to_owned(),
                 owner: "https://example.test/users/alice".to_owned(),
@@ -3186,6 +3222,16 @@ mod tests {
 
         assert_eq!(actor["preferredUsername"], "alice");
         assert!(actor.get("preferred_username").is_none());
+        assert_eq!(actor["icon"]["type"], "Image");
+        assert_eq!(
+            actor["icon"]["url"],
+            "https://example.test/media_attachments/files/accounts/alice-avatar.png"
+        );
+        assert_eq!(actor["image"]["type"], "Image");
+        assert_eq!(
+            actor["image"]["url"],
+            "https://example.test/media_attachments/files/accounts/alice-header.png"
+        );
         assert_eq!(collection["totalItems"], 1);
         assert!(collection.get("total_items").is_none());
         assert!(collection.get("ordered_items").is_none());

@@ -6,7 +6,7 @@
 
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
 - Local public/unlisted home-timeline fan-out, replies, mentions, favourites, boosts, notifications, and direct conversations.
-- Opt-in local ActivityPub identity: WebFinger, actor documents, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
+- Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Signed inbound remote-follow handling: `Follow` and `Undo(Follow)` update remote-follower state, with durable `Accept`/`Reject` responses for local actors.
 - Signed outbound delivery of local public and unlisted status lifecycle activities (`Create`, `Update`, and `Delete`) to accepted remote followers.
