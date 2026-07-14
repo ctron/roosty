@@ -724,9 +724,9 @@ async fn reblogged_by(
         Ok(cursor) => cursor,
         Err(()) => return bad_request("collection cursor is invalid"),
     };
-    match roosty_db::local_reblogged_by_for_status(&state.db, status_id, limit, cursor).await {
+    match roosty_db::reblogged_by_for_status(&state.db, status_id, limit, cursor).await {
         Ok(page) => {
-            account_collection_response(
+            reblogged_by_response(
                 &state,
                 page,
                 limit,
@@ -1163,7 +1163,165 @@ async fn status_collection_action(
     let status_id = StatusId(path.status_id);
     let status = match visible_status_for_account(state, status_id, account_id).await {
         Ok(Some(status)) => status,
-        Ok(None) => return not_found(),
+        Ok(None) => {
+            let remote = match roosty_db::find_remote_status_by_id(&state.db, status_id).await {
+                Ok(Some(status)) if matches!(status.visibility.as_str(), "public" | "unlisted") => {
+                    status
+                }
+                Ok(_) => return not_found(),
+                Err(error) => return server_error(error),
+            };
+            return match action {
+                StatusCollectionAction::Favourite => {
+                    let already_favourited = match roosty_db::is_remote_status_favourited(
+                        &state.db, account_id, remote.id,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => return server_error(error),
+                    };
+                    let result = if already_favourited {
+                        Ok(())
+                    } else {
+                        let activity_id = match crate::federation::enqueue_remote_favourite(
+                            state, account_id, &remote,
+                        )
+                        .await
+                        {
+                            Ok(id) => id,
+                            Err(error) => return server_error(error),
+                        };
+                        roosty_db::favourite_remote_status(
+                            &state.db,
+                            account_id,
+                            remote.id,
+                            &activity_id,
+                        )
+                        .await
+                    };
+                    match result {
+                        Ok(()) => {
+                            match remote_status_response_for_viewer(state, remote, Some(account_id))
+                                .await
+                            {
+                                Ok(response) => Json(response).into_response(),
+                                Err(error) => server_error(error),
+                            }
+                        }
+                        Err(error) => server_error(error),
+                    }
+                }
+                StatusCollectionAction::Unfavourite => {
+                    match roosty_db::unfavourite_remote_status(&state.db, account_id, remote.id)
+                        .await
+                    {
+                        Ok(Some(favourite)) => {
+                            if let Err(error) =
+                                crate::federation::enqueue_remote_unfavourite(state, favourite)
+                                    .await
+                            {
+                                return server_error(error);
+                            }
+                            match remote_status_response_for_viewer(state, remote, Some(account_id))
+                                .await
+                            {
+                                Ok(response) => Json(response).into_response(),
+                                Err(error) => server_error(error),
+                            }
+                        }
+                        Ok(None) => {
+                            match remote_status_response_for_viewer(state, remote, Some(account_id))
+                                .await
+                            {
+                                Ok(response) => Json(response).into_response(),
+                                Err(error) => server_error(error),
+                            }
+                        }
+                        Err(error) => server_error(error),
+                    }
+                }
+                StatusCollectionAction::Reblog => {
+                    let already_reblogged = match roosty_db::is_remote_status_reblogged(
+                        &state.db, account_id, remote.id,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => return server_error(error),
+                    };
+                    let reblog = if already_reblogged {
+                        match roosty_db::reblog_remote_status(&state.db, account_id, remote.id, "")
+                            .await
+                        {
+                            Ok(reblog) => reblog,
+                            Err(error) => return server_error(error),
+                        }
+                    } else {
+                        let activity_id = match crate::federation::enqueue_remote_reblog(
+                            state, account_id, &remote,
+                        )
+                        .await
+                        {
+                            Ok(id) => id,
+                            Err(error) => return server_error(error),
+                        };
+                        match roosty_db::reblog_remote_status(
+                            &state.db,
+                            account_id,
+                            remote.id,
+                            &activity_id,
+                        )
+                        .await
+                        {
+                            Ok(reblog) => reblog,
+                            Err(error) => return server_error(error),
+                        }
+                    };
+                    match local_remote_reblog_response(state, reblog, Some(account_id)).await {
+                        Ok(Some(response)) => {
+                            let recipients = reblog_stream_recipients(state, account_id).await;
+                            state.streaming_events.publish_status_update(
+                                &response,
+                                account_id,
+                                &response.visibility,
+                                &recipients,
+                            );
+                            Json(response).into_response()
+                        }
+                        Ok(None) => not_found(),
+                        Err(error) => server_error(error),
+                    }
+                }
+                StatusCollectionAction::Unreblog => {
+                    match roosty_db::unreblog_remote_status(&state.db, account_id, remote.id).await
+                    {
+                        Ok(Some(reblog)) => {
+                            let reblog_id = reblog.id;
+                            if let Err(error) =
+                                crate::federation::enqueue_remote_unreblog(state, reblog).await
+                            {
+                                return server_error(error);
+                            }
+                            let recipients = reblog_stream_recipients(state, account_id).await;
+                            state.streaming_events.publish_delete(
+                                &reblog_id.to_string(),
+                                account_id,
+                                "unlisted",
+                                &recipients,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => return server_error(error),
+                    }
+                    match remote_status_response_for_viewer(state, remote, Some(account_id)).await {
+                        Ok(response) => Json(response).into_response(),
+                        Err(error) => server_error(error),
+                    }
+                }
+                _ => not_found(),
+            };
+        }
         Err(error) => return server_error(error),
     };
 
@@ -1312,10 +1470,10 @@ async fn filter_stream_recipients(
     visible
 }
 
-/// Return a Mastodon account collection with cursor pagination headers.
-async fn account_collection_response(
+/// Return mixed local and remote boost actors with Mastodon cursor pagination.
+async fn reblogged_by_response(
     state: &AppState,
-    page: roosty_db::CollectionPage<roosty_db::LocalAccount>,
+    page: roosty_db::CollectionPage<roosty_db::RebloggedByAccount>,
     limit: u64,
     path: &str,
 ) -> Response {
@@ -1329,9 +1487,18 @@ async fn account_collection_response(
     .header_value();
     let mut accounts = Vec::with_capacity(page.items.len());
     for account in page.items {
-        match account_response(state, account).await {
-            Ok(account) => accounts.push(account),
-            Err(error) => return server_error(error),
+        match account {
+            roosty_db::RebloggedByAccount::Local(account) => {
+                match account_response(state, account).await {
+                    Ok(account) => accounts.push(StatusAccountResponse::Local(Box::new(account))),
+                    Err(error) => return server_error(error),
+                }
+            }
+            roosty_db::RebloggedByAccount::Remote(actor) => {
+                accounts.push(StatusAccountResponse::Remote(Box::new(
+                    crate::accounts::remote_account_response(actor),
+                )))
+            }
         }
     }
     let mut response = Json(accounts).into_response();
@@ -1374,7 +1541,7 @@ async fn status_collection_list(
     };
     let result = match collection {
         StatusCollectionList::Favourites => {
-            roosty_db::local_favourites_for_account(&state.db, account_id, limit, cursor).await
+            return favourites_response(state, account_id, limit, cursor).await;
         }
         StatusCollectionList::Bookmarks => {
             roosty_db::local_bookmarks_for_account(&state.db, account_id, limit, cursor).await
@@ -1396,6 +1563,48 @@ async fn status_collection_list(
             )
             .header_value();
             let mut response = statuses_response(state, page.items, Some(account_id)).await;
+            if let Some(link_header) = link_header {
+                response.headers_mut().insert(header::LINK, link_header);
+            }
+            response
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+/// Return the authenticated user's mixed local and cached-remote favourites collection.
+async fn favourites_response(
+    state: &AppState,
+    account_id: AccountId,
+    limit: u64,
+    cursor: roosty_db::CollectionCursor,
+) -> Response {
+    match roosty_db::favourites_for_account(&state.db, account_id, limit, cursor).await {
+        Ok(page) => {
+            let link_header = CollectionLink::new(
+                limit,
+                page.first_cursor,
+                page.last_cursor,
+                page.has_more,
+                "/api/v1/favourites",
+            )
+            .header_value();
+            let mut responses = Vec::with_capacity(page.items.len());
+            for status in page.items {
+                let response = match status {
+                    roosty_db::FavouriteStatus::Local(status) => {
+                        status_with_author(state, status, Some(account_id)).await
+                    }
+                    roosty_db::FavouriteStatus::Remote(status) => {
+                        remote_status_response_for_viewer(state, status, Some(account_id)).await
+                    }
+                };
+                match response {
+                    Ok(response) => responses.push(response),
+                    Err(error) => return server_error(error),
+                }
+            }
+            let mut response = Json(responses).into_response();
             if let Some(link_header) = link_header {
                 response.headers_mut().insert(header::LINK, link_header);
             }
@@ -1436,6 +1645,20 @@ async fn home_timeline_models(
             }
             roosty_db::HomeTimelineItem::RemoteStatus(status) => {
                 response.push(remote_status_response(state, status).await?);
+            }
+            roosty_db::HomeTimelineItem::LocalRemoteReblog(reblog) => {
+                if let Some(reblog_response) =
+                    local_remote_reblog_response(state, reblog, Some(viewer)).await?
+                {
+                    response.push(reblog_response);
+                }
+            }
+            roosty_db::HomeTimelineItem::RemoteReblog(reblog) => {
+                if let Some(reblog_response) =
+                    remote_reblog_response(state, reblog, Some(viewer)).await?
+                {
+                    response.push(reblog_response);
+                }
             }
         }
     }
@@ -1514,6 +1737,117 @@ pub(crate) async fn remote_status_response(
     state: &AppState,
     status: roosty_db::RemoteStatus,
 ) -> Result<StatusResponse, RoostyError> {
+    remote_status_response_for_viewer(state, status, None).await
+}
+
+/// Build a Mastodon boost wrapper for an Announce received from a remote actor.
+pub(crate) async fn remote_reblog_response(
+    state: &AppState,
+    reblog: roosty_db::RemoteStatusReblog,
+    viewer: Option<AccountId>,
+) -> Result<Option<StatusResponse>, RoostyError> {
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, reblog.remote_actor_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("remote boost actor does not exist".to_owned()))?;
+    let original = match reblog.target {
+        roosty_db::RemoteStatusReblogTarget::Local(status_id) => {
+            let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
+            else {
+                return Ok(None);
+            };
+            if !can_view_status(&status, viewer) {
+                return Ok(None);
+            }
+            Box::new(status_with_author(state, status, viewer).await?)
+        }
+        roosty_db::RemoteStatusReblogTarget::Remote(status_id) => {
+            let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await?
+            else {
+                return Ok(None);
+            };
+            Box::new(remote_status_response_for_viewer(state, status, viewer).await?)
+        }
+    };
+    Ok(Some(StatusResponse {
+        id: reblog.id.to_string(),
+        created_at: format_timestamp(reblog.created_at),
+        edited_at: None,
+        in_reply_to_id: None,
+        in_reply_to_account_id: None,
+        sensitive: original.sensitive,
+        spoiler_text: String::new(),
+        visibility: original.visibility.clone(),
+        language: None,
+        uri: reblog.activity_id.clone(),
+        url: reblog.activity_id,
+        content: String::new(),
+        account: StatusAccountResponse::Remote(Box::new(crate::accounts::remote_account_response(
+            actor,
+        ))),
+        media_attachments: Vec::new(),
+        mentions: Vec::new(),
+        tags: Vec::new(),
+        emojis: Vec::new(),
+        reblogs_count: 0,
+        favourites_count: 0,
+        replies_count: 0,
+        favourited: false,
+        reblogged: false,
+        muted: false,
+        bookmarked: false,
+        pinned: false,
+        reblog: Some(original),
+        application: None,
+    }))
+}
+
+/// Publish a remote actor's newly stored boost to accounts following that actor.
+pub(crate) async fn publish_remote_reblog_update(
+    state: &AppState,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<(), RoostyError> {
+    let Some(reblog) = roosty_db::find_remote_status_reblog_by_activity_id(
+        &state.db,
+        remote_actor_id,
+        activity_id,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let recipients =
+        roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+    if let Some(response) = remote_reblog_response(state, reblog, None).await? {
+        state
+            .streaming_events
+            .publish_home_update(&response, remote_actor_id, &recipients);
+    }
+    Ok(())
+}
+
+/// Publish deletion of a remote actor's undone boost to its local followers.
+pub(crate) async fn publish_remote_reblog_delete(
+    state: &AppState,
+    remote_actor_id: AccountId,
+    reblog_id: uuid::Uuid,
+) -> Result<(), RoostyError> {
+    let recipients =
+        roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+    state.streaming_events.publish_home_delete(
+        &reblog_id.to_string(),
+        remote_actor_id,
+        &recipients,
+    );
+    Ok(())
+}
+
+/// Build a cached remote Note projection with viewer-specific favourite state.
+async fn remote_status_response_for_viewer(
+    state: &AppState,
+    status: roosty_db::RemoteStatus,
+    viewer: Option<AccountId>,
+) -> Result<StatusResponse, RoostyError> {
     let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
         .await?
         .ok_or_else(|| {
@@ -1564,8 +1898,18 @@ pub(crate) async fn remote_status_response(
         reblogs_count: 0,
         favourites_count: 0,
         replies_count: 0,
-        favourited: false,
-        reblogged: false,
+        favourited: match viewer {
+            Some(account_id) => {
+                roosty_db::is_remote_status_favourited(&state.db, account_id, status.id).await?
+            }
+            None => false,
+        },
+        reblogged: match viewer {
+            Some(account_id) => {
+                roosty_db::is_remote_status_reblogged(&state.db, account_id, status.id).await?
+            }
+            None => false,
+        },
         muted: false,
         bookmarked: false,
         pinned: false,
@@ -1666,6 +2010,58 @@ async fn reblog_response(
         favourited: false,
         reblogged: reblogged_by_viewer,
         muted,
+        bookmarked: false,
+        pinned: false,
+        reblog: Some(original),
+        application: None,
+    }))
+}
+
+/// Build a Mastodon boost wrapper for a local account's Announce of a cached remote Note.
+async fn local_remote_reblog_response(
+    state: &AppState,
+    reblog: roosty_db::LocalRemoteStatusReblog,
+    viewer: Option<AccountId>,
+) -> Result<Option<StatusResponse>, RoostyError> {
+    let Some(original) =
+        roosty_db::find_remote_status_by_id(&state.db, reblog.remote_status_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(account) =
+        roosty_db::find_local_account_by_id(&state.db, reblog.local_account_id).await?
+    else {
+        return Ok(None);
+    };
+    let original = Box::new(remote_status_response_for_viewer(state, original, viewer).await?);
+    let url = public_url(
+        state,
+        &format!("@{}/reblogs/{}", account.username, reblog.id),
+    );
+    Ok(Some(StatusResponse {
+        id: reblog.id.to_string(),
+        created_at: format_timestamp(reblog.created_at),
+        edited_at: None,
+        in_reply_to_id: None,
+        in_reply_to_account_id: None,
+        sensitive: original.sensitive,
+        spoiler_text: String::new(),
+        visibility: original.visibility.clone(),
+        language: None,
+        uri: url.clone(),
+        url,
+        content: String::new(),
+        account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
+        media_attachments: Vec::new(),
+        mentions: Vec::new(),
+        tags: Vec::new(),
+        emojis: Vec::new(),
+        reblogs_count: 0,
+        favourites_count: 0,
+        replies_count: 0,
+        favourited: false,
+        reblogged: viewer.is_some_and(|viewer| viewer == reblog.local_account_id),
+        muted: false,
         bookmarked: false,
         pinned: false,
         reblog: Some(original),

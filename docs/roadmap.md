@@ -28,8 +28,8 @@
 - [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
 - [ ] Build remote reply contexts and conversation/thread traversal across cached local and remote parents.
 - [ ] Support remote reply delivery and addressing for non-public visibility, including follower-only replies.
-- [ ] Deliver and process favourites (`Like`/`Undo`), including remote counters and notifications.
-- [ ] Deliver and process boosts (`Announce`/`Undo`), including remote timeline entries, counters, and notifications.
+- [x] Deliver and process public/unlisted favourites (`Like`/`Undo`), including remote counters, local notifications, and mixed favourites collections.
+- [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
 - [ ] Repair cached-status timelines and notification references after signed remote Deletes.
 - [ ] Process Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle and account migration.
 - [ ] Safely fetch, validate, cache, expire, and render remote media attachments.
@@ -40,7 +40,6 @@
 - [ ] Support remote direct conversations, including encrypted/private addressing policy and timeline projection.
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
 - [ ] Add remote hashtag discovery, status/tag projections, and featured/profile tags.
-- [ ] Add ActivityPub `Announce` support for remote boosts.
 - [ ] Add replay protection for reused or absent remote activity IDs beyond current canonical-ID idempotency.
 - [ ] Support multi-process streaming fan-out and federation-worker coordination.
 
@@ -74,7 +73,6 @@
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
-- [ ] Add remote favourites and boosts (`Like`/`Announce` and their `Undo` activities).
 - [ ] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote media caching.
 - [ ] Add remote notifications and direct conversations.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
@@ -82,7 +80,6 @@
 - [ ] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [ ] Add cursor pagination for account status collections.
 - [ ] Expand local direct conversations toward remote conversation support.
-- [ ] Add remote ActivityPub `Announce` support for boosts.
 - [ ] Add remote hashtag discovery and featured/profile tags.
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.

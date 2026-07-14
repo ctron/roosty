@@ -26,11 +26,12 @@ mod entity;
 use entity::{
     job, local_account, local_account_block, local_account_mute, local_actor_key,
     local_conversation, local_conversation_account, local_follow, local_media_attachment,
-    local_notification, local_status, local_status_bookmark, local_status_favourite,
-    local_status_reblog, local_status_remote_mention, local_status_tag, local_tag,
-    local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
-    oauth_authorization_code, processed_inbox_activity, remote_actor, remote_follow,
-    remote_following, remote_status,
+    local_notification, local_remote_status_favourite, local_remote_status_reblog, local_status,
+    local_status_bookmark, local_status_favourite, local_status_reblog,
+    local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
+    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
+    processed_inbox_activity, remote_actor, remote_follow, remote_following, remote_status,
+    remote_status_favourite, remote_status_reblog,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -1090,6 +1091,45 @@ pub struct LocalStatusReblog {
     pub created_at: OffsetDateTime,
 }
 
+/// Stored local boost of a cached remote Note, including its ActivityPub identity.
+#[derive(Clone, Debug)]
+pub struct LocalRemoteStatusReblog {
+    /// Opaque boost identifier used as the Mastodon status id for boost entries.
+    pub id: Uuid,
+    /// Account that boosted the cached Note.
+    pub local_account_id: AccountId,
+    /// Cached Note that was boosted.
+    pub remote_status_id: StatusId,
+    /// Canonical locally authored Announce activity ID.
+    pub activity_id: String,
+    /// Creation timestamp for the boost.
+    pub created_at: OffsetDateTime,
+}
+
+/// Target of an inbound remote Announce activity.
+#[derive(Clone, Debug)]
+pub enum RemoteStatusReblogTarget {
+    /// A local status was boosted.
+    Local(StatusId),
+    /// A cached remote Note was boosted.
+    Remote(StatusId),
+}
+
+/// Stored remote Announce activity.
+#[derive(Clone, Debug)]
+pub struct RemoteStatusReblog {
+    /// Opaque local identifier for the timeline boost entry.
+    pub id: Uuid,
+    /// Remote actor that announced the status.
+    pub remote_actor_id: AccountId,
+    /// Local or cached remote target of the Announce.
+    pub target: RemoteStatusReblogTarget,
+    /// Canonical remote Announce activity ID.
+    pub activity_id: String,
+    /// Creation timestamp for the boost.
+    pub created_at: OffsetDateTime,
+}
+
 /// A home timeline row, either an authored status or a boost entry.
 #[derive(Clone, Debug)]
 pub enum HomeTimelineItem {
@@ -1099,6 +1139,39 @@ pub enum HomeTimelineItem {
     Reblog(LocalStatusReblog),
     /// Cached status from an accepted remote follow.
     RemoteStatus(RemoteStatus),
+    /// Local boost of a cached remote status.
+    LocalRemoteReblog(LocalRemoteStatusReblog),
+    /// Cached remote actor's boost of a local or cached remote status.
+    RemoteReblog(RemoteStatusReblog),
+}
+
+/// Local or remote actor that boosted a local status.
+#[derive(Clone, Debug)]
+pub enum RebloggedByAccount {
+    /// Local boost actor.
+    Local(LocalAccount),
+    /// Remote boost actor.
+    Remote(RemoteActor),
+}
+
+/// A local or cached remote status returned from the authenticated favourites collection.
+#[derive(Clone, Debug)]
+pub enum FavouriteStatus {
+    /// A locally authored status.
+    Local(LocalStatus),
+    /// A cached remote Note.
+    Remote(RemoteStatus),
+}
+
+/// Stored favourite of a cached remote Note, including its outbound activity identity.
+#[derive(Clone, Debug)]
+pub struct LocalRemoteStatusFavourite {
+    /// Local account that favourited the cached Note.
+    pub local_account_id: AccountId,
+    /// Cached Note that was favourited.
+    pub remote_status_id: StatusId,
+    /// Canonical locally authored Like activity ID.
+    pub activity_id: String,
 }
 
 impl LocalNotificationType {
@@ -1163,6 +1236,10 @@ pub enum JobKind {
     FederationStatusDelivery,
     /// Deliver a locally initiated Follow or Undo(Follow).
     FederationFollowDelivery,
+    /// Deliver a locally initiated Like or Undo(Like).
+    FederationFavouriteDelivery,
+    /// Deliver a locally initiated Announce or Undo(Announce).
+    FederationReblogDelivery,
 }
 
 impl JobKind {
@@ -1434,6 +1511,72 @@ pub async fn notify_remote_actor_follow(
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
+        remote_status_id: Set(None),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(local_notification_from_model(model))
+}
+
+/// Create an idempotent favourite notification caused by a remote actor.
+pub async fn notify_remote_actor_favourite(
+    db: &DbConnection,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+    status_id: StatusId,
+) -> Result<LocalNotification> {
+    if let Some(existing) = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq("favourite"))
+        .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
+        .filter(local_notification::Column::StatusId.eq(Some(status_id.0)))
+        .one(db)
+        .await?
+    {
+        return Ok(local_notification_from_model(existing));
+    }
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("favourite".to_owned()),
+        actor_account_id: Set(None),
+        remote_actor_id: Set(Some(remote_actor_id.0)),
+        status_id: Set(Some(status_id.0)),
+        remote_status_id: Set(None),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(local_notification_from_model(model))
+}
+
+/// Create an idempotent boost notification caused by a remote actor.
+pub async fn notify_remote_actor_reblog(
+    db: &DbConnection,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+    status_id: StatusId,
+) -> Result<LocalNotification> {
+    if let Some(existing) = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq("reblog"))
+        .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
+        .filter(local_notification::Column::StatusId.eq(Some(status_id.0)))
+        .one(db)
+        .await?
+    {
+        return Ok(local_notification_from_model(existing));
+    }
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("reblog".to_owned()),
+        actor_account_id: Set(None),
+        remote_actor_id: Set(Some(remote_actor_id.0)),
+        status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
@@ -3650,6 +3793,97 @@ pub async fn favourite_local_status(
     Ok(())
 }
 
+/// Store a remote actor's favourite of a local status idempotently.
+pub async fn favourite_local_status_by_remote_actor(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    status_id: StatusId,
+    activity_id: &str,
+) -> Result<bool> {
+    let existing = remote_status_favourite::Entity::find()
+        .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_favourite::Column::LocalStatusId.eq(status_id.0))
+        .one(db)
+        .await?;
+    if existing.is_some() {
+        return Ok(false);
+    }
+    remote_status_favourite::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        remote_actor_id: Set(remote_actor_id.0),
+        local_status_id: Set(status_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(db)
+    .await?;
+    Ok(true)
+}
+
+/// Remove a remote actor's favourite identified by its original Like activity.
+pub async fn unfavourite_local_status_by_remote_actor(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<bool> {
+    let result = remote_status_favourite::Entity::delete_many()
+        .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_favourite::Column::ActivityId.eq(activity_id))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected > 0)
+}
+
+/// Store one local account's favourite of a cached remote Note.
+pub async fn favourite_remote_status(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+    activity_id: &str,
+) -> Result<()> {
+    if local_remote_status_favourite::Entity::find()
+        .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(db)
+        .await?
+        .is_none()
+    {
+        local_remote_status_favourite::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_account_id: Set(local_account_id.0),
+            remote_status_id: Set(remote_status_id.0),
+            activity_id: Set(activity_id.to_owned()),
+            created_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Remove and return a local favourite of a cached remote Note for Undo delivery.
+pub async fn unfavourite_remote_status(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<Option<LocalRemoteStatusFavourite>> {
+    let favourite = local_remote_status_favourite::Entity::find()
+        .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(db)
+        .await?;
+    let Some(favourite) = favourite else {
+        return Ok(None);
+    };
+    let result = LocalRemoteStatusFavourite {
+        local_account_id: AccountId(favourite.local_account_id),
+        remote_status_id: StatusId(favourite.remote_status_id),
+        activity_id: favourite.activity_id.clone(),
+    };
+    favourite.into_active_model().delete(db).await?;
+    Ok(Some(result))
+}
+
 /// Remove a local account's favourite from a status when it exists.
 pub async fn unfavourite_local_status(
     db: &DbConnection,
@@ -3668,10 +3902,15 @@ pub async fn unfavourite_local_status(
 
 /// Count active local favourites on a status.
 pub async fn count_local_favourites(db: &DbConnection, status_id: StatusId) -> Result<u64> {
-    Ok(local_status_favourite::Entity::find()
+    let local = local_status_favourite::Entity::find()
         .filter(local_status_favourite::Column::StatusId.eq(status_id.0))
         .count(db)
-        .await?)
+        .await?;
+    let remote = remote_status_favourite::Entity::find()
+        .filter(remote_status_favourite::Column::LocalStatusId.eq(status_id.0))
+        .count(db)
+        .await?;
+    Ok(local + remote)
 }
 
 /// Return whether a local account has favourited a status.
@@ -3686,6 +3925,20 @@ pub async fn is_local_status_favourited(
             .await?
             .is_some(),
     )
+}
+
+/// Return whether a local account has favourited a cached remote Note.
+pub async fn is_remote_status_favourited(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<bool> {
+    Ok(local_remote_status_favourite::Entity::find()
+        .filter(local_remote_status_favourite::Column::LocalAccountId.eq(account_id.0))
+        .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(status_id.0))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 /// List local statuses favourited by an account, newest favourite first.
@@ -3714,6 +3967,50 @@ pub async fn local_favourites_for_account(
         items: active_statuses_by_id(db, status_ids).await?,
         first_cursor,
         last_cursor,
+        has_more,
+    })
+}
+
+/// List local and cached remote statuses favourited by an account, newest first.
+pub async fn favourites_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FavouriteStatus>> {
+    let local = local_status_favourite::Entity::find()
+        .filter(local_status_favourite::Column::AccountId.eq(account_id.0))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_status_favourite::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let remote = local_remote_status_favourite::Entity::find()
+        .filter(local_remote_status_favourite::Column::LocalAccountId.eq(account_id.0))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_remote_status_favourite::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let mut entries = Vec::new();
+    for favourite in local {
+        if let Some(status) = find_local_status_by_id(db, StatusId(favourite.status_id)).await? {
+            entries.push((favourite.id, FavouriteStatus::Local(status)));
+        }
+    }
+    for favourite in remote {
+        if let Some(status) =
+            find_remote_status_by_id(db, StatusId(favourite.remote_status_id)).await?
+        {
+            entries.push((favourite.id, FavouriteStatus::Remote(status)));
+        }
+    }
+    entries.sort_by_key(|(id, _)| Reverse(*id));
+    let (entries, has_more) = trim_to_page(entries, limit);
+    Ok(CollectionPage {
+        first_cursor: entries.first().map(|(id, _)| *id),
+        last_cursor: entries.last().map(|(id, _)| *id),
+        items: entries.into_iter().map(|(_, status)| status).collect(),
         has_more,
     })
 }
@@ -3845,12 +4142,146 @@ pub async fn unreblog_local_status(
     Ok(None)
 }
 
+/// Store a local account's Announce of a cached remote Note.
+pub async fn reblog_remote_status(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+    activity_id: &str,
+) -> Result<LocalRemoteStatusReblog> {
+    if let Some(model) = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(db)
+        .await?
+    {
+        return Ok(local_remote_status_reblog_from_model(model));
+    }
+    let model = local_remote_status_reblog::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        local_account_id: Set(local_account_id.0),
+        remote_status_id: Set(remote_status_id.0),
+        activity_id: Set(activity_id.to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(db)
+    .await?;
+    Ok(local_remote_status_reblog_from_model(model))
+}
+
+/// Remove a local account's Announce of a cached remote Note.
+pub async fn unreblog_remote_status(
+    db: &DbConnection,
+    local_account_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<Option<LocalRemoteStatusReblog>> {
+    let model = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
+        .one(db)
+        .await?;
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let reblog = local_remote_status_reblog_from_model(model.clone());
+    model.into_active_model().delete(db).await?;
+    Ok(Some(reblog))
+}
+
+/// Return whether a local account announced a cached remote Note.
+pub async fn is_remote_status_reblogged(
+    db: &DbConnection,
+    account_id: AccountId,
+    status_id: StatusId,
+) -> Result<bool> {
+    Ok(local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(account_id.0))
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status_id.0))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Store a validated inbound Announce, returning false when it already exists.
+pub async fn reblog_status_by_remote_actor(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    target: RemoteStatusReblogTarget,
+    activity_id: &str,
+) -> Result<bool> {
+    let (local_status_id, remote_status_id) = match target {
+        RemoteStatusReblogTarget::Local(id) => (Some(id.0), None),
+        RemoteStatusReblogTarget::Remote(id) => (None, Some(id.0)),
+    };
+    if remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_reblog::Column::LocalStatusId.eq(local_status_id))
+        .filter(remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    remote_status_reblog::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        remote_actor_id: Set(remote_actor_id.0),
+        local_status_id: Set(local_status_id),
+        remote_status_id: Set(remote_status_id),
+        activity_id: Set(activity_id.to_owned()),
+        created_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(db)
+    .await?;
+    Ok(true)
+}
+
+/// Remove a remote Announce by its canonical activity identity.
+pub async fn unreblog_status_by_remote_actor(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<Option<RemoteStatusReblog>> {
+    let model = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_reblog::Column::ActivityId.eq(activity_id))
+        .one(db)
+        .await?;
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let Some(reblog) = remote_status_reblog_from_model(model.clone()) else {
+        return Ok(None);
+    };
+    model.into_active_model().delete(db).await?;
+    Ok(Some(reblog))
+}
+
+/// Find a remote Announce by actor and ActivityPub identity.
+pub async fn find_remote_status_reblog_by_activity_id(
+    db: &DbConnection,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<Option<RemoteStatusReblog>> {
+    Ok(remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status_reblog::Column::ActivityId.eq(activity_id))
+        .one(db)
+        .await?
+        .and_then(remote_status_reblog_from_model))
+}
+
 /// Count active local boosts on a status.
 pub async fn count_local_reblogs(db: &DbConnection, status_id: StatusId) -> Result<u64> {
-    Ok(local_status_reblog::Entity::find()
+    let local = local_status_reblog::Entity::find()
         .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
         .count(db)
-        .await?)
+        .await?;
+    let remote = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::LocalStatusId.eq(Some(status_id.0)))
+        .count(db)
+        .await?;
+    Ok(local + remote)
 }
 
 /// Return whether a local account has boosted a status.
@@ -3891,6 +4322,52 @@ pub async fn local_reblogged_by_for_status(
 
     Ok(CollectionPage {
         items: local_accounts_by_id(db, account_ids).await?,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// List local and remote accounts that boosted a local status, newest first.
+pub async fn reblogged_by_for_status(
+    db: &DbConnection,
+    status_id: StatusId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<RebloggedByAccount>> {
+    let local = local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(local_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let remote = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::LocalStatusId.eq(Some(status_id.0)))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(remote_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let mut entries = Vec::new();
+    for reblog in local {
+        if let Some(account) = find_local_account_by_id(db, AccountId(reblog.account_id)).await? {
+            entries.push((reblog.id, RebloggedByAccount::Local(account)));
+        }
+    }
+    for reblog in remote {
+        if let Some(account) =
+            find_remote_actor_by_id(db, AccountId(reblog.remote_actor_id)).await?
+        {
+            entries.push((reblog.id, RebloggedByAccount::Remote(account)));
+        }
+    }
+    entries.sort_by_key(|(id, _)| Reverse(*id));
+    let (entries, has_more) = trim_to_page(entries, limit);
+    let first_cursor = entries.first().map(|(id, _)| *id);
+    let last_cursor = entries.last().map(|(id, _)| *id);
+    Ok(CollectionPage {
+        items: entries.into_iter().map(|(_, account)| account).collect(),
         first_cursor,
         last_cursor,
         has_more,
@@ -4128,7 +4605,7 @@ pub async fn home_timeline_for_account(
         .collect::<Vec<_>>();
     let mut reblog_query = apply_reblog_timeline_cursor(
         local_status_reblog::Entity::find()
-            .filter(local_status_reblog::Column::AccountId.is_in(reblog_account_ids)),
+            .filter(local_status_reblog::Column::AccountId.is_in(reblog_account_ids.clone())),
         cursor,
     );
     if !hidden_account_ids.is_empty() {
@@ -4137,6 +4614,25 @@ pub async fn home_timeline_for_account(
     }
     let reblogs = reblog_query
         .order_by_desc(local_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let mut remote_reblogs_by_local_query = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.is_in(reblog_account_ids));
+    if let Some(max_id) = cursor.max_id {
+        remote_reblogs_by_local_query = remote_reblogs_by_local_query
+            .filter(local_remote_status_reblog::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        remote_reblogs_by_local_query = remote_reblogs_by_local_query
+            .filter(local_remote_status_reblog::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        remote_reblogs_by_local_query = remote_reblogs_by_local_query
+            .filter(local_remote_status_reblog::Column::Id.gt(min_id.0));
+    }
+    let remote_reblogs_by_local = remote_reblogs_by_local_query
+        .order_by_desc(local_remote_status_reblog::Column::Id)
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
@@ -4166,6 +4662,33 @@ pub async fn home_timeline_for_account(
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let mut remote_reblog_query = remote_status_reblog::Entity::find().filter(
+        remote_status_reblog::Column::RemoteActorId.in_subquery(
+            Query::select()
+                .column(remote_following::Column::RemoteActorId)
+                .from(remote_following::Entity)
+                .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
+                .and_where(remote_following::Column::State.eq("accepted"))
+                .to_owned(),
+        ),
+    );
+    if let Some(max_id) = cursor.max_id {
+        remote_reblog_query =
+            remote_reblog_query.filter(remote_status_reblog::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        remote_reblog_query =
+            remote_reblog_query.filter(remote_status_reblog::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        remote_reblog_query =
+            remote_reblog_query.filter(remote_status_reblog::Column::Id.gt(min_id.0));
+    }
+    let remote_reblogs = remote_reblog_query
+        .order_by_desc(remote_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
     let mut items = statuses
         .into_iter()
         .map(local_status_from_model)
@@ -4181,6 +4704,18 @@ pub async fn home_timeline_for_account(
                 .into_iter()
                 .map(remote_status_from_model)
                 .map(HomeTimelineItem::RemoteStatus),
+        )
+        .chain(
+            remote_reblogs_by_local
+                .into_iter()
+                .map(local_remote_status_reblog_from_model)
+                .map(HomeTimelineItem::LocalRemoteReblog),
+        )
+        .chain(
+            remote_reblogs
+                .into_iter()
+                .filter_map(remote_status_reblog_from_model)
+                .map(HomeTimelineItem::RemoteReblog),
         )
         .collect::<Vec<_>>();
     items.sort_by_key(|item| Reverse(timeline_item_id(item)));
@@ -4248,6 +4783,8 @@ fn timeline_item_id(item: &HomeTimelineItem) -> Uuid {
         HomeTimelineItem::Status(status) => status.id.0,
         HomeTimelineItem::Reblog(reblog) => reblog.id,
         HomeTimelineItem::RemoteStatus(status) => status.id.0,
+        HomeTimelineItem::LocalRemoteReblog(reblog) => reblog.id,
+        HomeTimelineItem::RemoteReblog(reblog) => reblog.id,
     }
 }
 
@@ -4387,6 +4924,36 @@ impl ApplyCollectionCursor for Select<remote_follow::Entity> {
         }
         if let Some(min_id) = cursor.min_id {
             self = self.filter(remote_follow::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_remote_status_favourite::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_remote_status_favourite::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_remote_status_favourite::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_remote_status_favourite::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<remote_status_reblog::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(remote_status_reblog::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(remote_status_reblog::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(remote_status_reblog::Column::Id.gt(min_id));
         }
         self
     }
@@ -4688,6 +5255,37 @@ fn remote_status_from_model(status: remote_status::Model) -> RemoteStatus {
         in_reply_to_remote_status_id: status.in_reply_to_remote_status_id.map(StatusId),
         object: status.object,
     }
+}
+
+/// Convert a persisted local Announce of a remote Note into its shared projection.
+fn local_remote_status_reblog_from_model(
+    reblog: local_remote_status_reblog::Model,
+) -> LocalRemoteStatusReblog {
+    LocalRemoteStatusReblog {
+        id: reblog.id,
+        local_account_id: AccountId(reblog.local_account_id),
+        remote_status_id: StatusId(reblog.remote_status_id),
+        activity_id: reblog.activity_id,
+        created_at: reblog.created_at,
+    }
+}
+
+/// Convert a persisted remote Announce into its shared projection.
+fn remote_status_reblog_from_model(
+    reblog: remote_status_reblog::Model,
+) -> Option<RemoteStatusReblog> {
+    let target = match (reblog.local_status_id, reblog.remote_status_id) {
+        (Some(status_id), None) => RemoteStatusReblogTarget::Local(StatusId(status_id)),
+        (None, Some(status_id)) => RemoteStatusReblogTarget::Remote(StatusId(status_id)),
+        _ => return None,
+    };
+    Some(RemoteStatusReblog {
+        id: reblog.id,
+        remote_actor_id: AccountId(reblog.remote_actor_id),
+        target,
+        activity_id: reblog.activity_id,
+        created_at: reblog.created_at,
+    })
 }
 
 fn remote_following_from_model(follow: remote_following::Model) -> RemoteFollowing {

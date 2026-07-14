@@ -130,6 +130,87 @@ struct InboundUndoFollowActivity {
     object: InboundUndoFollowObject,
 }
 
+/// ActivityPub Like fields accepted from a signed remote inbox.
+#[derive(Deserialize)]
+struct InboundLikeActivity {
+    actor: String,
+    object: String,
+}
+
+/// ActivityPub Undo fields used to revoke a Like.
+#[derive(Deserialize)]
+struct InboundUndoLikeActivity {
+    object: InboundUndoLikeObject,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundUndoLikeObject {
+    Id(String),
+    Like { id: String, r#type: InboundLikeType },
+}
+
+/// Closed ActivityStreams type accepted in an embedded Undo(Like) object.
+#[derive(Deserialize, PartialEq)]
+enum InboundLikeType {
+    Like,
+}
+
+impl InboundUndoLikeObject {
+    /// Return an embedded Like activity ID only when its type is correct.
+    fn like_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Like {
+                id,
+                r#type: InboundLikeType::Like,
+            } => Some(id),
+        }
+    }
+}
+
+/// ActivityPub Announce fields accepted from a signed remote inbox.
+#[derive(Deserialize)]
+struct InboundAnnounceActivity {
+    actor: String,
+    object: String,
+}
+
+/// ActivityPub Undo fields used to revoke an Announce.
+#[derive(Deserialize)]
+struct InboundUndoAnnounceActivity {
+    object: InboundUndoAnnounceObject,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundUndoAnnounceObject {
+    Id(String),
+    Announce {
+        id: String,
+        r#type: InboundAnnounceType,
+    },
+}
+
+/// Closed ActivityStreams type accepted in an embedded Undo(Announce) object.
+#[derive(Deserialize, PartialEq)]
+enum InboundAnnounceType {
+    Announce,
+}
+
+impl InboundUndoAnnounceObject {
+    /// Return an embedded Announce activity ID only when its type is correct.
+    fn announce_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Announce {
+                id,
+                r#type: InboundAnnounceType::Announce,
+            } => Some(id),
+        }
+    }
+}
+
 /// Remote Note fields needed for the first cache projection.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -709,6 +790,189 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => internal_error(error),
         };
     }
+    if activity.get("type").and_then(JsonValue::as_str) == Some("Like") {
+        let like: InboundLikeActivity = match serde_json::from_value(activity.clone()) {
+            Ok(like) => like,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        if like.actor != remote_actor.activitypub_id || !like.object.starts_with("https://") {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        let Some(status_id) = local_status_id_from_url(state, &like.object)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return StatusCode::ACCEPTED.into_response();
+        };
+        let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+            Ok(Some(status)) if matches!(status.visibility.as_str(), "public" | "unlisted") => {
+                status
+            }
+            Ok(_) => return StatusCode::ACCEPTED.into_response(),
+            Err(error) => return internal_error(error),
+        };
+        match roosty_db::favourite_local_status_by_remote_actor(
+            &state.db,
+            remote_actor.id,
+            status.id,
+            &activity_id,
+        )
+        .await
+        {
+            Ok(created) => {
+                if created
+                    && let Err(error) =
+                        crate::notifications::create_and_stream_remote_favourite_notification(
+                            state,
+                            status.account_id,
+                            remote_actor.id,
+                            status.id,
+                        )
+                        .await
+                {
+                    tracing::warn!(%error, activity_id, "could not create remote favourite notification");
+                }
+                let _ = roosty_db::record_processed_inbox_activity(
+                    &state.db,
+                    &activity_id,
+                    remote_actor.id,
+                )
+                .await;
+                return StatusCode::ACCEPTED.into_response();
+            }
+            Err(error) => return internal_error(error),
+        }
+    }
+    if activity.get("type").and_then(JsonValue::as_str) == Some("Announce") {
+        let announce: InboundAnnounceActivity = match serde_json::from_value(activity.clone()) {
+            Ok(announce) => announce,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        if announce.actor != remote_actor.activitypub_id || !announce.object.starts_with("https://")
+        {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        let target = match local_status_id_from_url(state, &announce.object).await {
+            Ok(Some(status_id)) => match roosty_db::find_local_status_by_id(&state.db, status_id)
+                .await
+            {
+                Ok(Some(status)) if matches!(status.visibility.as_str(), "public" | "unlisted") => {
+                    roosty_db::RemoteStatusReblogTarget::Local(status.id)
+                }
+                Ok(_) => return StatusCode::ACCEPTED.into_response(),
+                Err(error) => return internal_error(error),
+            },
+            Ok(None) => {
+                match roosty_db::find_remote_status_by_activitypub_id(&state.db, &announce.object)
+                    .await
+                {
+                    Ok(Some(status))
+                        if matches!(status.visibility.as_str(), "public" | "unlisted") =>
+                    {
+                        roosty_db::RemoteStatusReblogTarget::Remote(status.id)
+                    }
+                    Ok(_) => return StatusCode::ACCEPTED.into_response(),
+                    Err(error) => return internal_error(error),
+                }
+            }
+            Err(error) => return internal_error(error),
+        };
+        match roosty_db::reblog_status_by_remote_actor(
+            &state.db,
+            remote_actor.id,
+            target.clone(),
+            &activity_id,
+        )
+        .await
+        {
+            Ok(created) => {
+                if created {
+                    if let roosty_db::RemoteStatusReblogTarget::Local(status_id) = target
+                        && let Ok(Some(status)) =
+                            roosty_db::find_local_status_by_id(&state.db, status_id).await
+                        && let Err(error) =
+                            crate::notifications::create_and_stream_remote_reblog_notification(
+                                state,
+                                status.account_id,
+                                remote_actor.id,
+                                status.id,
+                            )
+                            .await
+                    {
+                        tracing::warn!(%error, activity_id, "could not create remote reblog notification");
+                    }
+                    if let Err(error) = crate::statuses::publish_remote_reblog_update(
+                        state,
+                        remote_actor.id,
+                        &activity_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, activity_id, "could not stream remote reblog");
+                    }
+                }
+                let _ = roosty_db::record_processed_inbox_activity(
+                    &state.db,
+                    &activity_id,
+                    remote_actor.id,
+                )
+                .await;
+                return StatusCode::ACCEPTED.into_response();
+            }
+            Err(error) => return internal_error(error),
+        }
+    }
+    if activity.get("type").and_then(JsonValue::as_str) == Some("Undo")
+        && let Ok(undo) = serde_json::from_value::<InboundUndoAnnounceActivity>(activity.clone())
+        && let Some(original_id) = undo.object.announce_id()
+    {
+        match roosty_db::unreblog_status_by_remote_actor(&state.db, remote_actor.id, &original_id)
+            .await
+        {
+            Ok(Some(reblog)) => {
+                if let Err(error) =
+                    crate::statuses::publish_remote_reblog_delete(state, remote_actor.id, reblog.id)
+                        .await
+                {
+                    tracing::warn!(%error, activity_id, "could not stream remote unboost");
+                }
+                let _ = roosty_db::record_processed_inbox_activity(
+                    &state.db,
+                    &activity_id,
+                    remote_actor.id,
+                )
+                .await;
+                return StatusCode::ACCEPTED.into_response();
+            }
+            Ok(None) => {}
+            Err(error) => return internal_error(error),
+        }
+    }
+    if activity.get("type").and_then(JsonValue::as_str) == Some("Undo")
+        && let Ok(undo) = serde_json::from_value::<InboundUndoLikeActivity>(activity.clone())
+        && let Some(original_id) = undo.object.like_id()
+    {
+        match roosty_db::unfavourite_local_status_by_remote_actor(
+            &state.db,
+            remote_actor.id,
+            &original_id,
+        )
+        .await
+        {
+            Ok(true) => {
+                let _ = roosty_db::record_processed_inbox_activity(
+                    &state.db,
+                    &activity_id,
+                    remote_actor.id,
+                )
+                .await;
+                return StatusCode::ACCEPTED.into_response();
+            }
+            Ok(false) => {}
+            Err(error) => return internal_error(error),
+        }
+    }
     if !matches!(
         activity.get("type").and_then(JsonValue::as_str),
         Some("Follow") | Some("Undo")
@@ -1208,6 +1472,247 @@ struct FollowDelivery {
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity: JsonValue,
+}
+
+/// Durable payload for a local Like or Undo(Like) delivery.
+#[derive(Deserialize, Serialize)]
+struct FavouriteDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+}
+
+/// Durable payload for a local Announce or Undo(Announce) delivery.
+#[derive(Deserialize, Serialize)]
+struct ReblogDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+}
+
+/// Closed ActivityStreams activity types emitted for boost federation.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "PascalCase")]
+enum OutboundReblogType {
+    Announce,
+    Undo,
+}
+
+/// Typed embedded Announce reference used by Undo(Announce).
+#[derive(Serialize)]
+struct OutboundAnnounceReference {
+    id: String,
+    #[serde(rename = "type")]
+    r#type: OutboundReblogType,
+    actor: String,
+    object: String,
+}
+
+/// Typed ActivityPub Announce or Undo(Announce) payload.
+#[derive(Serialize)]
+struct OutboundReblogActivity<T> {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    #[serde(rename = "type")]
+    r#type: OutboundReblogType,
+    actor: String,
+    object: T,
+}
+
+/// Queue a signed Like activity for a cached remote Note.
+pub(crate) async fn enqueue_remote_favourite(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_status: &roosty_db::RemoteStatus,
+) -> Result<String, RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local favourite actor does not exist".to_owned())
+        })?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote status author does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#like-{}", Uuid::now_v7());
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Like", "actor": actor, "object": remote_status.activitypub_id});
+    enqueue_favourite_delivery(state, local_account_id, remote.id, activity, &id).await?;
+    Ok(id)
+}
+
+/// Queue a signed Undo(Like) activity for a cached remote Note.
+pub(crate) async fn enqueue_remote_unfavourite(
+    state: &AppState,
+    favourite: roosty_db::LocalRemoteStatusFavourite,
+) -> Result<(), RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, favourite.local_account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local favourite actor does not exist".to_owned())
+        })?;
+    let remote_status = roosty_db::find_remote_status_by_id(&state.db, favourite.remote_status_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote favourite status does not exist".to_owned())
+        })?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote status author does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#undo-like-{}", Uuid::now_v7());
+    let like = serde_json::json!({"id": favourite.activity_id, "type": "Like", "actor": actor, "object": remote_status.activitypub_id});
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": like});
+    enqueue_favourite_delivery(state, favourite.local_account_id, remote.id, activity, &id).await
+}
+
+async fn enqueue_favourite_delivery(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+    activity_id: &str,
+) -> Result<(), RoostyError> {
+    let payload = serde_json::to_value(FavouriteDelivery {
+        local_account_id,
+        remote_actor_id,
+        activity,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::enqueue_job(
+        &state.db,
+        roosty_db::JobKind::FederationFavouriteDelivery,
+        payload,
+        Some(activity_id),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Dispatch a durable Like or Undo(Like) delivery job.
+pub(crate) async fn deliver_favourite_activity(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: FavouriteDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid favourite delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+    )
+    .await
+}
+
+/// Queue a signed Announce activity for a cached remote Note.
+pub(crate) async fn enqueue_remote_reblog(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_status: &roosty_db::RemoteStatus,
+) -> Result<String, RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local boost actor does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote boost status author does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#announce-{}", Uuid::now_v7());
+    let activity = OutboundReblogActivity {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: id.clone(),
+        r#type: OutboundReblogType::Announce,
+        actor,
+        object: remote_status.activitypub_id.clone(),
+    };
+    enqueue_reblog_delivery(state, local_account_id, remote.id, activity, &id).await?;
+    Ok(id)
+}
+
+/// Queue a signed Undo(Announce) activity for a cached remote Note.
+pub(crate) async fn enqueue_remote_unreblog(
+    state: &AppState,
+    reblog: roosty_db::LocalRemoteStatusReblog,
+) -> Result<(), RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, reblog.local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local boost actor does not exist".to_owned()))?;
+    let remote_status = roosty_db::find_remote_status_by_id(&state.db, reblog.remote_status_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote boosted status does not exist".to_owned())
+        })?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote boost status author does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#undo-announce-{}", Uuid::now_v7());
+    let activity = OutboundReblogActivity {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: id.clone(),
+        r#type: OutboundReblogType::Undo,
+        actor: actor.clone(),
+        object: OutboundAnnounceReference {
+            id: reblog.activity_id,
+            r#type: OutboundReblogType::Announce,
+            actor,
+            object: remote_status.activitypub_id,
+        },
+    };
+    enqueue_reblog_delivery(state, reblog.local_account_id, remote.id, activity, &id).await
+}
+
+/// Serialize and enqueue an Announce-family activity for one remote destination.
+async fn enqueue_reblog_delivery<T: Serialize>(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: T,
+    activity_id: &str,
+) -> Result<(), RoostyError> {
+    let activity = serde_json::to_value(activity)
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let payload = serde_json::to_value(ReblogDelivery {
+        local_account_id,
+        remote_actor_id,
+        activity,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::enqueue_job(
+        &state.db,
+        roosty_db::JobKind::FederationReblogDelivery,
+        payload,
+        Some(activity_id),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Dispatch a durable Announce or Undo(Announce) delivery job.
+pub(crate) async fn deliver_reblog_activity(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: ReblogDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid reblog delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+    )
+    .await
 }
 
 /// Queue a signed Follow activity for a remote actor and return its stable activity ID.
@@ -1914,8 +2419,8 @@ mod tests {
 
     use super::{
         Actor, ActorType, CollectionType, Create, CreateType, InboundFollowActivity, InboundNote,
-        InboundUndoFollowActivity, MentionTag, MentionType, Note, NoteType, OrderedCollection,
-        PublicKey, parse_acct, remote_status_visibility,
+        InboundUndoAnnounceActivity, InboundUndoFollowActivity, MentionTag, MentionType, Note,
+        NoteType, OrderedCollection, PublicKey, parse_acct, remote_status_visibility,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -1972,6 +2477,32 @@ mod tests {
             Some("https://remote.test/follows/1")
         );
         assert_eq!(invalid.object.follow_id(), None);
+    }
+
+    /// Undo accepts a link or a correctly typed embedded Announce, never another activity type.
+    #[test]
+    fn parses_announce_undo_reference_forms() {
+        let string: InboundUndoAnnounceActivity =
+            serde_json::from_str(r#"{"object":"https://remote.test/announces/1"}"#).unwrap();
+        let embedded: InboundUndoAnnounceActivity = serde_json::from_str(
+            r#"{"object":{"id":"https://remote.test/announces/1","type":"Announce"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            string.object.announce_id().as_deref(),
+            Some("https://remote.test/announces/1")
+        );
+        assert_eq!(
+            embedded.object.announce_id().as_deref(),
+            Some("https://remote.test/announces/1")
+        );
+        assert!(
+            serde_json::from_str::<InboundUndoAnnounceActivity>(
+                r#"{"object":{"id":"https://remote.test/announces/1","type":"Like"}}"#,
+            )
+            .is_err()
+        );
     }
 
     /// Given isolated instances, when a remote account follows then unfollows, signed status
@@ -2199,6 +2730,148 @@ mod tests {
             .is_empty()
         );
 
+        context.teardown().await;
+    }
+
+    /// Given a cached public remote Note, when its local follower favourites then unfavourites it,
+    /// then signed Like and Undo activities update the origin's favourite count.
+    #[tokio::test]
+    async fn remote_favourite_and_undo_are_delivered_to_the_status_origin() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        test_transport::register_inbox("alpha.test", context.alpha.clone());
+        test_transport::register_inbox("beta.test", context.beta.clone());
+
+        let author = create_test_account(&context.alpha, "author").await;
+        let liker = create_test_account(&context.beta, "liker").await;
+        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+            .await
+            .unwrap();
+        let beta_key = super::ensure_actor_key(&context.beta, liker.id)
+            .await
+            .unwrap();
+        let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
+        let _beta_remote = cache_test_actor(&context.alpha, "liker", "beta.test", beta_key).await;
+        let local_status =
+            create_public_test_status(&context.alpha, author.id, "like target").await;
+        let remote_status = cache_test_status(
+            &context.beta,
+            alpha_remote.id,
+            &super::status_url(&context.alpha, "author", local_status.id),
+        )
+        .await;
+
+        let activity_id = super::enqueue_remote_favourite(&context.beta, liker.id, &remote_status)
+            .await
+            .unwrap();
+        roosty_db::favourite_remote_status(
+            &context.beta.db,
+            liker.id,
+            remote_status.id,
+            &activity_id,
+        )
+        .await
+        .unwrap();
+        deliver_test_job(
+            &context.beta,
+            roosty_db::JobKind::FederationFavouriteDelivery,
+        )
+        .await;
+        assert_eq!(
+            roosty_db::count_local_favourites(&context.alpha.db, local_status.id)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let favourite =
+            roosty_db::unfavourite_remote_status(&context.beta.db, liker.id, remote_status.id)
+                .await
+                .unwrap()
+                .unwrap();
+        super::enqueue_remote_unfavourite(&context.beta, favourite)
+            .await
+            .unwrap();
+        deliver_test_job(
+            &context.beta,
+            roosty_db::JobKind::FederationFavouriteDelivery,
+        )
+        .await;
+        assert_eq!(
+            roosty_db::count_local_favourites(&context.alpha.db, local_status.id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        test_transport::clear_inboxes();
+        context.teardown().await;
+    }
+
+    /// Given a cached public remote Note, when its local follower boosts then unboosts it, then
+    /// signed Announce and Undo activities update the origin's boost count.
+    #[tokio::test]
+    async fn remote_reblog_and_undo_are_delivered_to_the_status_origin() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        test_transport::register_inbox("alpha.test", context.alpha.clone());
+        test_transport::register_inbox("beta.test", context.beta.clone());
+
+        let author = create_test_account(&context.alpha, "author").await;
+        let booster = create_test_account(&context.beta, "booster").await;
+        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+            .await
+            .unwrap();
+        let beta_key = super::ensure_actor_key(&context.beta, booster.id)
+            .await
+            .unwrap();
+        let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
+        let _beta_remote = cache_test_actor(&context.alpha, "booster", "beta.test", beta_key).await;
+        let local_status =
+            create_public_test_status(&context.alpha, author.id, "boost target").await;
+        let remote_status = cache_test_status(
+            &context.beta,
+            alpha_remote.id,
+            &super::status_url(&context.alpha, "author", local_status.id),
+        )
+        .await;
+
+        let activity_id = super::enqueue_remote_reblog(&context.beta, booster.id, &remote_status)
+            .await
+            .unwrap();
+        roosty_db::reblog_remote_status(
+            &context.beta.db,
+            booster.id,
+            remote_status.id,
+            &activity_id,
+        )
+        .await
+        .unwrap();
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationReblogDelivery).await;
+        assert_eq!(
+            roosty_db::count_local_reblogs(&context.alpha.db, local_status.id)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let reblog =
+            roosty_db::unreblog_remote_status(&context.beta.db, booster.id, remote_status.id)
+                .await
+                .unwrap()
+                .unwrap();
+        super::enqueue_remote_unreblog(&context.beta, reblog)
+            .await
+            .unwrap();
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationReblogDelivery).await;
+        assert_eq!(
+            roosty_db::count_local_reblogs(&context.alpha.db, local_status.id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        test_transport::clear_inboxes();
         context.teardown().await;
     }
 
@@ -2484,6 +3157,30 @@ mod tests {
         .unwrap()
     }
 
+    async fn cache_test_status(
+        state: &AppState,
+        remote_actor_id: AccountId,
+        activitypub_id: &str,
+    ) -> roosty_db::RemoteStatus {
+        roosty_db::upsert_remote_status(
+            &state.db,
+            roosty_db::NewRemoteStatus {
+                activitypub_id: activitypub_id.to_owned(),
+                remote_actor_id,
+                content: "cached remote status".to_owned(),
+                visibility: "public".to_owned(),
+                published_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
     async fn deliver_test_job(state: &AppState, kind: roosty_db::JobKind) {
         let mut jobs =
             roosty_db::claim_due_jobs(&state.db, "federation-test", 10, time::Duration::minutes(1))
@@ -2505,6 +3202,16 @@ mod tests {
             }
             roosty_db::JobKind::FederationFollowDelivery => {
                 super::deliver_follow_activity(state, job.payload)
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationFavouriteDelivery => {
+                super::deliver_favourite_activity(state, job.payload)
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationReblogDelivery => {
+                super::deliver_reblog_activity(state, job.payload)
                     .await
                     .unwrap();
             }

@@ -94,17 +94,17 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Hashtags | Local `#tag` text is stored, linked in rendered status HTML, and returned in status `tags`; followed tags and remote tags are missing. |
 | 🟡 | Conversations | Local direct-message conversations list/read/delete and direct stream events work for direct statuses with local participants; remote conversations are missing. |
 | 🟡 | Visibility semantics | Public/unlisted URL reads work; direct reads work for local conversation participants; private remains owner-only until follow graph support exists. |
-| 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local favourites with cursor pagination. |
-| 🟢 | Favourites | Favourite/unfavourite APIs and status counts are implemented for local statuses. |
+| 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local and cached-remote favourites with cursor pagination. |
+| 🟡 | Favourites | Public/unlisted local and cached remote statuses support favourite/unfavourite. Signed ActivityPub `Like`/`Undo` updates local counts and notifications; remote favourite counts are not fetched. |
 | 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
-| 🟡 | Boosts | Local reblog/unreblog APIs, `reblogs_count`, viewer `reblogged`, `reblogged_by`, home timeline boost entries, and reblog notifications are implemented; ActivityPub `Announce` is missing. |
+| 🟡 | Boosts | Public/unlisted local and cached-remote statuses support reblog/unreblog. Signed ActivityPub `Announce`/`Undo` is delivered and processed, with remote boost counters, mixed `reblogged_by`, home timeline entries, and local notifications; quote posts and private boosts are missing. |
 | 🟢 | Bookmarks | Bookmark/unbookmark APIs are implemented for local statuses. |
 
 ### Timelines
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed local public/unlisted statuses, and followed local boosts when enabled. |
+| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed local public/unlisted statuses, local boosts, cached remote statuses, and inbound remote boosts. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
 | 🟡 | `GET /api/v1/timelines/tag/:tag` | Local public hashtag timeline with `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, and `Link` headers; remote hashtag timelines are missing. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
@@ -153,7 +153,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, reply references, and author ownership checks. Cached Notes from accepted remote follows appear in home timelines and are streamed to those followers; media and interactions remain missing. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
 | 🔴 | Remote timeline fan-out | Remote home-timeline delivery, repair, and remote visibility semantics are missing. |
-| 🟡 | Remote replies and mentions | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Remote favourites, boosts, mutes, and blocks remain missing. |
+| 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed for public/unlisted statuses. Remote mutes and blocks remain missing. |
 | 🔴 | Remote conversations and moderation | Direct conversations, account migration, signed inbox processing, domain-policy moderation, and delivery are missing. |
 
 ## TODO
@@ -163,10 +163,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add signed inbound Follow, Undo, Accept, Reject, and locked-account follow-request processing.
 - [ ] Add signed outbound Follow, Undo, Accept, Reject, Create, Update, and Delete delivery with retries.
 - [ ] Add remote follower home-timeline fan-out, repair jobs, and visibility semantics.
-- [ ] Add remote replies, mentions, favourites, boosts, deletes, notifications, mutes, and blocks.
+- [ ] Add remote deletes, recipient notifications, mutes, and blocks.
 - [ ] Add remote direct conversations, account migration, and domain-policy moderation.
 - [ ] Expand conversation support beyond local direct messages.
-- [ ] Add remote ActivityPub `Announce` support.
 - [ ] Add remote hashtag support.
 - [ ] Add grouped notifications, push integration, and remote notification events.
 - [ ] Support multiple Roosty processes with shared streaming fan-out and cross-process coordination.

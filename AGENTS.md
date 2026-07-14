@@ -29,20 +29,31 @@ Keep this as the default verification command for changes in this repository.
 - Use SeaORM migrations as the canonical migration system from the start.
 - Prefer SeaORM entities and query builders for database reads and writes. Use raw SQL only when it is materially clearer
   or required for a database-specific operation such as row locking, partial-index conflict inference, or a complex CTE.
+- Prefer idiomatic, strongly typed Rust: model domain concepts with dedicated types, structs, and enums instead of
+  stringly typed values or dynamically shaped data.
 - Model closed `kind`, `type`, `state`, and similar discriminator fields as Rust enums. Convert them to strings only at
   persistence or wire-format boundaries.
+- Prefer strongly typed Rust structs with Serde derives over manual JSON processing. Avoid using `serde_json::Value`
+  unless the JSON shape is genuinely dynamic or unknown.
+- Prefer importing types over repeatedly using fully qualified type paths, except where importing would make the code
+  ambiguous or less clear.
+- Avoid unnecessary cloning; prefer borrowing, moving, or restructuring ownership when it keeps the code clear.
 - Prefer file-backed Rust modules over nested inline modules. Use nested inline modules only when they are very small
   and local to their parent.
 - Before adding a new dependency, check for its most recent version.
 
+## Database Transactions
+
+- Prefer database transactions for multi-step reads and writes that must observe or preserve a consistent state.
+
 ## Documentation
 
-- Document all non-trivial Rust functions, types, and modules with rustdoc comments (`///` or `//!`). Trivial glue,
-  accessors, and one-line helpers do not need comments.
-- For larger or non-obvious function bodies, add concise internal comments that explain the major steps or invariants.
-- Document non-obvious tests with concise comments that state the compatibility behavior or invariant being protected
-  using Rust doc on the function. Also document `rstest` cases in their `#[case]` lines.
-- Document non-obvious tests in a give, when, then style.
+- Add concise rustdoc (`///` or `//!`) to non-trivial or reused Rust types, functions, and modules; trivial glue,
+  accessors, and one-line helpers do not need it. Document the purpose, contract, or compatibility behavior rather
+  than restating the name.
+- For larger or non-obvious function bodies, add concise internal comments explaining the major steps or invariants.
+- Add concise rustdoc to non-obvious tests describing the behavior or invariant protected, preferably in give, when,
+  then style. Document `rstest` cases in their `#[case]` lines.
 - Update `docs/roadmap.md` and `docs/compatibility.md` when adding, removing, or materially changing ActivityPub or
   Mastodon-compatible behavior.
 - When adding Mastodon-compatible endpoints that accept `limit`, check the official API shape and implement the
