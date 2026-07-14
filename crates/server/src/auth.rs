@@ -13,6 +13,7 @@ use axum_params::{Params, UploadFile};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use roosty_core::{AccountId, RoostyError};
+use sea_orm::TransactionTrait;
 use serde::{
     Deserialize, Serialize,
     de::{self, DeserializeOwned, MapAccess, Visitor},
@@ -988,11 +989,25 @@ async fn update_credentials(
         Err(error) => return bad_request(&error.to_string()),
     };
 
-    match roosty_db::update_local_account_settings(&state.db, account.id, update).await {
-        Ok(account) => match account_response(&state, account).await {
-            Ok(account) => Json(account).into_response(),
-            Err(error) => server_error(error),
-        },
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let updated = match roosty_db::update_local_account_settings(&txn, account.id, update).await {
+        Ok(account) => account,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) =
+        crate::federation::enqueue_actor_update_in_transaction(&state, &txn, updated.clone()).await
+    {
+        return server_error(error);
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+
+    match account_response(&state, updated).await {
+        Ok(account) => Json(account).into_response(),
         Err(error) => server_error(error),
     }
 }

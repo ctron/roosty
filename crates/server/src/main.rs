@@ -397,6 +397,9 @@ async fn worker_iteration(
         "federation_reblog_delivery" => {
             crate::federation::deliver_reblog_activity(&state, job.payload.clone()).await
         }
+        "federation_actor_update_delivery" => {
+            crate::federation::deliver_actor_update(&state, job.payload.clone()).await
+        }
         "federation_remote_media_fetch" => {
             crate::media::fetch_remote_media(&state, job.payload.clone()).await
         }

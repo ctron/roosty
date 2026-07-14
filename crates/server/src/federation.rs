@@ -427,6 +427,19 @@ struct Update {
     object: Note,
 }
 
+/// ActivityPub profile update containing the refreshed local actor document.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActorUpdate {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: UpdateType,
+    actor: String,
+    to: Vec<String>,
+    object: Actor,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Delete {
@@ -526,8 +539,17 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> R
         Ok(key) => key,
         Err(error) => return internal_error(error),
     };
-    let id = actor_url(&state, &account.username);
-    activity_response(Actor {
+    activity_response(actor_document(&state, account, public_key_pem))
+}
+
+/// Build the canonical public actor document used for direct reads and Update activities.
+fn actor_document(
+    state: &AppState,
+    account: roosty_db::LocalAccount,
+    public_key_pem: String,
+) -> Actor {
+    let id = actor_url(state, &account.username);
+    Actor {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: id.clone(),
         r#type: ActorType::Person,
@@ -545,18 +567,18 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> R
         manually_approves_followers: account.locked,
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
-            url: crate::media::media_url(&state, path),
+            url: crate::media::media_url(state, path),
         }),
         image: account.header_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
-            url: crate::media::media_url(&state, path),
+            url: crate::media::media_url(state, path),
         }),
         public_key: PublicKey {
             id: format!("{id}#main-key"),
             owner: id,
             public_key_pem,
         },
-    })
+    }
 }
 
 /// Serve the local actor's public outbox as an ordered ActivityStreams collection.
@@ -1557,6 +1579,14 @@ struct StatusDelivery {
     activity: JsonValue,
 }
 
+/// Durable payload for one local actor Update delivery to an accepted remote follower.
+#[derive(Deserialize, Serialize)]
+struct ActorUpdateDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+}
+
 /// Durable payload for a local Follow or Undo(Follow) delivery.
 #[derive(Deserialize, Serialize)]
 struct FollowDelivery {
@@ -2107,6 +2137,54 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
     Ok(())
 }
 
+/// Queue a refreshed local actor document for every accepted remote follower.
+pub(crate) async fn enqueue_actor_update_in_transaction(
+    state: &AppState,
+    txn: &sea_orm::DatabaseTransaction,
+    account: roosty_db::LocalAccount,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+
+    let public_key_pem = ensure_actor_key(state, account.id).await?;
+    let actor = actor_url(state, &account.username);
+    let activity = serde_json::to_value(ActorUpdate {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: format!("{actor}#update-{}", Uuid::now_v7()),
+        r#type: UpdateType::Update,
+        actor: actor.clone(),
+        to: vec![format!("{actor}/followers")],
+        object: actor_document(state, account.clone(), public_key_pem),
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let activity_id = activity
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| RoostyError::InvalidInput("actor update has no ID".to_owned()))?;
+
+    for remote in roosty_db::accepted_remote_followers(&state.db, account.id).await? {
+        let payload = serde_json::to_value(ActorUpdateDelivery {
+            local_account_id: account.id,
+            remote_actor_id: remote.id,
+            activity: activity.clone(),
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationActorUpdateDelivery,
+                payload,
+                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Resolve syntactically valid remote handles for a local status without making posting fail.
 pub(crate) async fn resolve_remote_mentions(
     state: &AppState,
@@ -2267,6 +2345,23 @@ pub(crate) async fn deliver_status_activity(
 ) -> Result<(), RoostyError> {
     let payload: StatusDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid status delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+    )
+    .await
+}
+
+/// Dispatch one durable local actor Update delivery job.
+pub(crate) async fn deliver_actor_update(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: ActorUpdateDelivery = serde_json::from_value(payload).map_err(|_| {
+        RoostyError::InvalidInput("invalid actor update delivery payload".to_owned())
+    })?;
     deliver_activity(
         state,
         payload.local_account_id,
@@ -2665,6 +2760,7 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_migration::Migrator;
+    use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
 
@@ -2976,6 +3072,78 @@ mod tests {
             .await
             .unwrap()
             .is_none()
+        );
+
+        context.teardown().await;
+    }
+
+    /// Given an accepted remote follower, when a local profile changes, then a durable Actor
+    /// Update carrying its refreshed avatar and header is queued for that follower.
+    #[tokio::test]
+    async fn profile_updates_enqueue_actor_update_delivery() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        let author = create_test_account(&context.alpha, "author").await;
+        let follower = create_test_account(&context.beta, "follower").await;
+        let follower_key = super::ensure_actor_key(&context.beta, follower.id)
+            .await
+            .unwrap();
+        let remote_follower =
+            cache_test_actor(&context.alpha, "follower", "beta.test", follower_key).await;
+        roosty_db::upsert_remote_follow(
+            &context.alpha.db,
+            remote_follower.id,
+            author.id,
+            "https://beta.test/follows/profile-update",
+            serde_json::json!({}),
+            "accepted",
+        )
+        .await
+        .unwrap();
+        let updated = roosty_db::update_local_account_settings(
+            &context.alpha.db,
+            author.id,
+            roosty_db::LocalAccountSettingsUpdate {
+                avatar_file_path: Some("accounts/avatar.png".to_owned()),
+                header_file_path: Some("accounts/header.png".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let txn = context.alpha.db.begin().await.unwrap();
+        super::enqueue_actor_update_in_transaction(&context.alpha, &txn, updated)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let job = roosty_db::claim_due_job(
+            &context.alpha.db,
+            "federation-test",
+            time::Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            job.kind,
+            roosty_db::JobKind::FederationActorUpdateDelivery.as_str()
+        );
+        let activity = &job.payload["activity"];
+        assert_eq!(activity["type"], "Update");
+        assert_eq!(activity["object"]["type"], "Person");
+        assert_eq!(
+            activity["object"]["icon"]["url"],
+            "https://alpha.test/media_attachments/files/accounts/avatar.png"
+        );
+        assert_eq!(
+            activity["object"]["image"]["url"],
+            "https://alpha.test/media_attachments/files/accounts/header.png"
+        );
+        assert!(
+            roosty_db::mark_job_completed(&context.alpha.db, &job)
+                .await
+                .unwrap()
         );
 
         context.teardown().await;
@@ -3484,6 +3652,11 @@ mod tests {
             }
             roosty_db::JobKind::FederationReblogDelivery => {
                 super::deliver_reblog_activity(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationActorUpdateDelivery => {
+                super::deliver_actor_update(state, job.payload.clone())
                     .await
                     .unwrap();
             }

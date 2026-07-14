@@ -27,7 +27,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | Inbox | Signed inbox handling supports follows and public/unlisted status lifecycle activities. |
 | 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
-| 🟡 | Outbound delivery | Durable jobs deliver follow responses and public/unlisted local status lifecycle activities, with retry until the configured maximum age. |
+| 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. |
 | 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; refresh and client projections remain incomplete. |
 
 ### Moderation and Safety

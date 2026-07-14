@@ -1571,6 +1571,8 @@ pub enum JobKind {
     FederationFavouriteDelivery,
     /// Deliver a locally initiated Announce or Undo(Announce).
     FederationReblogDelivery,
+    /// Deliver a local actor profile update to accepted remote followers.
+    FederationActorUpdateDelivery,
     /// Safely fetch one remote media attachment into the local cache.
     FederationRemoteMediaFetch,
 }
@@ -2961,11 +2963,14 @@ pub async fn local_following_for_account(
 }
 
 /// Update mutable local account settings and return the refreshed account.
-pub async fn update_local_account_settings(
-    db: &DbConnection,
+pub async fn update_local_account_settings<C>(
+    db: &C,
     account_id: AccountId,
     update: LocalAccountSettingsUpdate,
-) -> Result<LocalAccount> {
+) -> Result<LocalAccount>
+where
+    C: ConnectionTrait,
+{
     let account = local_account::Entity::find_by_id(account_id.0)
         .one(db)
         .await?
