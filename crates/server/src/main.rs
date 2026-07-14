@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use roosty_core::{Result, RoostyError};
 use roosty_migration::Migrator;
 use sea_orm_migration::MigratorTrait;
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -230,7 +230,7 @@ async fn serve(
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
     let worker_task = if with_worker {
         info!("starting in-process durable worker");
-        Some(tokio::spawn(worker_loop(
+        Some(tokio::spawn(worker_pool(
             db,
             config.clone(),
             shutdown_rx.clone(),
@@ -269,7 +269,7 @@ async fn worker() -> Result<()> {
     let db = roosty_db::connect(&config.database_url).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
-    let result = worker_loop(db, config, shutdown_rx).await;
+    let result = worker_pool(db, config, shutdown_rx).await;
     shutdown_task.abort();
     result
 }
@@ -304,78 +304,133 @@ async fn wait_for_shutdown(shutdown_tx: watch::Sender<bool>) {
     let _ = shutdown_tx.send(true);
 }
 
+/// Run the configured number of independent durable-job loops.
+async fn worker_pool(
+    db: roosty_db::DbConnection,
+    config: Config,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let process_identity = format!(
+        "{}:{}:{}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    );
+    let mut workers = JoinSet::new();
+    info!(
+        workers = config.worker_concurrency,
+        "starting durable worker pool"
+    );
+
+    for slot in 0..config.worker_concurrency {
+        let worker_id = format!("{process_identity}:{slot}");
+        workers.spawn(worker_loop(
+            db.clone(),
+            config.clone(),
+            worker_id,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    while let Some(result) = workers.join_next().await {
+        result.map_err(|error| RoostyError::Configuration(error.to_string()))??;
+    }
+
+    Ok(())
+}
+
+/// Repeatedly claim and execute one durable job for a single worker identity.
 async fn worker_loop(
     db: roosty_db::DbConnection,
     config: Config,
+    worker_id: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
+        if *shutdown_rx.borrow_and_update() {
+            info!(%worker_id, "worker shutdown requested");
+            return Ok(());
+        }
+
+        if worker_iteration(&db, &config, &worker_id).await? {
+            continue;
+        }
+
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    info!("worker shutdown requested");
+                    info!(%worker_id, "worker shutdown requested");
                     return Ok(());
                 }
             }
             () = tokio::time::sleep(Duration::from_secs(5)) => {
-                worker_iteration(&db, &config).await?;
             }
         }
     }
 }
 
-/// Release abandoned claims, process due work, and persist each delivery outcome.
-async fn worker_iteration(db: &roosty_db::DbConnection, config: &Config) -> Result<()> {
+/// Claim and process one due job, returning whether work was found.
+async fn worker_iteration(
+    db: &roosty_db::DbConnection,
+    config: &Config,
+    worker_id: &str,
+) -> Result<bool> {
     let claim_ttl = time::Duration::minutes(5);
-    let released = roosty_db::release_expired_claims(db, claim_ttl).await?;
-    if released > 0 {
-        info!(released, "released expired job claims");
-    }
+    let Some(job) = roosty_db::claim_due_job(db, worker_id, claim_ttl).await? else {
+        return Ok(false);
+    };
 
-    for job in roosty_db::claim_due_jobs(db, "roosty-worker", 20, claim_ttl).await? {
-        let state = AppState::new(config.clone(), db.clone());
-        let result = match job.kind.as_str() {
-            "federation_follow_response" => {
-                crate::federation::deliver_follow_response(&state, job.payload).await
+    let state = AppState::new(config.clone(), db.clone());
+    let result = match job.kind.as_str() {
+        "federation_follow_response" => {
+            crate::federation::deliver_follow_response(&state, job.payload.clone()).await
+        }
+        "federation_status_delivery" => {
+            crate::federation::deliver_status_activity(&state, job.payload.clone()).await
+        }
+        "federation_follow_delivery" => {
+            crate::federation::deliver_follow_activity(&state, job.payload.clone()).await
+        }
+        "federation_favourite_delivery" => {
+            crate::federation::deliver_favourite_activity(&state, job.payload.clone()).await
+        }
+        "federation_reblog_delivery" => {
+            crate::federation::deliver_reblog_activity(&state, job.payload.clone()).await
+        }
+        "federation_remote_media_fetch" => {
+            crate::media::fetch_remote_media(&state, job.payload.clone()).await
+        }
+        _ => Ok(()),
+    };
+    match result {
+        Ok(()) => {
+            if !roosty_db::mark_job_completed(db, &job).await? {
+                warn!(job_id = %job.id.0, %worker_id, "discarded stale job completion");
             }
-            "federation_status_delivery" => {
-                crate::federation::deliver_status_activity(&state, job.payload).await
-            }
-            "federation_follow_delivery" => {
-                crate::federation::deliver_follow_activity(&state, job.payload).await
-            }
-            "federation_favourite_delivery" => {
-                crate::federation::deliver_favourite_activity(&state, job.payload).await
-            }
-            "federation_reblog_delivery" => {
-                crate::federation::deliver_reblog_activity(&state, job.payload).await
-            }
-            "federation_remote_media_fetch" => {
-                crate::media::fetch_remote_media(&state, job.payload).await
-            }
-            _ => Ok(()),
-        };
-        match result {
-            Ok(()) => roosty_db::mark_job_completed(db, job.id).await?,
-            Err(error) => {
-                let permanent = roosty_db::job_has_exceeded_max_age(
-                    job.created_at,
-                    config.federation_delivery_max_age,
-                ) || error
-                    .to_string()
-                    .starts_with("permanent federation delivery failure:");
-                if permanent {
-                    roosty_db::mark_job_permanently_failed(db, job.id, &error.to_string()).await?;
+        }
+        Err(error) => {
+            let permanent = roosty_db::job_has_exceeded_max_age(
+                job.created_at,
+                config.federation_delivery_max_age,
+            ) || error
+                .to_string()
+                .starts_with("permanent federation delivery failure:");
+            if permanent {
+                if roosty_db::mark_job_permanently_failed(db, &job, &error.to_string()).await? {
                     warn!(job_id = %job.id.0, %error, "federation delivery failed permanently");
                 } else {
-                    roosty_db::mark_job_failed(db, job.id, &error.to_string(), job.attempts)
-                        .await?;
+                    warn!(job_id = %job.id.0, %worker_id, "discarded stale permanent job failure");
                 }
+            } else if roosty_db::mark_job_failed(db, &job, &error.to_string())
+                .await?
+                .is_none()
+            {
+                warn!(job_id = %job.id.0, %worker_id, "discarded stale job retry");
             }
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn validate_username(username: &str) -> Result<()> {
@@ -407,7 +462,10 @@ fn validate_email(email: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::HashSet,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use postgresql_embedded::PostgreSQL;
     use roosty_migration::Migrator;
@@ -581,7 +639,11 @@ mod tests {
         .await
         .unwrap();
 
-        worker_iteration(&db, &test_worker_config()).await.unwrap();
+        assert!(
+            worker_iteration(&db, &test_worker_config(), "permanent-test-worker")
+                .await
+                .unwrap()
+        );
 
         let job = db
             .query_one(Statement::from_sql_and_values(
@@ -605,10 +667,10 @@ mod tests {
             Some("invalid input: invalid follow delivery payload")
         );
         assert!(
-            roosty_db::claim_due_jobs(&db, "verification-worker", 10, time::Duration::minutes(5),)
+            roosty_db::claim_due_job(&db, "verification-worker", time::Duration::minutes(5),)
                 .await
                 .unwrap()
-                .is_empty()
+                .is_none()
         );
 
         db.close().await.unwrap();
@@ -634,7 +696,11 @@ mod tests {
         .await
         .unwrap();
 
-        worker_iteration(&db, &test_worker_config()).await.unwrap();
+        assert!(
+            worker_iteration(&db, &test_worker_config(), "recovery-test-worker")
+                .await
+                .unwrap()
+        );
 
         let job = db
             .query_one(Statement::from_sql_and_values(
@@ -654,6 +720,116 @@ mod tests {
         assert!(locked_at.is_none());
         assert!(locked_by.is_none());
         assert!(last_error.is_none());
+
+        db.close().await.unwrap();
+        postgresql.drop_database(&database_name).await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given concurrent worker identities, when they claim due jobs, then PostgreSQL assigns each
+    /// job to at most one worker through `FOR UPDATE SKIP LOCKED`.
+    #[tokio::test]
+    async fn concurrent_workers_claim_distinct_jobs() {
+        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        for _ in 0..3 {
+            roosty_db::enqueue_job(
+                &db,
+                roosty_db::JobKind::FederationFollowDelivery,
+                serde_json::json!({}),
+                None,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (first, second, third) = tokio::join!(
+            roosty_db::claim_due_job(&db, "worker-a", time::Duration::minutes(5)),
+            roosty_db::claim_due_job(&db, "worker-b", time::Duration::minutes(5)),
+            roosty_db::claim_due_job(&db, "worker-c", time::Duration::minutes(5)),
+        );
+        let jobs = [
+            first.unwrap().unwrap(),
+            second.unwrap().unwrap(),
+            third.unwrap().unwrap(),
+        ];
+        let ids: HashSet<_> = jobs.iter().map(|job| job.id).collect();
+        let claims: HashSet<_> = jobs.iter().map(|job| job.claim_id).collect();
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(claims.len(), 3);
+
+        db.close().await.unwrap();
+        postgresql.drop_database(&database_name).await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given a reclaimed job, when its former owner reports any outcome, then the stale writes do
+    /// not override the active claim.
+    #[tokio::test]
+    async fn stale_worker_outcomes_do_not_override_reclaimed_jobs() {
+        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let job_id = roosty_db::enqueue_job(
+            &db,
+            roosty_db::JobKind::FederationFollowDelivery,
+            serde_json::json!({}),
+            None,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        let original = roosty_db::claim_due_job(&db, "original-worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE job SET locked_at = now() - interval '10 minutes' WHERE id = $1",
+            vec![job_id.0.into()],
+        ))
+        .await
+        .unwrap();
+        let replacement =
+            roosty_db::claim_due_job(&db, "replacement-worker", time::Duration::minutes(5))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_ne!(original.claim_id, replacement.claim_id);
+        assert!(!roosty_db::mark_job_completed(&db, &original).await.unwrap());
+        assert!(
+            roosty_db::mark_job_failed(&db, &original, "stale failure")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !roosty_db::mark_job_permanently_failed(&db, &original, "stale permanent failure")
+                .await
+                .unwrap()
+        );
+
+        let job = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT claim_id, completed_at, last_error FROM job WHERE id = $1",
+                vec![job_id.0.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let claim_id: Option<uuid::Uuid> = job.try_get("", "claim_id").unwrap();
+        let completed_at: Option<time::OffsetDateTime> = job.try_get("", "completed_at").unwrap();
+        let last_error: Option<String> = job.try_get("", "last_error").unwrap();
+
+        assert_eq!(claim_id, Some(replacement.claim_id.0));
+        assert!(completed_at.is_none());
+        assert!(last_error.is_none());
+        assert!(
+            roosty_db::mark_job_completed(&db, &replacement)
+                .await
+                .unwrap()
+        );
 
         db.close().await.unwrap();
         postgresql.drop_database(&database_name).await.unwrap();
@@ -681,6 +857,7 @@ mod tests {
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
+            worker_concurrency: 4,
             instance_name: "Worker test".to_owned(),
             instance_description: None,
         }

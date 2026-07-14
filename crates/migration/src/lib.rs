@@ -36,6 +36,7 @@ mod m20260701_000031_create_local_status_remote_mention;
 mod m20260701_000032_create_federated_favourite_tables;
 mod m20260701_000033_create_federated_reblog_tables;
 mod m20260701_000034_create_remote_media_attachment;
+mod m20260701_000035_add_job_claim_id;
 
 pub struct Migrator;
 
@@ -77,6 +78,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000032_create_federated_favourite_tables::Migration),
             Box::new(m20260701_000033_create_federated_reblog_tables::Migration),
             Box::new(m20260701_000034_create_remote_media_attachment::Migration),
+            Box::new(m20260701_000035_add_job_claim_id::Migration),
         ]
     }
 }

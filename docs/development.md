@@ -6,7 +6,7 @@ Run the local stack:
 podman compose -f deploy/compose.yaml up --build
 ```
 
-The local stack starts Roosty with `serve --with-migrations --with-worker`, so migrations run before the server begins listening.
+The local stack starts Roosty with `serve --with-migrations --with-worker`, so migrations run before the server begins listening. It starts four durable worker loops; set `ROOSTY_WORKER_CONCURRENCY=0` to size the worker pool from the process's available logical CPUs.
 
 The local stack uses Caddy with an internal development certificate so Roosty and Elk can run over HTTPS. Your browser may ask you to accept the local certificate.
 

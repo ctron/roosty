@@ -179,6 +179,10 @@ exclude domains from that list. Configure `ROOSTY_FEDERATION_DELIVERY_MAX_AGE`
 with a human-readable duration such as `7d`, `12h`, or `30m`; failed delivery
 jobs retry with exponential backoff until this age is exceeded.
 
+Roosty runs four durable worker loops by default for both `roosty worker` and
+`serve --with-worker`. Set `ROOSTY_WORKER_CONCURRENCY` to choose a different
+count; set it to `0` to use the logical CPU count available to the process.
+
 This surface provides WebFinger, local actor documents, public Notes, outboxes,
 follower/following collections, policy-controlled remote `resolve=true` lookup,
 signed inbox processing, and signed follow delivery. With a public HTTPS base

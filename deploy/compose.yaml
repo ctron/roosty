@@ -16,6 +16,7 @@ services:
       ROOSTY_OBJECT_STORAGE_BACKEND: local
       ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
       ROOSTY_REGISTRATION_MODE: closed
+      ROOSTY_WORKER_CONCURRENCY: "4"
       ROOSTY_FEDERATION_ENABLED: "false"
     ports:
       - "3001:3001"

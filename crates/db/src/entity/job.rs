@@ -14,6 +14,7 @@ pub struct Model {
     pub attempts: i32,
     pub locked_at: Option<OffsetDateTime>,
     pub locked_by: Option<String>,
+    pub claim_id: Option<Uuid>,
     pub last_error: Option<String>,
     pub created_at: OffsetDateTime,
     pub completed_at: Option<OffsetDateTime>,

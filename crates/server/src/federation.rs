@@ -2822,15 +2822,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            roosty_db::claim_due_jobs(
+            roosty_db::claim_due_job(
                 &context.alpha.db,
                 "federation-test",
-                10,
                 time::Duration::minutes(1),
             )
             .await
             .unwrap()
-            .is_empty()
+            .is_none()
         );
 
         test_transport::clear_inboxes();
@@ -2925,35 +2924,32 @@ mod tests {
             cache_test_actor(&context.beta, "unreachable", "unreachable.test", actor_key).await;
 
         follow_test_actor(&context.beta, follower.id, unreachable.id).await;
-        let mut jobs = roosty_db::claim_due_jobs(
+        let job = roosty_db::claim_due_job(
             &context.beta.db,
             "federation-test",
-            10,
             time::Duration::minutes(1),
         )
         .await
+        .unwrap()
         .unwrap();
-        assert_eq!(jobs.len(), 1);
-        let job = jobs.remove(0);
-        let error = super::deliver_follow_activity(&context.beta, job.payload)
+        let error = super::deliver_follow_activity(&context.beta, job.payload.clone())
             .await
             .unwrap_err();
-        let retried_at =
-            roosty_db::mark_job_failed(&context.beta.db, job.id, &error.to_string(), job.attempts)
-                .await
-                .unwrap();
+        let retried_at = roosty_db::mark_job_failed(&context.beta.db, &job, &error.to_string())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(retried_at > time::OffsetDateTime::now_utc());
         assert!(
-            roosty_db::claim_due_jobs(
+            roosty_db::claim_due_job(
                 &context.beta.db,
                 "federation-test",
-                10,
                 time::Duration::minutes(1),
             )
             .await
             .unwrap()
-            .is_empty()
+            .is_none()
         );
 
         context.teardown().await;
@@ -3290,6 +3286,7 @@ mod tests {
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
+            worker_concurrency: 4,
             instance_name: "Federation test".to_owned(),
             instance_description: None,
         }
@@ -3412,47 +3409,48 @@ mod tests {
     }
 
     async fn deliver_test_job(state: &AppState, kind: roosty_db::JobKind) {
-        let mut jobs =
-            roosty_db::claim_due_jobs(&state.db, "federation-test", 10, time::Duration::minutes(1))
+        let job =
+            roosty_db::claim_due_job(&state.db, "federation-test", time::Duration::minutes(1))
                 .await
+                .unwrap()
                 .unwrap();
-        assert_eq!(jobs.len(), 1);
-        let job = jobs.remove(0);
         assert_eq!(job.kind, kind.as_str());
         match kind {
             roosty_db::JobKind::FederationFollowResponse => {
-                super::deliver_follow_response(state, job.payload)
+                super::deliver_follow_response(state, job.payload.clone())
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationStatusDelivery => {
-                super::deliver_status_activity(state, job.payload)
+                super::deliver_status_activity(state, job.payload.clone())
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationFollowDelivery => {
-                super::deliver_follow_activity(state, job.payload)
+                super::deliver_follow_activity(state, job.payload.clone())
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationFavouriteDelivery => {
-                super::deliver_favourite_activity(state, job.payload)
+                super::deliver_favourite_activity(state, job.payload.clone())
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationReblogDelivery => {
-                super::deliver_reblog_activity(state, job.payload)
+                super::deliver_reblog_activity(state, job.payload.clone())
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationRemoteMediaFetch => {
-                crate::media::fetch_remote_media(state, job.payload)
+                crate::media::fetch_remote_media(state, job.payload.clone())
                     .await
                     .unwrap();
             }
         }
-        roosty_db::mark_job_completed(&state.db, job.id)
-            .await
-            .unwrap();
+        assert!(
+            roosty_db::mark_job_completed(&state.db, &job)
+                .await
+                .unwrap()
+        );
     }
 }

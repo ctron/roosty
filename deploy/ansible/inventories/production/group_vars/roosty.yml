@@ -11,3 +11,4 @@ roosty_federation_enabled: false
 roosty_federation_allowed_domains: []
 roosty_federation_blocked_domains: []
 roosty_federation_delivery_max_age: 7d
+roosty_worker_concurrency: 4

@@ -7,6 +7,7 @@ const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:4000";
 const DEFAULT_MEDIA_ROOT: &str = "./media";
 const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
+const DEFAULT_WORKER_CONCURRENCY: &str = "4";
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -35,6 +36,8 @@ pub struct Config {
     pub remote_media_max_bytes: u64,
     /// Maximum remote media downloads this worker runs concurrently.
     pub remote_media_fetch_concurrency: usize,
+    /// Number of durable job loops to run in this process; zero in configuration uses available CPUs.
+    pub worker_concurrency: usize,
     pub instance_name: String,
     pub instance_description: Option<String>,
 }
@@ -72,6 +75,10 @@ impl Config {
                 "ROOSTY_REMOTE_MEDIA_FETCH_CONCURRENCY must be positive".to_owned(),
             ));
         }
+        let worker_concurrency = resolve_worker_concurrency(parse_env(
+            "ROOSTY_WORKER_CONCURRENCY",
+            DEFAULT_WORKER_CONCURRENCY,
+        )?)?;
         if federation_enabled {
             if public_base_url.scheme() != "https" || public_base_url.host_str().is_none() {
                 return Err(RoostyError::Configuration(
@@ -117,6 +124,7 @@ impl Config {
             remote_media_cache_ttl,
             remote_media_max_bytes,
             remote_media_fetch_concurrency,
+            worker_concurrency,
             instance_name: required_env("ROOSTY_INSTANCE_NAME")?,
             instance_description: optional_env("ROOSTY_INSTANCE_DESCRIPTION"),
         })
@@ -145,6 +153,21 @@ fn optional_bytesize_env(name: &str, default: &str) -> Result<u64> {
         .map_err(|_| {
             RoostyError::Configuration(format!(
                 "{name} must be a human-readable byte size, such as 40MiB"
+            ))
+        })
+}
+
+/// Resolve zero worker slots to the number of logical CPUs available to this process.
+fn resolve_worker_concurrency(configured: usize) -> Result<usize> {
+    if configured != 0 {
+        return Ok(configured);
+    }
+
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .map_err(|error| {
+            RoostyError::Configuration(format!(
+                "could not determine available worker CPUs: {error}"
             ))
         })
 }
@@ -291,6 +314,7 @@ mod tests {
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
+            worker_concurrency: 4,
             instance_name: "Roosty Test".to_owned(),
             instance_description: None,
         };
@@ -298,6 +322,15 @@ mod tests {
         assert!(config.federation_domain_is_allowed("remote.example"));
         assert!(config.federation_domain_is_allowed("REMOTE.EXAMPLE"));
         assert!(!config.federation_domain_is_allowed("blocked.example"));
+    }
+
+    #[test]
+    fn resolves_zero_worker_concurrency_to_available_cpus() {
+        assert_eq!(resolve_worker_concurrency(3).unwrap(), 3);
+        assert_eq!(
+            resolve_worker_concurrency(0).unwrap(),
+            std::thread::available_parallelism().unwrap().get()
+        );
     }
 
     fn optional_bool_value(value: &str) -> Result<bool> {

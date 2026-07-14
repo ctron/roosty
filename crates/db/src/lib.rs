@@ -3,7 +3,7 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
-use roosty_core::{AccountId, JobId, Result, RoostyError, StatusId};
+use roosty_core::{AccountId, JobClaimId, JobId, Result, RoostyError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult,
@@ -1725,6 +1725,7 @@ async fn insert_response_job(
         attempts: Set(0),
         locked_at: Set(None),
         locked_by: Set(None),
+        claim_id: Set(None),
         last_error: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         completed_at: Set(None),
@@ -6183,6 +6184,8 @@ fn oauth_application_from_model(app: oauth_application::Model) -> OAuthApplicati
 pub struct ClaimedJob {
     /// Job identifier.
     pub id: JobId,
+    /// Lease identity that must accompany the final job outcome.
+    pub claim_id: JobClaimId,
     /// Application job kind.
     pub kind: String,
     /// JSON job payload.
@@ -6269,139 +6272,129 @@ where
     Ok(JobId(id))
 }
 
-/// Claim due jobs using PostgreSQL row locking.
-pub async fn claim_due_jobs(
+/// Claim one due job using PostgreSQL row locking.
+pub async fn claim_due_job(
     db: &DbConnection,
     worker_id: &str,
-    limit: u64,
     claim_ttl: Duration,
-) -> Result<Vec<ClaimedJob>> {
+) -> Result<Option<ClaimedJob>> {
     let expired_before = OffsetDateTime::now_utc() - claim_ttl;
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
+    let claim_id = JobClaimId(Uuid::now_v7());
+    let row = db
+        .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"
             UPDATE job
-            SET locked_at = now(), locked_by = $1
+            SET locked_at = now(), locked_by = $1, claim_id = $2
             WHERE id IN (
                 SELECT id
                 FROM job
                 WHERE completed_at IS NULL
                   AND run_after <= now()
-                  AND (locked_at IS NULL OR locked_at < $2)
+                  AND (locked_at IS NULL OR locked_at < $3)
                 ORDER BY run_after, created_at
-                LIMIT $3
+                LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, kind, payload, attempts, created_at
+            RETURNING id, kind, payload, attempts, created_at, claim_id
             "#,
             vec![
                 worker_id.to_owned().into(),
+                claim_id.0.into(),
                 expired_before.into(),
-                (limit as i64).into(),
             ],
         ))
         .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            let id: Uuid = row.try_get("", "id")?;
-            let kind: String = row.try_get("", "kind")?;
-            let payload: JsonValue = row.try_get("", "payload")?;
-            let attempts: i32 = row.try_get("", "attempts")?;
-            let attempts = u32::try_from(attempts).map_err(|_| {
-                RoostyError::InvalidInput("stored job attempts must not be negative".to_owned())
-            })?;
-            let created_at: OffsetDateTime = row.try_get("", "created_at")?;
+    row.map(|row| {
+        let id: Uuid = row.try_get("", "id")?;
+        let kind: String = row.try_get("", "kind")?;
+        let payload: JsonValue = row.try_get("", "payload")?;
+        let attempts: i32 = row.try_get("", "attempts")?;
+        let attempts = u32::try_from(attempts).map_err(|_| {
+            RoostyError::InvalidInput("stored job attempts must not be negative".to_owned())
+        })?;
+        let created_at: OffsetDateTime = row.try_get("", "created_at")?;
+        let claim_id: Uuid = row.try_get("", "claim_id")?;
 
-            Ok(ClaimedJob {
-                id: JobId(id),
-                kind,
-                payload,
-                attempts,
-                created_at,
-            })
+        Ok(ClaimedJob {
+            id: JobId(id),
+            claim_id: JobClaimId(claim_id),
+            kind,
+            payload,
+            attempts,
+            created_at,
         })
-        .collect()
+    })
+    .transpose()
 }
 
-/// Mark a claimed job as completed.
-pub async fn mark_job_completed(db: &DbConnection, job_id: JobId) -> Result<()> {
-    db.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        r#"
+/// Mark a claimed job as completed when its lease is still owned by this worker.
+pub async fn mark_job_completed(db: &DbConnection, job: &ClaimedJob) -> Result<bool> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
         UPDATE job
-        SET completed_at = now(), locked_at = NULL, locked_by = NULL
-        WHERE id = $1
+        SET completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL
+        WHERE id = $1 AND claim_id = $2
         "#,
-        vec![job_id.0.into()],
-    ))
-    .await?;
+            vec![job.id.0.into(), job.claim_id.0.into()],
+        ))
+        .await?;
 
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Mark a job failed, release its claim, and schedule its next retry.
 pub async fn mark_job_failed(
     db: &DbConnection,
-    job_id: JobId,
+    job: &ClaimedJob,
     error: &str,
-    attempts: u32,
-) -> Result<OffsetDateTime> {
-    let run_after = next_retry_at(attempts);
-    db.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        r#"
+) -> Result<Option<OffsetDateTime>> {
+    let run_after = next_retry_at(job.attempts);
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
         UPDATE job
         SET attempts = attempts + 1,
             last_error = $2,
             run_after = $3,
             locked_at = NULL,
-            locked_by = NULL
-        WHERE id = $1
+            locked_by = NULL,
+            claim_id = NULL
+        WHERE id = $1 AND claim_id = $4
         "#,
-        vec![job_id.0.into(), error.to_owned().into(), run_after.into()],
-    ))
-    .await?;
+            vec![
+                job.id.0.into(),
+                error.to_owned().into(),
+                run_after.into(),
+                job.claim_id.0.into(),
+            ],
+        ))
+        .await?;
 
-    Ok(run_after)
+    Ok((result.rows_affected() == 1).then_some(run_after))
 }
 
 /// Mark a job as permanently failed while retaining its diagnostic error.
 pub async fn mark_job_permanently_failed(
     db: &DbConnection,
-    job_id: JobId,
+    job: &ClaimedJob,
     error: &str,
-) -> Result<()> {
-    db.execute(Statement::from_sql_and_values(
+) -> Result<bool> {
+    let result = db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "UPDATE job SET last_error = $2, completed_at = now(), locked_at = NULL, locked_by = NULL WHERE id = $1",
-        vec![job_id.0.into(), error.to_owned().into()],
+        "UPDATE job SET last_error = $2, completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE id = $1 AND claim_id = $3",
+        vec![job.id.0.into(), error.to_owned().into(), job.claim_id.0.into()],
     )).await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Return whether a job has exceeded its configured retry age.
 pub fn job_has_exceeded_max_age(created_at: OffsetDateTime, max_age: Duration) -> bool {
     OffsetDateTime::now_utc() - created_at >= max_age
-}
-
-/// Release job claims older than the configured claim TTL.
-pub async fn release_expired_claims(db: &DbConnection, claim_ttl: Duration) -> Result<u64> {
-    let expired_before = OffsetDateTime::now_utc() - claim_ttl;
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"
-            UPDATE job
-            SET locked_at = NULL, locked_by = NULL
-            WHERE completed_at IS NULL AND locked_at < $1
-            "#,
-            vec![expired_before.into()],
-        ))
-        .await?;
-
-    Ok(result.rows_affected())
 }
 
 /// Calculate the next retry timestamp for a failed job.

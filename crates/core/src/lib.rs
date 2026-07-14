@@ -35,3 +35,8 @@ pub struct StatusId(pub Uuid);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct JobId(pub Uuid);
+
+/// Opaque lease identity for one attempt to process a durable job.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct JobClaimId(pub Uuid);
