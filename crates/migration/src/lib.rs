@@ -29,6 +29,7 @@ mod m20260701_000024_allow_remote_notification_actors;
 mod m20260701_000025_constrain_job_attempts_nonnegative;
 mod m20260701_000026_create_remote_status_table;
 mod m20260701_000027_create_remote_following_table;
+mod m20260701_000028_add_remote_status_notifications;
 
 pub struct Migrator;
 
@@ -63,6 +64,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000025_constrain_job_attempts_nonnegative::Migration),
             Box::new(m20260701_000026_create_remote_status_table::Migration),
             Box::new(m20260701_000027_create_remote_following_table::Migration),
+            Box::new(m20260701_000028_add_remote_status_notifications::Migration),
         ]
     }
 }

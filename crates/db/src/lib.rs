@@ -469,6 +469,18 @@ pub async fn find_remote_status_by_activitypub_id(
         .map(remote_status_from_model))
 }
 
+/// Find one active cached remote Note by its UUID-backed API identifier.
+pub async fn find_remote_status_by_id(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Option<RemoteStatus>> {
+    Ok(remote_status::Entity::find_by_id(status_id.0)
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+        .map(remote_status_from_model))
+}
+
 /// Mark the locally initiated Follow identified by its activity ID as accepted.
 pub async fn accept_remote_following(
     db: &DbConnection,
@@ -1086,6 +1098,8 @@ pub struct LocalNotification {
     pub remote_actor_id: Option<AccountId>,
     /// Related local status for mention and favourite notifications.
     pub status_id: Option<StatusId>,
+    /// Related cached remote status for a remote mention notification.
+    pub remote_status_id: Option<StatusId>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Soft-dismiss timestamp.
@@ -1215,6 +1229,30 @@ pub async fn notify_remote_actor_follow(
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
+        remote_status_id: Set(None),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(local_notification_from_model(model))
+}
+
+/// Create an idempotent mention notification caused by a cached remote Note.
+pub async fn notify_remote_status_mention(
+    db: &DbConnection,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<LocalNotification> {
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("mention".to_owned()),
+        actor_account_id: Set(None),
+        remote_actor_id: Set(Some(remote_actor_id.0)),
+        status_id: Set(None),
+        remote_status_id: Set(Some(remote_status_id.0)),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -1926,6 +1964,7 @@ pub async fn notify_local_account(
         actor_account_id: Set(Some(actor_account_id.0)),
         remote_actor_id: Set(None),
         status_id: Set(status_uuid),
+        remote_status_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -4484,6 +4523,7 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         actor_account_id: notification.actor_account_id.map(AccountId),
         remote_actor_id: notification.remote_actor_id.map(AccountId),
         status_id: notification.status_id.map(StatusId),
+        remote_status_id: notification.remote_status_id.map(StatusId),
         created_at: notification.created_at,
         dismissed_at: notification.dismissed_at,
     }

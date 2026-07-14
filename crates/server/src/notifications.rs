@@ -263,15 +263,23 @@ async fn notification_response(
         }
         _ => return Ok(None),
     };
-    let status = match notification.status_id {
-        Some(status_id) => {
+    let status = match (notification.status_id, notification.remote_status_id) {
+        (Some(status_id), None) => {
             let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
             else {
                 return Ok(None);
             };
             Some(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?)
         }
-        None => None,
+        (None, Some(status_id)) => {
+            let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await?
+            else {
+                return Ok(None);
+            };
+            Some(crate::statuses::remote_status_response(state, status).await?)
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => return Ok(None),
     };
 
     Ok(Some(NotificationResponse {

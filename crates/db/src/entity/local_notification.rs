@@ -12,6 +12,7 @@ pub struct Model {
     pub actor_account_id: Option<Uuid>,
     pub remote_actor_id: Option<Uuid>,
     pub status_id: Option<Uuid>,
+    pub remote_status_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
     pub dismissed_at: Option<OffsetDateTime>,
 }
