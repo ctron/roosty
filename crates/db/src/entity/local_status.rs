@@ -14,6 +14,7 @@ pub struct Model {
     pub spoiler_text: String,
     pub language: Option<String>,
     pub in_reply_to_id: Option<Uuid>,
+    pub in_reply_to_remote_status_id: Option<Uuid>,
     pub conversation_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,

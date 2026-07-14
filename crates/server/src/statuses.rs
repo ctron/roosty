@@ -270,6 +270,16 @@ impl MentionResponse {
             acct: account.username.clone(),
         }
     }
+
+    /// Build the Mastodon mention shape for a cached remote actor.
+    fn remote(actor: &roosty_db::RemoteActor) -> Self {
+        Self {
+            id: actor.id.0.to_string(),
+            username: actor.username.clone(),
+            url: actor.activitypub_id.clone(),
+            acct: format!("{}@{}", actor.username, actor.domain),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -325,10 +335,11 @@ async fn create_status(
     if let Err(error) = validate_visibility(&visibility) {
         return bad_request(&error.to_string());
     }
-    let in_reply_to_id = match parse_optional_status_id(input.in_reply_to_id.as_deref()) {
+    let mut in_reply_to_id = match parse_optional_status_id(input.in_reply_to_id.as_deref()) {
         Ok(status_id) => status_id,
         Err(error) => return bad_request(&error.to_string()),
     };
+    let mut in_reply_to_remote_status_id = None;
     if let Some(parent_id) = in_reply_to_id {
         match roosty_db::find_local_status_by_id(&state.db, parent_id).await {
             Ok(Some(parent)) => {
@@ -338,7 +349,14 @@ async fn create_status(
                     Err(error) => return server_error(error),
                 }
             }
-            Ok(None) => return bad_request("reply target status does not exist"),
+            Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, parent_id).await {
+                Ok(Some(parent)) if matches!(parent.visibility.as_str(), "public" | "unlisted") => {
+                    in_reply_to_remote_status_id = Some(parent.id);
+                    in_reply_to_id = None;
+                }
+                Ok(_) => return bad_request("reply target status does not exist"),
+                Err(error) => return server_error(error),
+            },
             Err(error) => return server_error(error),
         }
     }
@@ -351,11 +369,31 @@ async fn create_status(
         spoiler_text: input.spoiler_text.unwrap_or_default(),
         language: input.language.or(account.default_language.clone()),
         in_reply_to_id,
+        in_reply_to_remote_status_id,
     };
 
     let author_id = account.id;
+    let remote_mentions = if state.config.federation_enabled
+        && matches!(new_status.visibility.as_str(), "public" | "unlisted")
+    {
+        crate::federation::resolve_remote_mentions(&state, &new_status.content).await
+    } else {
+        Vec::new()
+    };
     match roosty_db::create_local_status_with_media(&state.db, new_status, &media_ids).await {
         Ok(mut status) => {
+            if let Err(error) = roosty_db::replace_local_status_remote_mentions(
+                &state.db,
+                status.id,
+                &remote_mentions
+                    .iter()
+                    .map(|actor| actor.id)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            {
+                return server_error(error);
+            }
             if let Err(error) = crate::federation::enqueue_status_activity(
                 &state,
                 &status,
@@ -472,6 +510,25 @@ async fn update_status(
     .await
     {
         Ok(Some(status)) => {
+            let remote_mentions = if state.config.federation_enabled
+                && matches!(status.visibility.as_str(), "public" | "unlisted")
+            {
+                crate::federation::resolve_remote_mentions(&state, &status.content).await
+            } else {
+                Vec::new()
+            };
+            if let Err(error) = roosty_db::replace_local_status_remote_mentions(
+                &state.db,
+                status.id,
+                &remote_mentions
+                    .iter()
+                    .map(|actor| actor.id)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            {
+                return server_error(error);
+            }
             if let Err(error) = crate::federation::enqueue_status_activity(
                 &state,
                 &status,
@@ -1462,13 +1519,34 @@ pub(crate) async fn remote_status_response(
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote status author does not exist".to_owned())
         })?;
+    let mentions = remote_status_mentions(state, &status).await?;
+    let (in_reply_to_id, in_reply_to_account_id) =
+        if let Some(parent_id) = status.in_reply_to_local_status_id {
+            match roosty_db::find_local_status_by_id(&state.db, parent_id).await? {
+                Some(parent) => (
+                    Some(parent.id.0.to_string()),
+                    Some(parent.account_id.0.to_string()),
+                ),
+                None => (None, None),
+            }
+        } else if let Some(parent_id) = status.in_reply_to_remote_status_id {
+            match roosty_db::find_remote_status_by_id(&state.db, parent_id).await? {
+                Some(parent) => (
+                    Some(parent.id.0.to_string()),
+                    Some(parent.remote_actor_id.0.to_string()),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.published_at),
         edited_at: (status.updated_at != status.published_at)
             .then(|| format_timestamp(status.updated_at)),
-        in_reply_to_id: None,
-        in_reply_to_account_id: None,
+        in_reply_to_id,
+        in_reply_to_account_id,
         sensitive: false,
         spoiler_text: String::new(),
         visibility: status.visibility,
@@ -1480,7 +1558,7 @@ pub(crate) async fn remote_status_response(
             actor,
         ))),
         media_attachments: Vec::new(),
-        mentions: Vec::new(),
+        mentions,
         tags: Vec::new(),
         emojis: Vec::new(),
         reblogs_count: 0,
@@ -1494,6 +1572,44 @@ pub(crate) async fn remote_status_response(
         reblog: None,
         application: None,
     })
+}
+
+/// Project cached ActivityPub Mention tags without resolving new remote identities.
+async fn remote_status_mentions(
+    state: &AppState,
+    status: &roosty_db::RemoteStatus,
+) -> Result<Vec<MentionResponse>, RoostyError> {
+    let Some(tags) = status.object.get("tag").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let local_prefix = format!(
+        "{}/users/",
+        state.config.public_base_url.as_str().trim_end_matches('/')
+    );
+    let mut mentions = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in tags {
+        if tag.get("type").and_then(Value::as_str) != Some("Mention") {
+            continue;
+        }
+        let Some(href) = tag.get("href").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(username) = href.strip_prefix(&local_prefix)
+            && !username.contains('/')
+            && let Some(account) =
+                roosty_db::find_local_account_by_username(&state.db, username).await?
+            && seen.insert(account.id)
+        {
+            mentions.push(MentionResponse::new(state, &account));
+        } else if let Some(actor) =
+            roosty_db::find_remote_actor_by_activitypub_id(&state.db, href).await?
+            && seen.insert(actor.id)
+        {
+            mentions.push(MentionResponse::remote(&actor));
+        }
+    }
+    Ok(mentions)
 }
 
 async fn reblog_response(
@@ -1566,11 +1682,42 @@ async fn status_response_for_viewer(
     let status_path = format!("@{}/{}", account.username, status.id.0);
     let url = public_url(state, &status_path);
     let reply_target = reply_target(state, status.in_reply_to_id).await?;
+    let remote_reply_actor = match status.in_reply_to_remote_status_id {
+        Some(parent_id) => match roosty_db::find_remote_status_by_id(&state.db, parent_id).await? {
+            Some(parent) => {
+                roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
+            }
+            None => None,
+        },
+        None => None,
+    };
+    let in_reply_to_id = status
+        .in_reply_to_id
+        .or(status.in_reply_to_remote_status_id)
+        .map(|id| id.0.to_string());
     let in_reply_to_account_id = reply_target
         .as_ref()
-        .map(|target| target.account_id.0.to_string());
+        .map(|target| target.account_id.0.to_string())
+        .or_else(|| {
+            remote_reply_actor
+                .as_ref()
+                .map(|actor| actor.id.0.to_string())
+        });
     let text_mentions = local_text_mentions(state, &status.content).await?;
-    let mentions = status_mentions(state, reply_target.as_ref(), &text_mentions);
+    let remote_mentions = roosty_db::remote_mentions_for_local_status(&state.db, status.id).await?;
+    let mut mentions = status_mentions(
+        state,
+        reply_target.as_ref(),
+        &text_mentions,
+        &remote_mentions,
+    );
+    if let Some(actor) = remote_reply_actor
+        && !mentions
+            .iter()
+            .any(|mention| mention.id == actor.id.0.to_string())
+    {
+        mentions.insert(0, MentionResponse::remote(&actor));
+    }
     let tags = status_tags(state, status.id).await?;
     let replies_count = roosty_db::count_local_replies(&state.db, status.id).await?;
     let reblogs_count = roosty_db::count_local_reblogs(&state.db, status.id).await?;
@@ -1610,7 +1757,7 @@ async fn status_response_for_viewer(
         created_at: format_timestamp(status.created_at),
         edited_at: (status.updated_at != status.created_at)
             .then(|| format_timestamp(status.updated_at)),
-        in_reply_to_id: status.in_reply_to_id.map(|id| id.0.to_string()),
+        in_reply_to_id,
         in_reply_to_account_id,
         sensitive: status.sensitive,
         spoiler_text: status.spoiler_text,
@@ -1622,6 +1769,7 @@ async fn status_response_for_viewer(
             state,
             &status.content,
             &text_mentions,
+            &remote_mentions,
             &tags,
         ),
         account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
@@ -1693,6 +1841,7 @@ fn status_mentions(
     state: &AppState,
     reply_target: Option<&ReplyTarget>,
     text_mentions: &[roosty_db::LocalAccount],
+    remote_mentions: &[roosty_db::RemoteActor],
 ) -> Vec<MentionResponse> {
     let mut mentions = Vec::new();
     let mut seen = HashSet::new();
@@ -1705,6 +1854,12 @@ fn status_mentions(
     for account in text_mentions {
         if seen.insert(account.id) {
             mentions.push(MentionResponse::new(state, account));
+        }
+    }
+
+    for actor in remote_mentions {
+        if seen.insert(actor.id) {
+            mentions.push(MentionResponse::remote(actor));
         }
     }
 
@@ -1953,6 +2108,7 @@ fn status_content_html_with_mentions_and_tags(
     state: &AppState,
     content: &str,
     mentions: &[roosty_db::LocalAccount],
+    remote_mentions: &[roosty_db::RemoteActor],
     tags: &[TagResponse],
 ) -> String {
     let mention_urls = mentions
@@ -1964,6 +2120,15 @@ fn status_content_html_with_mentions_and_tags(
             )
         })
         .collect::<HashMap<_, _>>();
+    let remote_mention_urls = remote_mentions
+        .iter()
+        .map(|actor| {
+            (
+                format!("{}@{}", actor.username, actor.domain),
+                actor.activitypub_id.as_str(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let tag_urls = tags
         .iter()
         .map(|tag| (tag.name.as_str(), tag.url.as_str()))
@@ -1971,6 +2136,11 @@ fn status_content_html_with_mentions_and_tags(
     let mut matches = local_mention_matches(content)
         .into_iter()
         .map(TextLinkMatch::Mention)
+        .chain(
+            remote_mention_matches(content)
+                .into_iter()
+                .map(TextLinkMatch::RemoteMention),
+        )
         .chain(
             local_hashtag_matches(content)
                 .into_iter()
@@ -1999,6 +2169,19 @@ fn status_content_html_with_mentions_and_tags(
                 }
                 last = mention.end;
             }
+            TextLinkMatch::RemoteMention(mention) => {
+                let handle = format!("{}@{}", mention.username, mention.domain);
+                if let Some(url) = remote_mention_urls.get(handle.as_str()) {
+                    html.push_str(r#"<a href=""#);
+                    html.push_str(&escape_html(url));
+                    html.push_str(r#"" class="u-url mention">@"#);
+                    html.push_str(&escape_html(&handle));
+                    html.push_str("</a>");
+                } else {
+                    push_escaped_html_with_breaks(&mut html, &content[mention.start..mention.end]);
+                }
+                last = mention.end;
+            }
             TextLinkMatch::Hashtag(hashtag) => {
                 if let Some(url) = tag_urls.get(hashtag.name.as_str()) {
                     html.push_str(r#"<a href=""#);
@@ -2021,6 +2204,7 @@ fn status_content_html_with_mentions_and_tags(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TextLinkMatch {
     Mention(MentionMatch),
+    RemoteMention(RemoteMentionMatch),
     Hashtag(HashtagMatch),
 }
 
@@ -2028,6 +2212,7 @@ impl TextLinkMatch {
     fn start(&self) -> usize {
         match self {
             TextLinkMatch::Mention(mention) => mention.start,
+            TextLinkMatch::RemoteMention(mention) => mention.start,
             TextLinkMatch::Hashtag(hashtag) => hashtag.start,
         }
     }
@@ -2041,6 +2226,14 @@ struct MentionMatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteMentionMatch {
+    start: usize,
+    end: usize,
+    username: String,
+    domain: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct HashtagMatch {
     start: usize,
     end: usize,
@@ -2048,7 +2241,7 @@ struct HashtagMatch {
 }
 
 /// Return local mention usernames in first-seen order.
-fn mention_usernames(content: &str) -> Vec<String> {
+pub(crate) fn mention_usernames(content: &str) -> Vec<String> {
     local_mention_matches(content)
         .into_iter()
         .map(|mention| mention.username)
@@ -2091,7 +2284,9 @@ fn local_mention_matches(content: &str) -> Vec<MentionMatch> {
             username.push(next);
         }
 
-        if (2..=30).contains(&username.len()) {
+        if (2..=30).contains(&username.len())
+            && iter.peek().is_none_or(|(_, character)| *character != '@')
+        {
             matches.push(MentionMatch {
                 start,
                 end,
@@ -2102,6 +2297,70 @@ fn local_mention_matches(content: &str) -> Vec<MentionMatch> {
     }
 
     matches
+}
+
+/// Locate syntactic remote `@username@domain` mentions in a plain-text status.
+fn remote_mention_matches(content: &str) -> Vec<RemoteMentionMatch> {
+    let mut matches = Vec::new();
+    let mut previous = None;
+    let mut iter = content.char_indices().peekable();
+
+    while let Some((start, character)) = iter.next() {
+        if character != '@' || !valid_mention_prefix(previous) {
+            previous = Some(character);
+            continue;
+        }
+        let mut username = String::new();
+        let mut end = start + character.len_utf8();
+        while let Some((index, next)) = iter.peek().copied() {
+            if !valid_mention_name_character(next) {
+                break;
+            }
+            iter.next();
+            end = index + next.len_utf8();
+            username.push(next);
+        }
+        if iter.next_if(|(_, next)| *next == '@').is_none() {
+            previous = content[start..end].chars().last();
+            continue;
+        }
+        end += 1;
+        let mut domain = String::new();
+        while let Some((index, next)) = iter.peek().copied() {
+            if !(next.is_ascii_alphanumeric() || next == '.' || next == '-') {
+                break;
+            }
+            iter.next();
+            end = index + next.len_utf8();
+            domain.push(next);
+        }
+        if (2..=30).contains(&username.len())
+            && domain.contains('.')
+            && !domain.starts_with('.')
+            && !domain.ends_with('.')
+        {
+            matches.push(RemoteMentionMatch {
+                start,
+                end,
+                username,
+                domain,
+            });
+        }
+        previous = content[start..end].chars().last();
+    }
+    matches
+}
+
+/// Return syntactically valid remote handles in first-seen order.
+pub(crate) fn remote_mention_handles(content: &str) -> Vec<String> {
+    let mut handles = Vec::new();
+    for mention in remote_mention_matches(content) {
+        let handle = format!("{}@{}", mention.username, mention.domain);
+        if !handles.contains(&handle) {
+            handles.push(handle);
+        }
+    }
+    handles
 }
 
 fn valid_mention_prefix(previous: Option<char>) -> bool {
@@ -2266,7 +2525,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        escape_html, hashtag_names, mention_usernames, status_content_html, timeline_limit,
+        escape_html, hashtag_names, mention_usernames, remote_mention_matches, status_content_html,
+        timeline_limit,
     };
     use crate::{config::Config, http::AppState, password};
 
@@ -4220,6 +4480,17 @@ mod tests {
         assert_eq!(
             mention_usernames("@alice test x@y @bo_b"),
             ["alice", "bo_b"]
+        );
+        assert_eq!(
+            mention_usernames("@alice@example.test"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            remote_mention_matches("hello @alice@example.test!")
+                .into_iter()
+                .map(|mention| format!("{}@{}", mention.username, mention.domain))
+                .collect::<Vec<_>>(),
+            ["alice@example.test"]
         );
         assert_eq!(
             hashtag_names("#Rust text##ignored word#skip #web_dev"),

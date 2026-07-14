@@ -237,6 +237,7 @@ mod tests {
                 spoiler_text: String::new(),
                 language: None,
                 in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
             },
         )
         .await

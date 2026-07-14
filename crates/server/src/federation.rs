@@ -97,6 +97,19 @@ struct InboundNote {
     to: Vec<String>,
     #[serde(default)]
     cc: Vec<String>,
+    #[serde(default)]
+    in_reply_to: Option<String>,
+    #[serde(default)]
+    tag: Vec<InboundTag>,
+}
+
+/// ActivityPub tag fields retained from an inbound Note.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundTag {
+    r#type: String,
+    href: Option<String>,
+    name: Option<String>,
 }
 
 /// Signed remote Delete activity, whose object may be an object ID or a Tombstone.
@@ -190,9 +203,27 @@ struct Note {
     content: String,
     published: String,
     updated: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    in_reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tag: Vec<MentionTag>,
     to: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cc: Vec<String>,
+}
+
+/// Typed ActivityPub mention tag emitted on locally authored Notes.
+#[derive(Serialize)]
+struct MentionTag {
+    r#type: MentionType,
+    href: String,
+    name: String,
+}
+
+/// ActivityStreams tag type used by this federation slice.
+#[derive(Serialize)]
+enum MentionType {
+    Mention,
 }
 
 #[derive(Serialize)]
@@ -360,10 +391,13 @@ async fn outbox(State(state): State<AppState>, Path(username): Path<String>) -> 
     };
     match roosty_db::public_local_statuses_by_account(&state.db, account.id, 20).await {
         Ok(statuses) => {
-            let items = statuses
-                .into_iter()
-                .map(|status| create(&state, &account.username, status))
-                .collect();
+            let mut items = Vec::with_capacity(statuses.len());
+            for status in statuses {
+                match create(&state, &account.username, status).await {
+                    Ok(item) => items.push(item),
+                    Err(error) => return internal_error(error),
+                }
+            }
             match roosty_db::count_public_local_statuses_by_account(&state.db, account.id).await {
                 Ok(total_items) => activity_response(OrderedCollection {
                     context: ACTIVITYSTREAMS_CONTEXT,
@@ -393,7 +427,10 @@ async fn note(
         Ok(Some(status)) if status.visibility == "public" => {
             match roosty_db::find_local_account_by_id(&state.db, status.account_id).await {
                 Ok(Some(account)) if account.username == username => {
-                    activity_response(note_object(&state, &username, status))
+                    match note_object(&state, &username, status).await {
+                        Ok(note) => activity_response(note),
+                        Err(error) => internal_error(error),
+                    }
                 }
                 Ok(_) => StatusCode::NOT_FOUND.into_response(),
                 Err(error) => internal_error(error),
@@ -578,7 +615,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         activity.get("type").and_then(JsonValue::as_str),
         Some("Create") | Some("Update") | Some("Delete")
     ) {
-        return match process_remote_status_activity(&state.db, &activity, &remote_actor).await {
+        return match process_remote_status_activity(state, &activity, &remote_actor).await {
             Ok(change) => {
                 // Record only after validation and persistence so malformed activities leave no trace.
                 if let Err(error) = roosty_db::record_processed_inbox_activity(
@@ -707,14 +744,46 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
 /// Cached remote status change that can be published to accepted local followers.
 enum RemoteStatusChange {
     /// A newly created or edited Note.
-    Upsert(roosty_db::RemoteStatus),
+    Upsert(Box<roosty_db::RemoteStatus>, Vec<String>),
     /// A removed Note with its internal API ID.
     Delete(String),
 }
 
+/// Resolve a canonical local Note URL without accepting look-alike remote URLs.
+async fn local_status_id_from_url(
+    state: &AppState,
+    activitypub_id: &str,
+) -> Result<Option<StatusId>, RoostyError> {
+    let prefix = format!(
+        "{}/users/",
+        state.config.public_base_url.as_str().trim_end_matches('/')
+    );
+    let Some(path) = activitypub_id.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    let Some((username, status_id)) = path.split_once("/statuses/") else {
+        return Ok(None);
+    };
+    if username.is_empty() || status_id.contains('/') {
+        return Ok(None);
+    }
+    let Ok(status_id) = Uuid::parse_str(status_id) else {
+        return Ok(None);
+    };
+    let Some(status) = roosty_db::find_local_status_by_id(&state.db, StatusId(status_id)).await?
+    else {
+        return Ok(None);
+    };
+    let Some(account) = roosty_db::find_local_account_by_id(&state.db, status.account_id).await?
+    else {
+        return Ok(None);
+    };
+    Ok((account.username == username).then_some(status.id))
+}
+
 /// Validate and cache one signed public or unlisted remote status lifecycle activity.
 async fn process_remote_status_activity(
-    db: &roosty_db::DbConnection,
+    state: &AppState,
     activity: &JsonValue,
     remote_actor: &roosty_db::RemoteActor,
 ) -> Result<RemoteStatusChange, RoostyError> {
@@ -737,6 +806,12 @@ async fn process_remote_status_activity(
             let object = serde_json::to_value(&activity.object)
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
             let note = activity.object;
+            let mention_urls = note
+                .tag
+                .iter()
+                .filter(|tag| tag.r#type == "Mention")
+                .filter_map(|tag| tag.href.clone())
+                .collect::<Vec<_>>();
             if activity.actor != remote_actor.activitypub_id
                 || note.attributed_to != remote_actor.activitypub_id
                 || note.r#type != "Note"
@@ -760,8 +835,14 @@ async fn process_remote_status_activity(
                     RoostyError::InvalidInput("remote Note updated timestamp is invalid".to_owned())
                 })?
                 .unwrap_or(published_at);
+            let in_reply_to_remote_status_id = match note.in_reply_to.as_deref() {
+                Some(id) => roosty_db::find_remote_status_by_activitypub_id(&state.db, id)
+                    .await?
+                    .map(|status| status.id),
+                None => None,
+            };
             let status = roosty_db::upsert_remote_status(
-                db,
+                &state.db,
                 roosty_db::NewRemoteStatus {
                     activitypub_id: note.id,
                     remote_actor_id: remote_actor.id,
@@ -769,11 +850,17 @@ async fn process_remote_status_activity(
                     visibility: visibility.to_owned(),
                     published_at,
                     updated_at,
+                    in_reply_to: note.in_reply_to.clone(),
+                    in_reply_to_local_status_id: match note.in_reply_to.as_deref() {
+                        Some(url) => local_status_id_from_url(state, url).await?,
+                        None => None,
+                    },
+                    in_reply_to_remote_status_id,
                     object,
                 },
             )
             .await?;
-            Ok(RemoteStatusChange::Upsert(status))
+            Ok(RemoteStatusChange::Upsert(Box::new(status), mention_urls))
         }
         Some("Delete") => {
             let activity: InboundDeleteActivity = serde_json::from_value(activity.clone())
@@ -793,8 +880,9 @@ async fn process_remote_status_activity(
                     "remote Delete object is invalid".to_owned(),
                 ));
             }
-            let status = roosty_db::find_remote_status_by_activitypub_id(db, &object_id).await?;
-            roosty_db::delete_remote_status(db, &object_id, remote_actor.id).await?;
+            let status =
+                roosty_db::find_remote_status_by_activitypub_id(&state.db, &object_id).await?;
+            roosty_db::delete_remote_status(&state.db, &object_id, remote_actor.id).await?;
             Ok(RemoteStatusChange::Delete(
                 status
                     .map(|status| status.id.0.to_string())
@@ -815,20 +903,55 @@ async fn publish_remote_status_change(
 ) -> Result<(), RoostyError> {
     let recipients =
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
-    if recipients.is_empty() {
-        return Ok(());
-    }
     match change {
-        RemoteStatusChange::Upsert(status) => {
-            let response = crate::statuses::remote_status_response(state, status).await?;
-            state
-                .streaming_events
-                .publish_home_update(&response, remote_actor_id, &recipients);
+        RemoteStatusChange::Upsert(status, mention_urls) => {
+            let response =
+                crate::statuses::remote_status_response(state, (*status).clone()).await?;
+            if !recipients.is_empty() {
+                state
+                    .streaming_events
+                    .publish_home_update(&response, remote_actor_id, &recipients);
+            }
+            let prefix = format!(
+                "{}/users/",
+                state.config.public_base_url.as_str().trim_end_matches('/')
+            );
+            for mention_url in mention_urls {
+                if let Some(username) = mention_url.strip_prefix(&prefix)
+                    && !username.contains('/')
+                    && let Some(account) =
+                        roosty_db::find_local_account_by_username(&state.db, username).await?
+                {
+                    crate::notifications::create_and_stream_remote_status_mention(
+                        state,
+                        account.id,
+                        remote_actor_id,
+                        status.id,
+                    )
+                    .await?;
+                }
+            }
+            if let Some(parent_id) = status.in_reply_to_local_status_id
+                && let Some(parent) =
+                    roosty_db::find_local_status_by_id(&state.db, parent_id).await?
+            {
+                crate::notifications::create_and_stream_remote_status_mention(
+                    state,
+                    parent.account_id,
+                    remote_actor_id,
+                    status.id,
+                )
+                .await?;
+            }
         }
         RemoteStatusChange::Delete(status_id) if !status_id.is_empty() => {
-            state
-                .streaming_events
-                .publish_home_delete(&status_id, remote_actor_id, &recipients);
+            if !recipients.is_empty() {
+                state.streaming_events.publish_home_delete(
+                    &status_id,
+                    remote_actor_id,
+                    &recipients,
+                );
+            }
         }
         RemoteStatusChange::Delete(_) => {}
     }
@@ -1075,12 +1198,26 @@ pub(crate) async fn enqueue_status_activity(
     let local = roosty_db::find_local_account_by_id(&state.db, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local status actor does not exist".to_owned()))?;
-    let activity = status_activity(state, &local.username, status, kind)?;
+    let activity = status_activity(state, &local.username, status, kind).await?;
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
-    for remote in roosty_db::accepted_remote_followers(&state.db, local.id).await? {
+    let mut recipients = roosty_db::accepted_remote_followers(&state.db, local.id).await?;
+    if let Some(parent_id) = status.in_reply_to_remote_status_id
+        && let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, parent_id).await?
+        && let Some(actor) =
+            roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
+        && !recipients.iter().any(|recipient| recipient.id == actor.id)
+    {
+        recipients.push(actor);
+    }
+    for actor in roosty_db::remote_mentions_for_local_status(&state.db, status.id).await? {
+        if !recipients.iter().any(|recipient| recipient.id == actor.id) {
+            recipients.push(actor);
+        }
+    }
+    for remote in recipients {
         let payload = serde_json::to_value(StatusDelivery {
             local_account_id: local.id,
             remote_actor_id: remote.id,
@@ -1097,6 +1234,33 @@ pub(crate) async fn enqueue_status_activity(
         .await?;
     }
     Ok(())
+}
+
+/// Resolve syntactically valid remote handles for a local status without making posting fail.
+pub(crate) async fn resolve_remote_mentions(
+    state: &AppState,
+    content: &str,
+) -> Vec<roosty_db::RemoteActor> {
+    let mut actors = Vec::new();
+    for handle in remote_mention_handles(content) {
+        match discovery::resolve_remote_actor(state, &handle).await {
+            Ok(actor)
+                if !actors
+                    .iter()
+                    .any(|existing: &roosty_db::RemoteActor| existing.id == actor.id) =>
+            {
+                actors.push(actor)
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(%error, %handle, "could not resolve remote mention"),
+        }
+    }
+    actors
+}
+
+/// Return syntactic remote `@user@domain` handles in first-seen order.
+fn remote_mention_handles(content: &str) -> Vec<String> {
+    crate::statuses::remote_mention_handles(content)
 }
 
 /// Kinds of status lifecycle activities emitted to remote followers.
@@ -1328,9 +1492,13 @@ async fn signed_post(
     }
 }
 
-fn create(state: &AppState, username: &str, status: roosty_db::LocalStatus) -> Create {
-    let object = note_object(state, username, status);
-    Create {
+async fn create(
+    state: &AppState,
+    username: &str,
+    status: roosty_db::LocalStatus,
+) -> Result<Create, RoostyError> {
+    let object = note_object(state, username, status).await?;
+    Ok(Create {
         context: ACTIVITYSTREAMS_CONTEXT,
         r#type: CreateType::Create,
         id: format!("{}#create", object.id),
@@ -1339,16 +1507,16 @@ fn create(state: &AppState, username: &str, status: roosty_db::LocalStatus) -> C
         to: object.to.clone(),
         cc: object.cc.clone(),
         object,
-    }
+    })
 }
 
-fn status_activity(
+async fn status_activity(
     state: &AppState,
     username: &str,
     status: &roosty_db::LocalStatus,
     kind: StatusActivityKind,
 ) -> Result<JsonValue, RoostyError> {
-    let note = note_object(state, username, status.clone());
+    let note = note_object(state, username, status.clone()).await?;
     let actor = note.attributed_to.clone();
     let activity = match kind {
         StatusActivityKind::Create => serde_json::to_value(Create {
@@ -1383,10 +1551,68 @@ fn status_activity(
     activity.map_err(|error| RoostyError::InvalidInput(error.to_string()))
 }
 
-fn note_object(state: &AppState, username: &str, status: roosty_db::LocalStatus) -> Note {
+async fn note_object(
+    state: &AppState,
+    username: &str,
+    status: roosty_db::LocalStatus,
+) -> Result<Note, RoostyError> {
     let id = status_url(state, username, status.id);
     let (to, cc) = status_audience(state, username, &status.visibility);
-    Note {
+    let in_reply_to = match status.in_reply_to_remote_status_id {
+        Some(id) => roosty_db::find_remote_status_by_id(&state.db, id)
+            .await?
+            .map(|status| status.activitypub_id),
+        None => match status.in_reply_to_id {
+            Some(parent_id) => match roosty_db::find_local_status_by_id(&state.db, parent_id)
+                .await?
+            {
+                Some(parent) => {
+                    match roosty_db::find_local_account_by_id(&state.db, parent.account_id).await? {
+                        Some(parent_account) => {
+                            Some(status_url(state, &parent_account.username, parent.id))
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            },
+            None => None,
+        },
+    };
+    let mut tag = Vec::new();
+    for username in crate::statuses::mention_usernames(&status.content) {
+        if let Some(account) =
+            roosty_db::find_local_account_by_username(&state.db, &username).await?
+        {
+            tag.push(MentionTag {
+                r#type: MentionType::Mention,
+                href: actor_url(state, &account.username),
+                name: format!("@{}", account.username),
+            });
+        }
+    }
+    for actor in roosty_db::remote_mentions_for_local_status(&state.db, status.id).await? {
+        tag.push(MentionTag {
+            r#type: MentionType::Mention,
+            href: actor.activitypub_id,
+            name: format!("@{}@{}", actor.username, actor.domain),
+        });
+    }
+    if let Some(parent_id) = status.in_reply_to_remote_status_id
+        && let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, parent_id).await?
+        && let Some(actor) =
+            roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
+        && !tag
+            .iter()
+            .any(|mention| mention.href == actor.activitypub_id)
+    {
+        tag.push(MentionTag {
+            r#type: MentionType::Mention,
+            href: actor.activitypub_id,
+            name: format!("@{}@{}", actor.username, actor.domain),
+        });
+    }
+    Ok(Note {
         context: ACTIVITYSTREAMS_CONTEXT,
         id,
         r#type: NoteType::Note,
@@ -1394,9 +1620,11 @@ fn note_object(state: &AppState, username: &str, status: roosty_db::LocalStatus)
         content: status.content,
         published: crate::statuses::format_timestamp(status.created_at),
         updated: crate::statuses::format_timestamp(status.updated_at),
+        in_reply_to,
+        tag,
         to,
         cc,
-    }
+    })
 }
 
 fn status_audience(
@@ -1500,8 +1728,8 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        Actor, ActorType, CollectionType, Create, CreateType, InboundNote, Note, NoteType,
-        OrderedCollection, PublicKey, parse_acct, remote_status_visibility,
+        Actor, ActorType, CollectionType, Create, CreateType, InboundNote, MentionTag, MentionType,
+        Note, NoteType, OrderedCollection, PublicKey, parse_acct, remote_status_visibility,
     };
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
@@ -1529,6 +1757,8 @@ mod tests {
             updated: None,
             to: to.into_iter().map(str::to_owned).collect(),
             cc: cc.into_iter().map(str::to_owned).collect(),
+            in_reply_to: None,
+            tag: Vec::new(),
         };
         let public = "https://www.w3.org/ns/activitystreams#Public";
 
@@ -1573,6 +1803,12 @@ mod tests {
             content: "Hello".to_owned(),
             published: "2026-07-13T00:00:00Z".to_owned(),
             updated: "2026-07-13T00:00:00Z".to_owned(),
+            in_reply_to: None,
+            tag: vec![MentionTag {
+                r#type: MentionType::Mention,
+                href: "https://example.test/users/bob".to_owned(),
+                name: "@bob".to_owned(),
+            }],
             to: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
             cc: Vec::new(),
         };
@@ -1603,6 +1839,10 @@ mod tests {
         assert_eq!(
             collection["orderedItems"][0]["object"]["attributedTo"],
             "https://example.test/users/alice"
+        );
+        assert_eq!(
+            collection["orderedItems"][0]["object"]["tag"][0]["type"],
+            "Mention"
         );
         assert!(
             collection["orderedItems"][0]["object"]

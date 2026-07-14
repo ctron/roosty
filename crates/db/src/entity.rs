@@ -13,6 +13,7 @@ pub mod local_status;
 pub mod local_status_bookmark;
 pub mod local_status_favourite;
 pub mod local_status_reblog;
+pub mod local_status_remote_mention;
 pub mod local_status_tag;
 pub mod local_tag;
 pub mod local_tag_follow;

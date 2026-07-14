@@ -13,7 +13,8 @@
 
 ### Federation gaps
 
-- [ ] Add controlled remote actor cache refresh and remote account search projections.
+- [ ] Refresh cached remote actors before expiry, with bounded retries and observability.
+- [ ] Include cached and resolved remote accounts in Mastodon account search, with pagination and ranking.
 - [x] Add signed outbound `Follow` and `Undo(Follow)` delivery, including durable delivery jobs, destination deduplication, retries, and permanent-failure diagnostics.
 - [x] Process inbound `Accept` and `Reject` for locally initiated remote follows; signed inbound `Follow`/`Undo(Follow)` and locked-account requests are available.
 - [x] Persist local-to-remote follow/relationship state and expose accepted local and remote relationships through Mastodon and ActivityPub follower/following collections.
@@ -21,15 +22,27 @@
 - [x] Verify signed inbound public/unlisted `Create`, `Update`, and `Delete` activities and cache remote Notes by canonical object ID.
 - [x] Project cached remote Notes into local home timelines.
 - [x] Stream cached remote Note create/update/delete events to local home timelines.
-- [ ] Add remote home-timeline repair, visibility semantics, and remote follower collection contents.
-- [ ] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and home-timeline visibility.
-- [ ] Deliver and process favourites (`Like`/`Undo`) and boosts (`Announce`/`Undo`), including remote counters and notifications.
-- [ ] Deliver and process remote status deletes for cached Notes, including timeline repair and notifications.
-- [ ] Deliver and process Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle and account migration.
-- [ ] Add safe remote media attachment fetching, caching, validation, expiry, and public-status delivery references.
-- [ ] Add remote notifications for follows, mentions, replies, favourites, and boosts.
-- [ ] Add remote mute/block behavior and apply domain policy to inbox processing and delivery.
-- [ ] Add remote direct conversations and account migration.
+- [ ] Repair remote home timelines after missed delivery, cache expiry, deletion, and follow-state changes.
+- [ ] Implement remote visibility semantics beyond public/unlisted Notes, including replies and follower-only addressing.
+- [ ] Fetch and expose paginated remote followers/following collection contents.
+- [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
+- [ ] Build remote reply contexts and conversation/thread traversal across cached local and remote parents.
+- [ ] Support remote reply delivery and addressing for non-public visibility, including follower-only replies.
+- [ ] Deliver and process favourites (`Like`/`Undo`), including remote counters and notifications.
+- [ ] Deliver and process boosts (`Announce`/`Undo`), including remote timeline entries, counters, and notifications.
+- [ ] Repair cached-status timelines and notification references after signed remote Deletes.
+- [ ] Process Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle and account migration.
+- [ ] Safely fetch, validate, cache, expire, and render remote media attachments.
+- [ ] Federate follow, mention, reply, favourite, and boost notifications to remote recipients.
+- [ ] Add grouped notifications and Web Push integration.
+- [ ] Apply local mute/block and domain-policy decisions consistently to discovery, inbox processing, delivery, and notifications.
+- [ ] Deliver remote mute/block activities and project their relationship state.
+- [ ] Support remote direct conversations, including encrypted/private addressing policy and timeline projection.
+- [ ] Support remote account migration, redirects, and moved-account relationship updates.
+- [ ] Add remote hashtag discovery, status/tag projections, and featured/profile tags.
+- [ ] Add ActivityPub `Announce` support for remote boosts.
+- [ ] Add replay protection for reused or absent remote activity IDs beyond current canonical-ID idempotency.
+- [ ] Support multi-process streaming fan-out and federation-worker coordination.
 
 ## Long Term
 
@@ -51,26 +64,24 @@
 
 - [x] Harden inbound remote follow handling with signed HTTP `Date` freshness checks and activity-ID idempotency.
 - [ ] Add replay protection beyond activity-ID idempotency where remote actors reuse or omit canonical activity IDs.
-- Add cursor pagination and `Link` headers to remote follow-request listing.
+- [ ] Add cursor pagination and `Link` headers to remote follow-request listing.
 - [x] Retry federation deliveries with exponential backoff until the operator-configured `ROOSTY_FEDERATION_DELIVERY_MAX_AGE` horizon, then record permanent failures and emit diagnostics.
-- Add signature, retry, and two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, and Undo.
-- Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
-- Apply local mute/block policy to remote follow requests and remote follow notifications.
-- Enrich remote account projections with profile media and remote relationship/status counts as those data become available.
-- Implement local-to-remote Follow and Undo(Follow) initiation and relationship state.
+- [ ] Add signature, retry, and two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, and Undo.
+- [ ] Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
+- [ ] Apply local mute/block policy to remote follow requests and remote follow notifications.
+- [ ] Enrich remote account projections with profile media and remote relationship/status counts as those data become available.
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.
-- Add cached remote Notes to home timelines and streaming fan-out.
-- Add public/unlisted remote replies and mentions, including addressing and object resolution.
-- Add remote favourites and boosts (`Like`/`Announce` and their `Undo` activities).
-- Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote media caching.
-- Add remote notifications and direct conversations.
-- Fill Mastodon client startup gaps found by Elk and browser logs.
-- Improve local account administration now that multiple local users can be operator-created.
-- Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
-- Add cursor pagination for account status collections.
-- Expand local direct conversations toward remote conversation support.
-- Add remote ActivityPub `Announce` support for boosts.
-- Add remote hashtag discovery and featured/profile tags.
-- Extend media support with video/audio validation, async processing, and object storage.
-- Keep compatibility documentation updated with every implemented or intentionally deferred API.
+- [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
+- [ ] Add remote favourites and boosts (`Like`/`Announce` and their `Undo` activities).
+- [ ] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote media caching.
+- [ ] Add remote notifications and direct conversations.
+- [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
+- [ ] Improve local account administration now that multiple local users can be operator-created.
+- [ ] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
+- [ ] Add cursor pagination for account status collections.
+- [ ] Expand local direct conversations toward remote conversation support.
+- [ ] Add remote ActivityPub `Announce` support for boosts.
+- [ ] Add remote hashtag discovery and featured/profile tags.
+- [ ] Extend media support with video/audio validation, async processing, and object storage.
+- [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.

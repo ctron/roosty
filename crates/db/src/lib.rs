@@ -26,9 +26,9 @@ use entity::{
     local_account, local_account_block, local_account_mute, local_actor_key, local_conversation,
     local_conversation_account, local_follow, local_media_attachment, local_notification,
     local_status, local_status_bookmark, local_status_favourite, local_status_reblog,
-    local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
-    oauth_application, oauth_authorization_code, remote_actor, remote_follow, remote_following,
-    remote_status,
+    local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
+    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
+    remote_actor, remote_follow, remote_following, remote_status,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -241,6 +241,12 @@ pub struct RemoteStatus {
     pub updated_at: OffsetDateTime,
     /// Soft-delete timestamp, if a signed Delete was received.
     pub deleted_at: Option<OffsetDateTime>,
+    /// Canonical remote or local object URL named by `inReplyTo`.
+    pub in_reply_to: Option<String>,
+    /// Resolved local parent, when this instance owns the referenced object.
+    pub in_reply_to_local_status_id: Option<StatusId>,
+    /// Resolved cached remote parent, when available.
+    pub in_reply_to_remote_status_id: Option<StatusId>,
     /// Original Note object retained for future projection fields.
     pub object: JsonValue,
 }
@@ -260,6 +266,12 @@ pub struct NewRemoteStatus {
     pub published_at: OffsetDateTime,
     /// Remote edit timestamp.
     pub updated_at: OffsetDateTime,
+    /// Optional canonical object URL named by the remote Note's `inReplyTo`.
+    pub in_reply_to: Option<String>,
+    /// Locally resolved parent, if the reference belongs to this instance.
+    pub in_reply_to_local_status_id: Option<StatusId>,
+    /// Cached remote parent, if it has already been resolved.
+    pub in_reply_to_remote_status_id: Option<StatusId>,
     /// Original Note object.
     pub object: JsonValue,
 }
@@ -547,6 +559,10 @@ pub async fn upsert_remote_status(
         active.published_at = Set(status.published_at);
         active.updated_at = Set(status.updated_at);
         active.deleted_at = Set(None);
+        active.in_reply_to = Set(status.in_reply_to);
+        active.in_reply_to_local_status_id = Set(status.in_reply_to_local_status_id.map(|id| id.0));
+        active.in_reply_to_remote_status_id =
+            Set(status.in_reply_to_remote_status_id.map(|id| id.0));
         active.object = Set(status.object);
         active.update(db).await?
     } else {
@@ -559,6 +575,9 @@ pub async fn upsert_remote_status(
             published_at: Set(status.published_at),
             updated_at: Set(status.updated_at),
             deleted_at: Set(None),
+            in_reply_to: Set(status.in_reply_to),
+            in_reply_to_local_status_id: Set(status.in_reply_to_local_status_id.map(|id| id.0)),
+            in_reply_to_remote_status_id: Set(status.in_reply_to_remote_status_id.map(|id| id.0)),
             object: Set(status.object),
             ..Default::default()
         }
@@ -750,6 +769,8 @@ pub struct LocalStatus {
     pub language: Option<String>,
     /// Optional local status this status replies to.
     pub in_reply_to_id: Option<StatusId>,
+    /// Optional cached remote status this local status replies to.
+    pub in_reply_to_remote_status_id: Option<StatusId>,
     /// Optional local direct-message conversation containing this status.
     pub conversation_id: Option<Uuid>,
     /// Creation timestamp.
@@ -801,6 +822,8 @@ pub struct NewLocalStatus {
     pub language: Option<String>,
     /// Optional local status this status replies to.
     pub in_reply_to_id: Option<StatusId>,
+    /// Optional cached remote parent status.
+    pub in_reply_to_remote_status_id: Option<StatusId>,
 }
 
 /// Stored local direct-message conversation.
@@ -2289,6 +2312,7 @@ pub async fn create_local_status(
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
         in_reply_to_id: Set(new_status.in_reply_to_id.map(|id| id.0)),
+        in_reply_to_remote_status_id: Set(new_status.in_reply_to_remote_status_id.map(|id| id.0)),
         conversation_id: Set(None),
         created_at: Set(created_at),
         updated_at: Set(created_at),
@@ -2340,6 +2364,7 @@ pub async fn create_local_status_with_media(
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
         in_reply_to_id: Set(new_status.in_reply_to_id.map(|id| id.0)),
+        in_reply_to_remote_status_id: Set(new_status.in_reply_to_remote_status_id.map(|id| id.0)),
         conversation_id: Set(None),
         created_at: Set(created_at),
         updated_at: Set(created_at),
@@ -2398,6 +2423,56 @@ pub async fn replace_local_status_tags(
 
     txn.commit().await?;
     Ok(())
+}
+
+/// Replace the resolved remote actors explicitly mentioned by one local status.
+pub async fn replace_local_status_remote_mentions(
+    db: &DbConnection,
+    status_id: StatusId,
+    remote_actor_ids: &[AccountId],
+) -> Result<()> {
+    let txn = db.begin().await?;
+    local_status_remote_mention::Entity::delete_many()
+        .filter(local_status_remote_mention::Column::StatusId.eq(status_id.0))
+        .exec(&txn)
+        .await?;
+
+    let now = OffsetDateTime::now_utc();
+    let mut actor_ids = remote_actor_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    actor_ids.sort();
+    actor_ids.dedup();
+    for remote_actor_id in actor_ids {
+        local_status_remote_mention::ActiveModel {
+            status_id: Set(status_id.0),
+            remote_actor_id: Set(remote_actor_id),
+            created_at: Set(now),
+        }
+        .insert(&txn)
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// List remote actors explicitly mentioned by one local status.
+pub async fn remote_mentions_for_local_status(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Vec<RemoteActor>> {
+    let rows = local_status_remote_mention::Entity::find()
+        .filter(local_status_remote_mention::Column::StatusId.eq(status_id.0))
+        .all(db)
+        .await?;
+    let mut actors = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(actor) = remote_actor::Entity::find_by_id(row.remote_actor_id)
+            .one(db)
+            .await?
+        {
+            actors.push(remote_actor_from_model(actor));
+        }
+    }
+    Ok(actors)
 }
 
 /// List tags attached to a local status in normalized name order.
@@ -4411,6 +4486,9 @@ fn remote_status_from_model(status: remote_status::Model) -> RemoteStatus {
         published_at: status.published_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
+        in_reply_to: status.in_reply_to,
+        in_reply_to_local_status_id: status.in_reply_to_local_status_id.map(StatusId),
+        in_reply_to_remote_status_id: status.in_reply_to_remote_status_id.map(StatusId),
         object: status.object,
     }
 }
@@ -4465,6 +4543,7 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         spoiler_text: status.spoiler_text,
         language: status.language,
         in_reply_to_id: status.in_reply_to_id.map(StatusId),
+        in_reply_to_remote_status_id: status.in_reply_to_remote_status_id.map(StatusId),
         conversation_id: status.conversation_id,
         created_at: status.created_at,
         updated_at: status.updated_at,

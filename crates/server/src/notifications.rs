@@ -210,6 +210,28 @@ pub(crate) async fn create_and_stream_remote_follow_notification(
     Ok(())
 }
 
+/// Create and stream an idempotent mention notification caused by a cached remote Note.
+pub(crate) async fn create_and_stream_remote_status_mention(
+    state: &AppState,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<(), RoostyError> {
+    let notification = roosty_db::notify_remote_status_mention(
+        &state.db,
+        account_id,
+        remote_actor_id,
+        remote_status_id,
+    )
+    .await?;
+    if let Some(response) = notification_response(state, account_id, notification).await? {
+        state
+            .streaming_events
+            .publish_notification(&response, account_id);
+    }
+    Ok(())
+}
+
 async fn notification_page_response(
     state: &AppState,
     account_id: AccountId,
