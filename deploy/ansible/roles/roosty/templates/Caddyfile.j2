@@ -33,7 +33,7 @@ phanpy.{$ROOSTY_DOMAIN} {
 	route {
 		@phanpy_root {
 			path /
-			not query default=1
+			query ""
 		}
 		redir @phanpy_root /?default=1#/login?instance={$ROOSTY_DOMAIN} 302
 		root * /srv/phanpy

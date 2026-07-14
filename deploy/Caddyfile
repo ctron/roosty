@@ -20,7 +20,7 @@ https://localhost:4002 {
 	route {
 		@phanpy_root {
 			path /
-			not query default=1
+			query ""
 		}
 		redir @phanpy_root /?default=1#/login?instance=roosty.localhost:4000 302
 		root * /srv/phanpy
