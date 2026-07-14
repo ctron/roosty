@@ -230,6 +230,32 @@ struct InboundNote {
     in_reply_to: Option<String>,
     #[serde(default)]
     tag: Vec<InboundTag>,
+    #[serde(default)]
+    attachment: Vec<InboundAttachment>,
+}
+
+/// Attachment metadata declared by a remote ActivityPub Note.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundAttachment {
+    #[serde(rename = "type")]
+    r#type: String,
+    media_type: Option<String>,
+    url: Option<JsonValue>,
+    name: Option<String>,
+}
+
+impl InboundAttachment {
+    fn url(&self) -> Option<String> {
+        match self.url.as_ref()? {
+            JsonValue::String(url) => Some(url.clone()),
+            JsonValue::Object(object) => object
+                .get("href")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
 }
 
 /// ActivityPub tag fields retained from an inbound Note.
@@ -1169,6 +1195,20 @@ async fn process_remote_status_activity(
             let object = serde_json::to_value(&activity.object)
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
             let note = activity.object;
+            let attachments = note
+                .attachment
+                .iter()
+                .filter(|attachment| attachment.r#type == "Document")
+                .filter_map(|attachment| {
+                    attachment
+                        .url()
+                        .map(|remote_url| roosty_db::NewRemoteMediaAttachment {
+                            remote_url,
+                            content_type: attachment.media_type.clone(),
+                            description: attachment.name.clone(),
+                        })
+                })
+                .collect::<Vec<_>>();
             let mention_urls = note
                 .tag
                 .iter()
@@ -1224,6 +1264,7 @@ async fn process_remote_status_activity(
                     in_reply_to_remote_status_id,
                     object,
                 },
+                &attachments,
             )
             .await?;
             txn.commit().await?;
@@ -3074,6 +3115,7 @@ mod tests {
             cc: cc.into_iter().map(str::to_owned).collect(),
             in_reply_to: None,
             tag: Vec::new(),
+            attachment: Vec::new(),
         };
         let public = "https://www.w3.org/ns/activitystreams#Public";
 
@@ -3245,6 +3287,9 @@ mod tests {
             federation_allowed_domains: vec!["*".to_owned()],
             federation_blocked_domains: Vec::new(),
             federation_delivery_max_age: time::Duration::days(7),
+            remote_media_cache_ttl: time::Duration::days(30),
+            remote_media_max_bytes: 40 * 1024 * 1024,
+            remote_media_fetch_concurrency: 5,
             instance_name: "Federation test".to_owned(),
             instance_description: None,
         }
@@ -3397,6 +3442,11 @@ mod tests {
             }
             roosty_db::JobKind::FederationReblogDelivery => {
                 super::deliver_reblog_activity(state, job.payload)
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationRemoteMediaFetch => {
+                crate::media::fetch_remote_media(state, job.payload)
                     .await
                     .unwrap();
             }

@@ -342,6 +342,9 @@ async fn worker_loop(
                         "federation_reblog_delivery" => {
                             crate::federation::deliver_reblog_activity(&state, job.payload).await
                         }
+                        "federation_remote_media_fetch" => {
+                            crate::media::fetch_remote_media(&state, job.payload).await
+                        }
                         _ => Ok(()),
                     };
                     match result {

@@ -14,6 +14,7 @@ use axum::{
 use axum_params::{Params, UploadFile};
 use image::{GenericImageView, ImageFormat, ImageReader};
 use roosty_core::{AccountId, RoostyError};
+use sea_orm::TransactionTrait;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::task;
@@ -101,6 +102,183 @@ pub fn router() -> Router<AppState> {
             "/media_attachments/files/{*path}",
             get(serve_media_attachment),
         )
+        .route(
+            "/media_attachments/remote/{media_id}",
+            get(serve_remote_media_attachment),
+        )
+}
+
+/// Serve a successfully cached remote attachment from local storage.
+async fn serve_remote_media_attachment(
+    State(state): State<AppState>,
+    AxumPath(media_id): AxumPath<Uuid>,
+) -> Response {
+    let media = match roosty_db::find_remote_media_attachment(&state.db, media_id).await {
+        Ok(Some(media)) => media,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(error),
+    };
+    let Some(path) = media.file_path else {
+        if media.state != roosty_db::RemoteMediaState::Failed
+            && let Ok(txn) = state.db.begin().await
+        {
+            let _ = roosty_db::queue_remote_media_fetch(
+                &txn,
+                media_id,
+                roosty_db::NewJob {
+                    kind: roosty_db::JobKind::FederationRemoteMediaFetch,
+                    payload: serde_json::json!({"attachment_id": media_id}),
+                    deduplication_key: Some(media_id.to_string()),
+                    run_after: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await;
+            let _ = txn.commit().await;
+        }
+        return StatusCode::ACCEPTED.into_response();
+    };
+    match tokio::fs::read(media_path(&state, &path)).await {
+        Ok(bytes) => (
+            [(
+                header::CONTENT_TYPE,
+                media
+                    .content_type
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// Fetch one remote attachment through the federation network policy.
+pub(crate) async fn fetch_remote_media(
+    state: &AppState,
+    payload: serde_json::Value,
+) -> Result<(), RoostyError> {
+    let id = payload
+        .get("attachment_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| RoostyError::InvalidInput("invalid remote media payload".to_owned()))?;
+    let media = roosty_db::find_remote_media_attachment(&state.db, id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote media attachment does not exist".to_owned())
+        })?;
+    let url = url::Url::parse(&media.remote_url)
+        .map_err(|_| RoostyError::InvalidInput("remote media URL is invalid".to_owned()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| RoostyError::InvalidInput("remote media URL has no host".to_owned()))?
+        .to_owned();
+    let address = crate::federation::discovery::validate_remote_url(state, &url).await?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .resolve(&host, address)
+        .build()
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(RoostyError::InvalidInput(format!(
+            "remote media returned {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > state.config.remote_media_max_bytes)
+    {
+        return Err(RoostyError::InvalidInput(
+            "remote media exceeds configured size limit".to_owned(),
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    if bytes.len() as u64 > state.config.remote_media_max_bytes {
+        return Err(RoostyError::InvalidInput(
+            "remote media exceeds configured size limit".to_owned(),
+        ));
+    }
+    let path = format!("remote/{id}.bin");
+    let full_path = media_path(state, &path);
+    create_media_parent(&full_path)
+        .await
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    tokio::fs::write(full_path, &bytes)
+        .await
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::mark_remote_media_ready(
+        &state.db,
+        id,
+        content_type,
+        path,
+        bytes.len() as i64,
+        time::OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
+    )
+    .await
+}
+
+/// Project a remote cache entry into Mastodon's media attachment shape.
+pub(crate) fn remote_media_attachment_response(
+    state: &AppState,
+    media: roosty_db::RemoteMediaAttachment,
+) -> MediaAttachmentResponse {
+    let url = format!(
+        "{}/media_attachments/remote/{}",
+        state.config.public_base_url.as_str().trim_end_matches('/'),
+        media.id
+    );
+    let image = media
+        .width
+        .zip(media.height)
+        .map(|(width, height)| ImageMeta {
+            width,
+            height,
+            size: format!("{width}x{height}"),
+            aspect: width as f64 / height as f64,
+        });
+    MediaAttachmentResponse {
+        id: media.id.to_string(),
+        media_type: remote_media_type(media.content_type.as_deref()),
+        url: url.clone(),
+        preview_url: url,
+        remote_url: Some(media.remote_url),
+        meta: MediaMeta {
+            original: image,
+            small: None,
+            focus: None,
+        },
+        description: media.description,
+        blurhash: media.blurhash,
+    }
+}
+
+fn remote_media_type(content_type: Option<&str>) -> &'static str {
+    match content_type.unwrap_or_default() {
+        value if value.starts_with("image/") => "image",
+        value if value.starts_with("video/") => "video",
+        value if value.starts_with("audio/") => "audio",
+        _ => "unknown",
+    }
 }
 
 /// Mastodon media upload form fields.

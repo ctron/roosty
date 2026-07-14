@@ -29,6 +29,12 @@ pub struct Config {
     pub federation_blocked_domains: Vec<String>,
     /// Maximum age for retrying a failed federation delivery job.
     pub federation_delivery_max_age: time::Duration,
+    /// Retention period for successfully fetched remote media.
+    pub remote_media_cache_ttl: time::Duration,
+    /// Maximum bytes accepted from one remote media response.
+    pub remote_media_max_bytes: u64,
+    /// Maximum remote media downloads this worker runs concurrently.
+    pub remote_media_fetch_concurrency: usize,
     pub instance_name: String,
     pub instance_description: Option<String>,
 }
@@ -55,6 +61,17 @@ impl Config {
         let federation_blocked_domains = optional_domain_list("ROOSTY_FEDERATION_BLOCKED_DOMAINS")?;
         let federation_delivery_max_age =
             optional_humantime_duration_env("ROOSTY_FEDERATION_DELIVERY_MAX_AGE", "7d")?;
+        let remote_media_cache_ttl =
+            optional_humantime_duration_env("ROOSTY_REMOTE_MEDIA_CACHE_TTL", "30d")?;
+        let remote_media_max_bytes =
+            optional_bytesize_env("ROOSTY_REMOTE_MEDIA_MAX_BYTES", "40MiB")?;
+        let remote_media_fetch_concurrency =
+            parse_env("ROOSTY_REMOTE_MEDIA_FETCH_CONCURRENCY", "5")?;
+        if remote_media_fetch_concurrency == 0 {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_REMOTE_MEDIA_FETCH_CONCURRENCY must be positive".to_owned(),
+            ));
+        }
         if federation_enabled {
             if public_base_url.scheme() != "https" || public_base_url.host_str().is_none() {
                 return Err(RoostyError::Configuration(
@@ -97,6 +114,9 @@ impl Config {
             federation_allowed_domains,
             federation_blocked_domains,
             federation_delivery_max_age,
+            remote_media_cache_ttl,
+            remote_media_max_bytes,
+            remote_media_fetch_concurrency,
             instance_name: required_env("ROOSTY_INSTANCE_NAME")?,
             instance_description: optional_env("ROOSTY_INSTANCE_DESCRIPTION"),
         })
@@ -115,6 +135,18 @@ impl Config {
                 .iter()
                 .any(|blocked| blocked == &domain)
     }
+}
+
+fn optional_bytesize_env(name: &str, default: &str) -> Result<u64> {
+    let value = optional_env(name).unwrap_or_else(|| default.to_owned());
+    value
+        .parse::<bytesize::ByteSize>()
+        .map(|size| size.as_u64())
+        .map_err(|_| {
+            RoostyError::Configuration(format!(
+                "{name} must be a human-readable byte size, such as 40MiB"
+            ))
+        })
 }
 
 fn optional_humantime_duration_env(name: &str, default: &str) -> Result<time::Duration> {
@@ -256,6 +288,9 @@ mod tests {
             federation_allowed_domains: vec!["*".to_owned()],
             federation_blocked_domains: vec!["blocked.example".to_owned()],
             federation_delivery_max_age: time::Duration::days(7),
+            remote_media_cache_ttl: time::Duration::days(30),
+            remote_media_max_bytes: 40 * 1024 * 1024,
+            remote_media_fetch_concurrency: 5,
             instance_name: "Roosty Test".to_owned(),
             instance_description: None,
         };

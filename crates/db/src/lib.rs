@@ -6,16 +6,16 @@ use rand_core::{OsRng, RngCore};
 use roosty_core::{AccountId, JobId, Result, RoostyError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
-    DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, FromQueryResult, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
-    TryInsertResult,
+    DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult,
+    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
+    TransactionTrait, TryInsertResult,
     sea_query::{OnConflict, Query},
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::str::FromStr;
-use strum::{EnumString, IntoStaticStr};
+use strum::{Display, EnumString, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -30,8 +30,8 @@ use entity::{
     local_status_bookmark, local_status_favourite, local_status_reblog,
     local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
     local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    processed_inbox_activity, remote_actor, remote_follow, remote_following, remote_status,
-    remote_status_favourite, remote_status_reblog,
+    processed_inbox_activity, remote_actor, remote_follow, remote_following,
+    remote_media_attachment, remote_status, remote_status_favourite, remote_status_reblog,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -60,6 +60,41 @@ pub struct LocalStatusMetadata {
     pub tag_names: Vec<String>,
     /// Resolved remote actors explicitly mentioned by the status.
     pub remote_actor_ids: Vec<AccountId>,
+}
+
+/// An attachment declared by a verified remote Note.
+#[derive(Clone, Debug)]
+pub struct NewRemoteMediaAttachment {
+    pub remote_url: String,
+    pub content_type: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Lifecycle state of a locally cached remote attachment.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum RemoteMediaState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+/// Cached remote attachment metadata exposed to API projections.
+#[derive(Clone, Debug)]
+pub struct RemoteMediaAttachment {
+    pub id: Uuid,
+    pub remote_status_id: StatusId,
+    pub remote_url: String,
+    pub content_type: Option<String>,
+    pub description: Option<String>,
+    pub state: RemoteMediaState,
+    pub file_path: Option<String>,
+    pub preview_file_path: Option<String>,
+    pub file_size: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub blurhash: Option<String>,
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Open a database connection using SeaORM's PostgreSQL driver.
@@ -546,6 +581,162 @@ pub async fn find_remote_status_by_id(
         .map(remote_status_from_model))
 }
 
+/// Replace the declared attachment set for a cached remote status.
+pub async fn replace_remote_media_attachments(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    attachments: &[NewRemoteMediaAttachment],
+) -> Result<()> {
+    remote_media_attachment::Entity::delete_many()
+        .filter(remote_media_attachment::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    for attachment in attachments {
+        remote_media_attachment::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            remote_status_id: Set(status_id.0),
+            remote_url: Set(attachment.remote_url.clone()),
+            content_type: Set(attachment.content_type.clone()),
+            description: Set(attachment.description.clone()),
+            state: Set(RemoteMediaState::Pending.to_string()),
+            file_path: Set(None),
+            preview_file_path: Set(None),
+            file_size: Set(None),
+            width: Set(None),
+            height: Set(None),
+            blurhash: Set(None),
+            fetched_at: Set(None),
+            expires_at: Set(None),
+            last_error: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// List attachments declared by a cached remote status.
+pub async fn remote_media_attachments_for_status(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<RemoteMediaAttachment>> {
+    remote_media_attachment::Entity::find()
+        .filter(remote_media_attachment::Column::RemoteStatusId.eq(status_id.0))
+        .order_by_asc(remote_media_attachment::Column::CreatedAt)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_media_attachment_from_model)
+        .collect::<Result<Vec<_>>>()
+}
+
+/// Find one remote media attachment by cache identity.
+pub async fn find_remote_media_attachment(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+) -> Result<Option<RemoteMediaAttachment>> {
+    remote_media_attachment::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .map(remote_media_attachment_from_model)
+        .transpose()
+}
+
+fn remote_media_attachment_from_model(
+    model: remote_media_attachment::Model,
+) -> Result<RemoteMediaAttachment> {
+    let state = RemoteMediaState::from_str(&model.state).map_err(|_| {
+        RoostyError::InvalidInput("stored remote media state is invalid".to_owned())
+    })?;
+    Ok(RemoteMediaAttachment {
+        id: model.id,
+        remote_status_id: StatusId(model.remote_status_id),
+        remote_url: model.remote_url,
+        content_type: model.content_type,
+        description: model.description,
+        state,
+        file_path: model.file_path,
+        preview_file_path: model.preview_file_path,
+        file_size: model.file_size,
+        width: model.width,
+        height: model.height,
+        blurhash: model.blurhash,
+        expires_at: model.expires_at,
+    })
+}
+
+/// Mark an attachment as being fetched and insert a deduplicated fetch job.
+pub async fn queue_remote_media_fetch(
+    txn: &DatabaseTransaction,
+    attachment_id: Uuid,
+    job: NewJob,
+) -> Result<()> {
+    let attachment = remote_media_attachment::Entity::find_by_id(attachment_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote media attachment does not exist".to_owned())
+        })?;
+    let mut active = attachment.into_active_model();
+    active.state = Set(RemoteMediaState::Pending.to_string());
+    active.last_error = Set(None);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(txn).await?;
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(())
+}
+
+/// Record a completed remote-media cache write.
+pub async fn mark_remote_media_ready(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    content_type: String,
+    file_path: String,
+    file_size: i64,
+    expires_at: OffsetDateTime,
+) -> Result<()> {
+    let Some(model) = remote_media_attachment::Entity::find_by_id(id)
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.state = Set(RemoteMediaState::Ready.to_string());
+    active.content_type = Set(Some(content_type));
+    active.file_path = Set(Some(file_path));
+    active.file_size = Set(Some(file_size));
+    active.fetched_at = Set(Some(OffsetDateTime::now_utc()));
+    active.expires_at = Set(Some(expires_at));
+    active.last_error = Set(None);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+    Ok(())
+}
+
+/// Record a remote-media fetch failure without failing the owning status cache.
+pub async fn mark_remote_media_failed(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    error: &str,
+) -> Result<()> {
+    let Some(model) = remote_media_attachment::Entity::find_by_id(id)
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.state = Set(RemoteMediaState::Failed.to_string());
+    active.last_error = Set(Some(error.to_owned()));
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+    Ok(())
+}
+
 /// Mark the locally initiated Follow identified by its activity ID as accepted.
 pub async fn accept_remote_following(
     db: &DbConnection,
@@ -677,6 +868,7 @@ pub async fn process_remote_status_upsert(
     activity_id: &str,
     remote_actor_id: AccountId,
     status: NewRemoteStatus,
+    attachments: &[NewRemoteMediaAttachment],
 ) -> Result<Option<RemoteStatus>> {
     let processed =
         processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
@@ -691,6 +883,7 @@ pub async fn process_remote_status_upsert(
         return Ok(None);
     }
     let status = upsert_remote_status_on(txn, status).await?;
+    replace_remote_media_attachments(txn, status.id, attachments).await?;
     Ok(Some(status))
 }
 
@@ -1378,6 +1571,8 @@ pub enum JobKind {
     FederationFavouriteDelivery,
     /// Deliver a locally initiated Announce or Undo(Announce).
     FederationReblogDelivery,
+    /// Safely fetch one remote media attachment into the local cache.
+    FederationRemoteMediaFetch,
 }
 
 impl JobKind {

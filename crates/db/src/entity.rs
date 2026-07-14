@@ -28,6 +28,7 @@ pub mod processed_inbox_activity;
 pub mod remote_actor;
 pub mod remote_follow;
 pub mod remote_following;
+pub mod remote_media_attachment;
 pub mod remote_status;
 pub mod remote_status_favourite;
 pub mod remote_status_reblog;

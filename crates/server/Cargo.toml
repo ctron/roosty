@@ -16,6 +16,7 @@ axum = { workspace = true }
 axum-params = { workspace = true }
 base64 = { workspace = true }
 blurhash = { workspace = true }
+bytesize = { workspace = true }
 clap = { workspace = true }
 hmac = { workspace = true }
 humantime = { workspace = true }
