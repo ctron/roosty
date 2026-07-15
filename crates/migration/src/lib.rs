@@ -42,6 +42,11 @@ mod m20260701_000037_create_remote_profile_media;
 mod m20260701_000038_add_remote_actor_lifecycle;
 mod m20260701_000039_add_remote_media_preview_metadata;
 mod m20260701_000040_create_remote_custom_emoji;
+mod m20260701_000041_add_remote_direct_conversations;
+mod m20260701_000042_create_local_conversation_remote_participant;
+mod m20260701_000043_add_follow_request_notifications;
+mod m20260701_000044_add_direct_status_recipients;
+mod m20260701_000045_constrain_status_visibility;
 
 pub struct Migrator;
 
@@ -89,6 +94,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000038_add_remote_actor_lifecycle::Migration),
             Box::new(m20260701_000039_add_remote_media_preview_metadata::Migration),
             Box::new(m20260701_000040_create_remote_custom_emoji::Migration),
+            Box::new(m20260701_000041_add_remote_direct_conversations::Migration),
+            Box::new(m20260701_000042_create_local_conversation_remote_participant::Migration),
+            Box::new(m20260701_000043_add_follow_request_notifications::Migration),
+            Box::new(m20260701_000044_add_direct_status_recipients::Migration),
+            Box::new(m20260701_000045_constrain_status_visibility::Migration),
         ]
     }
 }

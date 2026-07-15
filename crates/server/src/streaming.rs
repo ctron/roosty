@@ -155,7 +155,9 @@ impl StreamingEvent {
                 self.event == StreamingEventType::Notification && self.account_id == account_id
             }
             "direct" => {
-                self.event == StreamingEventType::Conversation && self.account_id == account_id
+                (self.event == StreamingEventType::Conversation && self.account_id == account_id)
+                    || (self.event == StreamingEventType::Delete
+                        && self.user_recipient_ids.contains(&account_id))
             }
             "public" | "public:local" => self.visibility == "public",
             _ => false,

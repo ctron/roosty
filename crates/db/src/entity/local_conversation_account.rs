@@ -12,6 +12,8 @@ pub struct Model {
     pub account_id: Uuid,
     pub unread: bool,
     pub hidden_at: Option<OffsetDateTime>,
+    pub last_status_id: Option<Uuid>,
+    pub last_remote_status_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

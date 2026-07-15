@@ -15,8 +15,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
     http::AppState,
+    statuses::CollectionLink,
 };
 
 const DEFAULT_ACCOUNT_LIMIT: u64 = 40;
@@ -116,7 +117,7 @@ pub(crate) struct RemoteAccountResponse {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum CollectionAccountResponse {
-    Local(Box<crate::auth::AccountResponse>),
+    Local(Box<AccountResponse>),
     Remote(Box<RemoteAccountResponse>),
 }
 
@@ -236,6 +237,42 @@ pub(crate) async fn remote_account_response(
         ));
     }
     Ok(response)
+}
+
+/// Project an unresolved direct-message participant without fetching its actor document.
+pub(crate) fn unresolved_remote_account_response(
+    activitypub_id: &str,
+    mention_name: Option<&str>,
+) -> RemoteAccountResponse {
+    let acct = mention_name
+        .and_then(|name| name.strip_prefix('@'))
+        .unwrap_or(activitypub_id)
+        .to_owned();
+    let username = acct.split('@').next().unwrap_or(&acct).to_owned();
+    RemoteAccountResponse {
+        id: activitypub_id.to_owned(),
+        username,
+        acct,
+        display_name: String::new(),
+        locked: false,
+        bot: false,
+        discoverable: None,
+        group: false,
+        created_at: crate::statuses::format_timestamp(time::OffsetDateTime::now_utc()),
+        note: String::new(),
+        url: activitypub_id.to_owned(),
+        avatar: String::new(),
+        avatar_static: String::new(),
+        header: String::new(),
+        header_static: String::new(),
+        fields: Vec::new(),
+        emojis: Vec::new(),
+        followers_count: 0,
+        following_count: 0,
+        statuses_count: 0,
+        last_status_at: None,
+        moved: None,
+    }
 }
 
 fn remote_account_response_from_media(
@@ -617,7 +654,7 @@ async fn follow_requests(
                     Err(error) => return server_error(error),
                 }
             }
-            let link_header = crate::statuses::CollectionLink::new(
+            let link_header = CollectionLink::new(
                 limit,
                 page.first_cursor,
                 page.last_cursor,
@@ -805,7 +842,7 @@ async fn account_collection(
                     AccountCollection::Blocks => "/api/v1/blocks".to_owned(),
                     AccountCollection::Mutes => "/api/v1/mutes".to_owned(),
                 };
-                let link_header = crate::statuses::CollectionLink::new(
+                let link_header = CollectionLink::new(
                     limit,
                     page.first_cursor,
                     page.last_cursor,

@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    auth::{AuthenticatedAccount, account_response},
+    auth::{AccountResponse, AuthenticatedAccount, account_response},
     http::AppState,
+    statuses::TagResponse,
 };
 
 const DEFAULT_SEARCH_LIMIT: u64 = 20;
@@ -36,9 +37,9 @@ struct SearchParams {
 
 #[derive(Serialize)]
 struct SearchResponse {
-    accounts: Vec<crate::auth::AccountResponse>,
+    accounts: Vec<AccountResponse>,
     statuses: Vec<Value>,
-    hashtags: Vec<crate::statuses::TagResponse>,
+    hashtags: Vec<TagResponse>,
 }
 
 #[derive(Serialize)]
@@ -91,7 +92,7 @@ async fn search_accounts(
     account_id: roosty_core::AccountId,
     params: &SearchParams,
     max_limit: u64,
-) -> roosty_core::Result<Vec<crate::auth::AccountResponse>> {
+) -> roosty_core::Result<Vec<AccountResponse>> {
     let _resolve = params.resolve.unwrap_or(false);
     let _following = params.following.unwrap_or(false);
     let Some(query) = normalized_local_query(state, params.q.as_deref()) else {
@@ -117,7 +118,7 @@ async fn search_accounts(
 async fn search_hashtags(
     state: &AppState,
     params: &SearchParams,
-) -> roosty_core::Result<Vec<crate::statuses::TagResponse>> {
+) -> roosty_core::Result<Vec<TagResponse>> {
     let Some(query) = normalized_tag_query(params.q.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -130,7 +131,7 @@ async fn search_hashtags(
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
         let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
-        responses.push(crate::statuses::TagResponse::new(state, tag, history, None));
+        responses.push(TagResponse::new(state, tag, history, None));
     }
 
     Ok(responses)
@@ -189,6 +190,7 @@ mod tests {
     };
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
+    use roosty_db::StatusVisibility;
     use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
@@ -232,7 +234,7 @@ mod tests {
             roosty_db::NewLocalStatus {
                 account_id: context.account_id,
                 content: "searchable #RoostTag".to_owned(),
-                visibility: "public".to_owned(),
+                visibility: StatusVisibility::Public,
                 sensitive: false,
                 spoiler_text: String::new(),
                 language: None,

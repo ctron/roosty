@@ -9,8 +9,10 @@ use axum::{
     routing::{get, post},
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
-use roosty_db::LocalNotificationType;
-use sea_orm::TransactionTrait;
+use roosty_db::{
+    LocalNotificationType, RemoteConversationParticipant, RemoteStatus, StatusVisibility,
+};
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -18,8 +20,17 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    accounts::{RemoteAccountResponse, remote_account_response, remote_custom_emojis},
+    auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    conversations::{publish_conversation_update, publish_conversation_updates},
+    federation::{
+        StatusActivityKind, enqueue_status_activity_in_transaction, prepare_remote_favourite,
+        prepare_remote_reblog, prepare_remote_unfavourite, prepare_remote_unreblog,
+        resolve_remote_mentions,
+    },
     http::AppState,
+    media::{MediaAttachmentResponse, media_response, remote_media_attachment_response},
+    notifications::{create_and_stream_notification, publish_committed_notification},
 };
 
 const DEFAULT_LIMIT: u64 = 20;
@@ -81,8 +92,6 @@ enum StatusInputError {
     Empty,
     #[error("status is too long")]
     TooLong,
-    #[error("visibility is invalid")]
-    Visibility,
     #[error("status id is invalid")]
     StatusId,
     #[error("media id is invalid")]
@@ -180,7 +189,7 @@ pub(crate) struct StatusResponse {
     url: String,
     content: String,
     account: StatusAccountResponse,
-    media_attachments: Vec<crate::media::MediaAttachmentResponse>,
+    media_attachments: Vec<MediaAttachmentResponse>,
     mentions: Vec<MentionResponse>,
     tags: Vec<TagResponse>,
     emojis: Vec<Value>,
@@ -200,8 +209,8 @@ pub(crate) struct StatusResponse {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum StatusAccountResponse {
-    Local(Box<crate::auth::AccountResponse>),
-    Remote(Box<crate::accounts::RemoteAccountResponse>),
+    Local(Box<AccountResponse>),
+    Remote(Box<RemoteAccountResponse>),
 }
 
 /// Mastodon-compatible hashtag response.
@@ -332,10 +341,11 @@ async fn create_status(
 
     let visibility = input
         .visibility
-        .unwrap_or_else(|| account.default_visibility.clone());
-    if let Err(error) = validate_visibility(&visibility) {
-        return bad_request(&error.to_string());
-    }
+        .unwrap_or_else(|| account.default_visibility.to_string());
+    let visibility = match StatusVisibility::parse(&visibility) {
+        Ok(visibility) => visibility,
+        Err(error) => return bad_request(&error.to_string()),
+    };
     let mut in_reply_to_id = match parse_optional_status_id(input.in_reply_to_id.as_deref()) {
         Ok(status_id) => status_id,
         Err(error) => return bad_request(&error.to_string()),
@@ -351,11 +361,26 @@ async fn create_status(
                 }
             }
             Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, parent_id).await {
-                Ok(Some(parent)) if matches!(parent.visibility.as_str(), "public" | "unlisted") => {
-                    in_reply_to_remote_status_id = Some(parent.id);
-                    in_reply_to_id = None;
+                Ok(Some(parent)) => {
+                    let visible = if matches!(
+                        parent.visibility,
+                        StatusVisibility::Public | StatusVisibility::Unlisted
+                    ) {
+                        Ok(true)
+                    } else {
+                        roosty_db::remote_status_visible_to_account(&state.db, &parent, account.id)
+                            .await
+                    };
+                    match visible {
+                        Ok(true) => {
+                            in_reply_to_remote_status_id = Some(parent.id);
+                            in_reply_to_id = None;
+                        }
+                        Ok(false) => return bad_request("reply target status does not exist"),
+                        Err(error) => return server_error(error),
+                    }
                 }
-                Ok(_) => return bad_request("reply target status does not exist"),
+                Ok(None) => return bad_request("reply target status does not exist"),
                 Err(error) => return server_error(error),
             },
             Err(error) => return server_error(error),
@@ -374,10 +399,13 @@ async fn create_status(
     };
 
     let author_id = account.id;
+    let is_direct = new_status.visibility == StatusVisibility::Direct;
     let remote_mentions = if state.config.federation_enabled
-        && matches!(new_status.visibility.as_str(), "public" | "unlisted")
-    {
-        crate::federation::resolve_remote_mentions(&state, &new_status.content).await
+        && matches!(
+            new_status.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+        ) {
+        resolve_remote_mentions(&state, &new_status.content).await
     } else {
         Vec::new()
     };
@@ -386,6 +414,10 @@ async fn create_status(
         .iter()
         .map(|actor| actor.id)
         .collect::<Vec<_>>();
+    let notification_recipients = match local_text_mentions(&state, &new_status.content).await {
+        Ok(accounts) => accounts,
+        Err(error) => return server_error(error),
+    };
     let txn = match state.db.begin().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
@@ -397,16 +429,58 @@ async fn create_status(
         roosty_db::LocalStatusMetadata {
             tag_names,
             remote_actor_ids: remote_mention_ids,
+            local_recipient_ids: if is_direct {
+                notification_recipients
+                    .iter()
+                    .map(|account| account.id)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         },
     )
     .await
     {
         Ok(mut status) => {
-            if let Err(error) = crate::federation::enqueue_status_activity_in_transaction(
+            let mut notifications = Vec::new();
+            for account_id in notification_recipients
+                .iter()
+                .filter(|recipient| recipient.id != author_id)
+                .map(|recipient| recipient.id)
+            {
+                let allowed =
+                    match roosty_db::local_account_allows_notification(&txn, account_id, author_id)
+                        .await
+                    {
+                        Ok(allowed) => allowed,
+                        Err(error) => return server_error(error),
+                    };
+                if !allowed {
+                    continue;
+                }
+                match roosty_db::notify_local_account(
+                    &txn,
+                    account_id,
+                    LocalNotificationType::Mention,
+                    author_id,
+                    Some(status.id),
+                )
+                .await
+                {
+                    Ok(notification) => notifications.push(notification),
+                    Err(error) => return server_error(error),
+                }
+            }
+            if let Err(error) =
+                attach_direct_conversation(&state, &txn, &mut status, author_id).await
+            {
+                return server_error(error);
+            }
+            if let Err(error) = enqueue_status_activity_in_transaction(
                 &state,
                 &txn,
                 &status,
-                crate::federation::StatusActivityKind::Create,
+                StatusActivityKind::Create,
             )
             .await
             {
@@ -415,21 +489,24 @@ async fn create_status(
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
-            if let Err(error) = attach_direct_conversation(&state, &mut status, author_id).await {
-                return server_error(error);
-            }
             if let Some(conversation_id) = status.conversation_id
-                && let Err(error) =
-                    crate::conversations::publish_conversation_update(&state, conversation_id).await
+                && let Err(error) = publish_conversation_update(&state, conversation_id).await
             {
                 warn!(%error, "failed to publish conversation update");
             }
 
             match status_response(&state, status.clone(), account).await {
                 Ok(response) => {
-                    if let Err(error) = notify_mentioned_accounts(&state, &status, author_id).await
-                    {
-                        warn!(%error, "failed to create mention notifications");
+                    for notification in notifications {
+                        if let Err(error) = publish_committed_notification(
+                            &state,
+                            notification.account_id,
+                            notification,
+                        )
+                        .await
+                        {
+                            warn!(%error, "failed to publish mention notification");
+                        }
                     }
                     let recipients = status_stream_recipients(&state, &status).await;
                     state.streaming_events.publish_status_update(
@@ -515,9 +592,11 @@ async fn update_status(
         .clone()
         .unwrap_or_else(|| existing.content.clone());
     let remote_mentions = if state.config.federation_enabled
-        && matches!(existing.visibility.as_str(), "public" | "unlisted")
-    {
-        crate::federation::resolve_remote_mentions(&state, &final_content).await
+        && matches!(
+            existing.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+        ) {
+        resolve_remote_mentions(&state, &final_content).await
     } else {
         Vec::new()
     };
@@ -525,6 +604,14 @@ async fn update_status(
         .iter()
         .map(|actor| actor.id)
         .collect::<Vec<_>>();
+    let local_recipient_ids = if existing.visibility == StatusVisibility::Direct {
+        match local_text_mentions(&state, &final_content).await {
+            Ok(accounts) => accounts.into_iter().map(|account| account.id).collect(),
+            Err(error) => return server_error(error),
+        }
+    } else {
+        Vec::new()
+    };
     let txn = match state.db.begin().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
@@ -539,16 +626,26 @@ async fn update_status(
         roosty_db::LocalStatusMetadata {
             tag_names: hashtag_names(&final_content),
             remote_actor_ids: remote_mention_ids,
+            local_recipient_ids,
         },
     )
     .await
     {
         Ok(Some(status)) => {
-            if let Err(error) = crate::federation::enqueue_status_activity_in_transaction(
+            let refresh = match roosty_db::repair_direct_conversation_after_delete(
+                &txn,
+                status.conversation_id,
+            )
+            .await
+            {
+                Ok(refresh) => refresh,
+                Err(error) => return server_error(error),
+            };
+            if let Err(error) = enqueue_status_activity_in_transaction(
                 &state,
                 &txn,
                 &status,
-                crate::federation::StatusActivityKind::Update,
+                StatusActivityKind::Update,
             )
             .await
             {
@@ -556,6 +653,42 @@ async fn update_status(
             }
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
+            }
+            if let Some(refresh) = &refresh {
+                state.streaming_events.publish_delete(
+                    &status.id.0.to_string(),
+                    status.account_id,
+                    "direct",
+                    &refresh.removed_account_ids,
+                );
+            }
+            if let Some(refresh) = refresh {
+                let mut account_ids = refresh.updated_account_ids;
+                match roosty_db::local_conversation_accounts_for_last_status(
+                    &state.db,
+                    refresh.conversation_id,
+                    status.id,
+                )
+                .await
+                {
+                    Ok(last_status_account_ids) => {
+                        account_ids.extend(last_status_account_ids);
+                        account_ids.sort_by_key(|id| id.0);
+                        account_ids.dedup();
+                        if let Err(error) = publish_conversation_updates(
+                            &state,
+                            refresh.conversation_id,
+                            &account_ids,
+                        )
+                        .await
+                        {
+                            warn!(%error, "failed to publish conversation update after status edit");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to resolve changed conversation views after status edit")
+                    }
+                }
             }
             match status_response(&state, status.clone(), account).await {
                 Ok(status) => Json(status).into_response(),
@@ -581,11 +714,20 @@ async fn delete_status(
     match roosty_db::delete_owned_local_status(&txn, status_id, account.id).await {
         Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
             Ok(response) => {
-                if let Err(error) = crate::federation::enqueue_status_activity_in_transaction(
+                let refresh = match roosty_db::repair_direct_conversation_after_delete(
+                    &txn,
+                    status.conversation_id,
+                )
+                .await
+                {
+                    Ok(conversation_id) => conversation_id,
+                    Err(error) => return server_error(error),
+                };
+                if let Err(error) = enqueue_status_activity_in_transaction(
                     &state,
                     &txn,
                     &status,
-                    crate::federation::StatusActivityKind::Delete,
+                    StatusActivityKind::Delete,
                 )
                 .await
                 {
@@ -600,6 +742,24 @@ async fn delete_status(
                     Err(error) => return server_error(error),
                 };
                 publish_status_delete(&state, &status, &reblogs).await;
+                if let Some(refresh) = &refresh {
+                    state.streaming_events.publish_delete(
+                        &status.id.0.to_string(),
+                        status.account_id,
+                        "direct",
+                        &refresh.removed_account_ids,
+                    );
+                }
+                if let Some(refresh) = refresh
+                    && let Err(error) = publish_conversation_updates(
+                        &state,
+                        refresh.conversation_id,
+                        &refresh.updated_account_ids,
+                    )
+                    .await
+                {
+                    warn!(%error, "failed to publish conversation update after status deletion");
+                }
                 Json(response).into_response()
             }
             Err(error) => server_error(error),
@@ -620,7 +780,7 @@ async fn publish_status_delete(
     state.streaming_events.publish_delete(
         &status.id.0.to_string(),
         status.account_id,
-        &status.visibility,
+        (&status.visibility).into(),
         &recipients,
     );
     for reblog in reblogs {
@@ -1027,10 +1187,11 @@ fn validate_status_text(status: &str, has_media: bool) -> Result<(), StatusInput
 /// Attach newly created direct statuses to a local Mastodon conversation.
 async fn attach_direct_conversation(
     state: &AppState,
+    txn: &DatabaseTransaction,
     status: &mut roosty_db::LocalStatus,
     author_id: AccountId,
 ) -> Result<(), RoostyError> {
-    if status.visibility != "direct" {
+    if status.visibility != StatusVisibility::Direct {
         return Ok(());
     }
 
@@ -1039,21 +1200,27 @@ async fn attach_direct_conversation(
         .into_iter()
         .map(|account| account.id)
         .collect::<Vec<_>>();
-    if let Some(parent_id) = status.in_reply_to_id
-        && let Some(parent) = roosty_db::find_local_status_by_id(&state.db, parent_id).await?
-    {
-        participant_ids.push(parent.account_id);
-    }
-    participant_ids.push(author_id);
     participant_ids.sort_by_key(|account_id| account_id.0);
     participant_ids.dedup();
 
+    let remote_participants = roosty_db::remote_mentions_for_local_status(txn, status.id)
+        .await?
+        .into_iter()
+        .map(|actor| RemoteConversationParticipant {
+            activitypub_id: actor.activitypub_id,
+            remote_actor_id: Some(actor.id),
+            mention_name: Some(format!("@{}@{}", actor.username, actor.domain)),
+        })
+        .collect::<Vec<_>>();
+
     let conversation_id = roosty_db::attach_direct_status_to_conversation(
-        &state.db,
+        txn,
         status.id,
         author_id,
         status.in_reply_to_id,
+        status.in_reply_to_remote_status_id,
         &participant_ids,
+        &remote_participants,
     )
     .await?;
     status.conversation_id = Some(conversation_id);
@@ -1144,14 +1311,6 @@ fn parse_media_focus(value: Option<&str>) -> Result<Option<(f64, f64)>, ()> {
     }
 }
 
-/// Validate Mastodon visibility values accepted for local statuses.
-fn validate_visibility(value: &str) -> Result<(), StatusInputError> {
-    match value {
-        "public" | "unlisted" | "private" | "direct" => Ok(()),
-        _ => Err(StatusInputError::Visibility),
-    }
-}
-
 /// Parse an optional UUID status id from Mastodon form or JSON input.
 fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, StatusInputError> {
     value
@@ -1177,6 +1336,25 @@ async fn statuses_response(
     }
 }
 
+/// Persist a remote favourite and its federated delivery job atomically.
+async fn favourite_remote_status(
+    state: &AppState,
+    account_id: AccountId,
+    status: &RemoteStatus,
+) -> roosty_core::Result<()> {
+    let txn = state.db.begin().await?;
+    if roosty_db::is_remote_status_favourited(&txn, account_id, status.id).await? {
+        txn.commit().await?;
+        return Ok(());
+    }
+
+    let (activity_id, job) = prepare_remote_favourite(state, &txn, account_id, status).await?;
+    roosty_db::favourite_remote_status_with_job(&txn, account_id, status.id, &activity_id, job)
+        .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Apply a local status collection mutation and return the updated status.
 async fn status_collection_action(
     state: &AppState,
@@ -1189,7 +1367,12 @@ async fn status_collection_action(
         Ok(Some(status)) => status,
         Ok(None) => {
             let remote = match roosty_db::find_remote_status_by_id(&state.db, status_id).await {
-                Ok(Some(status)) if matches!(status.visibility.as_str(), "public" | "unlisted") => {
+                Ok(Some(status))
+                    if matches!(
+                        status.visibility,
+                        StatusVisibility::Public | StatusVisibility::Unlisted
+                    ) =>
+                {
                     status
                 }
                 Ok(_) => return not_found(),
@@ -1197,45 +1380,7 @@ async fn status_collection_action(
             };
             return match action {
                 StatusCollectionAction::Favourite => {
-                    let already_favourited = match roosty_db::is_remote_status_favourited(
-                        &state.db, account_id, remote.id,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(error) => return server_error(error),
-                    };
-                    let result = if already_favourited {
-                        Ok(())
-                    } else {
-                        let (activity_id, job) = match crate::federation::prepare_remote_favourite(
-                            state, account_id, &remote,
-                        )
-                        .await
-                        {
-                            Ok(id) => id,
-                            Err(error) => return server_error(error),
-                        };
-                        let txn = match state.db.begin().await {
-                            Ok(txn) => txn,
-                            Err(error) => return server_error(error.into()),
-                        };
-                        match roosty_db::favourite_remote_status_with_job(
-                            &txn,
-                            account_id,
-                            remote.id,
-                            &activity_id,
-                            job,
-                        )
-                        .await
-                        {
-                            Ok(()) => match txn.commit().await {
-                                Ok(()) => Ok(()),
-                                Err(error) => Err(error.into()),
-                            },
-                            Err(error) => Err(error),
-                        }
-                    };
+                    let result = favourite_remote_status(state, account_id, &remote).await;
                     match result {
                         Ok(()) => {
                             match remote_status_response_for_viewer(state, remote, Some(account_id))
@@ -1259,11 +1404,7 @@ async fn status_collection_action(
                     };
                     match favourite {
                         Some(favourite) => {
-                            let job = match crate::federation::prepare_remote_unfavourite(
-                                state, favourite,
-                            )
-                            .await
-                            {
+                            let job = match prepare_remote_unfavourite(state, favourite).await {
                                 Ok(job) => job,
                                 Err(error) => return server_error(error),
                             };
@@ -1316,14 +1457,11 @@ async fn status_collection_action(
                             Err(error) => return server_error(error),
                         }
                     } else {
-                        let (activity_id, job) = match crate::federation::prepare_remote_reblog(
-                            state, account_id, &remote,
-                        )
-                        .await
-                        {
-                            Ok(id) => id,
-                            Err(error) => return server_error(error),
-                        };
+                        let (activity_id, job) =
+                            match prepare_remote_reblog(state, account_id, &remote).await {
+                                Ok(id) => id,
+                                Err(error) => return server_error(error),
+                            };
                         let txn = match state.db.begin().await {
                             Ok(txn) => txn,
                             Err(error) => return server_error(error.into()),
@@ -1370,11 +1508,10 @@ async fn status_collection_action(
                     };
                     if let Some(reblog) = reblog {
                         let reblog_id = reblog.id;
-                        let job =
-                            match crate::federation::prepare_remote_unreblog(state, reblog).await {
-                                Ok(job) => job,
-                                Err(error) => return server_error(error),
-                            };
+                        let job = match prepare_remote_unreblog(state, reblog).await {
+                            Ok(job) => job,
+                            Err(error) => return server_error(error),
+                        };
                         let txn = match state.db.begin().await {
                             Ok(txn) => txn,
                             Err(error) => return server_error(error.into()),
@@ -1446,7 +1583,7 @@ async fn status_collection_action(
         Ok(()) => {
             if matches!(action, StatusCollectionAction::Favourite)
                 && status.account_id != account_id
-                && let Err(error) = crate::notifications::create_and_stream_notification(
+                && let Err(error) = create_and_stream_notification(
                     state,
                     status.account_id,
                     LocalNotificationType::Favourite,
@@ -1461,15 +1598,14 @@ async fn status_collection_action(
                 return match reblog {
                     Some(reblog) => {
                         if status.account_id != account_id
-                            && let Err(error) =
-                                crate::notifications::create_and_stream_notification(
-                                    state,
-                                    status.account_id,
-                                    LocalNotificationType::Reblog,
-                                    account_id,
-                                    Some(status.id),
-                                )
-                                .await
+                            && let Err(error) = create_and_stream_notification(
+                                state,
+                                status.account_id,
+                                LocalNotificationType::Reblog,
+                                account_id,
+                                Some(status.id),
+                            )
+                            .await
                         {
                             warn!(%error, "failed to create reblog notification");
                         }
@@ -1513,7 +1649,10 @@ async fn status_stream_recipients(
     state: &AppState,
     status: &roosty_db::LocalStatus,
 ) -> Vec<AccountId> {
-    if !matches!(status.visibility.as_str(), "public" | "unlisted") {
+    if !matches!(
+        status.visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted
+    ) {
         return Vec::new();
     }
     match roosty_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
@@ -1579,7 +1718,7 @@ async fn reblogged_by_response(
                 }
             }
             roosty_db::RebloggedByAccount::Remote(actor) => {
-                match crate::accounts::remote_account_response(state, actor).await {
+                match remote_account_response(state, actor).await {
                     Ok(account) => accounts.push(StatusAccountResponse::Remote(Box::new(account))),
                     Err(error) => return server_error(error),
                 }
@@ -1591,25 +1730,6 @@ async fn reblogged_by_response(
         response.headers_mut().insert(header::LINK, link_header);
     }
     response
-}
-
-/// Notify local accounts mentioned in a newly created status.
-async fn notify_mentioned_accounts(
-    state: &AppState,
-    status: &roosty_db::LocalStatus,
-    author_id: AccountId,
-) -> Result<(), RoostyError> {
-    for mention in local_text_mentions(state, &status.content).await? {
-        crate::notifications::create_and_stream_notification(
-            state,
-            mention.id,
-            LocalNotificationType::Mention,
-            author_id,
-            Some(status.id),
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 /// Return a local status collection for an authenticated account.
@@ -1867,7 +1987,7 @@ pub(crate) async fn remote_reblog_response(
         url: reblog.activity_id,
         content: String::new(),
         account: StatusAccountResponse::Remote(Box::new(
-            crate::accounts::remote_account_response(state, actor).await?,
+            remote_account_response(state, actor).await?,
         )),
         media_attachments: Vec::new(),
         mentions: Vec::new(),
@@ -1968,22 +2088,22 @@ async fn remote_status_response_for_viewer(
         in_reply_to_account_id,
         sensitive: false,
         spoiler_text: String::new(),
-        visibility: status.visibility,
+        visibility: status.visibility.to_string(),
         language: None,
         uri: status.activitypub_id.clone(),
         url: status.activitypub_id,
         content: status.content,
         account: StatusAccountResponse::Remote(Box::new(
-            crate::accounts::remote_account_response(state, actor).await?,
+            remote_account_response(state, actor).await?,
         )),
         media_attachments: roosty_db::remote_media_attachments_for_status(&state.db, status.id)
             .await?
             .into_iter()
-            .map(|media| crate::media::remote_media_attachment_response(state, media))
+            .map(|media| remote_media_attachment_response(state, media))
             .collect(),
         mentions,
-        tags: Vec::new(),
-        emojis: crate::accounts::remote_custom_emojis(&status.object),
+        tags: remote_status_tags(&status.object),
+        emojis: remote_custom_emojis(&status.object),
         reblogs_count: 0,
         favourites_count: 0,
         replies_count: 0,
@@ -2043,6 +2163,47 @@ async fn remote_status_mentions(
         }
     }
     Ok(mentions)
+}
+
+/// Project valid ActivityPub Hashtag tags without merging them into local tag state.
+fn remote_status_tags(object: &Value) -> Vec<TagResponse> {
+    let Some(tags) = object.get("tag").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut projected = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in tags {
+        let kind = tag.get("type").and_then(Value::as_str);
+        if !matches!(
+            kind,
+            Some("Hashtag") | Some("https://www.w3.org/ns/activitystreams#Hashtag")
+        ) {
+            continue;
+        }
+        let Some(name) = tag.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(name) = name.strip_prefix('#').filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let Some(url) = tag
+            .get("href")
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("https://"))
+        else {
+            continue;
+        };
+        if seen.insert((name.to_owned(), url.to_owned())) {
+            projected.push(TagResponse {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                url: url.to_owned(),
+                history: Vec::new(),
+                following: None,
+            });
+        }
+    }
+    projected
 }
 
 async fn reblog_response(
@@ -2234,7 +2395,7 @@ async fn status_response_for_viewer(
     let media_attachments = roosty_db::local_media_attachments_for_status(&state.db, status.id)
         .await?
         .iter()
-        .map(|media| crate::media::media_response(state, media))
+        .map(|media| media_response(state, media))
         .collect();
 
     Ok(StatusResponse {
@@ -2246,7 +2407,7 @@ async fn status_response_for_viewer(
         in_reply_to_account_id,
         sensitive: status.sensitive,
         spoiler_text: status.spoiler_text,
-        visibility: status.visibility,
+        visibility: status.visibility.to_string(),
         language: status.language,
         uri: url.clone(),
         url,
@@ -2549,8 +2710,10 @@ fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
 }
 
 fn can_view_status(status: &roosty_db::LocalStatus, viewer: Option<AccountId>) -> bool {
-    matches!(status.visibility.as_str(), "public" | "unlisted")
-        || viewer.is_some_and(|account_id| account_id == status.account_id)
+    matches!(
+        status.visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted
+    ) || viewer.is_some_and(|account_id| account_id == status.account_id)
 }
 
 /// Return whether a viewer can read a local status, including direct conversation membership.
@@ -3003,10 +3166,33 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        escape_html, hashtag_names, mention_usernames, remote_mention_matches, status_content_html,
-        timeline_limit,
+        escape_html, hashtag_names, mention_usernames, remote_mention_matches, remote_status_tags,
+        status_content_html, timeline_limit,
     };
     use crate::{config::Config, http::AppState, password};
+
+    #[test]
+    /// Remote hashtag metadata remains contextual and keeps its source-instance URL.
+    fn projects_valid_remote_hashtag_tags() {
+        let tags = remote_status_tags(&serde_json::json!({
+            "tag": [
+                {"type": "Hashtag", "name": "#cats", "href": "https://remote.test/tags/cats"},
+                {"type": "https://www.w3.org/ns/activitystreams#Hashtag", "name": "#cats", "href": "https://remote.test/tags/cats"},
+                {"type": "Hashtag", "name": "cats", "href": "https://remote.test/tags/cats"},
+                {"type": "Hashtag", "name": "#local", "href": "http://remote.test/tags/local"}
+            ]
+        }));
+        let value = serde_json::to_value(tags).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([{
+                "id": "cats",
+                "name": "cats",
+                "url": "https://remote.test/tags/cats",
+                "history": []
+            }])
+        );
+    }
 
     #[test_context(StatusContext)]
     #[tokio::test]

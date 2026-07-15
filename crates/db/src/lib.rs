@@ -21,18 +21,36 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Closed Mastodon status visibility values, serialized as text at persistence and API boundaries.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum StatusVisibility {
+    Public,
+    Unlisted,
+    Private,
+    Direct,
+}
+
+impl StatusVisibility {
+    /// Parse a persisted visibility without accepting unknown values.
+    pub fn parse(value: &str) -> Result<Self> {
+        Ok(Self::from_str(value)?)
+    }
+}
+
 mod entity;
 
 use entity::{
     job, local_account, local_account_block, local_account_mute, local_actor_key,
-    local_conversation, local_conversation_account, local_follow, local_media_attachment,
-    local_notification, local_remote_status_favourite, local_remote_status_reblog, local_status,
-    local_status_bookmark, local_status_favourite, local_status_reblog,
-    local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
-    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    processed_inbox_activity, remote_actor, remote_custom_emoji, remote_follow, remote_following,
-    remote_media_attachment, remote_profile_media, remote_status, remote_status_favourite,
-    remote_status_reblog,
+    local_conversation, local_conversation_account, local_conversation_remote_participant,
+    local_follow, local_media_attachment, local_notification, local_remote_status_favourite,
+    local_remote_status_reblog, local_status, local_status_bookmark, local_status_favourite,
+    local_status_local_recipient, local_status_reblog, local_status_remote_mention,
+    local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
+    oauth_application, oauth_authorization_code, processed_inbox_activity, remote_actor,
+    remote_custom_emoji, remote_follow, remote_following, remote_media_attachment,
+    remote_profile_media, remote_status, remote_status_favourite, remote_status_local_recipient,
+    remote_status_reblog, remote_status_remote_recipient,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -61,6 +79,8 @@ pub struct LocalStatusMetadata {
     pub tag_names: Vec<String>,
     /// Resolved remote actors explicitly mentioned by the status.
     pub remote_actor_ids: Vec<AccountId>,
+    /// Local accounts explicitly addressed by a direct status.
+    pub local_recipient_ids: Vec<AccountId>,
 }
 
 /// An attachment declared by a verified remote Note.
@@ -297,7 +317,7 @@ pub struct LocalAccount {
     /// Whether this account can be discovered in profile directories.
     pub discoverable: bool,
     /// Default visibility for authored statuses.
-    pub default_visibility: String,
+    pub default_visibility: StatusVisibility,
     /// Whether authored statuses are sensitive by default.
     pub default_sensitive: bool,
     /// Default language for authored statuses.
@@ -374,7 +394,7 @@ pub struct RemoteStatus {
     /// Sanitized-at-render-time remote HTML content.
     pub content: String,
     /// Mastodon-compatible public or unlisted visibility.
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     /// Remote publication timestamp.
     pub published_at: OffsetDateTime,
     /// Remote edit timestamp.
@@ -387,6 +407,8 @@ pub struct RemoteStatus {
     pub in_reply_to_local_status_id: Option<StatusId>,
     /// Resolved cached remote parent, when available.
     pub in_reply_to_remote_status_id: Option<StatusId>,
+    /// Direct-message conversation containing this cached Note, when applicable.
+    pub conversation_id: Option<Uuid>,
     /// Original Note object retained for future projection fields.
     pub object: JsonValue,
 }
@@ -401,7 +423,7 @@ pub struct NewRemoteStatus {
     /// Remote HTML content.
     pub content: String,
     /// Public or unlisted visibility.
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     /// Remote publication timestamp.
     pub published_at: OffsetDateTime,
     /// Remote edit timestamp.
@@ -705,12 +727,13 @@ pub async fn find_remote_status_by_activitypub_id(
     db: &DbConnection,
     activitypub_id: &str,
 ) -> Result<Option<RemoteStatus>> {
-    Ok(remote_status::Entity::find()
+    remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
         .filter(remote_status::Column::DeletedAt.is_null())
         .one(db)
         .await?
-        .map(remote_status_from_model))
+        .map(remote_status_from_model)
+        .transpose()
 }
 
 /// Find one active cached remote Note by its UUID-backed API identifier.
@@ -718,11 +741,12 @@ pub async fn find_remote_status_by_id(
     db: &DbConnection,
     status_id: StatusId,
 ) -> Result<Option<RemoteStatus>> {
-    Ok(remote_status::Entity::find_by_id(status_id.0)
+    remote_status::Entity::find_by_id(status_id.0)
         .filter(remote_status::Column::DeletedAt.is_null())
         .one(db)
         .await?
-        .map(remote_status_from_model))
+        .map(remote_status_from_model)
+        .transpose()
 }
 
 /// Replace the declared attachment set for a cached remote status.
@@ -1165,7 +1189,7 @@ where
         }
         let mut active = existing.into_active_model();
         active.content = Set(status.content);
-        active.visibility = Set(status.visibility);
+        active.visibility = Set(status.visibility.to_string());
         active.published_at = Set(status.published_at);
         active.updated_at = Set(status.updated_at);
         active.deleted_at = Set(None);
@@ -1181,20 +1205,21 @@ where
             activitypub_id: Set(status.activitypub_id),
             remote_actor_id: Set(status.remote_actor_id.0),
             content: Set(status.content),
-            visibility: Set(status.visibility),
+            visibility: Set(status.visibility.to_string()),
             published_at: Set(status.published_at),
             updated_at: Set(status.updated_at),
             deleted_at: Set(None),
             in_reply_to: Set(status.in_reply_to),
             in_reply_to_local_status_id: Set(status.in_reply_to_local_status_id.map(|id| id.0)),
             in_reply_to_remote_status_id: Set(status.in_reply_to_remote_status_id.map(|id| id.0)),
+            conversation_id: Set(None),
             object: Set(status.object),
             ..Default::default()
         }
         .insert(db)
         .await?
     };
-    Ok(remote_status_from_model(model))
+    remote_status_from_model(model)
 }
 
 /// Record an inbound Create or Update and cache its Note atomically.
@@ -1290,10 +1315,10 @@ pub async fn find_remote_actor_by_activitypub_id(
 }
 
 /// Find a remote actor by its UUID-backed API identifier.
-pub async fn find_remote_actor_by_id(
-    db: &DbConnection,
-    actor_id: AccountId,
-) -> Result<Option<RemoteActor>> {
+pub async fn find_remote_actor_by_id<C>(db: &C, actor_id: AccountId) -> Result<Option<RemoteActor>>
+where
+    C: ConnectionTrait,
+{
     Ok(remote_actor::Entity::find_by_id(actor_id.0)
         .one(db)
         .await?
@@ -1514,7 +1539,7 @@ pub struct LocalAccountSettingsUpdate {
     /// Whether this account can be discovered in profile directories.
     pub discoverable: Option<bool>,
     /// Default visibility for authored statuses.
-    pub default_visibility: Option<String>,
+    pub default_visibility: Option<StatusVisibility>,
     /// Whether authored statuses are sensitive by default.
     pub default_sensitive: Option<bool>,
     /// Default language for authored statuses.
@@ -1539,7 +1564,7 @@ pub struct LocalStatus {
     /// Plain text status content.
     pub content: String,
     /// Mastodon status visibility value.
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     /// Whether the status is marked sensitive.
     pub sensitive: bool,
     /// Optional content warning text.
@@ -1592,7 +1617,7 @@ pub struct NewLocalStatus {
     /// Plain text status content.
     pub content: String,
     /// Mastodon status visibility value.
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     /// Whether the status is marked sensitive.
     pub sensitive: bool,
     /// Optional content warning text.
@@ -1612,6 +1637,8 @@ pub struct LocalConversation {
     pub id: Uuid,
     /// Most recent status in the conversation, when still available.
     pub last_status_id: Option<StatusId>,
+    /// Most recent cached remote status in the conversation, when applicable.
+    pub last_remote_status_id: Option<StatusId>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Last update timestamp.
@@ -1633,6 +1660,10 @@ pub struct LocalConversationAccount {
     pub unread: bool,
     /// Soft-hide timestamp for this account's conversation view.
     pub hidden_at: Option<OffsetDateTime>,
+    /// Most recent visible local direct status for this account.
+    pub last_status_id: Option<StatusId>,
+    /// Most recent visible remote direct status for this account.
+    pub last_remote_status_id: Option<StatusId>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Last update timestamp.
@@ -1646,6 +1677,35 @@ pub struct LocalConversationView {
     pub conversation: LocalConversation,
     /// Authenticated account's conversation row.
     pub account: LocalConversationAccount,
+}
+
+/// Recipient views changed while refreshing a direct conversation after an edit or deletion.
+#[derive(Clone, Debug)]
+pub struct DirectConversationRefresh {
+    /// Shared conversation whose recipient views were refreshed.
+    pub conversation_id: Uuid,
+    /// Accounts whose remaining view points at a different latest status.
+    pub updated_account_ids: Vec<AccountId>,
+    /// Accounts whose view no longer has any visible status and was removed.
+    pub removed_account_ids: Vec<AccountId>,
+}
+
+/// A remote participant retained for a direct conversation.
+#[derive(Clone, Debug)]
+pub struct RemoteConversationParticipant {
+    /// Canonical actor ID, retained even when the actor cache entry is unavailable.
+    pub activitypub_id: String,
+    /// Cached remote actor, when known locally.
+    pub remote_actor_id: Option<AccountId>,
+    /// Mention text declared by the originating Note.
+    pub mention_name: Option<String>,
+}
+
+/// Exact audience projected for one account's visible direct status.
+#[derive(Clone, Debug, Default)]
+pub struct DirectStatusParticipants {
+    pub local_accounts: Vec<LocalAccount>,
+    pub remote_accounts: Vec<RemoteConversationParticipant>,
 }
 
 /// Mutable local status fields accepted by Mastodon status edit APIs.
@@ -1850,6 +1910,8 @@ pub enum LocalNotificationType {
     Favourite,
     /// A local account followed the recipient.
     Follow,
+    /// A remote account requested to follow a locked recipient.
+    FollowRequest,
     /// A local account boosted one of the recipient's statuses.
     Reblog,
 }
@@ -2347,14 +2409,35 @@ pub async fn record_processed_inbox_activity(
 
 /// Create a follow notification attributable to a remote actor.
 pub async fn notify_remote_actor_follow(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     remote_actor_id: AccountId,
-) -> Result<LocalNotification> {
+    notification_type: LocalNotificationType,
+) -> Result<Option<LocalNotification>> {
+    if !matches!(
+        notification_type,
+        LocalNotificationType::Follow | LocalNotificationType::FollowRequest
+    ) {
+        return Err(RoostyError::InvalidInput(
+            "remote actor notification type is invalid".to_owned(),
+        ));
+    }
+    if local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq(notification_type.as_str()))
+        .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
+        .filter(local_notification::Column::StatusId.is_null())
+        .filter(local_notification::Column::RemoteStatusId.is_null())
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("follow".to_owned()),
+        notification_type: Set(notification_type.as_str().to_owned()),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
@@ -2364,7 +2447,7 @@ pub async fn notify_remote_actor_follow(
     }
     .insert(db)
     .await?;
-    Ok(local_notification_from_model(model))
+    Ok(Some(local_notification_from_model(model)))
 }
 
 /// Create an idempotent favourite notification caused by a remote actor.
@@ -2405,20 +2488,21 @@ where
 
 /// Create an idempotent boost notification caused by a remote actor.
 pub async fn notify_remote_actor_reblog(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     remote_actor_id: AccountId,
     status_id: StatusId,
-) -> Result<LocalNotification> {
-    if let Some(existing) = local_notification::Entity::find()
+) -> Result<Option<LocalNotification>> {
+    if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq("reblog"))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::StatusId.eq(Some(status_id.0)))
         .one(db)
         .await?
+        .is_some()
     {
-        return Ok(local_notification_from_model(existing));
+        return Ok(None);
     }
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
@@ -2433,16 +2517,30 @@ pub async fn notify_remote_actor_reblog(
     }
     .insert(db)
     .await?;
-    Ok(local_notification_from_model(model))
+    Ok(Some(local_notification_from_model(model)))
 }
 
 /// Create an idempotent mention notification caused by a cached remote Note.
-pub async fn notify_remote_status_mention(
-    db: &DbConnection,
+pub async fn notify_remote_status_mention<C>(
+    db: &C,
     account_id: AccountId,
     remote_actor_id: AccountId,
     remote_status_id: StatusId,
-) -> Result<LocalNotification> {
+) -> Result<Option<LocalNotification>>
+where
+    C: ConnectionTrait,
+{
+    if local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq("mention"))
+        .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
+        .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -2456,7 +2554,7 @@ pub async fn notify_remote_status_mention(
     }
     .insert(db)
     .await?;
-    Ok(local_notification_from_model(model))
+    Ok(Some(local_notification_from_model(model)))
 }
 
 /// Timelines that support persisted Mastodon read markers.
@@ -2572,19 +2670,22 @@ pub async fn find_local_account_by_login(
         .one(db)
         .await?;
 
-    Ok(account.map(local_account_from_model))
+    account.map(local_account_from_model).transpose()
 }
 
 /// Find a local account by internal id.
-pub async fn find_local_account_by_id(
-    db: &DbConnection,
+pub async fn find_local_account_by_id<C>(
+    db: &C,
     account_id: AccountId,
-) -> Result<Option<LocalAccount>> {
+) -> Result<Option<LocalAccount>>
+where
+    C: ConnectionTrait,
+{
     let account = local_account::Entity::find_by_id(account_id.0)
         .one(db)
         .await?;
 
-    Ok(account.map(local_account_from_model))
+    account.map(local_account_from_model).transpose()
 }
 
 /// Find a local account by its exact local username.
@@ -2597,7 +2698,7 @@ pub async fn find_local_account_by_username(
         .one(db)
         .await?;
 
-    Ok(account.map(local_account_from_model))
+    account.map(local_account_from_model).transpose()
 }
 
 /// Search local accounts by username or display name for Mastodon autocomplete.
@@ -2630,7 +2731,7 @@ pub async fn search_local_accounts(
         .all(db)
         .await?;
 
-    Ok(accounts.into_iter().map(local_account_from_model).collect())
+    accounts.into_iter().map(local_account_from_model).collect()
 }
 
 /// Count local accounts following this account.
@@ -2902,7 +3003,7 @@ pub async fn unmute_local_account(
 
 /// Return whether either of two local accounts blocks the other.
 pub async fn local_accounts_are_blocked(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     first_account_id: AccountId,
     second_account_id: AccountId,
 ) -> Result<bool> {
@@ -2945,7 +3046,7 @@ pub async fn local_account_blocks(
 
 /// Return an active local mute relationship, ignoring rows whose duration has elapsed.
 pub async fn active_local_account_mute(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     target_account_id: AccountId,
 ) -> Result<Option<LocalAccountMute>> {
@@ -2978,7 +3079,7 @@ pub async fn local_account_is_hidden_for_viewer(
 
 /// Return whether a local interaction may create a notification for its recipient.
 pub async fn local_account_allows_notification(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     recipient_account_id: AccountId,
     actor_account_id: AccountId,
 ) -> Result<bool> {
@@ -3138,7 +3239,7 @@ async fn ensure_local_relation_target(
 
 /// Create or return an existing local notification for one logical event.
 pub async fn notify_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     notification_type: LocalNotificationType,
     actor_account_id: AccountId,
@@ -3427,7 +3528,9 @@ where
     set_if_some(&mut active.locked, update.locked);
     set_if_some(&mut active.bot, update.bot);
     set_if_some(&mut active.discoverable, update.discoverable);
-    set_if_some(&mut active.default_visibility, update.default_visibility);
+    if let Some(visibility) = update.default_visibility {
+        active.default_visibility = Set(visibility.to_string());
+    }
     set_if_some(&mut active.default_sensitive, update.default_sensitive);
     set_if_some(&mut active.default_language, update.default_language);
     set_if_some(
@@ -3443,7 +3546,7 @@ where
     }
     active.updated_at = Set(OffsetDateTime::now_utc());
 
-    Ok(local_account_from_model(active.update(db).await?))
+    local_account_from_model(active.update(db).await?)
 }
 
 /// Replace a local account password hash by username for operator password resets.
@@ -3463,7 +3566,7 @@ pub async fn update_local_account_password_hash(
     active.password_hash = Set(password_hash.to_owned());
     active.updated_at = Set(OffsetDateTime::now_utc());
 
-    Ok(Some(local_account_from_model(active.update(db).await?)))
+    Ok(Some(local_account_from_model(active.update(db).await?)?))
 }
 
 /// Replace a local account password hash by its stable account identifier.
@@ -3480,7 +3583,7 @@ pub async fn update_local_account_password_hash_by_id(
     active.password_hash = Set(password_hash.to_owned());
     active.updated_at = Set(OffsetDateTime::now_utc());
 
-    Ok(local_account_from_model(active.update(db).await?))
+    local_account_from_model(active.update(db).await?)
 }
 
 /// Create a local status authored by an account on this instance.
@@ -3495,7 +3598,7 @@ pub async fn create_local_status(
         id: Set(status_id),
         account_id: Set(new_status.account_id.0),
         content: Set(new_status.content),
-        visibility: Set(new_status.visibility),
+        visibility: Set(new_status.visibility.to_string()),
         sensitive: Set(new_status.sensitive),
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
@@ -3509,7 +3612,7 @@ pub async fn create_local_status(
     .insert(db)
     .await?;
 
-    Ok(local_status_from_model(status))
+    local_status_from_model(status)
 }
 
 /// Create a local status with media, tags, and remote mentions in one transaction.
@@ -3519,6 +3622,11 @@ pub async fn create_local_status_with_media(
     media_ids: &[Uuid],
     metadata: LocalStatusMetadata,
 ) -> Result<LocalStatus> {
+    let LocalStatusMetadata {
+        mut tag_names,
+        remote_actor_ids,
+        local_recipient_ids,
+    } = metadata;
     let status_id = Uuid::now_v7();
     let created_at = OffsetDateTime::now_utc();
     let account_id = new_status.account_id;
@@ -3543,7 +3651,7 @@ pub async fn create_local_status_with_media(
         id: Set(status_id),
         account_id: Set(account_id.0),
         content: Set(new_status.content),
-        visibility: Set(new_status.visibility),
+        visibility: Set(new_status.visibility.to_string()),
         sensitive: Set(new_status.sensitive),
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
@@ -3574,7 +3682,6 @@ pub async fn create_local_status_with_media(
     }
 
     let now = OffsetDateTime::now_utc();
-    let mut tag_names = metadata.tag_names;
     tag_names.sort();
     tag_names.dedup();
     for name in tag_names {
@@ -3587,8 +3694,7 @@ pub async fn create_local_status_with_media(
         .insert(txn)
         .await?;
     }
-    let mut remote_actor_ids = metadata
-        .remote_actor_ids
+    let mut remote_actor_ids = remote_actor_ids
         .into_iter()
         .map(|id| id.0)
         .collect::<Vec<_>>();
@@ -3603,8 +3709,23 @@ pub async fn create_local_status_with_media(
         .insert(txn)
         .await?;
     }
+    let mut local_recipient_ids = local_recipient_ids
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<Vec<_>>();
+    local_recipient_ids.sort();
+    local_recipient_ids.dedup();
+    for account_id in local_recipient_ids {
+        local_status_local_recipient::ActiveModel {
+            status_id: Set(status_id),
+            account_id: Set(account_id),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
 
-    Ok(local_status_from_model(status))
+    local_status_from_model(status)
 }
 
 /// Replace all local hashtag links for one status, creating tag rows as needed.
@@ -3947,7 +4068,10 @@ pub async fn local_tag_timeline(
     let last_cursor = statuses.last().map(|status| status.id);
 
     Ok(TimelinePage {
-        items: statuses.into_iter().map(local_status_from_model).collect(),
+        items: statuses
+            .into_iter()
+            .map(local_status_from_model)
+            .collect::<Result<_>>()?,
         first_cursor,
         last_cursor,
         has_more,
@@ -4122,7 +4246,11 @@ pub async fn update_owned_local_status(
         .filter(local_status_tag::Column::StatusId.eq(status_id.0))
         .exec(txn)
         .await?;
-    let mut tag_names = metadata.tag_names;
+    let LocalStatusMetadata {
+        mut tag_names,
+        remote_actor_ids,
+        local_recipient_ids,
+    } = metadata;
     tag_names.sort();
     tag_names.dedup();
     let now = OffsetDateTime::now_utc();
@@ -4140,8 +4268,7 @@ pub async fn update_owned_local_status(
         .filter(local_status_remote_mention::Column::StatusId.eq(status_id.0))
         .exec(txn)
         .await?;
-    let mut remote_actor_ids = metadata
-        .remote_actor_ids
+    let mut remote_actor_ids = remote_actor_ids
         .into_iter()
         .map(|id| id.0)
         .collect::<Vec<_>>();
@@ -4156,8 +4283,29 @@ pub async fn update_owned_local_status(
         .insert(txn)
         .await?;
     }
+    if status.visibility == "direct" {
+        local_status_local_recipient::Entity::delete_many()
+            .filter(local_status_local_recipient::Column::StatusId.eq(status_id.0))
+            .exec(txn)
+            .await?;
+        let mut recipient_ids = local_recipient_ids
+            .into_iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>();
+        recipient_ids.sort();
+        recipient_ids.dedup();
+        for account_id in recipient_ids {
+            local_status_local_recipient::ActiveModel {
+                status_id: Set(status_id.0),
+                account_id: Set(account_id),
+                created_at: Set(now),
+            }
+            .insert(txn)
+            .await?;
+        }
+    }
 
-    Ok(Some(local_status_from_model(status)))
+    Ok(Some(local_status_from_model(status)?))
 }
 
 /// Create local media metadata after the uploaded file has been stored.
@@ -4314,7 +4462,7 @@ pub async fn find_local_status_by_id(
         .one(db)
         .await?;
 
-    Ok(status.map(local_status_from_model))
+    status.map(local_status_from_model).transpose()
 }
 
 /// List an actor's public statuses for its ActivityPub outbox.
@@ -4331,7 +4479,7 @@ pub async fn public_local_statuses_by_account(
         .limit(limit)
         .all(db)
         .await?;
-    Ok(statuses.into_iter().map(local_status_from_model).collect())
+    statuses.into_iter().map(local_status_from_model).collect()
 }
 
 /// Count an actor's public statuses for its ActivityPub outbox metadata.
@@ -4395,25 +4543,32 @@ pub async fn local_replies_to_status(
         .all(db)
         .await?;
 
-    Ok(statuses.into_iter().map(local_status_from_model).collect())
+    statuses.into_iter().map(local_status_from_model).collect()
 }
 
 /// Attach a direct status to a local conversation and update participant views.
 pub async fn attach_direct_status_to_conversation(
-    db: &DbConnection,
+    txn: &DatabaseTransaction,
     status_id: StatusId,
     author_id: AccountId,
     parent_id: Option<StatusId>,
+    parent_remote_status_id: Option<StatusId>,
     participant_ids: &[AccountId],
+    remote_participants: &[RemoteConversationParticipant],
 ) -> Result<Uuid> {
-    let txn = db.begin().await?;
     let now = OffsetDateTime::now_utc();
     let parent_conversation_id = match parent_id {
         Some(parent_id) => local_status::Entity::find_by_id(parent_id.0)
-            .one(&txn)
+            .one(txn)
             .await?
             .and_then(|status| status.conversation_id),
-        None => None,
+        None => match parent_remote_status_id {
+            Some(parent_id) => remote_status::Entity::find_by_id(parent_id.0)
+                .one(txn)
+                .await?
+                .and_then(|status| status.conversation_id),
+            None => None,
+        },
     };
     let conversation_id = match parent_conversation_id {
         Some(conversation_id) => conversation_id,
@@ -4421,39 +4576,41 @@ pub async fn attach_direct_status_to_conversation(
             local_conversation::ActiveModel {
                 id: Set(Uuid::now_v7()),
                 last_status_id: Set(Some(status_id.0)),
+                last_remote_status_id: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
-            .insert(&txn)
+            .insert(txn)
             .await?
             .id
         }
     };
 
     let mut status = local_status::Entity::find_by_id(status_id.0)
-        .one(&txn)
+        .one(txn)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("conversation status not found".to_owned()))?
         .into_active_model();
     status.conversation_id = Set(Some(conversation_id));
     status.updated_at = Set(now);
-    status.update(&txn).await?;
+    status.update(txn).await?;
 
     let mut conversation = local_conversation::Entity::find_by_id(conversation_id)
-        .one(&txn)
+        .one(txn)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("conversation not found".to_owned()))?
         .into_active_model();
     conversation.last_status_id = Set(Some(status_id.0));
     conversation.updated_at = Set(now);
-    conversation.update(&txn).await?;
+    conversation.update(txn).await?;
 
     let existing_participants = local_conversation_account::Entity::find()
         .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
-        .all(&txn)
+        .all(txn)
         .await?;
     let mut account_ids = existing_participants
         .iter()
+        .filter(|participant| participant.account_id == author_id.0)
         .map(|participant| AccountId(participant.account_id))
         .chain(std::iter::once(author_id))
         .chain(participant_ids.iter().copied())
@@ -4472,8 +4629,10 @@ pub async fn attach_direct_status_to_conversation(
                 active.cursor_id = Set(Uuid::now_v7());
                 active.unread = Set(unread);
                 active.hidden_at = Set(None);
+                active.last_status_id = Set(Some(status_id.0));
+                active.last_remote_status_id = Set(None);
                 active.updated_at = Set(now);
-                active.update(&txn).await?;
+                active.update(txn).await?;
             }
             None => {
                 local_conversation_account::ActiveModel {
@@ -4483,17 +4642,358 @@ pub async fn attach_direct_status_to_conversation(
                     account_id: Set(account_id.0),
                     unread: Set(unread),
                     hidden_at: Set(None),
+                    last_status_id: Set(Some(status_id.0)),
+                    last_remote_status_id: Set(None),
                     created_at: Set(now),
                     updated_at: Set(now),
                 }
-                .insert(&txn)
+                .insert(txn)
                 .await?;
             }
         }
     }
 
-    txn.commit().await?;
+    upsert_remote_conversation_participants(txn, conversation_id, remote_participants).await?;
     Ok(conversation_id)
+}
+
+/// Attach a cached direct Note to a conversation visible to its local recipients.
+pub async fn attach_remote_direct_status_to_conversation(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    parent_local_status_id: Option<StatusId>,
+    parent_remote_status_id: Option<StatusId>,
+    local_recipient_ids: &[AccountId],
+    remote_participants: &[RemoteConversationParticipant],
+    mark_unread: bool,
+) -> Result<DirectConversationRefresh> {
+    let now = OffsetDateTime::now_utc();
+    remote_status_local_recipient::Entity::delete_many()
+        .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    remote_status_remote_recipient::Entity::delete_many()
+        .filter(remote_status_remote_recipient::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    for account_id in local_recipient_ids {
+        remote_status_local_recipient::ActiveModel {
+            remote_status_id: Set(status_id.0),
+            account_id: Set(account_id.0),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    for participant in remote_participants {
+        remote_status_remote_recipient::ActiveModel {
+            remote_status_id: Set(status_id.0),
+            activitypub_id: Set(participant.activitypub_id.clone()),
+            remote_actor_id: Set(participant.remote_actor_id.map(|id| id.0)),
+            mention_name: Set(participant.mention_name.clone()),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    let parent_conversation_id = match parent_local_status_id {
+        Some(parent_id) => local_status::Entity::find_by_id(parent_id.0)
+            .one(txn)
+            .await?
+            .and_then(|status| status.conversation_id),
+        None => match parent_remote_status_id {
+            Some(parent_id) => remote_status::Entity::find_by_id(parent_id.0)
+                .one(txn)
+                .await?
+                .and_then(|status| status.conversation_id),
+            None => None,
+        },
+    };
+    let conversation_id = match parent_conversation_id {
+        Some(id) => id,
+        None => {
+            local_conversation::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                last_status_id: Set(None),
+                last_remote_status_id: Set(Some(status_id.0)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(txn)
+            .await?
+            .id
+        }
+    };
+
+    let mut status = remote_status::Entity::find_by_id(status_id.0)
+        .one(txn)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote conversation status not found".to_owned())
+        })?
+        .into_active_model();
+    status.conversation_id = Set(Some(conversation_id));
+    status.update(txn).await?;
+
+    let mut conversation = local_conversation::Entity::find_by_id(conversation_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("conversation not found".to_owned()))?
+        .into_active_model();
+    if mark_unread {
+        conversation.last_status_id = Set(None);
+        conversation.last_remote_status_id = Set(Some(status_id.0));
+        conversation.updated_at = Set(now);
+        conversation.update(txn).await?;
+    }
+
+    let existing = local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .all(txn)
+        .await?;
+    for account_id in local_recipient_ids {
+        match existing.iter().find(|row| row.account_id == account_id.0) {
+            Some(row) => {
+                let mut active = row.clone().into_active_model();
+                if mark_unread {
+                    active.cursor_id = Set(Uuid::now_v7());
+                    active.unread = Set(true);
+                    active.hidden_at = Set(None);
+                    active.last_status_id = Set(None);
+                    active.last_remote_status_id = Set(Some(status_id.0));
+                }
+                active.updated_at = Set(now);
+                active.update(txn).await?;
+            }
+            None => {
+                local_conversation_account::ActiveModel {
+                    id: Set(Uuid::now_v7()),
+                    cursor_id: Set(Uuid::now_v7()),
+                    conversation_id: Set(conversation_id),
+                    account_id: Set(account_id.0),
+                    unread: Set(mark_unread),
+                    hidden_at: Set(None),
+                    last_status_id: Set(None),
+                    last_remote_status_id: Set(Some(status_id.0)),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(txn)
+                .await?;
+            }
+        }
+    }
+    upsert_remote_conversation_participants(txn, conversation_id, remote_participants).await?;
+    repair_direct_conversation_after_delete(txn, Some(conversation_id))
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("conversation refresh is missing".to_owned()))
+}
+
+/// Persist remote participants without resolving uncached ActivityPub actors.
+pub async fn upsert_remote_conversation_participants(
+    txn: &DatabaseTransaction,
+    conversation_id: Uuid,
+    participants: &[RemoteConversationParticipant],
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc();
+    for participant in participants {
+        let existing = local_conversation_remote_participant::Entity::find()
+            .filter(
+                local_conversation_remote_participant::Column::ConversationId.eq(conversation_id),
+            )
+            .filter(
+                local_conversation_remote_participant::Column::ActivitypubId
+                    .eq(&participant.activitypub_id),
+            )
+            .one(txn)
+            .await?;
+        match existing {
+            Some(row) => {
+                let mut active = row.into_active_model();
+                if participant.remote_actor_id.is_some() {
+                    active.remote_actor_id = Set(participant.remote_actor_id.map(|id| id.0));
+                }
+                if participant.mention_name.is_some() {
+                    active.mention_name = Set(participant.mention_name.clone());
+                }
+                active.updated_at = Set(now);
+                active.update(txn).await?;
+            }
+            None => {
+                local_conversation_remote_participant::ActiveModel {
+                    id: Set(Uuid::now_v7()),
+                    conversation_id: Set(conversation_id),
+                    activitypub_id: Set(participant.activitypub_id.clone()),
+                    remote_actor_id: Set(participant.remote_actor_id.map(|id| id.0)),
+                    mention_name: Set(participant.mention_name.clone()),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(txn)
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// List remote and unresolved direct-conversation participants.
+pub async fn remote_conversation_participants(
+    db: &DbConnection,
+    conversation_id: Uuid,
+) -> Result<Vec<RemoteConversationParticipant>> {
+    Ok(local_conversation_remote_participant::Entity::find()
+        .filter(local_conversation_remote_participant::Column::ConversationId.eq(conversation_id))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|participant| RemoteConversationParticipant {
+            activitypub_id: participant.activitypub_id,
+            remote_actor_id: participant.remote_actor_id.map(AccountId),
+            mention_name: participant.mention_name,
+        })
+        .collect())
+}
+
+/// Recompute a direct conversation's latest message after either kind of direct-status deletion.
+pub async fn repair_direct_conversation_after_delete(
+    txn: &DatabaseTransaction,
+    conversation_id: Option<Uuid>,
+) -> Result<Option<DirectConversationRefresh>> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(None);
+    };
+
+    // One shared latest status is retained for Mastodon conversation projection.
+    // Per-account views below are deliberately calculated separately because direct
+    // recipients may differ from one status to the next.
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+            WITH candidates AS (
+                SELECT id AS local_status_id, NULL::uuid AS remote_status_id, created_at AS occurred_at, 0 AS kind
+                FROM local_status
+                WHERE conversation_id = $1 AND visibility = 'direct' AND deleted_at IS NULL
+                UNION ALL
+                SELECT NULL::uuid, id, published_at, 1
+                FROM remote_status
+                WHERE conversation_id = $1 AND visibility = 'direct' AND deleted_at IS NULL
+            ), latest AS (
+                SELECT local_status_id, remote_status_id
+                FROM candidates
+                ORDER BY occurred_at DESC, kind ASC
+                LIMIT 1
+            )
+            UPDATE local_conversation
+            SET last_status_id = (SELECT local_status_id FROM latest),
+                last_remote_status_id = (SELECT remote_status_id FROM latest),
+                updated_at = NOW()
+            WHERE id = $1
+        "#,
+        vec![conversation_id.into()],
+    )).await?;
+
+    // Rank every visible status per view in SQL. This avoids loading all statuses
+    // and issuing recipient lookups once for every account/status pair.
+    let updated_account_ids = txn.query_all(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+            WITH candidates AS (
+                SELECT view.id AS view_id, status.id AS local_status_id,
+                       NULL::uuid AS remote_status_id, status.created_at AS occurred_at, 0 AS kind
+                FROM local_conversation_account AS view
+                JOIN local_status AS status ON status.conversation_id = view.conversation_id
+                WHERE view.conversation_id = $1
+                  AND status.visibility = 'direct'
+                  AND status.deleted_at IS NULL
+                  AND (status.account_id = view.account_id OR EXISTS (
+                      SELECT 1 FROM local_status_local_recipient AS recipient
+                      WHERE recipient.status_id = status.id AND recipient.account_id = view.account_id
+                  ))
+                UNION ALL
+                SELECT view.id, NULL::uuid, status.id, status.published_at, 1
+                FROM local_conversation_account AS view
+                JOIN remote_status AS status ON status.conversation_id = view.conversation_id
+                WHERE view.conversation_id = $1
+                  AND status.visibility = 'direct'
+                  AND status.deleted_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM remote_status_local_recipient AS recipient
+                      WHERE recipient.remote_status_id = status.id AND recipient.account_id = view.account_id
+                  )
+            ), ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY view_id ORDER BY occurred_at DESC, kind ASC
+                ) AS position
+                FROM candidates
+            ), latest AS (
+                SELECT view_id, local_status_id, remote_status_id
+                FROM ranked WHERE position = 1
+            )
+            UPDATE local_conversation_account AS view
+            SET last_status_id = latest.local_status_id,
+                last_remote_status_id = latest.remote_status_id,
+                updated_at = NOW()
+            FROM latest
+            WHERE view.id = latest.view_id
+              AND (view.last_status_id, view.last_remote_status_id)
+                  IS DISTINCT FROM (latest.local_status_id, latest.remote_status_id)
+            RETURNING view.account_id
+        "#,
+        vec![conversation_id.into()],
+    )).await?
+        .into_iter()
+        .map(|row| row.try_get::<Uuid>("", "account_id").map(AccountId))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let removed_account_ids = txn.query_all(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+            DELETE FROM local_conversation_account AS view
+            WHERE view.conversation_id = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM local_status AS status
+                  WHERE status.conversation_id = view.conversation_id
+                    AND status.visibility = 'direct'
+                    AND status.deleted_at IS NULL
+                    AND (status.account_id = view.account_id OR EXISTS (
+                        SELECT 1 FROM local_status_local_recipient AS recipient
+                        WHERE recipient.status_id = status.id AND recipient.account_id = view.account_id
+                    ))
+                  UNION ALL
+                  SELECT 1
+                  FROM remote_status AS status
+                  WHERE status.conversation_id = view.conversation_id
+                    AND status.visibility = 'direct'
+                    AND status.deleted_at IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM remote_status_local_recipient AS recipient
+                        WHERE recipient.remote_status_id = status.id AND recipient.account_id = view.account_id
+                    )
+              )
+            RETURNING view.account_id
+        "#,
+        vec![conversation_id.into()],
+    )).await?
+        .into_iter()
+        .map(|row| row.try_get::<Uuid>("", "account_id").map(AccountId))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some(DirectConversationRefresh {
+        conversation_id,
+        updated_account_ids,
+        removed_account_ids,
+    }))
+}
+
+/// Return the conversation containing a cached remote status, including a just-deleted status.
+pub async fn remote_status_conversation_id(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+) -> Result<Option<Uuid>> {
+    Ok(remote_status::Entity::find_by_id(status_id.0)
+        .one(txn)
+        .await?
+        .and_then(|status| status.conversation_id))
 }
 
 /// Return whether an account participates in a status's direct conversation.
@@ -4502,24 +5002,122 @@ pub async fn local_status_visible_to_account(
     status: &LocalStatus,
     account_id: AccountId,
 ) -> Result<bool> {
-    if matches!(status.visibility.as_str(), "public" | "unlisted")
-        || status.account_id == account_id
+    if matches!(
+        status.visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted
+    ) || status.account_id == account_id
     {
         return Ok(true);
     }
-    if status.visibility != "direct" {
+    if status.visibility != StatusVisibility::Direct {
         return Ok(false);
     }
-    let Some(conversation_id) = status.conversation_id else {
-        return Ok(false);
-    };
-
-    Ok(local_conversation_account::Entity::find()
-        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
-        .filter(local_conversation_account::Column::AccountId.eq(account_id.0))
+    Ok(local_status_local_recipient::Entity::find()
+        .filter(local_status_local_recipient::Column::StatusId.eq(status.id.0))
+        .filter(local_status_local_recipient::Column::AccountId.eq(account_id.0))
         .one(db)
         .await?
         .is_some())
+}
+
+/// Return whether a local account participates in a cached remote direct Note's conversation.
+pub async fn remote_status_visible_to_account(
+    db: &DbConnection,
+    status: &RemoteStatus,
+    account_id: AccountId,
+) -> Result<bool> {
+    if matches!(
+        status.visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted
+    ) {
+        return Ok(true);
+    }
+    if status.visibility != StatusVisibility::Direct {
+        return Ok(false);
+    }
+    Ok(remote_status_local_recipient::Entity::find()
+        .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status.id.0))
+        .filter(remote_status_local_recipient::Column::AccountId.eq(account_id.0))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Return the exact audience of the direct status selected for a conversation view.
+pub async fn direct_status_participants_for_view(
+    db: &DbConnection,
+    view: &LocalConversationAccount,
+) -> Result<DirectStatusParticipants> {
+    let mut participants = DirectStatusParticipants::default();
+    if let Some(status_id) = view.last_status_id {
+        if let Some(status) = find_local_status_by_id(db, status_id).await?
+            && let Some(author) = find_local_account_by_id(db, status.account_id).await?
+        {
+            participants.local_accounts.push(author);
+        }
+        for row in local_status_local_recipient::Entity::find()
+            .filter(local_status_local_recipient::Column::StatusId.eq(status_id.0))
+            .all(db)
+            .await?
+        {
+            if let Some(account) = find_local_account_by_id(db, AccountId(row.account_id)).await? {
+                participants.local_accounts.push(account);
+            }
+        }
+        participants.remote_accounts =
+            remote_conversation_participants_for_local_status(db, status_id).await?;
+    }
+    if let Some(status_id) = view.last_remote_status_id {
+        if let Some(status) = find_remote_status_by_id(db, status_id).await?
+            && let Some(author) = find_remote_actor_by_id(db, status.remote_actor_id).await?
+        {
+            participants
+                .remote_accounts
+                .push(RemoteConversationParticipant {
+                    activitypub_id: author.activitypub_id,
+                    remote_actor_id: Some(author.id),
+                    mention_name: Some(format!("@{}@{}", author.username, author.domain)),
+                });
+        }
+        for row in remote_status_local_recipient::Entity::find()
+            .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status_id.0))
+            .all(db)
+            .await?
+        {
+            if let Some(account) = find_local_account_by_id(db, AccountId(row.account_id)).await? {
+                participants.local_accounts.push(account);
+            }
+        }
+        participants.remote_accounts.extend(
+            remote_status_remote_recipient::Entity::find()
+                .filter(remote_status_remote_recipient::Column::RemoteStatusId.eq(status_id.0))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|row| RemoteConversationParticipant {
+                    activitypub_id: row.activitypub_id,
+                    remote_actor_id: row.remote_actor_id.map(AccountId),
+                    mention_name: row.mention_name,
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(participants)
+}
+
+async fn remote_conversation_participants_for_local_status(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Vec<RemoteConversationParticipant>> {
+    Ok(remote_mentions_for_local_status(db, status_id)
+        .await?
+        .into_iter()
+        .map(|actor| RemoteConversationParticipant {
+            activitypub_id: actor.activitypub_id,
+            remote_actor_id: Some(actor.id),
+            mention_name: Some(format!("@{}@{}", actor.username, actor.domain)),
+        })
+        .collect())
 }
 
 /// List visible local direct conversations for an account.
@@ -4614,6 +5212,38 @@ pub async fn local_conversation_views(
             conversation: conversation.clone(),
             account: local_conversation_account_from_model(row),
         })
+        .collect())
+}
+
+/// List accounts whose conversation view currently presents a given local status.
+pub async fn local_conversation_accounts_for_last_status(
+    db: &DbConnection,
+    conversation_id: Uuid,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    Ok(local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .filter(local_conversation_account::Column::LastStatusId.eq(status_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|view| AccountId(view.account_id))
+        .collect())
+}
+
+/// List accounts whose conversation view currently presents a given remote status.
+pub async fn local_conversation_accounts_for_last_remote_status(
+    db: &DbConnection,
+    conversation_id: Uuid,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    Ok(local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .filter(local_conversation_account::Column::LastRemoteStatusId.eq(status_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|view| AccountId(view.account_id))
         .collect())
 }
 
@@ -4999,7 +5629,7 @@ pub async fn is_local_status_favourited(
 
 /// Return whether a local account has favourited a cached remote Note.
 pub async fn is_remote_status_favourited(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<bool> {
@@ -5623,7 +6253,7 @@ pub async fn delete_owned_local_status(
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.updated_at = Set(OffsetDateTime::now_utc());
 
-    Ok(Some(local_status_from_model(active.update(db).await?)))
+    Ok(Some(local_status_from_model(active.update(db).await?)?))
 }
 
 /// List public local statuses for the public timeline.
@@ -5647,7 +6277,10 @@ pub async fn public_local_timeline(
     let last_cursor = statuses.last().map(|status| status.id);
 
     Ok(TimelinePage {
-        items: statuses.into_iter().map(local_status_from_model).collect(),
+        items: statuses
+            .into_iter()
+            .map(local_status_from_model)
+            .collect::<Result<_>>()?,
         first_cursor,
         last_cursor,
         has_more,
@@ -5698,7 +6331,10 @@ pub async fn local_statuses_by_account(
     let last_cursor = statuses.last().map(|status| status.id);
 
     Ok(TimelinePage {
-        items: statuses.into_iter().map(local_status_from_model).collect(),
+        items: statuses
+            .into_iter()
+            .map(local_status_from_model)
+            .collect::<Result<_>>()?,
         first_cursor,
         last_cursor,
         has_more,
@@ -5858,9 +6494,16 @@ pub async fn home_timeline_for_account(
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
-    let mut items = statuses
+    let statuses = statuses
         .into_iter()
         .map(local_status_from_model)
+        .collect::<Result<Vec<_>>>()?;
+    let remote_statuses = remote_statuses
+        .into_iter()
+        .map(remote_status_from_model)
+        .collect::<Result<Vec<_>>>()?;
+    let mut items = statuses
+        .into_iter()
         .map(HomeTimelineItem::Status)
         .chain(
             reblogs
@@ -5871,7 +6514,6 @@ pub async fn home_timeline_for_account(
         .chain(
             remote_statuses
                 .into_iter()
-                .map(remote_status_from_model)
                 .map(HomeTimelineItem::RemoteStatus),
         )
         .chain(
@@ -6330,7 +6972,9 @@ pub async fn find_account_by_access_token(
         .one(db)
         .await?;
 
-    Ok(account.map(|account| (local_account_from_model(account), token.scopes)))
+    account
+        .map(|account| Ok((local_account_from_model(account)?, token.scopes)))
+        .transpose()
 }
 
 /// Revoke an OAuth access token if it exists.
@@ -6369,8 +7013,8 @@ pub fn pkce_s256_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn local_account_from_model(account: local_account::Model) -> LocalAccount {
-    LocalAccount {
+fn local_account_from_model(account: local_account::Model) -> Result<LocalAccount> {
+    Ok(LocalAccount {
         id: AccountId(account.id),
         username: account.username,
         email: account.email,
@@ -6381,7 +7025,7 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         locked: account.locked,
         bot: account.bot,
         discoverable: account.discoverable,
-        default_visibility: account.default_visibility,
+        default_visibility: StatusVisibility::parse(&account.default_visibility)?,
         default_sensitive: account.default_sensitive,
         default_language: account.default_language,
         default_quote_policy: account.default_quote_policy,
@@ -6389,7 +7033,7 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         avatar_file_path: account.avatar_file_path,
         header_file_path: account.header_file_path,
         created_at: account.created_at,
-    }
+    })
 }
 
 /// Convert a persisted remote actor cache model into the shared projection.
@@ -6429,21 +7073,22 @@ fn remote_custom_emoji_from_model(model: remote_custom_emoji::Model) -> Result<R
 }
 
 /// Convert a persisted remote Note cache model into the shared projection.
-fn remote_status_from_model(status: remote_status::Model) -> RemoteStatus {
-    RemoteStatus {
+fn remote_status_from_model(status: remote_status::Model) -> Result<RemoteStatus> {
+    Ok(RemoteStatus {
         id: StatusId(status.id),
         activitypub_id: status.activitypub_id,
         remote_actor_id: AccountId(status.remote_actor_id),
         content: status.content,
-        visibility: status.visibility,
+        visibility: StatusVisibility::parse(&status.visibility)?,
         published_at: status.published_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
         in_reply_to: status.in_reply_to,
         in_reply_to_local_status_id: status.in_reply_to_local_status_id.map(StatusId),
         in_reply_to_remote_status_id: status.in_reply_to_remote_status_id.map(StatusId),
+        conversation_id: status.conversation_id,
         object: status.object,
-    }
+    })
 }
 
 /// Convert a persisted local Announce of a remote Note into its shared projection.
@@ -6528,12 +7173,12 @@ fn local_account_mute_from_model(mute: local_account_mute::Model) -> LocalAccoun
     }
 }
 
-fn local_status_from_model(status: local_status::Model) -> LocalStatus {
-    LocalStatus {
+fn local_status_from_model(status: local_status::Model) -> Result<LocalStatus> {
+    Ok(LocalStatus {
         id: StatusId(status.id),
         account_id: AccountId(status.account_id),
         content: status.content,
-        visibility: status.visibility,
+        visibility: StatusVisibility::parse(&status.visibility)?,
         sensitive: status.sensitive,
         spoiler_text: status.spoiler_text,
         language: status.language,
@@ -6543,7 +7188,7 @@ fn local_status_from_model(status: local_status::Model) -> LocalStatus {
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
-    }
+    })
 }
 
 fn local_tag_from_model(tag: local_tag::Model) -> LocalTag {
@@ -6559,6 +7204,7 @@ fn local_conversation_from_model(conversation: local_conversation::Model) -> Loc
     LocalConversation {
         id: conversation.id,
         last_status_id: conversation.last_status_id.map(StatusId),
+        last_remote_status_id: conversation.last_remote_status_id.map(StatusId),
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
     }
@@ -6574,6 +7220,8 @@ fn local_conversation_account_from_model(
         account_id: AccountId(account.account_id),
         unread: account.unread,
         hidden_at: account.hidden_at,
+        last_status_id: account.last_status_id.map(StatusId),
+        last_remote_status_id: account.last_remote_status_id.map(StatusId),
         created_at: account.created_at,
         updated_at: account.updated_at,
     }

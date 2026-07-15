@@ -17,6 +17,7 @@ pub struct Model {
     pub in_reply_to: Option<String>,
     pub in_reply_to_local_status_id: Option<Uuid>,
     pub in_reply_to_remote_status_id: Option<Uuid>,
+    pub conversation_id: Option<Uuid>,
     pub object: Json,
     pub created_at: OffsetDateTime,
 }

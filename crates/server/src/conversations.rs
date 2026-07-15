@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -11,9 +13,15 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
+    accounts::{
+        RemoteAccountResponse, remote_account_response, unresolved_remote_account_response,
+    },
     auth::{AccountResponse, AuthenticatedAccount, account_response},
     http::AppState,
-    statuses::{CollectionLink, StatusResponse},
+    statuses::{
+        CollectionLink, StatusResponse, remote_status_response, status_visible_to_viewer,
+        status_with_author,
+    },
 };
 
 const DEFAULT_CONVERSATION_LIMIT: u64 = 20;
@@ -50,8 +58,15 @@ struct ConversationParams {
 struct ConversationResponse {
     id: String,
     unread: bool,
-    accounts: Vec<AccountResponse>,
+    accounts: Vec<ConversationAccountResponse>,
     last_status: Option<StatusResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ConversationAccountResponse {
+    Local(Box<AccountResponse>),
+    Remote(Box<RemoteAccountResponse>),
 }
 
 #[derive(Serialize)]
@@ -143,10 +158,14 @@ async fn conversation_response(
     account_id: AccountId,
     view: roosty_db::LocalConversationView,
 ) -> Result<ConversationResponse, RoostyError> {
-    let accounts = conversation_accounts(state, account_id, view.conversation.id).await?;
-    let last_status = match view.conversation.last_status_id {
-        Some(status_id) => conversation_status(state, account_id, status_id).await?,
-        None => None,
+    let accounts = conversation_accounts(state, account_id, &view.account).await?;
+    let last_status = match (
+        view.account.last_status_id,
+        view.account.last_remote_status_id,
+    ) {
+        (Some(status_id), None) => conversation_status(state, account_id, status_id).await?,
+        (None, Some(status_id)) => remote_conversation_status(state, status_id).await?,
+        _ => None,
     };
 
     Ok(ConversationResponse {
@@ -173,21 +192,69 @@ pub(crate) async fn publish_conversation_update(
     Ok(())
 }
 
-async fn conversation_accounts(
+/// Publish only recipient views whose latest visible direct status changed.
+pub(crate) async fn publish_conversation_updates(
     state: &AppState,
-    account_id: AccountId,
     conversation_id: Uuid,
-) -> Result<Vec<AccountResponse>, RoostyError> {
-    let participants =
-        roosty_db::local_conversation_participants(&state.db, conversation_id).await?;
-    let mut accounts = Vec::new();
-    for participant in participants {
-        if participant.id != account_id {
-            accounts.push(account_response(state, participant).await?);
+    account_ids: &[AccountId],
+) -> Result<(), RoostyError> {
+    let account_ids = account_ids.iter().copied().collect::<HashSet<_>>();
+    for view in roosty_db::local_conversation_views(&state.db, conversation_id).await? {
+        let account_id = view.account.account_id;
+        if account_ids.contains(&account_id) {
+            let response = conversation_response(state, account_id, view).await?;
+            state
+                .streaming_events
+                .publish_conversation(&response, account_id);
         }
     }
 
+    Ok(())
+}
+
+async fn conversation_accounts(
+    state: &AppState,
+    account_id: AccountId,
+    view: &roosty_db::LocalConversationAccount,
+) -> Result<Vec<ConversationAccountResponse>, RoostyError> {
+    let participants = roosty_db::direct_status_participants_for_view(&state.db, view).await?;
+    let mut accounts = Vec::new();
+    for participant in participants.local_accounts {
+        if participant.id != account_id {
+            accounts.push(ConversationAccountResponse::Local(Box::new(
+                account_response(state, participant).await?,
+            )));
+        }
+    }
+
+    for participant in participants.remote_accounts {
+        let response = match participant.remote_actor_id {
+            Some(id) => match roosty_db::find_remote_actor_by_id(&state.db, id).await? {
+                Some(actor) => remote_account_response(state, actor).await?,
+                None => unresolved_remote_account_response(
+                    &participant.activitypub_id,
+                    participant.mention_name.as_deref(),
+                ),
+            },
+            None => unresolved_remote_account_response(
+                &participant.activitypub_id,
+                participant.mention_name.as_deref(),
+            ),
+        };
+        accounts.push(ConversationAccountResponse::Remote(Box::new(response)));
+    }
+
     Ok(accounts)
+}
+
+async fn remote_conversation_status(
+    state: &AppState,
+    status_id: StatusId,
+) -> Result<Option<StatusResponse>, RoostyError> {
+    let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await? else {
+        return Ok(None);
+    };
+    remote_status_response(state, status).await.map(Some)
 }
 
 async fn conversation_status(
@@ -198,11 +265,11 @@ async fn conversation_status(
     let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
         return Ok(None);
     };
-    if !crate::statuses::status_visible_to_viewer(state, &status, Some(account_id)).await? {
+    if !status_visible_to_viewer(state, &status, Some(account_id)).await? {
         return Ok(None);
     }
 
-    crate::statuses::status_with_author(state, status, Some(account_id))
+    status_with_author(state, status, Some(account_id))
         .await
         .map(Some)
 }

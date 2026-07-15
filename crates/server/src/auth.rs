@@ -13,6 +13,7 @@ use axum_params::{Params, UploadFile};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use roosty_core::{AccountId, RoostyError};
+use roosty_db::StatusVisibility;
 use sea_orm::TransactionTrait;
 use serde::{
     Deserialize, Serialize,
@@ -957,7 +958,7 @@ async fn verify_credentials(
 
 async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Response {
     Json(PreferencesResponse {
-        posting_default_visibility: account.default_visibility,
+        posting_default_visibility: account.default_visibility.to_string(),
         posting_default_sensitive: account.default_sensitive,
         posting_default_language: account.default_language,
         posting_default_quote_policy: account.default_quote_policy,
@@ -1116,7 +1117,7 @@ pub(crate) async fn account_response(
         source: AccountSource {
             note: account.note,
             fields: profile_fields,
-            privacy: account.default_visibility,
+            privacy: account.default_visibility.to_string(),
             sensitive: account.default_sensitive,
             language: account.default_language.unwrap_or_default(),
             quote_policy: account.default_quote_policy,
@@ -1156,9 +1157,12 @@ impl fmt::Display for DateOnly {
 fn settings_update_from_input(
     input: UpdateCredentialsInput,
 ) -> Result<roosty_db::LocalAccountSettingsUpdate, UpdateCredentialsError> {
-    if let Some(visibility) = input.default_visibility.as_deref() {
-        validate_visibility(visibility)?;
-    }
+    let default_visibility = input
+        .default_visibility
+        .as_deref()
+        .map(StatusVisibility::parse)
+        .transpose()
+        .map_err(|_| UpdateCredentialsError::Visibility)?;
     if let Some(quote_policy) = input.default_quote_policy.as_deref() {
         validate_quote_policy(quote_policy)?;
     }
@@ -1172,7 +1176,7 @@ fn settings_update_from_input(
         locked: input.locked,
         bot: input.bot,
         discoverable: input.discoverable,
-        default_visibility: input.default_visibility,
+        default_visibility,
         default_sensitive: input.default_sensitive,
         default_language: input.default_language,
         default_quote_policy: input.default_quote_policy,
@@ -1261,14 +1265,6 @@ async fn store_profile_image(
     tokio::fs::write(full_path, upload.bytes).await?;
 
     Ok(relative_path)
-}
-
-/// Validate default status visibility values accepted by Mastodon clients.
-fn validate_visibility(value: &str) -> Result<(), UpdateCredentialsError> {
-    match value {
-        "public" | "unlisted" | "private" | "direct" => Ok(()),
-        _ => Err(UpdateCredentialsError::Visibility),
-    }
 }
 
 /// Validate default quote policy values accepted by Mastodon clients.

@@ -17,6 +17,9 @@ pub enum RoostyError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("invalid status visibility: {0}")]
+    StatusVisibility(#[from] strum::ParseError),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

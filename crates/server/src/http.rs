@@ -13,7 +13,7 @@ use tower_http::{
 };
 use tracing::Level;
 
-use crate::config::Config;
+use crate::{config::Config, streaming::StreamingEvents};
 
 /// Shared Axum application state.
 #[derive(Clone)]
@@ -23,7 +23,7 @@ pub struct AppState {
     /// Database connection pool.
     pub db: roosty_db::DbConnection,
     /// In-process Mastodon streaming event bus.
-    pub streaming_events: crate::streaming::StreamingEvents,
+    pub streaming_events: StreamingEvents,
 }
 
 impl AppState {
@@ -32,7 +32,7 @@ impl AppState {
         Self {
             config: Arc::new(config),
             db,
-            streaming_events: crate::streaming::StreamingEvents::new(),
+            streaming_events: StreamingEvents::new(),
         }
     }
 }

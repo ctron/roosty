@@ -16,7 +16,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rand_core::{OsRng, RngCore};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
-use roosty_db::NewRemoteCustomEmoji;
+use roosty_db::{NewRemoteCustomEmoji, RemoteConversationParticipant, StatusVisibility};
 use rsa::{
     RsaPrivateKey,
     pkcs1v15::SigningKey,
@@ -24,7 +24,7 @@ use rsa::{
     pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
     signature::{SignatureEncoding, Signer, Verifier},
 };
-use sea_orm::TransactionTrait;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -70,7 +70,7 @@ enum DeleteType {
 }
 
 /// Activity types that carry a remote Note object in an inbox request.
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 enum InboundStatusType {
     Create,
     Update,
@@ -264,11 +264,23 @@ impl InboundAttachment {
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InboundTag {
-    r#type: String,
+    r#type: InboundTagType,
     href: Option<String>,
     name: Option<String>,
     #[serde(default)]
     icon: Option<InboundEmojiIcon>,
+}
+
+/// ActivityPub tag types understood by this implementation.
+#[derive(Deserialize, Serialize, PartialEq)]
+enum InboundTagType {
+    Mention,
+    Hashtag,
+    Emoji,
+    #[serde(rename = "http://joinmastodon.org/ns#Emoji")]
+    MastodonEmoji,
+    #[serde(other)]
+    Other,
 }
 
 /// Image reference used by Mastodon ActivityPub Emoji tags.
@@ -747,7 +759,7 @@ async fn note(
         return StatusCode::NOT_FOUND.into_response();
     };
     match roosty_db::find_local_status_by_id(&state.db, StatusId(id)).await {
-        Ok(Some(status)) if status.visibility == "public" => {
+        Ok(Some(status)) if status.visibility == StatusVisibility::Public => {
             match roosty_db::find_local_account_by_id(&state.db, status.account_id).await {
                 Ok(Some(account)) if account.username == username => {
                     match note_object(&state, &username, status).await {
@@ -1014,7 +1026,12 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             return StatusCode::ACCEPTED.into_response();
         };
         let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-            Ok(Some(status)) if matches!(status.visibility.as_str(), "public" | "unlisted") => {
+            Ok(Some(status))
+                if matches!(
+                    status.visibility,
+                    StatusVisibility::Public | StatusVisibility::Unlisted
+                ) =>
+            {
                 status
             }
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
@@ -1062,21 +1079,29 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             return StatusCode::ACCEPTED.into_response();
         }
         let target = match local_status_id_from_url(state, &announce.object).await {
-            Ok(Some(status_id)) => match roosty_db::find_local_status_by_id(&state.db, status_id)
-                .await
-            {
-                Ok(Some(status)) if matches!(status.visibility.as_str(), "public" | "unlisted") => {
-                    roosty_db::RemoteStatusReblogTarget::Local(status.id)
+            Ok(Some(status_id)) => {
+                match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+                    Ok(Some(status))
+                        if matches!(
+                            status.visibility,
+                            StatusVisibility::Public | StatusVisibility::Unlisted
+                        ) =>
+                    {
+                        roosty_db::RemoteStatusReblogTarget::Local(status.id)
+                    }
+                    Ok(_) => return StatusCode::ACCEPTED.into_response(),
+                    Err(error) => return internal_error(error),
                 }
-                Ok(_) => return StatusCode::ACCEPTED.into_response(),
-                Err(error) => return internal_error(error),
-            },
+            }
             Ok(None) => {
                 match roosty_db::find_remote_status_by_activitypub_id(&state.db, &announce.object)
                     .await
                 {
                     Ok(Some(status))
-                        if matches!(status.visibility.as_str(), "public" | "unlisted") =>
+                        if matches!(
+                            status.visibility,
+                            StatusVisibility::Public | StatusVisibility::Unlisted
+                        ) =>
                     {
                         roosty_db::RemoteStatusReblogTarget::Remote(status.id)
                     }
@@ -1101,6 +1126,29 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Ok(created) => created,
             Err(error) => return internal_error(error),
         };
+        let notification = if created {
+            if let roosty_db::RemoteStatusReblogTarget::Local(status_id) = target {
+                match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+                    Ok(Some(status)) => match roosty_db::notify_remote_actor_reblog(
+                        &txn,
+                        status.account_id,
+                        remote_actor.id,
+                        status.id,
+                    )
+                    .await
+                    {
+                        Ok(notification) => notification,
+                        Err(error) => return internal_error(error),
+                    },
+                    Ok(None) => None,
+                    Err(error) => return internal_error(error),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Err(error) =
             roosty_db::record_processed_inbox_activity(&txn, &activity_id, remote_actor.id).await
         {
@@ -1110,19 +1158,15 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             return internal_error(error);
         }
         if created {
-            if let roosty_db::RemoteStatusReblogTarget::Local(status_id) = target
-                && let Ok(Some(status)) =
-                    roosty_db::find_local_status_by_id(&state.db, status_id).await
-                && let Err(error) =
-                    crate::notifications::create_and_stream_remote_reblog_notification(
-                        state,
-                        status.account_id,
-                        remote_actor.id,
-                        status.id,
-                    )
-                    .await
+            if let Some(notification) = notification
+                && let Err(error) = crate::notifications::publish_committed_notification(
+                    state,
+                    notification.account_id,
+                    notification,
+                )
+                .await
             {
-                tracing::warn!(%error, activity_id, "could not create remote reblog notification");
+                tracing::warn!(%error, activity_id, "could not publish remote reblog notification");
             }
             if let Err(error) =
                 crate::statuses::publish_remote_reblog_update(state, remote_actor.id, &activity_id)
@@ -1285,14 +1329,34 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         .await
     };
     let persisted = match persisted {
-        Ok(persisted) => match txn.commit().await {
-            Ok(()) => Ok(persisted),
-            Err(error) => Err(error.into()),
-        },
-        Err(error) => Err(error),
+        Ok(persisted) => persisted,
+        Err(error) => return internal_error(error),
     };
+    let notification = if persisted {
+        let notification_type = if matches!(follow_state, InboundFollowState::Pending) {
+            roosty_db::LocalNotificationType::FollowRequest
+        } else {
+            roosty_db::LocalNotificationType::Follow
+        };
+        match roosty_db::notify_remote_actor_follow(
+            &txn,
+            local_account.id,
+            remote_actor.id,
+            notification_type,
+        )
+        .await
+        {
+            Ok(notification) => notification,
+            Err(error) => return internal_error(error),
+        }
+    } else {
+        None
+    };
+    if let Err(error) = txn.commit().await {
+        return internal_error(error);
+    }
     match persisted {
-        Ok(true) => {
+        true => {
             tracing::info!(
                 activity_id,
                 remote_actor_id = %remote_actor.id.0,
@@ -1300,19 +1364,19 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 state = follow_state.as_str(),
                 "processed remote follow"
             );
-            if let Err(error) = crate::notifications::create_and_stream_remote_follow_notification(
-                state,
-                local_account.id,
-                remote_actor.id,
-            )
-            .await
+            if let Some(notification) = notification
+                && let Err(error) = crate::notifications::publish_committed_notification(
+                    state,
+                    notification.account_id,
+                    notification,
+                )
+                .await
             {
-                tracing::warn!(%error, "failed to create remote follow notification");
+                tracing::warn!(%error, "failed to publish remote follow notification");
             }
             StatusCode::ACCEPTED.into_response()
         }
-        Ok(false) => StatusCode::ACCEPTED.into_response(),
-        Err(error) => internal_error(error),
+        false => StatusCode::ACCEPTED.into_response(),
     }
 }
 
@@ -1431,9 +1495,13 @@ enum RemoteStatusChange {
     /// An idempotent replay with no state or stream effect.
     Ignored,
     /// A newly created or edited Note.
-    Upsert(Box<roosty_db::RemoteStatus>, Vec<String>),
+    Upsert(
+        Box<roosty_db::RemoteStatus>,
+        Vec<roosty_db::LocalNotification>,
+        Option<roosty_db::DirectConversationRefresh>,
+    ),
     /// A removed Note with its internal API ID.
-    Delete(String),
+    Delete(String, Option<roosty_db::DirectConversationRefresh>),
 }
 
 /// Resolve a canonical local Note URL without accepting look-alike remote URLs.
@@ -1491,6 +1559,7 @@ async fn process_remote_status_activity(
                     "remote status activity type is invalid".to_owned(),
                 ));
             }
+            let is_create = matches!(activity.r#type, InboundStatusType::Create);
             let object = serde_json::to_value(&activity.object)
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
             let note = activity.object;
@@ -1512,7 +1581,7 @@ async fn process_remote_status_activity(
             let mention_urls = note
                 .tag
                 .iter()
-                .filter(|tag| tag.r#type == "Mention")
+                .filter(|tag| tag.r#type == InboundTagType::Mention)
                 .filter_map(|tag| tag.href.clone())
                 .collect::<Vec<_>>();
             if activity.actor != remote_actor.activitypub_id
@@ -1524,8 +1593,14 @@ async fn process_remote_status_activity(
                     "remote status activity has an invalid actor or object".to_owned(),
                 ));
             }
+            let direct_recipients = remote_direct_recipients(state, &note).await?;
+            let direct_participants =
+                remote_direct_participants(state, &note, remote_actor).await?;
             let visibility = remote_status_visibility(&note)
-                .ok_or_else(|| RoostyError::InvalidInput("remote Note is not public".to_owned()))?;
+                .or_else(|| direct_recipients.as_ref().map(|_| "direct"))
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("remote Note audience is unsupported".to_owned())
+                })?;
             let published_at = OffsetDateTime::parse(&note.published, &Rfc3339).map_err(|_| {
                 RoostyError::InvalidInput("remote Note published timestamp is invalid".to_owned())
             })?;
@@ -1544,6 +1619,20 @@ async fn process_remote_status_activity(
                     .map(|status| status.id),
                 None => None,
             };
+            let mut notification_recipients =
+                local_mention_recipients(state, &mention_urls).await?;
+            if let Some(parent_id) = note.in_reply_to.as_deref()
+                && let Some(status_id) = local_status_id_from_url(state, parent_id).await?
+                && let Some(parent) =
+                    roosty_db::find_local_status_by_id(&state.db, status_id).await?
+            {
+                notification_recipients.push(parent.account_id);
+            }
+            if let Some(recipients) = direct_recipients.as_ref() {
+                notification_recipients.extend(recipients.iter().copied());
+            }
+            notification_recipients.sort_by_key(|id| id.0);
+            notification_recipients.dedup();
             let txn = state.db.begin().await?;
             roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
             let status = roosty_db::process_remote_status_upsert(
@@ -1554,7 +1643,7 @@ async fn process_remote_status_activity(
                     activitypub_id: note.id,
                     remote_actor_id: remote_actor.id,
                     content: note.content,
-                    visibility: visibility.to_owned(),
+                    visibility: StatusVisibility::parse(visibility)?,
                     published_at,
                     updated_at,
                     in_reply_to: note.in_reply_to.clone(),
@@ -1568,17 +1657,59 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
-            if let Some(status) = &status
-                && !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
+            let direct_conversation_refresh =
+                if let (Some(status), Some(recipients)) = (&status, direct_recipients.as_deref()) {
+                    Some(
+                        roosty_db::attach_remote_direct_status_to_conversation(
+                            &txn,
+                            status.id,
+                            status.in_reply_to_local_status_id,
+                            status.in_reply_to_remote_status_id,
+                            recipients,
+                            &direct_participants,
+                            is_create,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+            let mut notifications = Vec::new();
+            if let Some(status) = &status {
+                for account_id in notification_recipients {
+                    if let Some(notification) = roosty_db::notify_remote_status_mention(
+                        &txn,
+                        account_id,
+                        remote_actor.id,
+                        status.id,
+                    )
                     .await?
-                    .is_empty()
-            {
-                crate::media::enqueue_remote_status_media_fetches_in_transaction(&txn, status.id)
+                    {
+                        notifications.push(notification);
+                    }
+                }
+            }
+            if let Some(status) = &status {
+                let has_local_recipients =
+                    !direct_recipients.as_deref().unwrap_or_default().is_empty();
+                let has_local_followers =
+                    !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
+                        .await?
+                        .is_empty();
+                if has_local_recipients || has_local_followers {
+                    crate::media::enqueue_remote_status_media_fetches_in_transaction(
+                        &txn, status.id,
+                    )
                     .await?;
+                }
             }
             txn.commit().await?;
             Ok(match status {
-                Some(status) => RemoteStatusChange::Upsert(Box::new(status), mention_urls),
+                Some(status) => RemoteStatusChange::Upsert(
+                    Box::new(status),
+                    notifications,
+                    direct_conversation_refresh,
+                ),
                 None => RemoteStatusChange::Ignored,
             })
         }
@@ -1608,9 +1739,21 @@ async fn process_remote_status_activity(
                 &object_id,
             )
             .await?;
+            let conversation_id = match deleted {
+                Some(status_id) => {
+                    roosty_db::repair_direct_conversation_after_delete(
+                        &txn,
+                        roosty_db::remote_status_conversation_id(&txn, status_id).await?,
+                    )
+                    .await?
+                }
+                None => None,
+            };
             txn.commit().await?;
             Ok(match deleted {
-                Some(status_id) => RemoteStatusChange::Delete(status_id.0.to_string()),
+                Some(status_id) => {
+                    RemoteStatusChange::Delete(status_id.0.to_string(), conversation_id)
+                }
                 None => RemoteStatusChange::Ignored,
             })
         }
@@ -1630,47 +1773,43 @@ async fn publish_remote_status_change(
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
     match change {
         RemoteStatusChange::Ignored => {}
-        RemoteStatusChange::Upsert(status, mention_urls) => {
+        RemoteStatusChange::Upsert(status, notifications, refresh) => {
             let response =
                 crate::statuses::remote_status_response(state, (*status).clone()).await?;
+            if let Some(refresh) = refresh {
+                let mut account_ids = refresh.updated_account_ids;
+                account_ids.extend(
+                    roosty_db::local_conversation_accounts_for_last_remote_status(
+                        &state.db,
+                        refresh.conversation_id,
+                        status.id,
+                    )
+                    .await?,
+                );
+                account_ids.sort_by_key(|id| id.0);
+                account_ids.dedup();
+                crate::conversations::publish_conversation_updates(
+                    state,
+                    refresh.conversation_id,
+                    &account_ids,
+                )
+                .await?;
+            }
             if !recipients.is_empty() {
                 state
                     .streaming_events
                     .publish_home_update(&response, remote_actor_id, &recipients);
             }
-            let prefix = format!(
-                "{}/users/",
-                state.config.public_base_url.as_str().trim_end_matches('/')
-            );
-            for mention_url in mention_urls {
-                if let Some(username) = mention_url.strip_prefix(&prefix)
-                    && !username.contains('/')
-                    && let Some(account) =
-                        roosty_db::find_local_account_by_username(&state.db, username).await?
-                {
-                    crate::notifications::create_and_stream_remote_status_mention(
-                        state,
-                        account.id,
-                        remote_actor_id,
-                        status.id,
-                    )
-                    .await?;
-                }
-            }
-            if let Some(parent_id) = status.in_reply_to_local_status_id
-                && let Some(parent) =
-                    roosty_db::find_local_status_by_id(&state.db, parent_id).await?
-            {
-                crate::notifications::create_and_stream_remote_status_mention(
+            for notification in notifications {
+                crate::notifications::publish_committed_notification(
                     state,
-                    parent.account_id,
-                    remote_actor_id,
-                    status.id,
+                    notification.account_id,
+                    notification,
                 )
                 .await?;
             }
         }
-        RemoteStatusChange::Delete(status_id) if !status_id.is_empty() => {
+        RemoteStatusChange::Delete(status_id, refresh) if !status_id.is_empty() => {
             if !recipients.is_empty() {
                 state.streaming_events.publish_home_delete(
                     &status_id,
@@ -1678,8 +1817,22 @@ async fn publish_remote_status_change(
                     &recipients,
                 );
             }
+            if let Some(refresh) = refresh {
+                state.streaming_events.publish_delete(
+                    &status_id,
+                    remote_actor_id,
+                    "direct",
+                    &refresh.removed_account_ids,
+                );
+                crate::conversations::publish_conversation_updates(
+                    state,
+                    refresh.conversation_id,
+                    &refresh.updated_account_ids,
+                )
+                .await?;
+            }
         }
-        RemoteStatusChange::Delete(_) => {}
+        RemoteStatusChange::Delete(_, _) => {}
     }
     Ok(())
 }
@@ -1690,8 +1843,8 @@ fn remote_custom_emoji_definitions(tags: &[InboundTag]) -> Vec<NewRemoteCustomEm
     tags.iter()
         .filter(|tag| {
             matches!(
-                tag.r#type.as_str(),
-                "Emoji" | "http://joinmastodon.org/ns#Emoji"
+                tag.r#type,
+                InboundTagType::Emoji | InboundTagType::MastodonEmoji
             )
         })
         .filter_map(|tag| {
@@ -1716,6 +1869,117 @@ fn remote_status_visibility(note: &InboundNote) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Return addressed local actors only for Mastodon-compatible direct Notes.
+async fn remote_direct_recipients(
+    state: &AppState,
+    note: &InboundNote,
+) -> Result<Option<Vec<AccountId>>, RoostyError> {
+    if note
+        .to
+        .iter()
+        .chain(&note.cc)
+        .any(|value| value == PUBLIC_AUDIENCE)
+    {
+        return Ok(None);
+    }
+    let mentions = note
+        .tag
+        .iter()
+        .filter(|tag| tag.r#type == InboundTagType::Mention)
+        .filter_map(|tag| tag.href.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    let audience = note.to.iter().chain(&note.cc).collect::<Vec<_>>();
+    if audience.is_empty()
+        || audience
+            .iter()
+            .any(|address| !mentions.contains(address.as_str()))
+        || mentions
+            .iter()
+            .any(|mention| !audience.iter().any(|address| address.as_str() == *mention))
+    {
+        return Ok(None);
+    }
+    let prefix = format!(
+        "{}/users/",
+        state.config.public_base_url.as_str().trim_end_matches('/')
+    );
+    let mut recipients = Vec::new();
+    for address in audience {
+        if let Some(username) = address.strip_prefix(&prefix)
+            && !username.contains('/')
+            && let Some(account) =
+                roosty_db::find_local_account_by_username(&state.db, username).await?
+        {
+            recipients.push(account.id);
+        }
+    }
+    recipients.sort_by_key(|id| id.0);
+    recipients.dedup();
+    Ok((!recipients.is_empty()).then_some(recipients))
+}
+
+/// Retain every remote direct-message participant without fetching unknown actors.
+async fn remote_direct_participants(
+    state: &AppState,
+    note: &InboundNote,
+    author: &roosty_db::RemoteActor,
+) -> Result<Vec<RemoteConversationParticipant>, RoostyError> {
+    let mut participants = vec![RemoteConversationParticipant {
+        activitypub_id: author.activitypub_id.clone(),
+        remote_actor_id: Some(author.id),
+        mention_name: Some(format!("@{}@{}", author.username, author.domain)),
+    }];
+    let local_prefix = format!(
+        "{}/users/",
+        state.config.public_base_url.as_str().trim_end_matches('/')
+    );
+    for tag in &note.tag {
+        if tag.r#type != InboundTagType::Mention {
+            continue;
+        }
+        let Some(activitypub_id) = tag.href.as_deref() else {
+            continue;
+        };
+        if activitypub_id.starts_with(&local_prefix) {
+            continue;
+        }
+        let remote_actor_id =
+            roosty_db::find_remote_actor_by_activitypub_id(&state.db, activitypub_id)
+                .await?
+                .map(|actor| actor.id);
+        participants.push(RemoteConversationParticipant {
+            activitypub_id: activitypub_id.to_owned(),
+            remote_actor_id,
+            mention_name: tag.name.clone(),
+        });
+    }
+    participants.sort_by(|left, right| left.activitypub_id.cmp(&right.activitypub_id));
+    participants.dedup_by(|left, right| left.activitypub_id == right.activitypub_id);
+    Ok(participants)
+}
+
+/// Resolve local recipients named by verified Mention tags without remote fetches.
+async fn local_mention_recipients(
+    state: &AppState,
+    mention_urls: &[String],
+) -> Result<Vec<AccountId>, RoostyError> {
+    let prefix = format!(
+        "{}/users/",
+        state.config.public_base_url.as_str().trim_end_matches('/')
+    );
+    let mut recipients = Vec::new();
+    for url in mention_urls {
+        if let Some(username) = url.strip_prefix(&prefix)
+            && !username.contains('/')
+            && let Some(account) =
+                roosty_db::find_local_account_by_username(&state.db, username).await?
+        {
+            recipients.push(account.id);
+        }
+    }
+    Ok(recipients)
 }
 
 fn verify_legacy_signature(
@@ -1862,6 +2126,8 @@ struct StatusDelivery {
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity: JsonValue,
+    #[serde(default)]
+    personal_inbox: bool,
 }
 
 /// Durable payload for one local actor Update delivery to an accepted remote follower.
@@ -1933,7 +2199,8 @@ pub(crate) async fn enqueue_remote_favourite(
     local_account_id: AccountId,
     remote_status: &roosty_db::RemoteStatus,
 ) -> Result<String, RoostyError> {
-    let (id, job) = prepare_remote_favourite(state, local_account_id, remote_status).await?;
+    let (id, job) =
+        prepare_remote_favourite(state, &state.db, local_account_id, remote_status).await?;
     roosty_db::enqueue_job(
         &state.db,
         job.kind,
@@ -1948,15 +2215,16 @@ pub(crate) async fn enqueue_remote_favourite(
 /// Build the durable Like delivery without inserting it.
 pub(crate) async fn prepare_remote_favourite(
     state: &AppState,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status: &roosty_db::RemoteStatus,
 ) -> Result<(String, roosty_db::NewJob), RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("local favourite actor does not exist".to_owned())
         })?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_status.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote status author does not exist".to_owned())
@@ -2048,6 +2316,7 @@ pub(crate) async fn deliver_favourite_activity(
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
+        false,
     )
     .await
 }
@@ -2188,6 +2457,7 @@ pub(crate) async fn deliver_reblog_activity(
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
+        false,
     )
     .await
 }
@@ -2310,6 +2580,7 @@ pub(crate) async fn deliver_follow_activity(
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
+        false,
     )
     .await
 }
@@ -2322,7 +2593,10 @@ pub(crate) async fn enqueue_status_activity(
     kind: StatusActivityKind,
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled
-        || !matches!(status.visibility.as_str(), "public" | "unlisted")
+        || !matches!(
+            status.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+        )
     {
         return Ok(());
     }
@@ -2334,15 +2608,11 @@ pub(crate) async fn enqueue_status_activity(
         .get("id")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
-    let mut recipients = roosty_db::accepted_remote_followers(&state.db, local.id).await?;
-    if let Some(parent_id) = status.in_reply_to_remote_status_id
-        && let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, parent_id).await?
-        && let Some(actor) =
-            roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
-        && !recipients.iter().any(|recipient| recipient.id == actor.id)
-    {
-        recipients.push(actor);
-    }
+    let mut recipients = if status.visibility == StatusVisibility::Direct {
+        Vec::new()
+    } else {
+        roosty_db::accepted_remote_followers(&state.db, local.id).await?
+    };
     for actor in roosty_db::remote_mentions_for_local_status(&state.db, status.id).await? {
         if !recipients.iter().any(|recipient| recipient.id == actor.id) {
             recipients.push(actor);
@@ -2353,6 +2623,7 @@ pub(crate) async fn enqueue_status_activity(
             local_account_id: local.id,
             remote_actor_id: remote.id,
             activity: activity.clone(),
+            personal_inbox: status.visibility == StatusVisibility::Direct,
         })
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job(
@@ -2375,7 +2646,10 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
     kind: StatusActivityKind,
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled
-        || !matches!(status.visibility.as_str(), "public" | "unlisted")
+        || !matches!(
+            status.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+        )
     {
         return Ok(());
     }
@@ -2387,15 +2661,11 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
         .get("id")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
-    let mut recipients = roosty_db::accepted_remote_followers(&state.db, local.id).await?;
-    if let Some(parent_id) = status.in_reply_to_remote_status_id
-        && let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, parent_id).await?
-        && let Some(actor) =
-            roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
-        && !recipients.iter().any(|recipient| recipient.id == actor.id)
-    {
-        recipients.push(actor);
-    }
+    let mut recipients = if status.visibility == StatusVisibility::Direct {
+        Vec::new()
+    } else {
+        roosty_db::accepted_remote_followers(&state.db, local.id).await?
+    };
     for actor in roosty_db::remote_mentions_for_local_status(txn, status.id).await? {
         if !recipients.iter().any(|recipient| recipient.id == actor.id) {
             recipients.push(actor);
@@ -2406,6 +2676,7 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
             local_account_id: local.id,
             remote_actor_id: remote.id,
             activity: activity.clone(),
+            personal_inbox: status.visibility == StatusVisibility::Direct,
         })
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job_in_transaction(
@@ -2635,6 +2906,7 @@ pub(crate) async fn deliver_status_activity(
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
+        payload.personal_inbox,
     )
     .await
 }
@@ -2652,6 +2924,7 @@ pub(crate) async fn deliver_actor_update(
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
+        false,
     )
     .await
 }
@@ -2662,6 +2935,7 @@ async fn deliver_activity(
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity: &JsonValue,
+    personal_inbox: bool,
 ) -> Result<(), RoostyError> {
     let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
         .await?
@@ -2681,10 +2955,14 @@ async fn deliver_activity(
     let private_key = decrypt_private_key(state, &key)?;
     signed_post(
         state,
-        remote
-            .shared_inbox_url
-            .as_deref()
-            .unwrap_or(&remote.inbox_url),
+        if personal_inbox {
+            &remote.inbox_url
+        } else {
+            remote
+                .shared_inbox_url
+                .as_deref()
+                .unwrap_or(&remote.inbox_url)
+        },
         &private_key,
         &format!("{}#main-key", actor_url(state, &local.username)),
         activity,
@@ -2867,7 +3145,7 @@ async fn note_object(
     status: roosty_db::LocalStatus,
 ) -> Result<Note, RoostyError> {
     let id = status_url(state, username, status.id);
-    let (to, cc) = status_audience(state, username, &status.visibility);
+    let (to, cc) = status_audience(state, username, (&status.visibility).into());
     let in_reply_to = match status.in_reply_to_remote_status_id {
         Some(id) => roosty_db::find_remote_status_by_id(&state.db, id)
             .await?
@@ -2908,20 +3186,14 @@ async fn note_object(
             name: format!("@{}@{}", actor.username, actor.domain),
         });
     }
-    if let Some(parent_id) = status.in_reply_to_remote_status_id
-        && let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, parent_id).await?
-        && let Some(actor) =
-            roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
-        && !tag
-            .iter()
-            .any(|mention| mention.href == actor.activitypub_id)
-    {
-        tag.push(MentionTag {
-            r#type: MentionType::Mention,
-            href: actor.activitypub_id,
-            name: format!("@{}@{}", actor.username, actor.domain),
-        });
-    }
+    let (to, cc) = if status.visibility == StatusVisibility::Direct {
+        (
+            tag.iter().map(|mention| mention.href.clone()).collect(),
+            Vec::new(),
+        )
+    } else {
+        (to, cc)
+    };
     Ok(Note {
         context: ACTIVITYSTREAMS_CONTEXT,
         id,
@@ -3044,6 +3316,7 @@ mod tests {
 
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
+    use roosty_db::StatusVisibility;
     use roosty_migration::Migrator;
     use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
@@ -3942,7 +4215,7 @@ mod tests {
             roosty_db::NewLocalStatus {
                 account_id,
                 content: content.to_owned(),
-                visibility: "public".to_owned(),
+                visibility: StatusVisibility::Public,
                 sensitive: false,
                 spoiler_text: String::new(),
                 language: None,
@@ -3965,7 +4238,7 @@ mod tests {
                 activitypub_id: activitypub_id.to_owned(),
                 remote_actor_id,
                 content: "cached remote status".to_owned(),
-                visibility: "public".to_owned(),
+                visibility: StatusVisibility::Public,
                 published_at: time::OffsetDateTime::now_utc(),
                 updated_at: time::OffsetDateTime::now_utc(),
                 in_reply_to: None,

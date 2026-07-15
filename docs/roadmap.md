@@ -38,9 +38,12 @@
 - [ ] Add grouped notifications and Web Push integration.
 - [ ] Apply local mute/block and domain-policy decisions consistently to discovery, inbox processing, delivery, and notifications.
 - [ ] Deliver remote mute/block activities and project their relationship state.
-- [ ] Support remote direct conversations, including encrypted/private addressing policy and timeline projection.
+- [x] Complete remote direct conversations: persist mixed local/remote participants, support replies to cached direct Notes, and repair conversation state after remote updates/deletes.
+- [x] Add recipient-scoped direct-message audiences, per-account last-status projection, local/remote deletion repair, and transactional notification creation.
+- [x] Finish transactional remote notifications for Follow and Announce flows, matching the existing transactional mention/reply and Like handling.
+- [ ] Replace stringly persisted status visibility with the typed `StatusVisibility` model at persistence and wire boundaries.
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
-- [ ] Add remote hashtag discovery, status/tag projections, and featured/profile tags.
+- [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
 - [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, and account migration metadata.
 - [ ] Add replay protection for reused or absent remote activity IDs beyond current canonical-ID idempotency.
 - [ ] Support multi-process streaming fan-out and federation-worker coordination.
@@ -76,13 +79,11 @@
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
-- [ ] Add remote notifications and direct conversations.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [ ] Improve local account administration now that multiple local users can be operator-created.
 - [ ] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [ ] Add cursor pagination for account status collections.
-- [ ] Expand local direct conversations toward remote conversation support.
-- [ ] Add remote hashtag discovery and featured/profile tags.
+- [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.
 - [x] Expose persisted local account creation dates through Mastodon account responses.

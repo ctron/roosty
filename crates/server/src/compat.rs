@@ -19,6 +19,7 @@ use roosty_core::AccountId;
 use crate::{
     auth::{self, AuthenticatedAccount},
     http::AppState,
+    streaming::StreamingEvents,
 };
 
 /// Build compatibility routes probed by Mastodon browser clients.
@@ -120,7 +121,7 @@ async fn handle_streaming_socket(
     mut socket: WebSocket,
     account_id: AccountId,
     initial_stream: Option<String>,
-    events: crate::streaming::StreamingEvents,
+    events: StreamingEvents,
 ) {
     let mut streams = initial_stream.map_or_else(|| vec!["user".to_owned()], |stream| vec![stream]);
     debug!(?streams, "streaming client subscribed");

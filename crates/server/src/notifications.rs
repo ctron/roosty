@@ -15,8 +15,10 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthenticatedAccount, account_response},
+    accounts::RemoteAccountResponse,
+    auth::{AccountResponse, AuthenticatedAccount, account_response},
     http::AppState,
+    statuses::{CollectionLink, StatusResponse},
 };
 
 const DEFAULT_NOTIFICATION_LIMIT: u64 = 40;
@@ -64,14 +66,14 @@ struct NotificationResponse {
     created_at: String,
     account: NotificationAccountResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<crate::statuses::StatusResponse>,
+    status: Option<StatusResponse>,
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
 enum NotificationAccountResponse {
-    Local(Box<crate::auth::AccountResponse>),
-    Remote(Box<crate::accounts::RemoteAccountResponse>),
+    Local(Box<AccountResponse>),
+    Remote(Box<RemoteAccountResponse>),
 }
 
 #[derive(Serialize)]
@@ -194,22 +196,6 @@ pub(crate) async fn create_and_stream_notification(
     Ok(())
 }
 
-/// Create and publish a follow notification caused by a remote actor.
-pub(crate) async fn create_and_stream_remote_follow_notification(
-    state: &AppState,
-    account_id: AccountId,
-    remote_actor_id: AccountId,
-) -> Result<(), RoostyError> {
-    let notification =
-        roosty_db::notify_remote_actor_follow(&state.db, account_id, remote_actor_id).await?;
-    if let Some(response) = notification_response(state, account_id, notification).await? {
-        state
-            .streaming_events
-            .publish_notification(&response, account_id);
-    }
-    Ok(())
-}
-
 /// Publish a notification that was persisted by a caller-owned transaction.
 pub(crate) async fn publish_committed_notification(
     state: &AppState,
@@ -224,53 +210,13 @@ pub(crate) async fn publish_committed_notification(
     Ok(())
 }
 
-/// Create and publish a boost notification caused by a remote actor.
-pub(crate) async fn create_and_stream_remote_reblog_notification(
-    state: &AppState,
-    account_id: AccountId,
-    remote_actor_id: AccountId,
-    status_id: StatusId,
-) -> Result<(), RoostyError> {
-    let notification =
-        roosty_db::notify_remote_actor_reblog(&state.db, account_id, remote_actor_id, status_id)
-            .await?;
-    if let Some(response) = notification_response(state, account_id, notification).await? {
-        state
-            .streaming_events
-            .publish_notification(&response, account_id);
-    }
-    Ok(())
-}
-
-/// Create and stream an idempotent mention notification caused by a cached remote Note.
-pub(crate) async fn create_and_stream_remote_status_mention(
-    state: &AppState,
-    account_id: AccountId,
-    remote_actor_id: AccountId,
-    remote_status_id: StatusId,
-) -> Result<(), RoostyError> {
-    let notification = roosty_db::notify_remote_status_mention(
-        &state.db,
-        account_id,
-        remote_actor_id,
-        remote_status_id,
-    )
-    .await?;
-    if let Some(response) = notification_response(state, account_id, notification).await? {
-        state
-            .streaming_events
-            .publish_notification(&response, account_id);
-    }
-    Ok(())
-}
-
 async fn notification_page_response(
     state: &AppState,
     account_id: AccountId,
     page: CollectionPage<LocalNotification>,
     limit: u64,
 ) -> Response {
-    let link_header = crate::statuses::CollectionLink::new(
+    let link_header = CollectionLink::new(
         limit,
         page.first_cursor,
         page.last_cursor,
