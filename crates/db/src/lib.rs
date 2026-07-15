@@ -318,6 +318,10 @@ pub struct RemoteActor {
     pub profile_created_at: Option<OffsetDateTime>,
     /// Timestamp when this instance first cached the remote actor.
     pub first_seen_at: OffsetDateTime,
+    /// When a signed Actor Delete tombstoned this cache entry.
+    pub deleted_at: Option<OffsetDateTime>,
+    /// Verified replacement actor declared through a signed Move activity.
+    pub moved_to_remote_actor_id: Option<AccountId>,
 }
 
 /// Public or unlisted Note cached from a remote ActivityPub actor.
@@ -459,6 +463,7 @@ pub async fn find_remote_following(
     Ok(remote_following::Entity::find()
         .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
         .one(db)
         .await?
         .map(remote_following_from_model))
@@ -472,6 +477,7 @@ pub async fn accepted_local_followers_of_remote_actor(
     Ok(remote_following::Entity::find()
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_following::Column::State.eq("accepted"))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
         .all(db)
         .await?
         .into_iter()
@@ -587,8 +593,73 @@ pub async fn count_remote_following(db: &DbConnection, account_id: AccountId) ->
     Ok(remote_following::Entity::find()
         .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
         .filter(remote_following::Column::State.eq("accepted"))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
         .count(db)
         .await?)
+}
+
+/// Tombstone a remote actor and hide its cached public activity without purging audit data.
+pub async fn process_remote_actor_delete(
+    txn: &DatabaseTransaction,
+    activity_id: &str,
+    remote_actor_id: AccountId,
+) -> Result<bool> {
+    if !record_processed_inbox_activity(txn, activity_id, remote_actor_id).await? {
+        return Ok(false);
+    }
+    let now = OffsetDateTime::now_utc();
+    let Some(actor) = remote_actor::Entity::find_by_id(remote_actor_id.0)
+        .one(txn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut actor = actor.into_active_model();
+    actor.deleted_at = Set(Some(now));
+    actor.updated_at = Set(now);
+    actor.update(txn).await?;
+    remote_status::Entity::update_many()
+        .col_expr(
+            remote_status::Column::DeletedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .exec(txn)
+        .await?;
+    remote_following::Entity::update_many()
+        .col_expr(
+            remote_following::Column::DeactivatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .exec(txn)
+        .await?;
+    Ok(true)
+}
+
+/// Record a verified ActivityPub account migration without retargeting follows.
+pub async fn process_remote_actor_move(
+    txn: &DatabaseTransaction,
+    activity_id: &str,
+    remote_actor_id: AccountId,
+    target_actor_id: AccountId,
+) -> Result<bool> {
+    if !record_processed_inbox_activity(txn, activity_id, remote_actor_id).await? {
+        return Ok(false);
+    }
+    let Some(actor) = remote_actor::Entity::find_by_id(remote_actor_id.0)
+        .one(txn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut actor = actor.into_active_model();
+    actor.moved_to_remote_actor_id = Set(Some(target_actor_id.0));
+    actor.updated_at = Set(OffsetDateTime::now_utc());
+    actor.update(txn).await?;
+    Ok(true)
 }
 
 /// Find one cached remote Note by its canonical ActivityPub ID.
@@ -5593,6 +5664,7 @@ pub async fn home_timeline_for_account(
                     .from(remote_following::Entity)
                     .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
                     .and_where(remote_following::Column::State.eq("accepted"))
+                    .and_where(remote_following::Column::DeactivatedAt.is_null())
                     .to_owned(),
             ),
         )
@@ -5618,6 +5690,7 @@ pub async fn home_timeline_for_account(
                 .from(remote_following::Entity)
                 .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
                 .and_where(remote_following::Column::State.eq("accepted"))
+                .and_where(remote_following::Column::DeactivatedAt.is_null())
                 .to_owned(),
         ),
     );
@@ -6188,6 +6261,8 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         expires_at: actor.expires_at,
         profile_created_at: actor.profile_created_at,
         first_seen_at: actor.created_at,
+        deleted_at: actor.deleted_at,
+        moved_to_remote_actor_id: actor.moved_to_remote_actor_id.map(AccountId),
     }
 }
 

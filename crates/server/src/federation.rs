@@ -284,6 +284,14 @@ enum InboundDeleteObject {
     Tombstone { id: String },
 }
 
+/// Signed remote account migration fields.
+#[derive(Deserialize)]
+struct InboundMoveActivity {
+    actor: String,
+    object: InboundActorReference,
+    target: InboundActorReference,
+}
+
 /// ActivityStreams collection types exposed by local actor endpoints.
 #[derive(Serialize)]
 enum CollectionType {
@@ -904,6 +912,17 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     if !activity_id.starts_with("https://") {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if is_remote_actor_lifecycle_activity(&activity, &remote_actor.activitypub_id) {
+        return match process_remote_actor_lifecycle(state, &activity_id, &activity, &remote_actor)
+            .await
+        {
+            Ok(()) => StatusCode::ACCEPTED.into_response(),
+            Err(error) => {
+                tracing::warn!(%error, activity_id, "rejected remote actor lifecycle activity");
+                StatusCode::ACCEPTED.into_response()
+            }
+        };
+    }
     if matches!(
         activity.get("type").and_then(JsonValue::as_str),
         Some("Create") | Some("Update") | Some("Delete")
@@ -1272,6 +1291,116 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         }
         Ok(false) => StatusCode::ACCEPTED.into_response(),
         Err(error) => internal_error(error),
+    }
+}
+
+/// Identify actor lifecycle activities before the similarly named Note handlers.
+fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> bool {
+    match activity.get("type").and_then(JsonValue::as_str) {
+        Some("Move") => true,
+        Some("Update") => activity
+            .get("object")
+            .and_then(|object| match object {
+                JsonValue::String(id) => Some(id == actor_id),
+                JsonValue::Object(object) => Some(
+                    object
+                        .get("id")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|id| id == actor_id)
+                        && object.get("type").and_then(JsonValue::as_str) == Some("Person"),
+                ),
+                _ => None,
+            })
+            .unwrap_or(false),
+        Some("Delete") => activity
+            .get("object")
+            .and_then(|object| match object {
+                JsonValue::String(id) => Some(id == actor_id),
+                JsonValue::Object(object) => object
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .map(|id| id == actor_id),
+                _ => None,
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Process a verified remote actor refresh, tombstone, or Move activity.
+async fn process_remote_actor_lifecycle(
+    state: &AppState,
+    activity_id: &str,
+    activity: &JsonValue,
+    remote_actor: &roosty_db::RemoteActor,
+) -> Result<(), RoostyError> {
+    match activity.get("type").and_then(JsonValue::as_str) {
+        Some("Update") => {
+            let object_id = activity
+                .get("object")
+                .and_then(|object| match object {
+                    JsonValue::String(id) => Some(id.as_str()),
+                    JsonValue::Object(object) => object.get("id").and_then(JsonValue::as_str),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("remote actor Update is invalid".to_owned())
+                })?;
+            if object_id != remote_actor.activitypub_id {
+                return Err(RoostyError::InvalidInput(
+                    "remote actor Update does not match signer".to_owned(),
+                ));
+            }
+            let refreshed = discovery::refresh_remote_actor_by_id(state, object_id).await?;
+            let txn = state.db.begin().await?;
+            roosty_db::record_processed_inbox_activity(&txn, activity_id, refreshed.id).await?;
+            txn.commit().await?;
+            Ok(())
+        }
+        Some("Delete") => {
+            let delete: InboundDeleteActivity =
+                serde_json::from_value(activity.clone()).map_err(|_| {
+                    RoostyError::InvalidInput("remote actor Delete is invalid".to_owned())
+                })?;
+            let object_id = match delete.object {
+                InboundDeleteObject::Id(id) | InboundDeleteObject::Tombstone { id } => id,
+            };
+            if delete.actor != remote_actor.activitypub_id
+                || object_id != remote_actor.activitypub_id
+            {
+                return Err(RoostyError::InvalidInput(
+                    "remote actor Delete does not match signer".to_owned(),
+                ));
+            }
+            let txn = state.db.begin().await?;
+            roosty_db::process_remote_actor_delete(&txn, activity_id, remote_actor.id).await?;
+            txn.commit().await?;
+            Ok(())
+        }
+        Some("Move") => {
+            let movement: InboundMoveActivity =
+                serde_json::from_value(activity.clone()).map_err(|_| {
+                    RoostyError::InvalidInput("remote actor Move is invalid".to_owned())
+                })?;
+            let source = movement.object.id();
+            let target = movement.target.id();
+            if movement.actor != remote_actor.activitypub_id
+                || source != remote_actor.activitypub_id
+            {
+                return Err(RoostyError::InvalidInput(
+                    "remote actor Move does not match signer".to_owned(),
+                ));
+            }
+            let target = discovery::resolve_remote_move_target(state, &target, &source).await?;
+            let txn = state.db.begin().await?;
+            roosty_db::process_remote_actor_move(&txn, activity_id, remote_actor.id, target.id)
+                .await?;
+            txn.commit().await?;
+            Ok(())
+        }
+        _ => Err(RoostyError::InvalidInput(
+            "unsupported remote actor lifecycle activity".to_owned(),
+        )),
     }
 }
 
@@ -2869,7 +2998,8 @@ mod tests {
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
         InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
         MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
-        actor_profile_fields, local_actor_type, parse_acct, remote_status_visibility,
+        actor_profile_fields, is_remote_actor_lifecycle_activity, local_actor_type, parse_acct,
+        remote_status_visibility,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -2901,6 +3031,28 @@ mod tests {
         assert_eq!(string.object.id(), "https://roosty.test/users/alice");
         assert_eq!(object.object.id(), "https://roosty.test/users/alice");
         assert!(serde_json::from_str::<InboundFollowActivity>(r#"{"object":{}}"#).is_err());
+    }
+
+    /// Actor lifecycle routing must not capture Note updates and deletes.
+    #[test]
+    fn distinguishes_remote_actor_lifecycle_activities() {
+        let actor = "https://remote.test/users/alice";
+        assert!(is_remote_actor_lifecycle_activity(
+            &serde_json::json!({"type":"Update", "object":{"id":actor, "type":"Person"}}),
+            actor,
+        ));
+        assert!(is_remote_actor_lifecycle_activity(
+            &serde_json::json!({"type":"Delete", "object":{"id":actor, "type":"Tombstone"}}),
+            actor,
+        ));
+        assert!(is_remote_actor_lifecycle_activity(
+            &serde_json::json!({"type":"Move", "object":actor}),
+            actor,
+        ));
+        assert!(!is_remote_actor_lifecycle_activity(
+            &serde_json::json!({"type":"Update", "object":{"id":"https://remote.test/statuses/1", "type":"Note"}}),
+            actor,
+        ));
     }
 
     /// Undo may reference the original Follow directly or embed its typed activity object.
@@ -3710,6 +3862,8 @@ mod tests {
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
             profile_created_at: None,
             first_seen_at: time::OffsetDateTime::now_utc(),
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
         };
         roosty_db::upsert_remote_actor(&state.db, &actor)
             .await

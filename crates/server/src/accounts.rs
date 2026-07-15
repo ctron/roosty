@@ -107,6 +107,8 @@ pub(crate) struct RemoteAccountResponse {
     following_count: u64,
     statuses_count: u64,
     last_status_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved: Option<Box<RemoteAccountResponse>>,
 }
 
 /// Mastodon account projection used by collections containing local and remote actors.
@@ -190,6 +192,7 @@ async fn lookup_account(
         return not_found();
     };
     match crate::federation::discovery::resolve_remote_actor(&state, acct).await {
+        Ok(actor) if actor.deleted_at.is_some() => not_found(),
         Ok(actor) => match remote_account_response(&state, actor).await {
             Ok(response) => Json(response).into_response(),
             Err(error) => server_error(error),
@@ -219,7 +222,19 @@ pub(crate) async fn remote_account_response(
     };
     let avatar = media_url(RemoteProfileMediaKind::Avatar);
     let header = media_url(RemoteProfileMediaKind::Header);
-    Ok(remote_account_response_from_media(actor, avatar, header))
+    let moved_to_remote_actor_id = actor.moved_to_remote_actor_id;
+    let mut response = remote_account_response_from_media(actor, avatar, header);
+    if let Some(moved_to_remote_actor_id) = moved_to_remote_actor_id
+        && let Some(mut moved) =
+            roosty_db::find_remote_actor_by_id(&state.db, moved_to_remote_actor_id).await?
+    {
+        // Mastodon exposes one replacement account; suppress nested moves to avoid cycles.
+        moved.moved_to_remote_actor_id = None;
+        response.moved = Some(Box::new(
+            Box::pin(remote_account_response(state, moved)).await?,
+        ));
+    }
+    Ok(response)
 }
 
 fn remote_account_response_from_media(
@@ -251,6 +266,7 @@ fn remote_account_response_from_media(
         following_count: 0,
         statuses_count: 0,
         last_status_at: None,
+        moved: None,
     }
 }
 
@@ -1038,6 +1054,8 @@ mod tests {
             expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
             profile_created_at: Some(profile_created_at),
             first_seen_at,
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1071,6 +1089,8 @@ mod tests {
             expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
             profile_created_at: None,
             first_seen_at,
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1854,6 +1874,8 @@ mod tests {
                 expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
                 profile_created_at: None,
                 first_seen_at: time::OffsetDateTime::now_utc(),
+                deleted_at: None,
+                moved_to_remote_actor_id: None,
             };
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

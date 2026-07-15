@@ -32,7 +32,7 @@
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
 - [x] Commit supported inbox side effects, idempotency markers, and durable follow/favourite/boost delivery jobs atomically; publish streams only after commit.
 - [ ] Repair cached-status timelines and notification references after signed remote Deletes.
-- [ ] Process Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle and account migration.
+- [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
 - [ ] Safely fetch, validate, cache, expire, and render remote media attachments.
 - [ ] Federate follow, mention, reply, favourite, and boost notifications to remote recipients.
 - [ ] Add grouped notifications and Web Push integration.
@@ -75,7 +75,7 @@
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
-- [ ] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote media caching.
+- [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Add remote notifications and direct conversations.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [ ] Improve local account administration now that multiple local users can be operator-created.

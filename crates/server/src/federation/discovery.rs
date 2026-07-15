@@ -49,6 +49,8 @@ struct RemoteActorDocument {
     icon: Option<RemoteActorImage>,
     #[serde(default)]
     image: Option<RemoteActorImage>,
+    #[serde(default)]
+    also_known_as: Vec<String>,
     published: Option<String>,
     inbox: String,
     #[serde(default)]
@@ -133,6 +135,8 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
         profile_created_at,
         first_seen_at: OffsetDateTime::now_utc(),
+        deleted_at: None,
+        moved_to_remote_actor_id: None,
     };
     store_remote_actor(state, actor, document.icon, document.image).await
 }
@@ -148,6 +152,14 @@ pub async fn resolve_remote_actor_by_id(
     {
         return Ok(actor);
     }
+    refresh_remote_actor_by_id(state, activitypub_id).await
+}
+
+/// Re-fetch an actor document after a signed lifecycle activity.
+pub async fn refresh_remote_actor_by_id(
+    state: &AppState,
+    activitypub_id: &str,
+) -> Result<RemoteActor> {
     let actor_url =
         Url::parse(activitypub_id).map_err(|_| invalid("remote actor ID is invalid"))?;
     let domain = actor_url
@@ -190,6 +202,65 @@ pub async fn resolve_remote_actor_by_id(
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
             profile_created_at,
             first_seen_at: OffsetDateTime::now_utc(),
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
+        },
+        document.icon,
+        document.image,
+    )
+    .await
+}
+
+/// Resolve a Move target only when it reciprocally declares the source actor.
+pub async fn resolve_remote_move_target(
+    state: &AppState,
+    target_id: &str,
+    source_id: &str,
+) -> Result<RemoteActor> {
+    let actor_url = Url::parse(target_id).map_err(|_| invalid("remote Move target is invalid"))?;
+    let domain = actor_url
+        .host_str()
+        .ok_or_else(|| invalid("remote Move target has no host"))?
+        .to_ascii_lowercase();
+    let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
+    if document.r#type != ActorType::Person
+        || document.id != target_id
+        || document.preferred_username.is_empty()
+        || document.public_key.owner != document.id
+        || document.public_key.id.is_empty()
+        || document.public_key.public_key_pem.is_empty()
+        || !document.also_known_as.iter().any(|id| id == source_id)
+    {
+        return Err(invalid("remote Move target is invalid"));
+    }
+    let inbox =
+        Url::parse(&document.inbox).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
+    if inbox.scheme() != "https"
+        || inbox
+            .host_str()
+            .is_none_or(|host| !host.eq_ignore_ascii_case(&domain))
+    {
+        return Err(invalid("remote actor inbox is outside its actor domain"));
+    }
+    let profile_created_at = remote_profile_created_at(&document)?;
+    store_remote_actor(
+        state,
+        RemoteActor {
+            id: AccountId(Uuid::now_v7()),
+            activitypub_id: document.id,
+            username: document.preferred_username,
+            domain,
+            display_name: document.name,
+            summary: document.summary,
+            inbox_url: document.inbox,
+            shared_inbox_url: document.endpoints.shared_inbox,
+            public_key_id: document.public_key.id,
+            public_key_pem: document.public_key.public_key_pem,
+            expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
+            profile_created_at,
+            first_seen_at: OffsetDateTime::now_utc(),
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
         },
         document.icon,
         document.image,
