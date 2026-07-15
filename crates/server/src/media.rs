@@ -55,9 +55,9 @@ pub(crate) struct SupportedImageFormat {
     /// Canonical MIME type accepted from multipart uploads.
     pub(crate) content_type: &'static str,
     /// File extension used when storing original uploads.
-    extension: &'static str,
+    pub(crate) extension: &'static str,
     /// Decoder hint passed to the image crate.
-    image_format: ImageFormat,
+    pub(crate) image_format: ImageFormat,
 }
 
 impl SupportedImageFormat {
@@ -82,12 +82,12 @@ pub(crate) fn supported_image_mime_types() -> Vec<&'static str> {
         .collect()
 }
 
-/// Return whether a content type is one of the image types Roosty accepts locally.
-pub(crate) fn supported_image_extension(content_type: &str) -> Option<&'static str> {
+/// Return image format metadata for one of the image types Roosty accepts locally.
+pub(crate) fn supported_image_format(content_type: &str) -> Option<SupportedImageFormat> {
     SUPPORTED_IMAGE_FORMATS
         .iter()
+        .copied()
         .find(|format| format.content_type == content_type)
-        .map(|format| format.extension)
 }
 
 /// Build Mastodon-compatible media upload and serving routes.
@@ -137,6 +137,13 @@ async fn serve_remote_profile_media(
         }
         return Ok(StatusCode::ACCEPTED.into_response());
     };
+    if media
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+    {
+        // Continue serving the last known-good image while a deduplicated refresh runs.
+        let _ = enqueue_remote_profile_media_fetches(&state, media.remote_actor_id).await;
+    }
     Ok(match tokio::fs::read(media_path(&state, &path)).await {
         Ok(bytes) => (
             [(
@@ -406,17 +413,29 @@ async fn fetch_remote_media_inner(
             "remote media exceeds configured size limit".to_owned(),
         ));
     }
-    let processed_image = if !profile_media && content_type.starts_with("image/") {
-        let format =
-            validate_image_content_type(&content_type).map_err(RoostyError::InvalidInput)?;
-        Some(
+    let image_format = content_type
+        .starts_with("image/")
+        .then(|| validate_image_content_type(&content_type))
+        .transpose()
+        .map_err(RoostyError::InvalidInput)?;
+    let processed_image = match image_format {
+        Some(format) if !profile_media => Some(
             process_image(bytes.to_vec(), None, format.image_format)
                 .await
                 .map_err(media_store_error_to_roosty)?,
-        )
-    } else {
-        None
+        ),
+        _ => None,
     };
+    if profile_media {
+        let format = image_format.ok_or_else(|| {
+            RoostyError::InvalidInput("remote profile media content type is unsupported".to_owned())
+        })?;
+        // Decode according to the response MIME type before making profile bytes available to
+        // browsers. This prevents the proxy from becoming a passthrough for arbitrary content.
+        process_image(bytes.to_vec(), None, format.image_format)
+            .await
+            .map_err(media_store_error_to_roosty)?;
+    }
     if !profile_media
         && !content_type.starts_with("image/")
         && !content_type.starts_with("video/")
@@ -426,16 +445,7 @@ async fn fetch_remote_media_inner(
             "remote media content type is unsupported".to_owned(),
         ));
     }
-    let extension = if profile_media {
-        "bin"
-    } else if let Some(format) = SUPPORTED_IMAGE_FORMATS
-        .iter()
-        .find(|format| format.content_type == content_type)
-    {
-        format.extension
-    } else {
-        "bin"
-    };
+    let extension = image_format.map_or_else(|| "bin", |format| format.extension);
     let path = if profile_media {
         format!("remote/profile/{id}.{extension}")
     } else {
@@ -1278,7 +1288,7 @@ mod tests {
 
     use image::{DynamicImage, ImageFormat};
 
-    use super::process_image;
+    use super::{process_image, supported_image_format};
 
     /// Given a valid remote image, processing produces preview metadata suitable for Mastodon.
     #[tokio::test]
@@ -1306,6 +1316,22 @@ mod tests {
     async fn rejects_invalid_remote_image_bytes() {
         assert!(
             process_image(b"not an image".to_vec(), None, ImageFormat::Png)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Remote profile-media validation requires both a supported MIME type and matching bytes.
+    #[tokio::test]
+    async fn rejects_profile_image_mime_and_byte_mismatches() {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+
+        assert!(supported_image_format("image/svg+xml").is_none());
+        assert!(
+            process_image(bytes.into_inner(), None, ImageFormat::Jpeg)
                 .await
                 .is_err()
         );

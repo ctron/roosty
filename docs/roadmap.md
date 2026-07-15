@@ -86,4 +86,4 @@
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.
 - [x] Expose persisted local account creation dates through Mastodon account responses.
-- [ ] Account images/header/avator remote processing (both directions) still seems to not work properly
+- [x] Harden local and remote avatar/header processing with MIME/byte validation, signed Actor `Update` delivery assertions, and stale-while-refresh proxy caching.

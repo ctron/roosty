@@ -3392,6 +3392,11 @@ mod tests {
         );
         let activity = &job.payload["activity"];
         assert_eq!(activity["type"], "Update");
+        assert_eq!(activity["actor"], activity["object"]["id"]);
+        assert_eq!(
+            activity["to"],
+            serde_json::json!(["https://alpha.test/users/author/followers"])
+        );
         assert_eq!(activity["object"]["type"], "Person");
         assert_eq!(
             activity["object"]["icon"]["url"],

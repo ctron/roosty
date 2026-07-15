@@ -975,12 +975,14 @@ async fn update_credentials(
     if let Some(avatar) = input.avatar.take() {
         match store_profile_image(&state, account.id, "avatar", avatar).await {
             Ok(path) => input.avatar_file_path = Some(path),
+            Err(RoostyError::InvalidInput(error)) => return bad_request(&error),
             Err(error) => return server_error(error),
         }
     }
     if let Some(header) = input.header.take() {
         match store_profile_image(&state, account.id, "header", header).await {
             Ok(path) => input.header_file_path = Some(path),
+            Err(RoostyError::InvalidInput(error)) => return bad_request(&error),
             Err(error) => return server_error(error),
         }
     }
@@ -1240,9 +1242,9 @@ async fn store_profile_image(
     kind: &str,
     upload: ProfileImageUpload,
 ) -> Result<String, RoostyError> {
-    let extension = crate::media::supported_image_extension(&upload.content_type)
+    let format = crate::media::supported_image_format(&upload.content_type)
         .ok_or_else(|| RoostyError::InvalidInput("profile image type is invalid".to_owned()))?;
-    image::load_from_memory(&upload.bytes)
+    image::load_from_memory_with_format(&upload.bytes, format.image_format)
         .map_err(|error| RoostyError::InvalidInput(format!("profile image is invalid: {error}")))?;
 
     let relative_path = format!(
@@ -1250,7 +1252,7 @@ async fn store_profile_image(
         account_id.0.simple(),
         kind,
         Uuid::now_v7().simple(),
-        extension
+        format.extension
     );
     let full_path = Path::new(&state.config.media_root).join(&relative_path);
     if let Some(parent) = full_path.parent() {
@@ -2225,6 +2227,43 @@ mod tests {
             )
             .await;
         assert_eq!(served.status(), StatusCode::OK);
+    }
+
+    /// A declared profile-image MIME type must match the uploaded bytes.
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn update_credentials_rejects_mismatched_profile_image_mime(
+        context: &mut EndpointContext,
+    ) {
+        let token = context.authenticated_token().await;
+        let boundary = "geckoformboundarymismatchedimage";
+        let mut body = Vec::new();
+        append_multipart_file(
+            &mut body,
+            boundary,
+            "avatar",
+            "avatar.jpg",
+            "image/jpeg",
+            &encoded_test_image(),
+        );
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/accounts/update_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test_context(EndpointContext)]
