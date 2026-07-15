@@ -16,7 +16,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors, public keys, and configured avatar/header image URLs. |
+| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors, profile creation timestamps, public keys, and configured avatar/header image URLs. |
 | 🟡 | Outbox | `GET /users/:username/outbox` exposes local public activities. |
 | 🟢 | Status object pages | Public local Notes are available at `/users/:username/statuses/:id`. |
 | 🟢 | Actor keys | RSA signing keys are encrypted at rest and the public key is published in actor documents. |
@@ -28,7 +28,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Inbox | Signed inbox handling supports follows and public/unlisted status lifecycle activities. |
 | 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
 | 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. |
-| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; refresh and client projections remain incomplete. |
+| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; profile creation dates use actor `published` when supplied and fall back to first-seen time. |
 
 ### Moderation and Safety
 
@@ -65,7 +65,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
 | 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
 | 🟡 | `GET /api/v1/accounts/lookup` | Local username/address lookup only; no WebFinger resolution. |
-| 🟢 | Status metadata | Local `statuses_count` and `last_status_at` are populated. |
+| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses with media and hashtag filters; pinned statuses are missing. |

@@ -11,7 +11,7 @@ use reqwest::{
 };
 use roosty_core::{Result, RoostyError};
 use serde::Deserialize;
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 use uuid::Uuid;
 
@@ -43,6 +43,7 @@ struct RemoteActorDocument {
     name: String,
     #[serde(default)]
     summary: String,
+    published: Option<String>,
     inbox: String,
     #[serde(default)]
     endpoints: RemoteEndpoints,
@@ -98,6 +99,7 @@ pub async fn resolve_remote_actor(
         Url::parse(&actor_url).map_err(|_| invalid("WebFinger actor URL is invalid"))?;
     let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
     validate_actor_document(&document, &actor_url, username, &domain)?;
+    let profile_created_at = remote_profile_created_at(&document)?;
     let actor = roosty_db::RemoteActor {
         id: roosty_core::AccountId(Uuid::now_v7()),
         activitypub_id: document.id,
@@ -110,6 +112,8 @@ pub async fn resolve_remote_actor(
         public_key_id: document.public_key.id,
         public_key_pem: document.public_key.public_key_pem,
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
+        profile_created_at,
+        first_seen_at: OffsetDateTime::now_utc(),
     };
     roosty_db::upsert_remote_actor(&state.db, &actor).await
 }
@@ -141,6 +145,7 @@ pub async fn resolve_remote_actor_by_id(
     {
         return Err(invalid("remote actor document is invalid"));
     }
+    let profile_created_at = remote_profile_created_at(&document)?;
     let inbox =
         Url::parse(&document.inbox).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
     if inbox.scheme() != "https"
@@ -164,9 +169,23 @@ pub async fn resolve_remote_actor_by_id(
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
+            profile_created_at,
+            first_seen_at: OffsetDateTime::now_utc(),
         },
     )
     .await
+}
+
+/// Parse the optional ActivityStreams profile creation timestamp from an actor document.
+fn remote_profile_created_at(document: &RemoteActorDocument) -> Result<Option<OffsetDateTime>> {
+    document
+        .published
+        .as_deref()
+        .map(|published| {
+            OffsetDateTime::parse(published, &Rfc3339)
+                .map_err(|_| invalid("remote actor published timestamp is invalid"))
+        })
+        .transpose()
 }
 
 /// Fetch a JSON document with policy revalidation before every request.
@@ -379,7 +398,7 @@ mod tests {
 
     use super::{
         RemoteActorDocument, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
-        parse_remote_handle,
+        parse_remote_handle, remote_profile_created_at,
     };
 
     #[test]
@@ -430,6 +449,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(actor.preferred_username, "alice");
+    }
+
+    #[test]
+    /// Reads a Mastodon actor's optional profile creation timestamp.
+    fn parses_remote_profile_creation_time() {
+        let actor: RemoteActorDocument = serde_json::from_str(
+            r#"{
+                "id": "https://social.example/users/alice",
+                "type": "Person",
+                "preferredUsername": "alice",
+                "inbox": "https://social.example/users/alice/inbox",
+                "published": "2026-07-13T12:00:00Z",
+                "publicKey": {
+                    "id": "https://social.example/users/alice#main-key",
+                    "owner": "https://social.example/users/alice",
+                    "publicKeyPem": "public-key"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote_profile_created_at(&actor).unwrap(),
+            Some(
+                time::OffsetDateTime::UNIX_EPOCH
+                    + time::Duration::days(20_647)
+                    + time::Duration::hours(12)
+            )
+        );
+    }
+
+    #[test]
+    /// Rejects a supplied remote actor profile creation timestamp when it is malformed.
+    fn rejects_invalid_remote_profile_creation_time() {
+        let actor: RemoteActorDocument = serde_json::from_str(
+            r#"{
+                "id": "https://social.example/users/alice",
+                "type": "Person",
+                "preferredUsername": "alice",
+                "inbox": "https://social.example/users/alice/inbox",
+                "published": "not-a-timestamp",
+                "publicKey": {
+                    "id": "https://social.example/users/alice#main-key",
+                    "owner": "https://social.example/users/alice",
+                    "publicKeyPem": "public-key"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(remote_profile_created_at(&actor).is_err());
     }
 
     /// Given profiled JSON-LD WebFinger metadata, when selecting an actor link, then the

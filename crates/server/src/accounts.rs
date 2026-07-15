@@ -207,7 +207,9 @@ pub(crate) fn remote_account_response(actor: roosty_db::RemoteActor) -> RemoteAc
         bot: false,
         discoverable: None,
         group: false,
-        created_at: actor.expires_at.to_string(),
+        created_at: crate::statuses::format_timestamp(
+            actor.profile_created_at.unwrap_or(actor.first_seen_at),
+        ),
         note: actor.summary,
         url: actor.activitypub_id,
         avatar: String::new(),
@@ -983,7 +985,65 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
+    use super::remote_account_response;
     use crate::{config::Config, http::AppState, password};
+
+    #[test]
+    /// Prefers a remote actor's declared profile creation time over local cache metadata.
+    fn remote_account_response_uses_profile_creation_time() {
+        let profile_created_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        let first_seen_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(20);
+        let actor = roosty_db::RemoteActor {
+            id: AccountId(uuid::Uuid::now_v7()),
+            activitypub_id: "https://remote.test/users/alice".to_owned(),
+            username: "alice".to_owned(),
+            domain: "remote.test".to_owned(),
+            display_name: "Alice".to_owned(),
+            summary: String::new(),
+            inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
+            shared_inbox_url: None,
+            public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
+            public_key_pem: "test-public-key".to_owned(),
+            expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
+            profile_created_at: Some(profile_created_at),
+            first_seen_at,
+        };
+
+        let response = serde_json::to_value(remote_account_response(actor)).unwrap();
+
+        assert_eq!(
+            response["created_at"],
+            crate::statuses::format_timestamp(profile_created_at)
+        );
+    }
+
+    #[test]
+    /// Falls back to first-seen time rather than the cache expiry for actors without `published`.
+    fn remote_account_response_falls_back_to_first_seen_time() {
+        let first_seen_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(20);
+        let actor = roosty_db::RemoteActor {
+            id: AccountId(uuid::Uuid::now_v7()),
+            activitypub_id: "https://remote.test/users/alice".to_owned(),
+            username: "alice".to_owned(),
+            domain: "remote.test".to_owned(),
+            display_name: "Alice".to_owned(),
+            summary: String::new(),
+            inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
+            shared_inbox_url: None,
+            public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
+            public_key_pem: "test-public-key".to_owned(),
+            expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
+            profile_created_at: None,
+            first_seen_at,
+        };
+
+        let response = serde_json::to_value(remote_account_response(actor)).unwrap();
+
+        assert_eq!(
+            response["created_at"],
+            crate::statuses::format_timestamp(first_seen_at)
+        );
+    }
 
     #[test_context(AccountContext)]
     #[tokio::test]
@@ -1751,6 +1811,8 @@ mod tests {
                 public_key_id: format!("https://remote.test/users/{username}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                profile_created_at: None,
+                first_seen_at: time::OffsetDateTime::now_utc(),
             };
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

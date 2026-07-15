@@ -344,6 +344,7 @@ struct Actor {
     followers: String,
     following: String,
     manually_approves_followers: bool,
+    published: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<ActorImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -565,6 +566,7 @@ fn actor_document(
         followers: format!("{id}/followers"),
         following: format!("{id}/following"),
         manually_approves_followers: account.locked,
+        published: crate::statuses::format_timestamp(account.created_at),
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
             url: crate::media::media_url(state, path),
@@ -3336,6 +3338,7 @@ mod tests {
             followers: "https://example.test/users/alice/followers".to_owned(),
             following: "https://example.test/users/alice/following".to_owned(),
             manually_approves_followers: false,
+            published: "2026-07-13T00:00:00.000Z".to_owned(),
             icon: Some(ActorImage {
                 r#type: ActorImageType::Image,
                 url: "https://example.test/media_attachments/files/accounts/alice-avatar.png"
@@ -3389,6 +3392,7 @@ mod tests {
         let collection = serde_json::to_value(collection).unwrap();
 
         assert_eq!(actor["preferredUsername"], "alice");
+        assert_eq!(actor["published"], "2026-07-13T00:00:00.000Z");
         assert!(actor.get("preferred_username").is_none());
         assert_eq!(actor["icon"]["type"], "Image");
         assert_eq!(
@@ -3570,6 +3574,8 @@ mod tests {
             public_key_id: format!("https://{domain}/users/{username}#main-key"),
             public_key_pem,
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            profile_created_at: None,
+            first_seen_at: time::OffsetDateTime::now_utc(),
         };
         roosty_db::upsert_remote_actor(&state.db, &actor)
             .await

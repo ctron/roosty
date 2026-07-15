@@ -84,3 +84,5 @@
 - [ ] Add remote hashtag discovery and featured/profile tags.
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.
+- [x] Expose persisted local account creation dates through Mastodon account responses.
+- [ ] Account images/header/avator remote processing (both directions) still seems to not work properly

@@ -1098,7 +1098,7 @@ pub(crate) async fn account_response(
         bot: account.bot,
         discoverable: account.discoverable,
         group: false,
-        created_at: "1970-01-01T00:00:00.000Z".to_owned(),
+        created_at: crate::statuses::format_timestamp(account.created_at),
         note: account.note.clone(),
         url: account_url,
         avatar: avatar.clone(),
@@ -1765,6 +1765,14 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["username"], "admin");
         assert_eq!(body["role"]["name"], "Admin");
+        let account = roosty_db::find_local_account_by_login(&context.db, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["created_at"],
+            crate::statuses::format_timestamp(account.created_at)
+        );
     }
 
     #[test_context(EndpointContext)]

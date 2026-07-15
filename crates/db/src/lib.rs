@@ -245,6 +245,8 @@ pub struct LocalAccount {
     pub avatar_file_path: Option<String>,
     /// Optional local header image path relative to the media root.
     pub header_file_path: Option<String>,
+    /// Timestamp when the local account was created.
+    pub created_at: OffsetDateTime,
 }
 
 /// Encrypted ActivityPub signing key material for a local actor.
@@ -283,6 +285,10 @@ pub struct RemoteActor {
     pub public_key_pem: String,
     /// Cache expiry instant.
     pub expires_at: OffsetDateTime,
+    /// Creation timestamp declared by the remote actor document, when available.
+    pub profile_created_at: Option<OffsetDateTime>,
+    /// Timestamp when this instance first cached the remote actor.
+    pub first_seen_at: OffsetDateTime,
 }
 
 /// Public or unlisted Note cached from a remote ActivityPub actor.
@@ -998,6 +1004,9 @@ pub async fn upsert_remote_actor(db: &DbConnection, actor: &RemoteActor) -> Resu
         active.public_key_pem = Set(actor.public_key_pem.clone());
         active.fetched_at = Set(now);
         active.expires_at = Set(actor.expires_at);
+        if let Some(profile_created_at) = actor.profile_created_at {
+            active.profile_created_at = Set(Some(profile_created_at));
+        }
         active.updated_at = Set(now);
         active.update(db).await?
     } else {
@@ -1014,6 +1023,8 @@ pub async fn upsert_remote_actor(db: &DbConnection, actor: &RemoteActor) -> Resu
             public_key_pem: Set(actor.public_key_pem.clone()),
             fetched_at: Set(now),
             expires_at: Set(actor.expires_at),
+            profile_created_at: Set(actor.profile_created_at),
+            created_at: Set(actor.first_seen_at),
             ..Default::default()
         }
         .insert(db)
@@ -5941,6 +5952,7 @@ fn local_account_from_model(account: local_account::Model) -> LocalAccount {
         profile_fields: account.profile_fields,
         avatar_file_path: account.avatar_file_path,
         header_file_path: account.header_file_path,
+        created_at: account.created_at,
     }
 }
 
@@ -5958,6 +5970,8 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         public_key_id: actor.public_key_id,
         public_key_pem: actor.public_key_pem,
         expires_at: actor.expires_at,
+        profile_created_at: actor.profile_created_at,
+        first_seen_at: actor.created_at,
     }
 }
 

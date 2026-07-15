@@ -18,6 +18,7 @@ pub struct Model {
     pub public_key_pem: String,
     pub fetched_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+    pub profile_created_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
