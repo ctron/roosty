@@ -38,9 +38,10 @@ const ACTIVITYSTREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
 
 /// ActivityStreams actor types accepted and emitted by Roosty.
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum ActorType {
     Person,
+    Service,
 }
 
 /// ActivityStreams object types emitted for local statuses.
@@ -333,7 +334,7 @@ struct PublicKey {
 #[serde(rename_all = "camelCase")]
 struct Actor {
     #[serde(rename = "@context")]
-    context: &'static str,
+    context: ActorContext,
     id: String,
     r#type: ActorType,
     preferred_username: String,
@@ -343,7 +344,9 @@ struct Actor {
     outbox: String,
     followers: String,
     following: String,
+    url: String,
     manually_approves_followers: bool,
+    discoverable: bool,
     published: String,
     attachment: Vec<ActorProfileField>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,6 +354,30 @@ struct Actor {
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<ActorImage>,
     public_key: PublicKey,
+}
+
+/// JSON-LD context for local actors, including Mastodon's profile metadata vocabulary.
+#[derive(Serialize)]
+struct ActorContext([ActorContextEntry; 3]);
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ActorContextEntry {
+    ActivityStreams(&'static str),
+    Security(&'static str),
+    Extensions(ActorExtensionsContext),
+}
+
+#[derive(Serialize)]
+struct ActorExtensionsContext {
+    #[serde(rename = "manuallyApprovesFollowers")]
+    manually_approves_followers: &'static str,
+    toot: &'static str,
+    discoverable: &'static str,
+    schema: &'static str,
+    #[serde(rename = "PropertyValue")]
+    property_value: &'static str,
+    value: &'static str,
 }
 
 /// ActivityStreams image reference used for actor avatars and headers.
@@ -565,9 +592,9 @@ fn actor_document(
 ) -> Actor {
     let id = actor_url(state, &account.username);
     Actor {
-        context: ACTIVITYSTREAMS_CONTEXT,
+        context: actor_context(),
         id: id.clone(),
-        r#type: ActorType::Person,
+        r#type: local_actor_type(account.bot),
         preferred_username: account.username.clone(),
         name: if account.display_name.is_empty() {
             account.username.clone()
@@ -579,7 +606,9 @@ fn actor_document(
         outbox: format!("{id}/outbox"),
         followers: format!("{id}/followers"),
         following: format!("{id}/following"),
+        url: public_url(state, &format!("@{}", account.username)),
         manually_approves_followers: account.locked,
+        discoverable: account.discoverable,
         published: crate::statuses::format_timestamp(account.created_at),
         attachment: actor_profile_fields(&account.profile_fields),
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
@@ -596,6 +625,31 @@ fn actor_document(
             public_key_pem,
         },
     }
+}
+
+/// Map Roosty's local bot setting to the ActivityPub actor type Mastodon uses for services.
+fn local_actor_type(bot: bool) -> ActorType {
+    if bot {
+        ActorType::Service
+    } else {
+        ActorType::Person
+    }
+}
+
+/// Build the actor JSON-LD context required for Schema.org profile fields.
+fn actor_context() -> ActorContext {
+    ActorContext([
+        ActorContextEntry::ActivityStreams(ACTIVITYSTREAMS_CONTEXT),
+        ActorContextEntry::Security("https://w3id.org/security/v1"),
+        ActorContextEntry::Extensions(ActorExtensionsContext {
+            manually_approves_followers: "as:manuallyApprovesFollowers",
+            toot: "http://joinmastodon.org/ns#",
+            discoverable: "toot:discoverable",
+            schema: "http://schema.org#",
+            property_value: "schema:PropertyValue",
+            value: "schema:value",
+        }),
+    ])
 }
 
 /// Convert persisted Mastodon profile fields to ActivityStreams `PropertyValue` attachments.
@@ -2800,8 +2854,8 @@ mod tests {
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
         InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
-        MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey,
-        actor_profile_fields, parse_acct, remote_status_visibility,
+        MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
+        actor_profile_fields, local_actor_type, parse_acct, remote_status_visibility,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -3358,7 +3412,7 @@ mod tests {
     #[test]
     fn serializes_activitystreams_property_names() {
         let actor = Actor {
-            context: "https://www.w3.org/ns/activitystreams",
+            context: actor_context(),
             id: "https://example.test/users/alice".to_owned(),
             r#type: ActorType::Person,
             preferred_username: "alice".to_owned(),
@@ -3368,7 +3422,9 @@ mod tests {
             outbox: "https://example.test/users/alice/outbox".to_owned(),
             followers: "https://example.test/users/alice/followers".to_owned(),
             following: "https://example.test/users/alice/following".to_owned(),
+            url: "https://example.test/@alice".to_owned(),
             manually_approves_followers: false,
+            discoverable: true,
             published: "2026-07-13T00:00:00.000Z".to_owned(),
             attachment: actor_profile_fields(&serde_json::json!([
                 { "name": "Website", "value": "https://example.test/?a=<b>" }
@@ -3426,6 +3482,24 @@ mod tests {
         let collection = serde_json::to_value(collection).unwrap();
 
         assert_eq!(actor["preferredUsername"], "alice");
+        assert_eq!(
+            actor["@context"][0],
+            "https://www.w3.org/ns/activitystreams"
+        );
+        assert_eq!(actor["@context"][1], "https://w3id.org/security/v1");
+        assert_eq!(
+            actor["@context"][2]["manuallyApprovesFollowers"],
+            "as:manuallyApprovesFollowers"
+        );
+        assert_eq!(actor["@context"][2]["discoverable"], "toot:discoverable");
+        assert_eq!(actor["@context"][2]["schema"], "http://schema.org#");
+        assert_eq!(
+            actor["@context"][2]["PropertyValue"],
+            "schema:PropertyValue"
+        );
+        assert_eq!(actor["@context"][2]["value"], "schema:value");
+        assert_eq!(actor["url"], "https://example.test/@alice");
+        assert!(actor["discoverable"].as_bool().unwrap());
         assert_eq!(actor["published"], "2026-07-13T00:00:00.000Z");
         assert_eq!(actor["attachment"][0]["type"], "PropertyValue");
         assert_eq!(actor["attachment"][0]["name"], "Website");
@@ -3433,6 +3507,8 @@ mod tests {
             actor["attachment"][0]["value"],
             "https://example.test/?a=&lt;b&gt;"
         );
+        assert_eq!(local_actor_type(false), ActorType::Person);
+        assert_eq!(local_actor_type(true), ActorType::Service);
         assert!(actor.get("preferred_username").is_none());
         assert_eq!(actor["icon"]["type"], "Image");
         assert_eq!(
