@@ -939,7 +939,17 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             roosty_db::reject_remote_following(&state.db, remote_actor.id, object_id).await
         };
         return match result {
-            Ok(_) => StatusCode::ACCEPTED.into_response(),
+            Ok(accepted) => {
+                if accepted
+                    && activity.get("type").and_then(JsonValue::as_str) == Some("Accept")
+                    && let Err(error) =
+                        crate::media::enqueue_remote_profile_media_fetches(state, remote_actor.id)
+                            .await
+                {
+                    tracing::warn!(%error, "could not queue remote profile media fetches");
+                }
+                StatusCode::ACCEPTED.into_response()
+            }
             Err(error) => internal_error(error),
         };
     }

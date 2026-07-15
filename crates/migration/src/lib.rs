@@ -38,6 +38,7 @@ mod m20260701_000033_create_federated_reblog_tables;
 mod m20260701_000034_create_remote_media_attachment;
 mod m20260701_000035_add_job_claim_id;
 mod m20260701_000036_add_remote_actor_profile_created_at;
+mod m20260701_000037_create_remote_profile_media;
 
 pub struct Migrator;
 
@@ -81,6 +82,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000034_create_remote_media_attachment::Migration),
             Box::new(m20260701_000035_add_job_claim_id::Migration),
             Box::new(m20260701_000036_add_remote_actor_profile_created_at::Migration),
+            Box::new(m20260701_000037_create_remote_profile_media::Migration),
         ]
     }
 }

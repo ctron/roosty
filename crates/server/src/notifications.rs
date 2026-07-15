@@ -311,9 +311,9 @@ async fn notification_response(
             let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, actor_id).await? else {
                 return Ok(None);
             };
-            NotificationAccountResponse::Remote(Box::new(crate::accounts::remote_account_response(
-                actor,
-            )))
+            NotificationAccountResponse::Remote(Box::new(
+                crate::accounts::remote_account_response(state, actor).await?,
+            ))
         }
         _ => return Ok(None),
     };

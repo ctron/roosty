@@ -28,7 +28,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Inbox | Signed inbox handling supports follows and public/unlisted status lifecycle activities. |
 | 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
 | 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. |
-| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; profile creation dates use actor `published` when supplied and fall back to first-seen time. |
+| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; profile creation dates use actor `published` when supplied and fall back to first-seen time. Discovered remote avatar/header URLs are cached through a same-origin proxy, eagerly for followed accounts and lazily on request for other actors. |
 
 ### Moderation and Safety
 
@@ -65,7 +65,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
 | 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
 | 🟡 | `GET /api/v1/accounts/lookup` | Local username/address lookup only; no WebFinger resolution. |
-| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback. |
+| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, and remote avatar/header fields use locally cached proxy URLs when advertised. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses with media and hashtag filters; pinned statuses are missing. |
@@ -148,7 +148,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
-| 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs policy-controlled WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections. Search integration and refresh jobs are missing. |
+| 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs policy-controlled WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections with proxied actor avatar/header images. Search integration and refresh jobs are missing. |
 | 🟡 | Outbound public status lifecycle | Public and unlisted local status creates, edits, and deletes are queued as signed ActivityPub deliveries to accepted remote followers. |
 | 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, reply references, and author ownership checks. Their cache changes and inbox-idempotency markers commit atomically. Cached Notes from accepted remote follows appear in home timelines and are streamed to those followers; media and interactions remain missing. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |

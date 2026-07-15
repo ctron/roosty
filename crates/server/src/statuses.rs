@@ -1579,9 +1579,10 @@ async fn reblogged_by_response(
                 }
             }
             roosty_db::RebloggedByAccount::Remote(actor) => {
-                accounts.push(StatusAccountResponse::Remote(Box::new(
-                    crate::accounts::remote_account_response(actor),
-                )))
+                match crate::accounts::remote_account_response(state, actor).await {
+                    Ok(account) => accounts.push(StatusAccountResponse::Remote(Box::new(account))),
+                    Err(error) => return server_error(error),
+                }
             }
         }
     }
@@ -1865,9 +1866,9 @@ pub(crate) async fn remote_reblog_response(
         uri: reblog.activity_id.clone(),
         url: reblog.activity_id,
         content: String::new(),
-        account: StatusAccountResponse::Remote(Box::new(crate::accounts::remote_account_response(
-            actor,
-        ))),
+        account: StatusAccountResponse::Remote(Box::new(
+            crate::accounts::remote_account_response(state, actor).await?,
+        )),
         media_attachments: Vec::new(),
         mentions: Vec::new(),
         tags: Vec::new(),
@@ -1972,9 +1973,9 @@ async fn remote_status_response_for_viewer(
         uri: status.activitypub_id.clone(),
         url: status.activitypub_id,
         content: status.content,
-        account: StatusAccountResponse::Remote(Box::new(crate::accounts::remote_account_response(
-            actor,
-        ))),
+        account: StatusAccountResponse::Remote(Box::new(
+            crate::accounts::remote_account_response(state, actor).await?,
+        )),
         media_attachments: roosty_db::remote_media_attachments_for_status(&state.db, status.id)
             .await?
             .into_iter()

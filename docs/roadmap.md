@@ -71,7 +71,7 @@
 - [x] Add end-to-end worker tests for permanent-failure classification and expired-claim recovery.
 - [ ] Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
 - [ ] Apply local mute/block policy to remote follow requests and remote follow notifications.
-- [ ] Enrich remote account projections with profile media and remote relationship/status counts as those data become available.
+- [ ] Enrich remote account projections with remote relationship/status counts as those data become available.
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.

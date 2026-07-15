@@ -7,8 +7,8 @@ use axum::{
     routing::{get, post},
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
-use roosty_db::LocalNotificationType;
-use sea_orm::TransactionTrait;
+use roosty_db::{LocalNotificationType, RemoteActor, RemoteProfileMediaKind};
+use sea_orm::{AccessMode, TransactionTrait};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::warn;
 use uuid::Uuid;
@@ -190,14 +190,43 @@ async fn lookup_account(
         return not_found();
     };
     match crate::federation::discovery::resolve_remote_actor(&state, acct).await {
-        Ok(actor) => Json(remote_account_response(actor)).into_response(),
+        Ok(actor) => match remote_account_response(&state, actor).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => server_error(error),
+        },
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
 }
 
 /// Convert a cached remote actor to the public Mastodon account projection.
-pub(crate) fn remote_account_response(actor: roosty_db::RemoteActor) -> RemoteAccountResponse {
+pub(crate) async fn remote_account_response(
+    state: &AppState,
+    actor: RemoteActor,
+) -> roosty_core::Result<RemoteAccountResponse> {
+    let txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let profile_media = roosty_db::remote_profile_media_for_actor(&txn, actor.id).await?;
+    txn.commit().await?;
+    let media_url = |kind| {
+        profile_media
+            .iter()
+            .find(|media| media.kind == kind)
+            .map(|media| crate::media::remote_profile_media_url(state, media.id))
+            .unwrap_or_default()
+    };
+    let avatar = media_url(RemoteProfileMediaKind::Avatar);
+    let header = media_url(RemoteProfileMediaKind::Header);
+    Ok(remote_account_response_from_media(actor, avatar, header))
+}
+
+fn remote_account_response_from_media(
+    actor: RemoteActor,
+    avatar: String,
+    header: String,
+) -> RemoteAccountResponse {
     RemoteAccountResponse {
         id: actor.id.0.to_string(),
         username: actor.username.clone(),
@@ -212,10 +241,10 @@ pub(crate) fn remote_account_response(actor: roosty_db::RemoteActor) -> RemoteAc
         ),
         note: actor.summary,
         url: actor.activitypub_id,
-        avatar: String::new(),
-        avatar_static: String::new(),
-        header: String::new(),
-        header_static: String::new(),
+        avatar: avatar.clone(),
+        avatar_static: avatar,
+        header: header.clone(),
+        header_static: header,
         fields: Vec::new(),
         emojis: Vec::new(),
         followers_count: 0,
@@ -526,11 +555,13 @@ async fn follow_requests(
     };
     match roosty_db::pending_remote_follow_requests(&state.db, account.id, limit, cursor).await {
         Ok(page) => {
-            let actors = page
-                .items
-                .into_iter()
-                .map(remote_account_response)
-                .collect::<Vec<_>>();
+            let mut actors = Vec::with_capacity(page.items.len());
+            for actor in page.items {
+                match remote_account_response(&state, actor).await {
+                    Ok(actor) => actors.push(actor),
+                    Err(error) => return server_error(error),
+                }
+            }
             let link_header = crate::statuses::CollectionLink::new(
                 limit,
                 page.first_cursor,
@@ -750,9 +781,9 @@ async fn account_responses(
             roosty_db::FollowCollectionAccount::Local(account) => {
                 CollectionAccountResponse::Local(Box::new(account_response(state, account).await?))
             }
-            roosty_db::FollowCollectionAccount::Remote(actor) => {
-                CollectionAccountResponse::Remote(Box::new(remote_account_response(actor)))
-            }
+            roosty_db::FollowCollectionAccount::Remote(actor) => CollectionAccountResponse::Remote(
+                Box::new(remote_account_response(state, actor).await?),
+            ),
         });
     }
 
@@ -985,7 +1016,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
-    use super::remote_account_response;
+    use super::remote_account_response_from_media;
     use crate::{config::Config, http::AppState, password};
 
     #[test]
@@ -1009,7 +1040,12 @@ mod tests {
             first_seen_at,
         };
 
-        let response = serde_json::to_value(remote_account_response(actor)).unwrap();
+        let response = serde_json::to_value(remote_account_response_from_media(
+            actor,
+            String::new(),
+            String::new(),
+        ))
+        .unwrap();
 
         assert_eq!(
             response["created_at"],
@@ -1037,7 +1073,12 @@ mod tests {
             first_seen_at,
         };
 
-        let response = serde_json::to_value(remote_account_response(actor)).unwrap();
+        let response = serde_json::to_value(remote_account_response_from_media(
+            actor,
+            String::new(),
+            String::new(),
+        ))
+        .unwrap();
 
         assert_eq!(
             response["created_at"],

@@ -7,8 +7,8 @@ use roosty_core::{AccountId, JobClaimId, JobId, Result, RoostyError, StatusId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult,
-    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
-    TransactionTrait, TryInsertResult,
+    IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set,
+    Statement, TransactionTrait, TryInsertResult,
     sea_query::{OnConflict, Query},
 };
 use serde_json::Value as JsonValue;
@@ -31,7 +31,8 @@ use entity::{
     local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
     local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
     processed_inbox_activity, remote_actor, remote_follow, remote_following,
-    remote_media_attachment, remote_status, remote_status_favourite, remote_status_reblog,
+    remote_media_attachment, remote_profile_media, remote_status, remote_status_favourite,
+    remote_status_reblog,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -95,6 +96,34 @@ pub struct RemoteMediaAttachment {
     pub height: Option<i32>,
     pub blurhash: Option<String>,
     pub expires_at: Option<OffsetDateTime>,
+}
+
+/// The two actor image slots understood by Mastodon-compatible clients.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum RemoteProfileMediaKind {
+    Avatar,
+    Header,
+}
+
+/// A remote actor image cached independently from status attachments.
+#[derive(Clone, Debug)]
+pub struct RemoteProfileMedia {
+    pub id: Uuid,
+    pub remote_actor_id: AccountId,
+    pub kind: RemoteProfileMediaKind,
+    pub remote_url: String,
+    pub content_type: Option<String>,
+    pub state: RemoteMediaState,
+    pub file_path: Option<String>,
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// The remote actor profile images discovered from its ActivityPub document.
+#[derive(Clone, Debug, Default)]
+pub struct NewRemoteProfileMedia {
+    pub avatar_url: Option<String>,
+    pub header_url: Option<String>,
 }
 
 /// Open a database connection using SeaORM's PostgreSQL driver.
@@ -437,7 +466,7 @@ pub async fn find_remote_following(
 
 /// List local accounts whose accepted remote follow targets the supplied actor.
 pub async fn accepted_local_followers_of_remote_actor(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
 ) -> Result<Vec<AccountId>> {
     Ok(remote_following::Entity::find()
@@ -743,6 +772,190 @@ pub async fn mark_remote_media_failed(
     Ok(())
 }
 
+/// Replace the profile-image URLs advertised by a remote actor.
+///
+/// Unchanged URLs retain their cache entry; changed URLs are reset to pending so
+/// a subsequent fetch cannot serve bytes from the old image.
+pub async fn replace_remote_profile_media(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+    media: NewRemoteProfileMedia,
+) -> Result<()> {
+    replace_remote_profile_media_kind(
+        db,
+        remote_actor_id,
+        RemoteProfileMediaKind::Avatar,
+        media.avatar_url,
+    )
+    .await?;
+    replace_remote_profile_media_kind(
+        db,
+        remote_actor_id,
+        RemoteProfileMediaKind::Header,
+        media.header_url,
+    )
+    .await
+}
+
+async fn replace_remote_profile_media_kind(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+    kind: RemoteProfileMediaKind,
+    remote_url: Option<String>,
+) -> Result<()> {
+    let existing = remote_profile_media::Entity::find()
+        .filter(remote_profile_media::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_profile_media::Column::Kind.eq(kind.to_string()))
+        .one(db)
+        .await?;
+    match (existing, remote_url) {
+        (Some(existing), Some(remote_url)) if existing.remote_url == remote_url => Ok(()),
+        (Some(existing), Some(remote_url)) => {
+            let mut active = existing.into_active_model();
+            active.remote_url = Set(remote_url);
+            active.content_type = Set(None);
+            active.state = Set(RemoteMediaState::Pending.to_string());
+            active.file_path = Set(None);
+            active.file_size = Set(None);
+            active.fetched_at = Set(None);
+            active.expires_at = Set(None);
+            active.last_error = Set(None);
+            active.updated_at = Set(OffsetDateTime::now_utc());
+            active.update(db).await?;
+            Ok(())
+        }
+        (Some(existing), None) => {
+            existing.delete(db).await?;
+            Ok(())
+        }
+        (None, Some(remote_url)) => {
+            let now = OffsetDateTime::now_utc();
+            remote_profile_media::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                remote_actor_id: Set(remote_actor_id.0),
+                kind: Set(kind.to_string()),
+                remote_url: Set(remote_url),
+                state: Set(RemoteMediaState::Pending.to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+            Ok(())
+        }
+        (None, None) => Ok(()),
+    }
+}
+
+/// List cached profile-image metadata for a remote actor.
+pub async fn remote_profile_media_for_actor(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+) -> Result<Vec<RemoteProfileMedia>> {
+    remote_profile_media::Entity::find()
+        .filter(remote_profile_media::Column::RemoteActorId.eq(remote_actor_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_profile_media_from_model)
+        .collect()
+}
+
+/// Find a remote profile image by its public cache identity.
+pub async fn find_remote_profile_media(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+) -> Result<Option<RemoteProfileMedia>> {
+    remote_profile_media::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .map(remote_profile_media_from_model)
+        .transpose()
+}
+
+fn remote_profile_media_from_model(
+    model: remote_profile_media::Model,
+) -> Result<RemoteProfileMedia> {
+    Ok(RemoteProfileMedia {
+        id: model.id,
+        remote_actor_id: AccountId(model.remote_actor_id),
+        kind: RemoteProfileMediaKind::from_str(&model.kind).map_err(|_| {
+            RoostyError::InvalidInput("stored remote profile media kind is invalid".to_owned())
+        })?,
+        remote_url: model.remote_url,
+        content_type: model.content_type,
+        state: RemoteMediaState::from_str(&model.state).map_err(|_| {
+            RoostyError::InvalidInput("stored remote profile media state is invalid".to_owned())
+        })?,
+        file_path: model.file_path,
+        expires_at: model.expires_at,
+    })
+}
+
+/// Mark a remote profile image as pending and enqueue its fetch transactionally.
+pub async fn queue_remote_profile_media_fetch(
+    txn: &DatabaseTransaction,
+    media_id: Uuid,
+    job: NewJob,
+) -> Result<()> {
+    let media = remote_profile_media::Entity::find_by_id(media_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote profile media does not exist".to_owned())
+        })?;
+    let mut active = media.into_active_model();
+    active.state = Set(RemoteMediaState::Pending.to_string());
+    active.last_error = Set(None);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(txn).await?;
+    enqueue_job_in_transaction(txn, job).await?;
+    Ok(())
+}
+
+/// Record a completed remote profile-image cache write.
+pub async fn mark_remote_profile_media_ready(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    content_type: String,
+    file_path: String,
+    file_size: i64,
+    expires_at: OffsetDateTime,
+) -> Result<()> {
+    let Some(model) = remote_profile_media::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.state = Set(RemoteMediaState::Ready.to_string());
+    active.content_type = Set(Some(content_type));
+    active.file_path = Set(Some(file_path));
+    active.file_size = Set(Some(file_size));
+    active.fetched_at = Set(Some(OffsetDateTime::now_utc()));
+    active.expires_at = Set(Some(expires_at));
+    active.last_error = Set(None);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+    Ok(())
+}
+
+/// Record a failed remote profile-image fetch.
+pub async fn mark_remote_profile_media_failed(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    error: &str,
+) -> Result<()> {
+    let Some(model) = remote_profile_media::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.state = Set(RemoteMediaState::Failed.to_string());
+    active.last_error = Set(Some(error.to_owned()));
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+    Ok(())
+}
+
 /// Mark the locally initiated Follow identified by its activity ID as accepted.
 pub async fn accept_remote_following(
     db: &DbConnection,
@@ -986,7 +1199,10 @@ pub async fn find_remote_actor_by_handle(
 }
 
 /// Insert or refresh a remote actor cache entry by canonical actor ID.
-pub async fn upsert_remote_actor(db: &DbConnection, actor: &RemoteActor) -> Result<RemoteActor> {
+pub async fn upsert_remote_actor(
+    db: &impl ConnectionTrait,
+    actor: &RemoteActor,
+) -> Result<RemoteActor> {
     let now = OffsetDateTime::now_utc();
     let existing = remote_actor::Entity::find()
         .filter(remote_actor::Column::ActivitypubId.eq(&actor.activitypub_id))

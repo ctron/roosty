@@ -9,7 +9,9 @@ use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE},
 };
-use roosty_core::{Result, RoostyError};
+use roosty_core::{AccountId, Result, RoostyError};
+use roosty_db::{NewRemoteProfileMedia, RemoteActor};
+use sea_orm::{AccessMode, TransactionTrait};
 use serde::Deserialize;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
@@ -43,11 +45,31 @@ struct RemoteActorDocument {
     name: String,
     #[serde(default)]
     summary: String,
+    #[serde(default)]
+    icon: Option<RemoteActorImage>,
+    #[serde(default)]
+    image: Option<RemoteActorImage>,
     published: Option<String>,
     inbox: String,
     #[serde(default)]
     endpoints: RemoteEndpoints,
     public_key: RemotePublicKey,
+}
+
+/// ActivityStreams allows image references as either URLs or Image objects.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RemoteActorImage {
+    Url(String),
+    Object { url: String },
+}
+
+impl RemoteActorImage {
+    fn into_url(self) -> String {
+        match self {
+            Self::Url(url) | Self::Object { url } => url,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -65,10 +87,7 @@ struct RemotePublicKey {
 }
 
 /// Resolve and cache a remote actor after applying the configured network policy.
-pub async fn resolve_remote_actor(
-    state: &AppState,
-    handle: &str,
-) -> Result<roosty_db::RemoteActor> {
+pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<RemoteActor> {
     let (username, domain) = parse_remote_handle(handle)?;
     let domain = domain.to_ascii_lowercase();
     if let Some(actor) =
@@ -100,8 +119,8 @@ pub async fn resolve_remote_actor(
     let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
     validate_actor_document(&document, &actor_url, username, &domain)?;
     let profile_created_at = remote_profile_created_at(&document)?;
-    let actor = roosty_db::RemoteActor {
-        id: roosty_core::AccountId(Uuid::now_v7()),
+    let actor = RemoteActor {
+        id: AccountId(Uuid::now_v7()),
         activitypub_id: document.id,
         username: document.preferred_username,
         domain,
@@ -115,14 +134,14 @@ pub async fn resolve_remote_actor(
         profile_created_at,
         first_seen_at: OffsetDateTime::now_utc(),
     };
-    roosty_db::upsert_remote_actor(&state.db, &actor).await
+    store_remote_actor(state, actor, document.icon, document.image).await
 }
 
 /// Resolve an actor by canonical ActivityPub ID for an authenticated inbox activity.
 pub async fn resolve_remote_actor_by_id(
     state: &AppState,
     activitypub_id: &str,
-) -> Result<roosty_db::RemoteActor> {
+) -> Result<RemoteActor> {
     if let Some(actor) =
         roosty_db::find_remote_actor_by_activitypub_id(&state.db, activitypub_id).await?
         && actor.expires_at > OffsetDateTime::now_utc()
@@ -155,10 +174,10 @@ pub async fn resolve_remote_actor_by_id(
     {
         return Err(invalid("remote actor inbox is outside its actor domain"));
     }
-    roosty_db::upsert_remote_actor(
-        &state.db,
-        &roosty_db::RemoteActor {
-            id: roosty_core::AccountId(Uuid::now_v7()),
+    store_remote_actor(
+        state,
+        RemoteActor {
+            id: AccountId(Uuid::now_v7()),
             activitypub_id: document.id,
             username: document.preferred_username,
             domain,
@@ -172,8 +191,44 @@ pub async fn resolve_remote_actor_by_id(
             profile_created_at,
             first_seen_at: OffsetDateTime::now_utc(),
         },
+        document.icon,
+        document.image,
     )
     .await
+}
+
+/// Store an actor and reconcile its optional ActivityStreams profile images.
+async fn store_remote_actor(
+    state: &AppState,
+    actor: RemoteActor,
+    icon: Option<RemoteActorImage>,
+    image: Option<RemoteActorImage>,
+) -> Result<RemoteActor> {
+    let txn = state.db.begin().await?;
+    let actor = roosty_db::upsert_remote_actor(&txn, &actor).await?;
+    roosty_db::replace_remote_profile_media(
+        &txn,
+        actor.id,
+        NewRemoteProfileMedia {
+            avatar_url: icon.map(RemoteActorImage::into_url),
+            header_url: image.map(RemoteActorImage::into_url),
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    let read_txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let has_accepted_followers =
+        !roosty_db::accepted_local_followers_of_remote_actor(&read_txn, actor.id)
+            .await?
+            .is_empty();
+    read_txn.commit().await?;
+    if has_accepted_followers {
+        crate::media::enqueue_remote_profile_media_fetches(state, actor.id).await?;
+    }
+    Ok(actor)
 }
 
 /// Parse the optional ActivityStreams profile creation timestamp from an actor document.
@@ -449,6 +504,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(actor.preferred_username, "alice");
+    }
+
+    /// Reads both allowed ActivityStreams forms for remote profile images.
+    #[test]
+    fn deserializes_remote_profile_image_references() {
+        let actor: RemoteActorDocument = serde_json::from_str(
+            r#"{
+                "id": "https://social.example/users/alice",
+                "type": "Person",
+                "preferredUsername": "alice",
+                "icon": {"type": "Image", "url": "https://social.example/avatar.png"},
+                "image": "https://social.example/header.png",
+                "inbox": "https://social.example/users/alice/inbox",
+                "publicKey": {
+                    "id": "https://social.example/users/alice#main-key",
+                    "owner": "https://social.example/users/alice",
+                    "publicKeyPem": "public-key"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            actor.icon.map(super::RemoteActorImage::into_url).as_deref(),
+            Some("https://social.example/avatar.png")
+        );
+        assert_eq!(
+            actor
+                .image
+                .map(super::RemoteActorImage::into_url)
+                .as_deref(),
+            Some("https://social.example/header.png")
+        );
     }
 
     #[test]
