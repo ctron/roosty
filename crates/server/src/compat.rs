@@ -25,10 +25,16 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/push/subscription", get(push_subscription))
+        .route("/api/v1/custom_emojis", get(custom_emojis))
         .route("/api/v1/followed_tags", get(followed_tags))
         .route("/api/v1/streaming", get(streaming))
         .route("/api/v1/streaming/direct", get(streaming_direct))
         .route("/api/v1/streaming/health", get(streaming_health))
+}
+
+/// Roosty exposes the standard picker API but does not host local custom emoji.
+async fn custom_emojis() -> Json<Vec<Value>> {
+    Json(Vec::new())
 }
 
 #[derive(Serialize)]
@@ -259,7 +265,7 @@ mod tests {
     };
 
     use axum::{
-        Router,
+        Json, Router,
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     };
@@ -272,7 +278,7 @@ mod tests {
     use test_context::{AsyncTestContext, test_context};
     use tower::ServiceExt;
 
-    use super::{streaming_token, update_stream_subscription};
+    use super::{custom_emojis, streaming_token, update_stream_subscription};
     use crate::{config::Config, http::AppState, password};
 
     #[test_context(CompatContext)]
@@ -300,6 +306,13 @@ mod tests {
             let unauthorized = context.get(uri).await;
             assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    /// Roosty advertises the standard public picker API without hosting local emoji.
+    #[tokio::test]
+    async fn custom_emoji_picker_is_public_and_empty() {
+        let Json(emojis) = custom_emojis().await;
+        assert!(emojis.is_empty());
     }
 
     #[test_context(CompatContext)]

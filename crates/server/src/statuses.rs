@@ -1983,7 +1983,7 @@ async fn remote_status_response_for_viewer(
             .collect(),
         mentions,
         tags: Vec::new(),
-        emojis: Vec::new(),
+        emojis: crate::accounts::remote_custom_emojis(&status.object),
         reblogs_count: 0,
         favourites_count: 0,
         replies_count: 0,

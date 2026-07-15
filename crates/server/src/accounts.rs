@@ -10,6 +10,7 @@ use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{LocalNotificationType, RemoteActor, RemoteProfileMediaKind};
 use sea_orm::{AccessMode, TransactionTrait};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -101,8 +102,8 @@ pub(crate) struct RemoteAccountResponse {
     avatar_static: String,
     header: String,
     header_static: String,
-    fields: Vec<serde_json::Value>,
-    emojis: Vec<serde_json::Value>,
+    fields: Vec<Value>,
+    emojis: Vec<Value>,
     followers_count: u64,
     following_count: u64,
     statuses_count: u64,
@@ -261,13 +262,51 @@ fn remote_account_response_from_media(
         header: header.clone(),
         header_static: header,
         fields: Vec::new(),
-        emojis: Vec::new(),
+        emojis: remote_custom_emojis(&actor.emojis),
         followers_count: 0,
         following_count: 0,
         statuses_count: 0,
         last_status_at: None,
         moved: None,
     }
+}
+
+/// Project valid Mastodon ActivityPub Emoji tags into the REST custom-emoji shape.
+pub(crate) fn remote_custom_emojis(tags: &Value) -> Vec<Value> {
+    let Some(tags) = tags
+        .as_array()
+        .or_else(|| tags.get("tag").and_then(Value::as_array))
+    else {
+        return Vec::new();
+    };
+    tags.iter()
+        .filter_map(|tag| {
+            let kind = tag.get("type").and_then(Value::as_str)?;
+            if kind != "Emoji" && kind != "http://joinmastodon.org/ns#Emoji" {
+                return None;
+            }
+            let name = tag.get("name").and_then(Value::as_str)?;
+            let shortcode = name.strip_prefix(':')?.strip_suffix(':')?;
+            if shortcode.is_empty() || shortcode.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let icon = tag.get("icon")?;
+            let url = match icon.get("url")? {
+                Value::String(url) => url,
+                Value::Object(url) => url.get("href")?.as_str()?,
+                _ => return None,
+            };
+            (url.starts_with("https://")).then(|| {
+                json!({
+                    "shortcode": shortcode,
+                    "url": url,
+                    "static_url": url,
+                    "visible_in_picker": false,
+                    "category": null,
+                })
+            })
+        })
+        .collect()
 }
 
 /// Return a public local account profile by account id.
@@ -1026,13 +1065,13 @@ mod tests {
     use roosty_core::AccountId;
     use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_context::{AsyncTestContext, test_context};
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
-    use super::remote_account_response_from_media;
+    use super::{remote_account_response_from_media, remote_custom_emojis};
     use crate::{config::Config, http::AppState, password};
 
     #[test]
@@ -1047,6 +1086,7 @@ mod tests {
             domain: "remote.test".to_owned(),
             display_name: "Alice".to_owned(),
             summary: String::new(),
+            emojis: json!([]),
             inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
             shared_inbox_url: None,
             public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
@@ -1072,6 +1112,20 @@ mod tests {
     }
 
     #[test]
+    /// ActivityPub Emoji tags become Mastodon custom emoji metadata for remote projections.
+    fn projects_remote_activitypub_emoji_tags() {
+        let emojis = remote_custom_emojis(&json!({
+            "tag": [{
+                "type": "Emoji",
+                "name": ":wave:",
+                "icon": {"url": "https://remote.example/emoji/wave.png"}
+            }]
+        }));
+        assert_eq!(emojis[0]["shortcode"], "wave");
+        assert_eq!(emojis[0]["visible_in_picker"], false);
+    }
+
+    #[test]
     /// Falls back to first-seen time rather than the cache expiry for actors without `published`.
     fn remote_account_response_falls_back_to_first_seen_time() {
         let first_seen_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(20);
@@ -1082,6 +1136,7 @@ mod tests {
             domain: "remote.test".to_owned(),
             display_name: "Alice".to_owned(),
             summary: String::new(),
+            emojis: json!([]),
             inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
             shared_inbox_url: None,
             public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
@@ -1867,6 +1922,7 @@ mod tests {
                 domain: "remote.test".to_owned(),
                 display_name: username.to_owned(),
                 summary: String::new(),
+                emojis: json!([]),
                 inbox_url: format!("https://remote.test/users/{username}/inbox"),
                 shared_inbox_url: None,
                 public_key_id: format!("https://remote.test/users/{username}#main-key"),

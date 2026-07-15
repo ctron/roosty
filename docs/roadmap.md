@@ -41,7 +41,7 @@
 - [ ] Support remote direct conversations, including encrypted/private addressing policy and timeline projection.
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
 - [ ] Add remote hashtag discovery, status/tag projections, and featured/profile tags.
-- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, custom emoji, and account migration metadata.
+- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, and account migration metadata.
 - [ ] Add replay protection for reused or absent remote activity IDs beyond current canonical-ID idempotency.
 - [ ] Support multi-process streaming fan-out and federation-worker coordination.
 

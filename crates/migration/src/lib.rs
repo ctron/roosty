@@ -41,6 +41,7 @@ mod m20260701_000036_add_remote_actor_profile_created_at;
 mod m20260701_000037_create_remote_profile_media;
 mod m20260701_000038_add_remote_actor_lifecycle;
 mod m20260701_000039_add_remote_media_preview_metadata;
+mod m20260701_000040_create_remote_custom_emoji;
 
 pub struct Migrator;
 
@@ -87,6 +88,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000037_create_remote_profile_media::Migration),
             Box::new(m20260701_000038_add_remote_actor_lifecycle::Migration),
             Box::new(m20260701_000039_add_remote_media_preview_metadata::Migration),
+            Box::new(m20260701_000040_create_remote_custom_emoji::Migration),
         ]
     }
 }

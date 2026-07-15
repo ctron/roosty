@@ -10,9 +10,10 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE},
 };
 use roosty_core::{AccountId, Result, RoostyError};
-use roosty_db::{NewRemoteProfileMedia, RemoteActor};
+use roosty_db::{NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor};
 use sea_orm::{AccessMode, TransactionTrait};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 use uuid::Uuid;
@@ -49,6 +50,8 @@ struct RemoteActorDocument {
     icon: Option<RemoteActorImage>,
     #[serde(default)]
     image: Option<RemoteActorImage>,
+    #[serde(default)]
+    tag: Vec<JsonValue>,
     #[serde(default)]
     also_known_as: Vec<String>,
     published: Option<String>,
@@ -128,6 +131,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         domain,
         display_name: document.name,
         summary: document.summary,
+        emojis: JsonValue::Array(document.tag),
         inbox_url: document.inbox,
         shared_inbox_url: document.endpoints.shared_inbox,
         public_key_id: document.public_key.id,
@@ -195,6 +199,7 @@ pub async fn refresh_remote_actor_by_id(
             domain,
             display_name: document.name,
             summary: document.summary,
+            emojis: JsonValue::Array(document.tag),
             inbox_url: document.inbox,
             shared_inbox_url: document.endpoints.shared_inbox,
             public_key_id: document.public_key.id,
@@ -252,6 +257,7 @@ pub async fn resolve_remote_move_target(
             domain,
             display_name: document.name,
             summary: document.summary,
+            emojis: JsonValue::Array(document.tag),
             inbox_url: document.inbox,
             shared_inbox_url: document.endpoints.shared_inbox,
             public_key_id: document.public_key.id,
@@ -277,6 +283,16 @@ async fn store_remote_actor(
 ) -> Result<RemoteActor> {
     let txn = state.db.begin().await?;
     let actor = roosty_db::upsert_remote_actor(&txn, &actor).await?;
+    let emojis = crate::accounts::remote_custom_emojis(&actor.emojis)
+        .into_iter()
+        .filter_map(|emoji| {
+            Some(NewRemoteCustomEmoji {
+                shortcode: emoji.get("shortcode")?.as_str()?.to_owned(),
+                remote_url: emoji.get("url")?.as_str()?.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
     roosty_db::replace_remote_profile_media(
         &txn,
         actor.id,

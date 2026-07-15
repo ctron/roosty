@@ -16,6 +16,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rand_core::{OsRng, RngCore};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
+use roosty_db::NewRemoteCustomEmoji;
 use rsa::{
     RsaPrivateKey,
     pkcs1v15::SigningKey,
@@ -266,6 +267,27 @@ struct InboundTag {
     r#type: String,
     href: Option<String>,
     name: Option<String>,
+    #[serde(default)]
+    icon: Option<InboundEmojiIcon>,
+}
+
+/// Image reference used by Mastodon ActivityPub Emoji tags.
+#[derive(Deserialize, Serialize)]
+struct InboundEmojiIcon {
+    url: JsonValue,
+}
+
+impl InboundEmojiIcon {
+    fn url(&self) -> Option<String> {
+        match &self.url {
+            JsonValue::String(url) => Some(url.clone()),
+            JsonValue::Object(value) => value
+                .get("href")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
 }
 
 /// Signed remote Delete activity, whose object may be an object ID or a Tombstone.
@@ -1486,6 +1508,7 @@ async fn process_remote_status_activity(
                         })
                 })
                 .collect::<Vec<_>>();
+            let emojis = remote_custom_emoji_definitions(&note.tag);
             let mention_urls = note
                 .tag
                 .iter()
@@ -1522,6 +1545,7 @@ async fn process_remote_status_activity(
                 None => None,
             };
             let txn = state.db.begin().await?;
+            roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
             let status = roosty_db::process_remote_status_upsert(
                 &txn,
                 activity_id,
@@ -1661,6 +1685,29 @@ async fn publish_remote_status_change(
 }
 
 /// Return a Mastodon visibility only for ActivityPub's public and unlisted audiences.
+/// Retain only well-formed Mastodon Emoji tags; malformed decorations do not reject a Note.
+fn remote_custom_emoji_definitions(tags: &[InboundTag]) -> Vec<NewRemoteCustomEmoji> {
+    tags.iter()
+        .filter(|tag| {
+            matches!(
+                tag.r#type.as_str(),
+                "Emoji" | "http://joinmastodon.org/ns#Emoji"
+            )
+        })
+        .filter_map(|tag| {
+            let shortcode = tag.name.as_deref()?.strip_prefix(':')?.strip_suffix(':')?;
+            let remote_url = tag.icon.as_ref()?.url()?;
+            (!shortcode.is_empty()
+                && !shortcode.chars().any(char::is_whitespace)
+                && remote_url.starts_with("https://"))
+            .then(|| NewRemoteCustomEmoji {
+                shortcode: shortcode.to_owned(),
+                remote_url,
+            })
+        })
+        .collect()
+}
+
 fn remote_status_visibility(note: &InboundNote) -> Option<&'static str> {
     if note.to.iter().any(|audience| audience == PUBLIC_AUDIENCE) {
         Some("public")
@@ -3000,6 +3047,7 @@ mod tests {
     use roosty_migration::Migrator;
     use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
@@ -3868,6 +3916,7 @@ mod tests {
             domain: domain.to_owned(),
             display_name: username.to_owned(),
             summary: String::new(),
+            emojis: json!([]),
             inbox_url: format!("https://{domain}/inbox"),
             shared_inbox_url: None,
             public_key_id: format!("https://{domain}/users/{username}#main-key"),

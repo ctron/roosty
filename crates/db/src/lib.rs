@@ -30,7 +30,7 @@ use entity::{
     local_status_bookmark, local_status_favourite, local_status_reblog,
     local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
     local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    processed_inbox_activity, remote_actor, remote_follow, remote_following,
+    processed_inbox_activity, remote_actor, remote_custom_emoji, remote_follow, remote_following,
     remote_media_attachment, remote_profile_media, remote_status, remote_status_favourite,
     remote_status_reblog,
 };
@@ -97,6 +97,25 @@ pub struct RemoteMediaAttachment {
     pub preview_width: Option<i32>,
     pub preview_height: Option<i32>,
     pub blurhash: Option<String>,
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// A remote custom emoji discovered in a signed actor or Note document.
+#[derive(Clone, Debug)]
+pub struct NewRemoteCustomEmoji {
+    pub shortcode: String,
+    pub remote_url: String,
+}
+
+/// Cached remote custom emoji metadata.
+#[derive(Clone, Debug)]
+pub struct RemoteCustomEmoji {
+    pub id: Uuid,
+    pub shortcode: String,
+    pub remote_url: String,
+    pub content_type: Option<String>,
+    pub state: RemoteMediaState,
+    pub file_path: Option<String>,
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -321,6 +340,8 @@ pub struct RemoteActor {
     pub display_name: String,
     /// Profile summary from the actor document.
     pub summary: String,
+    /// Original remote ActivityPub Emoji tags retained for API projection.
+    pub emojis: JsonValue,
     /// Direct inbox URL.
     pub inbox_url: String,
     /// Optional shared inbox URL.
@@ -1309,6 +1330,7 @@ pub async fn upsert_remote_actor(
         active.domain = Set(actor.domain.clone());
         active.display_name = Set(actor.display_name.clone());
         active.summary = Set(actor.summary.clone());
+        active.emojis = Set(actor.emojis.clone());
         active.inbox_url = Set(actor.inbox_url.clone());
         active.shared_inbox_url = Set(actor.shared_inbox_url.clone());
         active.public_key_id = Set(actor.public_key_id.clone());
@@ -1328,6 +1350,7 @@ pub async fn upsert_remote_actor(
             domain: Set(actor.domain.clone()),
             display_name: Set(actor.display_name.clone()),
             summary: Set(actor.summary.clone()),
+            emojis: Set(actor.emojis.clone()),
             inbox_url: Set(actor.inbox_url.clone()),
             shared_inbox_url: Set(actor.shared_inbox_url.clone()),
             public_key_id: Set(actor.public_key_id.clone()),
@@ -1342,6 +1365,106 @@ pub async fn upsert_remote_actor(
         .await?
     };
     Ok(remote_actor_from_model(model))
+}
+
+/// Store remote custom emoji metadata before their image bytes are fetched.
+pub async fn upsert_remote_custom_emojis(
+    db: &impl ConnectionTrait,
+    emojis: &[NewRemoteCustomEmoji],
+) -> Result<()> {
+    for emoji in emojis {
+        let existing = remote_custom_emoji::Entity::find()
+            .filter(remote_custom_emoji::Column::RemoteUrl.eq(&emoji.remote_url))
+            .one(db)
+            .await?;
+        if let Some(existing) = existing {
+            let mut active = existing.into_active_model();
+            active.shortcode = Set(emoji.shortcode.clone());
+            active.updated_at = Set(OffsetDateTime::now_utc());
+            active.update(db).await?;
+        } else {
+            let now = OffsetDateTime::now_utc();
+            remote_custom_emoji::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                shortcode: Set(emoji.shortcode.clone()),
+                remote_url: Set(emoji.remote_url.clone()),
+                state: Set(RemoteMediaState::Pending.to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Look up a cached remote emoji using the URL declared in its ActivityPub tag.
+pub async fn find_remote_custom_emoji_by_url(
+    db: &impl ConnectionTrait,
+    remote_url: &str,
+) -> Result<Option<RemoteCustomEmoji>> {
+    remote_custom_emoji::Entity::find()
+        .filter(remote_custom_emoji::Column::RemoteUrl.eq(remote_url))
+        .one(db)
+        .await?
+        .map(remote_custom_emoji_from_model)
+        .transpose()
+}
+
+/// Look up one remote emoji cache entry by proxy ID.
+pub async fn find_remote_custom_emoji(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+) -> Result<Option<RemoteCustomEmoji>> {
+    remote_custom_emoji::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .map(remote_custom_emoji_from_model)
+        .transpose()
+}
+
+/// Record a completed remote custom-emoji cache write.
+pub async fn mark_remote_custom_emoji_ready(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    content_type: String,
+    file_path: String,
+    file_size: i64,
+    expires_at: OffsetDateTime,
+) -> Result<()> {
+    let Some(model) = remote_custom_emoji::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.state = Set(RemoteMediaState::Ready.to_string());
+    active.content_type = Set(Some(content_type));
+    active.file_path = Set(Some(file_path));
+    active.file_size = Set(Some(file_size));
+    active.fetched_at = Set(Some(OffsetDateTime::now_utc()));
+    active.expires_at = Set(Some(expires_at));
+    active.last_error = Set(None);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+    Ok(())
+}
+
+/// Record a remote custom-emoji fetch failure.
+pub async fn mark_remote_custom_emoji_failed(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    error: &str,
+) -> Result<()> {
+    let Some(model) = remote_custom_emoji::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.state = Set(RemoteMediaState::Failed.to_string());
+    active.last_error = Set(Some(error.to_owned()));
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    active.update(db).await?;
+    Ok(())
 }
 
 /// Look up the persisted ActivityPub signing key for a local account.
@@ -6278,6 +6401,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         domain: actor.domain,
         display_name: actor.display_name,
         summary: actor.summary,
+        emojis: actor.emojis,
         inbox_url: actor.inbox_url,
         shared_inbox_url: actor.shared_inbox_url,
         public_key_id: actor.public_key_id,
@@ -6288,6 +6412,20 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         deleted_at: actor.deleted_at,
         moved_to_remote_actor_id: actor.moved_to_remote_actor_id.map(AccountId),
     }
+}
+
+fn remote_custom_emoji_from_model(model: remote_custom_emoji::Model) -> Result<RemoteCustomEmoji> {
+    Ok(RemoteCustomEmoji {
+        id: model.id,
+        shortcode: model.shortcode,
+        remote_url: model.remote_url,
+        content_type: model.content_type,
+        state: RemoteMediaState::from_str(&model.state).map_err(|_| {
+            RoostyError::InvalidInput("stored remote custom emoji state is invalid".to_owned())
+        })?,
+        file_path: model.file_path,
+        expires_at: model.expires_at,
+    })
 }
 
 /// Convert a persisted remote Note cache model into the shared projection.

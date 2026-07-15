@@ -128,7 +128,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
 | 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
 | 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
-| 🔴 | Custom emojis | `GET /api/v1/custom_emojis` is missing. |
+| 🟡 | Custom emojis | `GET /api/v1/custom_emojis` is public and returns an empty local picker. Cached remote account and status projections expose valid ActivityPub Emoji tags; local emoji management and outbound emoji federation are missing. |
 
 ### Streaming
 
