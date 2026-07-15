@@ -33,7 +33,7 @@
 - [x] Commit supported inbox side effects, idempotency markers, and durable follow/favourite/boost delivery jobs atomically; publish streams only after commit.
 - [ ] Repair cached-status timelines and notification references after signed remote Deletes.
 - [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
-- [ ] Safely fetch, validate, cache, expire, and render remote media attachments.
+- [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
 - [ ] Federate follow, mention, reply, favourite, and boost notifications to remote recipients.
 - [ ] Add grouped notifications and Web Push integration.
 - [ ] Apply local mute/block and domain-policy decisions consistently to discovery, inbox processing, delivery, and notifications.

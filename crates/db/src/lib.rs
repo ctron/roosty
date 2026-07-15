@@ -94,8 +94,25 @@ pub struct RemoteMediaAttachment {
     pub file_size: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub preview_width: Option<i32>,
+    pub preview_height: Option<i32>,
     pub blurhash: Option<String>,
     pub expires_at: Option<OffsetDateTime>,
+}
+
+/// Completed cache metadata for one remote status attachment.
+#[derive(Clone, Debug)]
+pub struct RemoteMediaCacheWrite {
+    pub content_type: String,
+    pub file_path: String,
+    pub preview_file_path: Option<String>,
+    pub file_size: i64,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub preview_width: Option<i32>,
+    pub preview_height: Option<i32>,
+    pub blurhash: Option<String>,
+    pub expires_at: OffsetDateTime,
 }
 
 /// The two actor image slots understood by Mastodon-compatible clients.
@@ -711,6 +728,8 @@ pub async fn replace_remote_media_attachments(
             file_size: Set(None),
             width: Set(None),
             height: Set(None),
+            preview_width: Set(None),
+            preview_height: Set(None),
             blurhash: Set(None),
             fetched_at: Set(None),
             expires_at: Set(None),
@@ -769,6 +788,8 @@ fn remote_media_attachment_from_model(
         file_size: model.file_size,
         width: model.width,
         height: model.height,
+        preview_width: model.preview_width,
+        preview_height: model.preview_height,
         blurhash: model.blurhash,
         expires_at: model.expires_at,
     })
@@ -799,10 +820,7 @@ pub async fn queue_remote_media_fetch(
 pub async fn mark_remote_media_ready(
     db: &impl ConnectionTrait,
     id: Uuid,
-    content_type: String,
-    file_path: String,
-    file_size: i64,
-    expires_at: OffsetDateTime,
+    cache: RemoteMediaCacheWrite,
 ) -> Result<()> {
     let Some(model) = remote_media_attachment::Entity::find_by_id(id)
         .one(db)
@@ -812,11 +830,17 @@ pub async fn mark_remote_media_ready(
     };
     let mut active = model.into_active_model();
     active.state = Set(RemoteMediaState::Ready.to_string());
-    active.content_type = Set(Some(content_type));
-    active.file_path = Set(Some(file_path));
-    active.file_size = Set(Some(file_size));
+    active.content_type = Set(Some(cache.content_type));
+    active.file_path = Set(Some(cache.file_path));
+    active.preview_file_path = Set(cache.preview_file_path);
+    active.file_size = Set(Some(cache.file_size));
+    active.width = Set(cache.width);
+    active.height = Set(cache.height);
+    active.preview_width = Set(cache.preview_width);
+    active.preview_height = Set(cache.preview_height);
+    active.blurhash = Set(cache.blurhash);
     active.fetched_at = Set(Some(OffsetDateTime::now_utc()));
-    active.expires_at = Set(Some(expires_at));
+    active.expires_at = Set(Some(cache.expires_at));
     active.last_error = Set(None);
     active.updated_at = Set(OffsetDateTime::now_utc());
     active.update(db).await?;

@@ -15,7 +15,7 @@ use axum_params::{Params, UploadFile};
 use image::{GenericImageView, ImageFormat, ImageReader};
 use roosty_core::{AccountId, RoostyError};
 use roosty_db::{NewJob, RemoteMediaState};
-use sea_orm::{AccessMode, TransactionTrait};
+use sea_orm::{AccessMode, DatabaseTransaction, TransactionTrait};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::task;
@@ -108,6 +108,10 @@ pub fn router() -> Router<AppState> {
             get(serve_remote_media_attachment),
         )
         .route(
+            "/media_attachments/remote/{media_id}/preview",
+            get(serve_remote_media_preview),
+        )
+        .route(
             "/media_attachments/remote/profile/{media_id}",
             get(serve_remote_profile_media),
         )
@@ -194,24 +198,17 @@ async fn serve_remote_media_attachment(
         Err(error) => return server_error(error),
     };
     let Some(path) = media.file_path else {
-        if media.state != RemoteMediaState::Failed
-            && let Ok(txn) = state.db.begin().await
-        {
-            let _ = roosty_db::queue_remote_media_fetch(
-                &txn,
-                media_id,
-                NewJob {
-                    kind: roosty_db::JobKind::FederationRemoteMediaFetch,
-                    payload: serde_json::json!({"attachment_id": media_id}),
-                    deduplication_key: Some(media_id.to_string()),
-                    run_after: time::OffsetDateTime::now_utc(),
-                },
-            )
-            .await;
-            let _ = txn.commit().await;
+        if media.state != RemoteMediaState::Failed {
+            let _ = enqueue_remote_media_fetch(&state, media_id).await;
         }
         return StatusCode::ACCEPTED.into_response();
     };
+    if media
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+    {
+        let _ = enqueue_remote_media_fetch(&state, media_id).await;
+    }
     match tokio::fs::read(media_path(&state, &path)).await {
         Ok(bytes) => (
             [(
@@ -227,8 +224,97 @@ async fn serve_remote_media_attachment(
     }
 }
 
+/// Serve the generated preview for a remote image attachment.
+async fn serve_remote_media_preview(
+    State(state): State<AppState>,
+    AxumPath(media_id): AxumPath<Uuid>,
+) -> Response {
+    let media = match roosty_db::find_remote_media_attachment(&state.db, media_id).await {
+        Ok(Some(media)) => media,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(error),
+    };
+    let Some(path) = media.preview_file_path else {
+        return serve_remote_media_attachment(State(state), AxumPath(media_id)).await;
+    };
+    match tokio::fs::read(media_path(&state, &path)).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Err(_) => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// Queue one remote attachment fetch, deduplicating an in-flight or refresh job.
+async fn enqueue_remote_media_fetch(state: &AppState, media_id: Uuid) -> Result<(), RoostyError> {
+    let txn = state.db.begin().await?;
+    roosty_db::queue_remote_media_fetch(
+        &txn,
+        media_id,
+        NewJob {
+            kind: roosty_db::JobKind::FederationRemoteMediaFetch,
+            payload: serde_json::json!({"attachment_id": media_id}),
+            deduplication_key: Some(format!("remote-media:{media_id}")),
+            run_after: time::OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Add attachment fetch jobs to the transaction that made their status visible.
+pub(crate) async fn enqueue_remote_status_media_fetches_in_transaction(
+    txn: &DatabaseTransaction,
+    status_id: roosty_core::StatusId,
+) -> Result<(), RoostyError> {
+    for media in roosty_db::remote_media_attachments_for_status(txn, status_id).await? {
+        if media.state != RemoteMediaState::Ready
+            || media
+                .expires_at
+                .is_none_or(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+        {
+            roosty_db::queue_remote_media_fetch(
+                txn,
+                media.id,
+                NewJob {
+                    kind: roosty_db::JobKind::FederationRemoteMediaFetch,
+                    payload: serde_json::json!({"attachment_id": media.id}),
+                    deduplication_key: Some(format!("remote-media:{}", media.id)),
+                    run_after: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Fetch one remote attachment through the federation network policy.
 pub(crate) async fn fetch_remote_media(
+    state: &AppState,
+    payload: serde_json::Value,
+) -> Result<(), RoostyError> {
+    let attachment_id = payload
+        .get("attachment_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let profile_media_id = payload
+        .get("profile_media_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let result = fetch_remote_media_inner(state, payload).await;
+    if let Err(error) = &result {
+        if let Some(id) = attachment_id {
+            roosty_db::mark_remote_media_failed(&state.db, id, &error.to_string()).await?;
+        }
+        if let Some(id) = profile_media_id {
+            roosty_db::mark_remote_profile_media_failed(&state.db, id, &error.to_string()).await?;
+        }
+    }
+    result
+}
+
+/// Perform one remote-media fetch after the worker has selected its cache entry.
+async fn fetch_remote_media_inner(
     state: &AppState,
     payload: serde_json::Value,
 ) -> Result<(), RoostyError> {
@@ -320,10 +406,40 @@ pub(crate) async fn fetch_remote_media(
             "remote media exceeds configured size limit".to_owned(),
         ));
     }
-    let path = if profile_media {
-        format!("remote/profile/{id}.bin")
+    let processed_image = if !profile_media && content_type.starts_with("image/") {
+        let format =
+            validate_image_content_type(&content_type).map_err(RoostyError::InvalidInput)?;
+        Some(
+            process_image(bytes.to_vec(), None, format.image_format)
+                .await
+                .map_err(media_store_error_to_roosty)?,
+        )
     } else {
-        format!("remote/{id}.bin")
+        None
+    };
+    if !profile_media
+        && !content_type.starts_with("image/")
+        && !content_type.starts_with("video/")
+        && !content_type.starts_with("audio/")
+    {
+        return Err(RoostyError::InvalidInput(
+            "remote media content type is unsupported".to_owned(),
+        ));
+    }
+    let extension = if profile_media {
+        "bin"
+    } else if let Some(format) = SUPPORTED_IMAGE_FORMATS
+        .iter()
+        .find(|format| format.content_type == content_type)
+    {
+        format.extension
+    } else {
+        "bin"
+    };
+    let path = if profile_media {
+        format!("remote/profile/{id}.{extension}")
+    } else {
+        format!("remote/{id}.{extension}")
     };
     let full_path = media_path(state, &path);
     create_media_parent(&full_path)
@@ -343,13 +459,34 @@ pub(crate) async fn fetch_remote_media(
         )
         .await
     } else {
+        let preview_file_path = if let Some(processed) = &processed_image {
+            let preview_path = format!("remote/{id}-small.png");
+            let preview_full_path = media_path(state, &preview_path);
+            create_media_parent(&preview_full_path)
+                .await
+                .map_err(media_store_error_to_roosty)?;
+            tokio::fs::write(preview_full_path, &processed.preview_bytes)
+                .await
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+            Some(preview_path)
+        } else {
+            None
+        };
         roosty_db::mark_remote_media_ready(
             &state.db,
             id,
-            content_type,
-            path,
-            bytes.len() as i64,
-            time::OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
+            roosty_db::RemoteMediaCacheWrite {
+                content_type,
+                file_path: path,
+                preview_file_path,
+                file_size: bytes.len() as i64,
+                width: processed_image.as_ref().map(|image| image.width),
+                height: processed_image.as_ref().map(|image| image.height),
+                preview_width: processed_image.as_ref().map(|image| image.preview_width),
+                preview_height: processed_image.as_ref().map(|image| image.preview_height),
+                blurhash: processed_image.map(|image| image.blurhash),
+                expires_at: time::OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
+            },
         )
         .await
     }
@@ -374,15 +511,28 @@ pub(crate) fn remote_media_attachment_response(
             size: format!("{width}x{height}"),
             aspect: width as f64 / height as f64,
         });
+    let preview_image = media
+        .preview_width
+        .zip(media.preview_height)
+        .map(|(width, height)| ImageMeta {
+            width,
+            height,
+            size: format!("{width}x{height}"),
+            aspect: width as f64 / height as f64,
+        });
+    let preview_url = media
+        .preview_file_path
+        .as_ref()
+        .map_or_else(|| url.clone(), |_| format!("{url}/preview"));
     MediaAttachmentResponse {
         id: media.id.to_string(),
         media_type: remote_media_type(media.content_type.as_deref()),
         url: url.clone(),
-        preview_url: url,
+        preview_url,
         remote_url: Some(media.remote_url),
         meta: MediaMeta {
-            original: image,
-            small: None,
+            original: image.clone(),
+            small: preview_image,
             focus: None,
         },
         description: media.description,
@@ -400,6 +550,7 @@ pub(crate) fn remote_profile_media_url(state: &AppState, media_id: Uuid) -> Stri
 
 fn remote_media_type(content_type: Option<&str>) -> &'static str {
     match content_type.unwrap_or_default() {
+        "image/gif" => "gifv",
         value if value.starts_with("image/") => "image",
         value if value.starts_with("video/") => "video",
         value if value.starts_with("audio/") => "audio",
@@ -1092,6 +1243,14 @@ enum MediaStoreError {
     Roosty(#[from] RoostyError),
 }
 
+/// Translate local image-processing failures at the remote-fetch boundary.
+fn media_store_error_to_roosty(error: MediaStoreError) -> RoostyError {
+    match error {
+        MediaStoreError::Validation(error) => RoostyError::InvalidInput(error),
+        MediaStoreError::Roosty(error) => error,
+    }
+}
+
 impl From<sea_orm::DbErr> for MediaStoreError {
     fn from(error: sea_orm::DbErr) -> Self {
         Self::Roosty(error.into())
@@ -1110,5 +1269,45 @@ impl IntoResponse for MediaStoreError {
 impl From<std::io::Error> for MediaStoreError {
     fn from(error: std::io::Error) -> Self {
         Self::Roosty(RoostyError::from(error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageFormat};
+
+    use super::process_image;
+
+    /// Given a valid remote image, processing produces preview metadata suitable for Mastodon.
+    #[tokio::test]
+    async fn processes_remote_image_with_preview_metadata() {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(800, 200)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+
+        let processed = process_image(bytes.into_inner(), None, ImageFormat::Png)
+            .await
+            .unwrap();
+
+        assert_eq!((processed.width, processed.height), (800, 200));
+        assert_eq!(
+            (processed.preview_width, processed.preview_height),
+            (400, 100)
+        );
+        assert!(!processed.preview_bytes.is_empty());
+        assert!(!processed.blurhash.is_empty());
+    }
+
+    /// Invalid remote image bytes cannot be transformed into a cache entry.
+    #[tokio::test]
+    async fn rejects_invalid_remote_image_bytes() {
+        assert!(
+            process_image(b"not an image".to_vec(), None, ImageFormat::Png)
+                .await
+                .is_err()
+        );
     }
 }

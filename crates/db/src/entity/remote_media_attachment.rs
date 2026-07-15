@@ -17,6 +17,8 @@ pub struct Model {
     pub file_size: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub preview_width: Option<i32>,
+    pub preview_height: Option<i32>,
     pub blurhash: Option<String>,
     pub fetched_at: Option<OffsetDateTime>,
     pub expires_at: Option<OffsetDateTime>,

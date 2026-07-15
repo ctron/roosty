@@ -1544,6 +1544,14 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
+            if let Some(status) = &status
+                && !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
+                    .await?
+                    .is_empty()
+            {
+                crate::media::enqueue_remote_status_media_fetches_in_transaction(&txn, status.id)
+                    .await?;
+            }
             txn.commit().await?;
             Ok(match status {
                 Some(status) => RemoteStatusChange::Upsert(Box::new(status), mention_urls),
