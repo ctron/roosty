@@ -465,9 +465,22 @@ struct Note {
     in_reply_to: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tag: Vec<MentionTag>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachment: Vec<NoteAttachment>,
     to: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cc: Vec<String>,
+}
+
+/// ActivityStreams document attached to a locally authored Note.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NoteAttachment {
+    r#type: &'static str,
+    media_type: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 /// Typed ActivityPub mention tag emitted on locally authored Notes.
@@ -1543,6 +1556,11 @@ async fn process_remote_status_activity(
     activity: &JsonValue,
     remote_actor: &roosty_db::RemoteActor,
 ) -> Result<RemoteStatusChange, RoostyError> {
+    if !same_url_origin(activity_id, &remote_actor.activitypub_id) {
+        return Err(RoostyError::InvalidInput(
+            "remote status activity origin does not match signer".to_owned(),
+        ));
+    }
     match activity.get("type").and_then(JsonValue::as_str) {
         Some("Create") | Some("Update") => {
             let activity_type = activity.get("type").and_then(JsonValue::as_str);
@@ -1588,6 +1606,7 @@ async fn process_remote_status_activity(
                 || note.attributed_to != remote_actor.activitypub_id
                 || note.r#type != "Note"
                 || !note.id.starts_with("https://")
+                || !same_url_origin(&note.id, &remote_actor.activitypub_id)
             {
                 return Err(RoostyError::InvalidInput(
                     "remote status activity has an invalid actor or object".to_owned(),
@@ -1657,8 +1676,8 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
-            let direct_conversation_refresh =
-                if let (Some(status), Some(recipients)) = (&status, direct_recipients.as_deref()) {
+            let direct_conversation_refresh = if let Some(status) = &status {
+                if let Some(recipients) = direct_recipients.as_deref() {
                     Some(
                         roosty_db::attach_remote_direct_status_to_conversation(
                             &txn,
@@ -1672,8 +1691,13 @@ async fn process_remote_status_activity(
                         .await?,
                     )
                 } else {
-                    None
-                };
+                    roosty_db::clear_remote_direct_status_recipients(&txn, status.id).await?;
+                    roosty_db::repair_direct_conversation_after_delete(&txn, status.conversation_id)
+                        .await?
+                }
+            } else {
+                None
+            };
             let mut notifications = Vec::new();
             if let Some(status) = &status {
                 for account_id in notification_recipients {
@@ -1731,6 +1755,11 @@ async fn process_remote_status_activity(
                     "remote Delete object is invalid".to_owned(),
                 ));
             }
+            if !same_url_origin(&object_id, &remote_actor.activitypub_id) {
+                return Err(RoostyError::InvalidInput(
+                    "remote Delete object origin does not match signer".to_owned(),
+                ));
+            }
             let txn = state.db.begin().await?;
             let deleted = roosty_db::process_remote_status_delete(
                 &txn,
@@ -1761,6 +1790,17 @@ async fn process_remote_status_activity(
             "unsupported remote status activity".to_owned(),
         )),
     }
+}
+
+/// Return whether two absolute HTTPS identifiers share scheme, host, and effective port.
+fn same_url_origin(left: &str, right: &str) -> bool {
+    let Ok(left) = url::Url::parse(left) else {
+        return false;
+    };
+    let Ok(right) = url::Url::parse(right) else {
+        return false;
+    };
+    left.scheme() == "https" && left.origin() == right.origin()
 }
 
 /// Publish a cached remote Note lifecycle event only to local accounts following its author.
@@ -1890,6 +1930,13 @@ async fn remote_direct_recipients(
         .filter(|tag| tag.r#type == InboundTagType::Mention)
         .filter_map(|tag| tag.href.as_deref())
         .collect::<std::collections::HashSet<_>>();
+    if note
+        .tag
+        .iter()
+        .any(|tag| tag.r#type == InboundTagType::Mention && tag.href.is_none())
+    {
+        return Ok(None);
+    }
     let audience = note.to.iter().chain(&note.cc).collect::<Vec<_>>();
     if audience.is_empty()
         || audience
@@ -2644,6 +2691,7 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
     txn: &sea_orm::DatabaseTransaction,
     status: &roosty_db::LocalStatus,
     kind: StatusActivityKind,
+    previous_remote_recipients: &[roosty_db::RemoteActor],
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled
         || !matches!(
@@ -2669,6 +2717,13 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
     for actor in roosty_db::remote_mentions_for_local_status(txn, status.id).await? {
         if !recipients.iter().any(|recipient| recipient.id == actor.id) {
             recipients.push(actor);
+        }
+    }
+    // An Update carries only the replacement audience, but actors removed by the
+    // edit must receive it as well so they can revoke their cached access.
+    for actor in previous_remote_recipients {
+        if !recipients.iter().any(|recipient| recipient.id == actor.id) {
+            recipients.push(actor.clone());
         }
     }
     for remote in recipients {
@@ -3194,6 +3249,16 @@ async fn note_object(
     } else {
         (to, cc)
     };
+    let attachment = roosty_db::local_media_attachments_for_status(&state.db, status.id)
+        .await?
+        .into_iter()
+        .map(|media| NoteAttachment {
+            r#type: "Document",
+            media_type: media.content_type,
+            url: crate::media::media_url(state, &media.file_path),
+            name: media.description,
+        })
+        .collect();
     Ok(Note {
         context: ACTIVITYSTREAMS_CONTEXT,
         id,
@@ -3204,6 +3269,7 @@ async fn note_object(
         updated: crate::statuses::format_timestamp(status.updated_at),
         in_reply_to,
         tag,
+        attachment,
         to,
         cc,
     })
@@ -3328,7 +3394,7 @@ mod tests {
         InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
         MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
         actor_profile_fields, is_remote_actor_lifecycle_activity, local_actor_type, parse_acct,
-        remote_status_visibility,
+        remote_status_visibility, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -3909,6 +3975,27 @@ mod tests {
         assert_eq!(remote_status_visibility(&note(vec![], vec![])), None);
     }
 
+    #[test]
+    /// Given signed activity identifiers, when origins are compared, then only the signer's
+    /// HTTPS origin is accepted regardless of path.
+    fn status_activity_identifiers_must_share_the_signer_origin() {
+        let actor = "https://remote.example/users/alice";
+
+        assert!(same_url_origin(
+            "https://remote.example/activities/1",
+            actor
+        ));
+        assert!(!same_url_origin(
+            "https://attacker.example/activities/1",
+            actor
+        ));
+        assert!(!same_url_origin(
+            "http://remote.example/activities/1",
+            actor
+        ));
+        assert!(!same_url_origin("not-a-url", actor));
+    }
+
     /// Given public ActivityStreams payloads, when serialized, then their property names use the
     /// ActivityStreams camelCase spelling required by Mastodon.
     #[test]
@@ -3963,6 +4050,7 @@ mod tests {
                 href: "https://example.test/users/bob".to_owned(),
                 name: "@bob".to_owned(),
             }],
+            attachment: Vec::new(),
             to: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
             cc: Vec::new(),
         };

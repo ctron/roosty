@@ -4657,6 +4657,56 @@ pub async fn attach_direct_status_to_conversation(
     Ok(conversation_id)
 }
 
+/// Add newly addressed accounts to an existing direct conversation without changing
+/// established views; the caller subsequently recalculates each account's last status.
+pub async fn sync_edited_direct_status_conversation(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    author_id: AccountId,
+    participant_ids: &[AccountId],
+    remote_participants: &[RemoteConversationParticipant],
+) -> Result<Uuid> {
+    let conversation_id = local_status::Entity::find_by_id(status_id.0)
+        .one(txn)
+        .await?
+        .and_then(|status| status.conversation_id)
+        .ok_or_else(|| RoostyError::InvalidInput("conversation status not found".to_owned()))?;
+    let now = OffsetDateTime::now_utc();
+    let existing = local_conversation_account::Entity::find()
+        .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
+        .all(txn)
+        .await?;
+    let mut account_ids = std::iter::once(author_id)
+        .chain(participant_ids.iter().copied())
+        .collect::<Vec<_>>();
+    account_ids.sort_by_key(|account_id| account_id.0);
+    account_ids.dedup();
+    for account_id in account_ids {
+        if existing
+            .iter()
+            .any(|participant| participant.account_id == account_id.0)
+        {
+            continue;
+        }
+        local_conversation_account::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            cursor_id: Set(Uuid::now_v7()),
+            conversation_id: Set(conversation_id),
+            account_id: Set(account_id.0),
+            unread: Set(account_id != author_id),
+            hidden_at: Set(None),
+            last_status_id: Set(None),
+            last_remote_status_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    upsert_remote_conversation_participants(txn, conversation_id, remote_participants).await?;
+    Ok(conversation_id)
+}
+
 /// Attach a cached direct Note to a conversation visible to its local recipients.
 pub async fn attach_remote_direct_status_to_conversation(
     txn: &DatabaseTransaction,
@@ -4787,6 +4837,22 @@ pub async fn attach_remote_direct_status_to_conversation(
     repair_direct_conversation_after_delete(txn, Some(conversation_id))
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("conversation refresh is missing".to_owned()))
+}
+
+/// Remove cached direct-audience rows when a replacement Note is no longer direct.
+pub async fn clear_remote_direct_status_recipients(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+) -> Result<()> {
+    remote_status_local_recipient::Entity::delete_many()
+        .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    remote_status_remote_recipient::Entity::delete_many()
+        .filter(remote_status_remote_recipient::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    Ok(())
 }
 
 /// Persist remote participants without resolving uncached ActivityPub actors.

@@ -161,8 +161,8 @@ struct StatusInput {
     language: Option<String>,
     #[serde(alias = "inReplyToId")]
     in_reply_to_id: Option<String>,
-    #[serde(default, alias = "mediaIds")]
-    media_ids: Vec<String>,
+    #[serde(alias = "mediaIds")]
+    media_ids: Option<Vec<String>>,
     #[serde(default, alias = "mediaAttributes")]
     media_attributes: Vec<MediaAttributeInput>,
 }
@@ -328,7 +328,7 @@ async fn create_status(
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
     };
-    let media_ids = match parse_media_ids(&input.media_ids) {
+    let media_ids = match parse_media_ids(input.media_ids.as_deref().unwrap_or_default()) {
         Ok(media_ids) => media_ids,
         Err(error) => return bad_request(&error.to_string()),
     };
@@ -481,6 +481,7 @@ async fn create_status(
                 &txn,
                 &status,
                 StatusActivityKind::Create,
+                &[],
             )
             .await
             {
@@ -559,11 +560,13 @@ async fn update_status(
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
     };
-    let media_ids = match parse_media_ids(&input.media_ids) {
-        Ok(media_ids) => media_ids,
-        Err(error) => return bad_request(&error.to_string()),
+    let media_ids = match input.media_ids.as_deref() {
+        Some(values) => match parse_media_ids(values) {
+            Ok(media_ids) => Some(media_ids),
+            Err(error) => return bad_request(&error.to_string()),
+        },
+        None => None,
     };
-    let media_ids = (!input.media_ids.is_empty()).then_some(media_ids);
     let media_attributes = match parse_media_attributes(&input.media_attributes) {
         Ok(attributes) => attributes,
         Err(error) => return bad_request(&error.to_string()),
@@ -612,6 +615,11 @@ async fn update_status(
     } else {
         Vec::new()
     };
+    let previous_remote_recipients =
+        match roosty_db::remote_mentions_for_local_status(&state.db, existing.id).await {
+            Ok(recipients) => recipients,
+            Err(error) => return server_error(error),
+        };
     let txn = match state.db.begin().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
@@ -632,6 +640,11 @@ async fn update_status(
     .await
     {
         Ok(Some(status)) => {
+            if status.visibility == StatusVisibility::Direct
+                && let Err(error) = sync_edited_direct_conversation(&state, &txn, &status).await
+            {
+                return server_error(error);
+            }
             let refresh = match roosty_db::repair_direct_conversation_after_delete(
                 &txn,
                 status.conversation_id,
@@ -646,6 +659,7 @@ async fn update_status(
                 &txn,
                 &status,
                 StatusActivityKind::Update,
+                &previous_remote_recipients,
             )
             .await
             {
@@ -728,6 +742,7 @@ async fn delete_status(
                     &txn,
                     &status,
                     StatusActivityKind::Delete,
+                    &[],
                 )
                 .await
                 {
@@ -1225,6 +1240,40 @@ async fn attach_direct_conversation(
     .await?;
     status.conversation_id = Some(conversation_id);
 
+    Ok(())
+}
+
+/// Add recipients introduced by a direct-status edit without promoting an historical edit
+/// over a newer visible status in any existing account's conversation view.
+async fn sync_edited_direct_conversation(
+    state: &AppState,
+    txn: &DatabaseTransaction,
+    status: &roosty_db::LocalStatus,
+) -> Result<(), RoostyError> {
+    let mut participant_ids = local_text_mentions(state, &status.content)
+        .await?
+        .into_iter()
+        .map(|account| account.id)
+        .collect::<Vec<_>>();
+    participant_ids.sort_by_key(|account_id| account_id.0);
+    participant_ids.dedup();
+    let remote_participants = roosty_db::remote_mentions_for_local_status(txn, status.id)
+        .await?
+        .into_iter()
+        .map(|actor| RemoteConversationParticipant {
+            activitypub_id: actor.activitypub_id,
+            remote_actor_id: Some(actor.id),
+            mention_name: Some(format!("@{}@{}", actor.username, actor.domain)),
+        })
+        .collect::<Vec<_>>();
+    roosty_db::sync_edited_direct_status_conversation(
+        txn,
+        status.id,
+        status.account_id,
+        &participant_ids,
+        &remote_participants,
+    )
+    .await?;
     Ok(())
 }
 
@@ -3725,6 +3774,99 @@ mod tests {
         .await;
         assert_eq!(bob_conversations, serde_json::json!([]));
         assert_eq!(alice_conversations.as_array().unwrap().len(), 1);
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{direct_id}"), &bob_token)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a direct status, when its text and mentions are edited, then visibility and
+    /// account-specific conversation identity stay fixed while access follows the new audience.
+    async fn direct_status_edits_replace_the_audience(context: &mut StatusContext) {
+        let alice_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("bob", "bob-edit-conversation@example.com")
+            .await;
+        let charlie_token = context
+            .access_token_for("charlie", "charlie-edit-conversation@example.com")
+            .await;
+        let direct = context
+            .create_status(&alice_token, "hello @bob", Some("direct"), None)
+            .await;
+        let direct_id = direct["id"].as_str().unwrap();
+        let original_conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &alice_token)
+                .await,
+        )
+        .await;
+        let original_conversation_id = original_conversations[0]["id"].clone();
+
+        let content_edit = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{direct_id}"),
+                &alice_token,
+                serde_json::json!({"status": "edited hello @bob"}),
+            )
+            .await;
+        assert_eq!(content_edit.status(), StatusCode::OK);
+        assert_eq!(json_body(content_edit).await["visibility"], "direct");
+        let conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &alice_token)
+                .await,
+        )
+        .await;
+        assert_eq!(conversations[0]["id"], original_conversation_id);
+        assert_eq!(conversations[0]["accounts"][0]["username"], "bob");
+
+        let audience_edit = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{direct_id}"),
+                &alice_token,
+                serde_json::json!({"status": "hello @charlie"}),
+            )
+            .await;
+        assert_eq!(audience_edit.status(), StatusCode::OK);
+        assert_eq!(json_body(audience_edit).await["visibility"], "direct");
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{direct_id}"), &bob_token)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{direct_id}"), &charlie_token)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let conversations = json_body(
+            context
+                .authenticated_get("/api/v1/conversations", &alice_token)
+                .await,
+        )
+        .await;
+        assert_eq!(conversations[0]["id"], original_conversation_id);
+        assert_eq!(conversations[0]["accounts"][0]["username"], "charlie");
+        assert_eq!(
+            json_body(
+                context
+                    .authenticated_get("/api/v1/conversations", &bob_token)
+                    .await,
+            )
+            .await,
+            serde_json::json!([])
+        );
     }
 
     #[test_context(StatusContext)]
@@ -4236,6 +4378,77 @@ mod tests {
         assert_eq!(update["media_attachments"][0]["description"], "Alt test");
         assert_eq!(update["media_attachments"][0]["meta"]["focus"]["x"], 0.1);
         assert_eq!(update["media_attachments"][0]["meta"]["focus"]["y"], -0.2);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an owned status with media, omitting `media_ids` retains its attachments while an
+    /// explicitly empty collection detaches every attachment.
+    async fn status_update_distinguishes_omitted_and_empty_media_ids(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let image = encoded_test_image(ImageFormat::Png);
+        let upload = context
+            .authenticated_multipart(
+                "/api/v2/media",
+                &token,
+                &[MultipartPart::file(
+                    "file",
+                    "attachment.png",
+                    "image/png",
+                    &image,
+                )],
+            )
+            .await;
+        let upload = json_body(upload).await;
+        let media_id = upload["id"].as_str().unwrap();
+        let status = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &token,
+                serde_json::json!({
+                    "status": "with attachment",
+                    "media_ids": [media_id]
+                }),
+            )
+            .await;
+        let status = json_body(status).await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let omitted = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &token,
+                serde_json::json!({"status": "attachment retained"}),
+            )
+            .await;
+        assert_eq!(omitted.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(omitted).await["media_attachments"][0]["id"],
+            media_id
+        );
+
+        let empty = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &token,
+                serde_json::json!({"media_ids": []}),
+            )
+            .await;
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(empty).await["media_attachments"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/media/{media_id}"), &token)
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[test_context(StatusContext)]
