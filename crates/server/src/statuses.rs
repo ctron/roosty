@@ -2904,7 +2904,8 @@ fn push_escaped_html_with_breaks(output: &mut String, value: &str) {
     }
 }
 
-fn escape_html(value: &str) -> String {
+/// Escape untrusted plain text for use in an HTML-valued Mastodon or ActivityPub field.
+pub(crate) fn escape_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {

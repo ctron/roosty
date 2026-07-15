@@ -345,6 +345,7 @@ struct Actor {
     following: String,
     manually_approves_followers: bool,
     published: String,
+    attachment: Vec<ActorProfileField>,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<ActorImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,6 +364,19 @@ struct ActorImage {
 #[derive(Serialize)]
 enum ActorImageType {
     Image,
+}
+
+/// ActivityStreams `PropertyValue` metadata published on local actor profiles.
+#[derive(Serialize)]
+struct ActorProfileField {
+    r#type: ActorProfileFieldType,
+    name: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+enum ActorProfileFieldType {
+    PropertyValue,
 }
 
 #[derive(Serialize)]
@@ -567,6 +581,7 @@ fn actor_document(
         following: format!("{id}/following"),
         manually_approves_followers: account.locked,
         published: crate::statuses::format_timestamp(account.created_at),
+        attachment: actor_profile_fields(&account.profile_fields),
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
             url: crate::media::media_url(state, path),
@@ -581,6 +596,22 @@ fn actor_document(
             public_key_pem,
         },
     }
+}
+
+/// Convert persisted Mastodon profile fields to ActivityStreams `PropertyValue` attachments.
+fn actor_profile_fields(profile_fields: &JsonValue) -> Vec<ActorProfileField> {
+    profile_fields
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|field| {
+            Some(ActorProfileField {
+                r#type: ActorProfileFieldType::PropertyValue,
+                name: field.get("name")?.as_str()?.to_owned(),
+                value: crate::statuses::escape_html(field.get("value")?.as_str()?),
+            })
+        })
+        .collect()
 }
 
 /// Serve the local actor's public outbox as an ordered ActivityStreams collection.
@@ -2769,8 +2800,8 @@ mod tests {
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
         InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
-        MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, parse_acct,
-        remote_status_visibility,
+        MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey,
+        actor_profile_fields, parse_acct, remote_status_visibility,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -3339,6 +3370,9 @@ mod tests {
             following: "https://example.test/users/alice/following".to_owned(),
             manually_approves_followers: false,
             published: "2026-07-13T00:00:00.000Z".to_owned(),
+            attachment: actor_profile_fields(&serde_json::json!([
+                { "name": "Website", "value": "https://example.test/?a=<b>" }
+            ])),
             icon: Some(ActorImage {
                 r#type: ActorImageType::Image,
                 url: "https://example.test/media_attachments/files/accounts/alice-avatar.png"
@@ -3393,6 +3427,12 @@ mod tests {
 
         assert_eq!(actor["preferredUsername"], "alice");
         assert_eq!(actor["published"], "2026-07-13T00:00:00.000Z");
+        assert_eq!(actor["attachment"][0]["type"], "PropertyValue");
+        assert_eq!(actor["attachment"][0]["name"], "Website");
+        assert_eq!(
+            actor["attachment"][0]["value"],
+            "https://example.test/?a=&lt;b&gt;"
+        );
         assert!(actor.get("preferred_username").is_none());
         assert_eq!(actor["icon"]["type"], "Image");
         assert_eq!(
