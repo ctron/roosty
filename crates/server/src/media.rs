@@ -1019,6 +1019,11 @@ fn content_type_from_path(path: &Path) -> &'static str {
         .unwrap_or("application/octet-stream")
 }
 
+/// Infer the ActivityStreams media type for a stored local media path.
+pub(crate) fn media_content_type(relative_path: &str) -> &'static str {
+    content_type_from_path(Path::new(relative_path))
+}
+
 /// Resolve a stored relative media path under the configured media root.
 fn media_path(state: &AppState, relative_path: &str) -> PathBuf {
     Path::new(&state.config.media_root).join(relative_path)

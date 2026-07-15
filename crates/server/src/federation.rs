@@ -384,6 +384,8 @@ struct ActorExtensionsContext {
 #[derive(Serialize)]
 struct ActorImage {
     r#type: ActorImageType,
+    #[serde(rename = "mediaType")]
+    media_type: String,
     url: String,
 }
 
@@ -613,10 +615,12 @@ fn actor_document(
         attachment: actor_profile_fields(&account.profile_fields),
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
+            media_type: crate::media::media_content_type(path).to_owned(),
             url: crate::media::media_url(state, path),
         }),
         image: account.header_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
+            media_type: crate::media::media_content_type(path).to_owned(),
             url: crate::media::media_url(state, path),
         }),
         public_key: PublicKey {
@@ -3233,10 +3237,12 @@ mod tests {
             activity["object"]["icon"]["url"],
             "https://alpha.test/media_attachments/files/accounts/avatar.png"
         );
+        assert_eq!(activity["object"]["icon"]["mediaType"], "image/png");
         assert_eq!(
             activity["object"]["image"]["url"],
             "https://alpha.test/media_attachments/files/accounts/header.png"
         );
+        assert_eq!(activity["object"]["image"]["mediaType"], "image/png");
         assert!(
             roosty_db::mark_job_completed(&context.alpha.db, &job)
                 .await
@@ -3441,11 +3447,13 @@ mod tests {
             ])),
             icon: Some(ActorImage {
                 r#type: ActorImageType::Image,
+                media_type: "image/png".to_owned(),
                 url: "https://example.test/media_attachments/files/accounts/alice-avatar.png"
                     .to_owned(),
             }),
             image: Some(ActorImage {
                 r#type: ActorImageType::Image,
+                media_type: "image/png".to_owned(),
                 url: "https://example.test/media_attachments/files/accounts/alice-header.png"
                     .to_owned(),
             }),
