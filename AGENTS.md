@@ -64,3 +64,11 @@ Keep this as the default verification command for changes in this repository.
 ## Git
 
 - Use Conventional Commits for commit messages.
+
+## Social Announcements
+
+- The `toot` CLI is installed and can publish Mastodon posts for this project.
+- When finishing a notable user-facing feature or preparing a release, proactively offer a concise announcement draft
+  that describes the benefit and includes the relevant release or project link when available.
+- Publishing is an external side effect: get approval for the exact text before running `toot post "..."`. Use `--using`
+  when a specific account is needed, and pair every `--media` attachment with an accessibility `--description`.

@@ -51,7 +51,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟢 | `POST /api/v1/apps` | OAuth app registration. |
-| 🟢 | `GET/POST /oauth/authorize` | Local authorization flow. |
+| 🟢 | `GET/POST /oauth/authorize` | Local authorization flow, including the trailing-slash form and out-of-band code display used by CLI clients such as toot. |
 | 🟢 | `POST /oauth/token` | Authorization code and Elk-compatible token flow. |
 | 🟢 | `POST /oauth/revoke` | Bearer token revocation. |
 

@@ -30,6 +30,7 @@ use crate::{http::AppState, password};
 type HmacSha256 = Hmac<Sha256>;
 
 const SESSION_COOKIE: &str = "roosty_session";
+const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 
 /// Authenticated local account extracted from an OAuth bearer token.
 pub(crate) struct AuthenticatedAccount(pub roosty_db::LocalAccount);
@@ -124,6 +125,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/apps", post(register_app))
         .route("/oauth/authorize", get(authorize_form).post(authorize))
+        .route("/oauth/authorize/", get(authorize_form).post(authorize))
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke))
         .route(
@@ -448,6 +450,25 @@ struct AuthorizeTemplate<'a> {
     code_challenge_method: &'a str,
 }
 
+#[derive(Template)]
+#[template(
+    source = r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Authorization code</title></head>
+<body>
+<main>
+<h1>Authorization complete</h1>
+<p>Copy this authorization code into your application:</p>
+<code id="authorization-code">{{ code }}</code>
+</main>
+</body>
+</html>"#,
+    ext = "html"
+)]
+struct AuthorizationCodeTemplate<'a> {
+    code: &'a str,
+}
+
 async fn authorize_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -545,6 +566,13 @@ async fn authorize(
         Ok(code) => code,
         Err(error) => return server_error(error),
     };
+
+    if params.redirect_uri == OOB_REDIRECT_URI {
+        return match (AuthorizationCodeTemplate { code: &code }).render() {
+            Ok(html) => Html(html).into_response(),
+            Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
+        };
+    }
 
     let separator = if params.redirect_uri.contains('?') {
         '&'
@@ -1564,6 +1592,7 @@ mod tests {
     use crate::{config::Config, http::AppState, password};
 
     const REDIRECT_URI: &str = "https://localhost:4001/oauth";
+    const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
     const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
@@ -1650,6 +1679,143 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = header_value(&response, LOCATION);
         assert!(location.starts_with("https://localhost:4000/login?next="));
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given toot's trailing-slash OOB request, an anonymous user is sent through login with the grant intact.
+    async fn toot_authorize_path_redirects_anonymous_users_to_login(context: &mut EndpointContext) {
+        let app = context.register_oob_app().await;
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri(oob_authorize_uri(&app.client_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = Url::parse(&header_value(&response, LOCATION)).unwrap();
+        let next = location
+            .query_pairs()
+            .find_map(|(name, value)| (name == "next").then(|| value.into_owned()))
+            .unwrap();
+        assert!(next.starts_with("/oauth/authorize?"));
+        let next = Url::parse(&format!("https://localhost{next}")).unwrap();
+        assert_eq!(
+            next.query_pairs()
+                .find(|(name, _)| name == "redirect_uri")
+                .map(|(_, value)| value),
+            Some(OOB_REDIRECT_URI.into())
+        );
+        assert_eq!(
+            next.query_pairs()
+                .find(|(name, _)| name == "scope")
+                .map(|(_, value)| value),
+            Some("read write follow".into())
+        );
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given toot's OOB OAuth flow, approval displays a code that can authenticate and create a status.
+    async fn toot_oob_code_flow_can_create_status(context: &mut EndpointContext) {
+        let app = context.register_oob_app().await;
+        let cookie = context.login().await;
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri(oob_authorize_uri(&app.client_id))
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("Authorize toot"));
+
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("response_type", "code"),
+                ("client_id", app.client_id.as_str()),
+                ("redirect_uri", OOB_REDIRECT_URI),
+                ("scope", "read write follow"),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize/")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(LOCATION).is_none());
+        let html = body_text(response).await;
+        let code = html
+            .split_once("<code id=\"authorization-code\">")
+            .and_then(|(_, html)| html.split_once("</code>"))
+            .map(|(code, _)| code)
+            .unwrap();
+
+        let response = context
+            .form(
+                "POST",
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &app.client_id),
+                    ("client_secret", &app.client_secret),
+                    ("redirect_uri", OOB_REDIRECT_URI),
+                    ("code", code),
+                ],
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = json_body(response).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["username"], "admin");
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/statuses")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", "toot-oauth-regression")
+                    .body(Body::from(r#"{"status":"OAuth CLI test"}"#))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            json_body(response).await["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("OAuth CLI test"))
+        );
     }
 
     #[test_context(EndpointContext)]
@@ -2629,6 +2795,28 @@ mod tests {
             }
         }
 
+        async fn register_oob_app(&self) -> RegisteredApp {
+            let response = self
+                .json(
+                    "POST",
+                    "/api/v1/apps",
+                    serde_json::json!({
+                        "client_name": "toot",
+                        "redirect_uris": OOB_REDIRECT_URI,
+                        "scopes": "read write follow",
+                        "website": "https://toot.bezdomni.net",
+                    }),
+                )
+                .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            RegisteredApp {
+                client_id: body["client_id"].as_str().unwrap().to_owned(),
+                client_secret: body["client_secret"].as_str().unwrap().to_owned(),
+            }
+        }
+
         async fn login(&self) -> String {
             let response = self
                 .form(
@@ -2783,6 +2971,19 @@ mod tests {
         format!("/oauth/authorize?{query}")
     }
 
+    fn oob_authorize_uri(client_id: &str) -> String {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("response_type", "code"),
+                ("client_id", client_id),
+                ("redirect_uri", OOB_REDIRECT_URI),
+                ("scope", "read write follow"),
+            ])
+            .finish();
+
+        format!("/oauth/authorize/?{query}")
+    }
+
     fn header_value(response: &Response<Body>, name: axum::http::header::HeaderName) -> String {
         response
             .headers()
@@ -2804,6 +3005,11 @@ mod tests {
     async fn json_body(response: Response<Body>) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn body_text(response: Response<Body>) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
     }
 
     fn unique_name() -> String {
