@@ -25,7 +25,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | Inbox | Signed inbox handling supports follows and public/unlisted status lifecycle activities. |
+| 🟢 | Inbox integrity | Every supported durable signed activity requires an absolute HTTPS ID at the verified actor origin. Canonical-JSON SHA-256 replay records make exact deliveries idempotent and ignore reused IDs with a different signer or payload. Transient ID-less activities are intentionally unsupported. |
 | 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
 | 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. |
 | 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; profile creation dates use actor `published` when supplied and fall back to first-seen time. Discovered remote avatar/header URLs are cached through a same-origin proxy, eagerly for followed accounts and lazily on request for other actors. Profile images must be supported, decodable raster images and refresh stale-while-serving. Remote status images are validated, cached with PNG previews and Mastodon metadata, and refreshed stale-while-serving; video/audio remain proxy-only. Signed Actor `Update`, `Delete`, and reciprocal `Move` activities refresh, tombstone, or redirect cached profiles; moves do not migrate follows. |
@@ -150,7 +150,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
 | 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs policy-controlled WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections with proxied actor avatar/header images. Search integration and refresh jobs are missing. |
 | 🟡 | Outbound public status lifecycle | Public and unlisted local status creates, edits, and deletes are queued as signed ActivityPub deliveries to accepted remote followers. |
-| 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, reply references, and author ownership checks. Their cache changes and inbox-idempotency markers commit atomically. Cached Notes from accepted remote follows appear in home timelines and are streamed to those followers; media and interactions remain missing. |
+| 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, reply references, and author ownership checks. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
 | 🔴 | Remote timeline fan-out | Remote home-timeline delivery, repair, and remote visibility semantics are missing. |
 | 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed for public/unlisted statuses. Remote mutes and blocks remain missing. |
@@ -163,7 +163,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add signed inbound Follow, Undo, Accept, Reject, and locked-account follow-request processing.
 - [ ] Add signed outbound Follow, Undo, Accept, Reject, Create, Update, and Delete delivery with retries.
 - [ ] Add remote follower home-timeline fan-out, repair jobs, and visibility semantics.
-- [ ] Add remote deletes, recipient notifications, mutes, and blocks.
+- [ ] Add remote mutes, blocks, and broader recipient notification federation. Signed remote delete repair is implemented.
 - [ ] Add federated direct-message media fetching, account migration, and domain-policy moderation.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote hashtag support.

@@ -8,6 +8,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub activity_id: String,
     pub remote_actor_id: Uuid,
+    pub payload_digest: Option<Vec<u8>>,
+    pub activity_type: Option<String>,
+    pub outcome: Option<String>,
     pub processed_at: OffsetDateTime,
 }
 

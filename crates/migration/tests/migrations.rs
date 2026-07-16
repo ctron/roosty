@@ -124,6 +124,23 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_account_mute", "notifications").await);
     assert!(column_exists(database.connection(), "local_account_mute", "expires_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "profile_created_at").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "processed_inbox_activity",
+            "payload_digest"
+        )
+        .await
+    );
+    assert!(
+        column_exists(
+            database.connection(),
+            "processed_inbox_activity",
+            "activity_type"
+        )
+        .await
+    );
+    assert!(column_exists(database.connection(), "processed_inbox_activity", "outcome").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "id").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "account_id").await);
     assert!(column_exists(database.connection(), "local_status_reblog", "status_id").await);
@@ -210,6 +227,61 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_timeline_marker").await);
     assert!(!table_exists(database.connection(), "local_account_block").await);
     assert!(!table_exists(database.connection(), "local_account_mute").await);
+}
+
+/// A legacy ID-only replay marker survives the payload-aware ledger upgrade.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn replay_ledger_upgrade_preserves_legacy_rows(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(45)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000001',
+                'https://remote.test/users/alice', 'alice', 'remote.test',
+                'https://remote.test/inbox',
+                'https://remote.test/users/alice#main-key', 'key', now() + interval '1 day'
+            );
+            INSERT INTO processed_inbox_activity (activity_id, remote_actor_id)
+            VALUES (
+                'https://remote.test/activities/legacy',
+                '00000000-0000-0000-0000-000000000001'
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), None).await.unwrap();
+    let row = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT payload_digest, activity_type, outcome FROM processed_inbox_activity WHERE activity_id = 'https://remote.test/activities/legacy'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.try_get::<Option<Vec<u8>>>("", "payload_digest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        row.try_get::<Option<String>>("", "activity_type")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        row.try_get::<Option<String>>("", "outcome")
+            .unwrap()
+            .is_none()
+    );
 }
 
 struct EmbeddedDatabase {

@@ -47,6 +47,7 @@ mod m20260701_000042_create_local_conversation_remote_participant;
 mod m20260701_000043_add_follow_request_notifications;
 mod m20260701_000044_add_direct_status_recipients;
 mod m20260701_000045_constrain_status_visibility;
+mod m20260701_000046_harden_inbox_replay;
 
 pub struct Migrator;
 
@@ -99,6 +100,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000043_add_follow_request_notifications::Migration),
             Box::new(m20260701_000044_add_direct_status_recipients::Migration),
             Box::new(m20260701_000045_constrain_status_visibility::Migration),
+            Box::new(m20260701_000046_harden_inbox_replay::Migration),
         ]
     }
 }

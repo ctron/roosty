@@ -1,5 +1,7 @@
 //! ActivityPub discovery and public-object endpoints for local actors.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub(crate) mod discovery;
 #[cfg(test)]
 mod test_transport;
@@ -37,6 +39,12 @@ const ACTIVITYSTREAMS_CONTENT_TYPE: &str = "application/activity+json";
 const JRD_CONTENT_TYPE: &str = "application/jrd+json";
 const ACTIVITYSTREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
+static INBOX_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static INBOX_DUPLICATE: AtomicU64 = AtomicU64::new(0);
+static INBOX_CONFLICT: AtomicU64 = AtomicU64::new(0);
+static INBOX_INVALID_ID: AtomicU64 = AtomicU64::new(0);
+static STATUS_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
+static ACTOR_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
 
 /// ActivityStreams actor types accepted and emitted by Roosty.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -949,21 +957,75 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     if !verify_legacy_signature(&parts, &body, &remote_actor).unwrap_or(false) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let activity_type = activity.get("type").and_then(JsonValue::as_str);
+    let supported = matches!(
+        activity_type,
+        Some(
+            "Follow"
+                | "Accept"
+                | "Reject"
+                | "Create"
+                | "Update"
+                | "Delete"
+                | "Like"
+                | "Announce"
+                | "Undo"
+                | "Move"
+        )
+    );
+    if !supported {
+        return StatusCode::ACCEPTED.into_response();
+    }
     let Some(activity_id) = activity
         .get("id")
         .and_then(JsonValue::as_str)
         .map(str::to_owned)
     else {
+        INBOX_INVALID_ID.fetch_add(1, Ordering::Relaxed);
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if !activity_id.starts_with("https://") {
+    if !same_url_origin(&activity_id, &remote_actor.activitypub_id) {
+        INBOX_INVALID_ID.fetch_add(1, Ordering::Relaxed);
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let digest = match canonical_activity_digest(&activity) {
+        Ok(digest) => digest,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let existing = roosty_db::classify_inbox_activity(
+        &state.db,
+        roosty_db::InboxActivityMetadata {
+            activity_id: &activity_id,
+            remote_actor_id: remote_actor.id,
+            payload_digest: &digest,
+            activity_type: activity_type.unwrap_or_default(),
+            outcome: "accepted",
+        },
+    )
+    .await;
+    match existing {
+        Ok(Some(roosty_db::InboxReplayResult::Duplicate)) => {
+            INBOX_DUPLICATE.fetch_add(1, Ordering::Relaxed);
+            return StatusCode::ACCEPTED.into_response();
+        }
+        Ok(Some(roosty_db::InboxReplayResult::Conflict)) => {
+            INBOX_CONFLICT.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(activity_id, remote_actor_id = %remote_actor.id.0, "ignored conflicting inbox activity replay");
+            return StatusCode::ACCEPTED.into_response();
+        }
+        Ok(Some(roosty_db::InboxReplayResult::New) | None) => {}
+        Err(error) => return internal_error(error),
+    }
     if is_remote_actor_lifecycle_activity(&activity, &remote_actor.activitypub_id) {
-        return match process_remote_actor_lifecycle(state, &activity_id, &activity, &remote_actor)
-            .await
-        {
-            Ok(()) => StatusCode::ACCEPTED.into_response(),
+        return match process_remote_actor_lifecycle(state, &activity, &remote_actor).await {
+            Ok(repair) => {
+                if let Some(repair) = repair
+                    && let Err(error) = publish_delete_repair(state, repair).await
+                {
+                    tracing::warn!(%error, activity_id, "could not stream remote actor deletion");
+                }
+                StatusCode::ACCEPTED.into_response()
+            }
             Err(error) => {
                 tracing::warn!(%error, activity_id, "rejected remote actor lifecycle activity");
                 StatusCode::ACCEPTED.into_response()
@@ -1003,13 +1065,30 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         else {
             return StatusCode::BAD_REQUEST.into_response();
         };
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(error) => return internal_error(error),
+        };
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if !is_new {
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
         let result = if activity.get("type").and_then(JsonValue::as_str) == Some("Accept") {
-            roosty_db::accept_remote_following(&state.db, remote_actor.id, object_id).await
+            roosty_db::accept_remote_following(&txn, remote_actor.id, object_id).await
         } else {
-            roosty_db::reject_remote_following(&state.db, remote_actor.id, object_id).await
+            roosty_db::reject_remote_following(&txn, remote_actor.id, object_id).await
         };
         return match result {
             Ok(accepted) => {
+                if let Err(error) = txn.commit().await {
+                    return internal_error(error);
+                }
                 if accepted
                     && activity.get("type").and_then(JsonValue::as_str) == Some("Accept")
                     && let Err(error) =
@@ -1029,14 +1108,14 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         };
         if like.actor != remote_actor.activitypub_id || !like.object.starts_with("https://") {
-            return StatusCode::ACCEPTED.into_response();
+            return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         }
         let Some(status_id) = local_status_id_from_url(state, &like.object)
             .await
             .ok()
             .flatten()
         else {
-            return StatusCode::ACCEPTED.into_response();
+            return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         };
         let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
             Ok(Some(status))
@@ -1047,13 +1126,23 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             {
                 status
             }
-            Ok(_) => return StatusCode::ACCEPTED.into_response(),
+            Ok(_) => return finish_ignored_inbox_activity(state, &activity, &remote_actor).await,
             Err(error) => return internal_error(error),
         };
         let txn = match state.db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if !is_new {
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
         match roosty_db::process_remote_like(
             &txn,
             remote_actor.id,
@@ -1089,7 +1178,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         };
         if announce.actor != remote_actor.activitypub_id || !announce.object.starts_with("https://")
         {
-            return StatusCode::ACCEPTED.into_response();
+            return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         }
         let target = match local_status_id_from_url(state, &announce.object).await {
             Ok(Some(status_id)) => {
@@ -1102,7 +1191,10 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     {
                         roosty_db::RemoteStatusReblogTarget::Local(status.id)
                     }
-                    Ok(_) => return StatusCode::ACCEPTED.into_response(),
+                    Ok(_) => {
+                        return finish_ignored_inbox_activity(state, &activity, &remote_actor)
+                            .await;
+                    }
                     Err(error) => return internal_error(error),
                 }
             }
@@ -1118,7 +1210,10 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     {
                         roosty_db::RemoteStatusReblogTarget::Remote(status.id)
                     }
-                    Ok(_) => return StatusCode::ACCEPTED.into_response(),
+                    Ok(_) => {
+                        return finish_ignored_inbox_activity(state, &activity, &remote_actor)
+                            .await;
+                    }
                     Err(error) => return internal_error(error),
                 }
             }
@@ -1128,6 +1223,16 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if !is_new {
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
         let created = match roosty_db::reblog_status_by_remote_actor(
             &txn,
             remote_actor.id,
@@ -1162,11 +1267,6 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         } else {
             None
         };
-        if let Err(error) =
-            roosty_db::record_processed_inbox_activity(&txn, &activity_id, remote_actor.id).await
-        {
-            return internal_error(error);
-        }
         if let Err(error) = txn.commit().await {
             return internal_error(error);
         }
@@ -1198,14 +1298,17 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
-        match roosty_db::process_remote_undo_reblog(
-            &txn,
-            remote_actor.id,
-            &activity_id,
-            &original_id,
-        )
-        .await
-        {
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if !is_new {
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
+        match roosty_db::process_remote_undo_reblog(&txn, remote_actor.id, &original_id).await {
             Ok(Some(reblog)) => {
                 if let Err(error) = txn.commit().await {
                     return internal_error(error);
@@ -1233,9 +1336,17 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
-        match roosty_db::process_remote_undo_like(&txn, remote_actor.id, &activity_id, &original_id)
-            .await
-        {
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if !is_new {
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
+        match roosty_db::process_remote_undo_like(&txn, remote_actor.id, &original_id).await {
             Ok(true) | Ok(false) => {
                 if let Err(error) = txn.commit().await {
                     return internal_error(error);
@@ -1263,14 +1374,17 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
-        match roosty_db::process_remote_undo_follow(
-            &txn,
-            remote_actor.id,
-            &activity_id,
-            &original_id,
-        )
-        .await
-        {
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if !is_new {
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
+        match roosty_db::process_remote_undo_follow(&txn, remote_actor.id, &original_id).await {
             Ok(_) => match txn.commit().await {
                 Ok(()) => {}
                 Err(error) => return internal_error(error),
@@ -1292,11 +1406,11 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         return StatusCode::BAD_REQUEST.into_response();
     };
     if target_url != actor_url(state, username) {
-        return StatusCode::ACCEPTED.into_response();
+        return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
     }
     let local_account = match roosty_db::find_local_account_by_username(&state.db, username).await {
         Ok(Some(account)) => account,
-        Ok(None) => return StatusCode::ACCEPTED.into_response(),
+        Ok(None) => return finish_ignored_inbox_activity(state, &activity, &remote_actor).await,
         Err(error) => return internal_error(error),
     };
     let follow_state = if local_account.locked {
@@ -1308,6 +1422,16 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         Ok(txn) => txn,
         Err(error) => return internal_error(error),
     };
+    let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+        Ok(is_new) => is_new,
+        Err(error) => return internal_error(error),
+    };
+    if !is_new {
+        return match txn.commit().await {
+            Ok(()) => StatusCode::ACCEPTED.into_response(),
+            Err(error) => internal_error(error),
+        };
+    }
     let persisted = if matches!(follow_state, InboundFollowState::Accepted) {
         let payload = match serde_json::to_value(FollowResponseDelivery {
             local_account_id: local_account.id,
@@ -1393,6 +1517,112 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     }
 }
 
+/// Hash compact canonical JSON with recursively sorted object keys.
+fn canonical_activity_digest(activity: &JsonValue) -> Result<[u8; 32], RoostyError> {
+    fn canonicalize(value: &JsonValue) -> JsonValue {
+        match value {
+            JsonValue::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                JsonValue::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), canonicalize(value)))
+                        .collect(),
+                )
+            }
+            JsonValue::Array(values) => JsonValue::Array(values.iter().map(canonicalize).collect()),
+            _ => value.clone(),
+        }
+    }
+
+    let bytes = serde_json::to_vec(&canonicalize(activity))
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+async fn register_inbox_replay(
+    txn: &sea_orm::DatabaseTransaction,
+    activity: &JsonValue,
+    remote_actor: &roosty_db::RemoteActor,
+    outcome: &str,
+) -> Result<roosty_db::InboxReplayResult, RoostyError> {
+    let activity_id = activity
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| RoostyError::InvalidInput("inbox activity ID is missing".to_owned()))?;
+    let activity_type = activity
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| RoostyError::InvalidInput("inbox activity type is missing".to_owned()))?;
+    let digest = canonical_activity_digest(activity)?;
+    roosty_db::register_inbox_activity(
+        txn,
+        roosty_db::InboxActivityMetadata {
+            activity_id,
+            remote_actor_id: remote_actor.id,
+            payload_digest: &digest,
+            activity_type,
+            outcome,
+        },
+    )
+    .await
+}
+
+async fn is_new_inbox_activity(
+    txn: &sea_orm::DatabaseTransaction,
+    activity: &JsonValue,
+    remote_actor: &roosty_db::RemoteActor,
+) -> Result<bool, RoostyError> {
+    match register_inbox_replay(txn, activity, remote_actor, "accepted").await? {
+        roosty_db::InboxReplayResult::New => {
+            INBOX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        roosty_db::InboxReplayResult::Duplicate => {
+            INBOX_DUPLICATE.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
+        }
+        roosty_db::InboxReplayResult::Conflict => {
+            INBOX_CONFLICT.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                activity_id = activity.get("id").and_then(JsonValue::as_str),
+                remote_actor_id = %remote_actor.id.0,
+                "ignored conflicting inbox activity replay"
+            );
+            Ok(false)
+        }
+    }
+}
+
+async fn finish_ignored_inbox_activity(
+    state: &AppState,
+    activity: &JsonValue,
+    remote_actor: &roosty_db::RemoteActor,
+) -> Response {
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return internal_error(error),
+    };
+    let result = register_inbox_replay(&txn, activity, remote_actor, "ignored").await;
+    match result {
+        Ok(roosty_db::InboxReplayResult::New) => {
+            INBOX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(roosty_db::InboxReplayResult::Duplicate) => {
+            INBOX_DUPLICATE.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(roosty_db::InboxReplayResult::Conflict) => {
+            INBOX_CONFLICT.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => return internal_error(error),
+    }
+    match txn.commit().await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 /// Identify actor lifecycle activities before the similarly named Note handlers.
 fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> bool {
     match activity.get("type").and_then(JsonValue::as_str) {
@@ -1429,10 +1659,9 @@ fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> b
 /// Process a verified remote actor refresh, tombstone, or Move activity.
 async fn process_remote_actor_lifecycle(
     state: &AppState,
-    activity_id: &str,
     activity: &JsonValue,
     remote_actor: &roosty_db::RemoteActor,
-) -> Result<(), RoostyError> {
+) -> Result<Option<roosty_db::RemoteDeleteRepair>, RoostyError> {
     match activity.get("type").and_then(JsonValue::as_str) {
         Some("Update") => {
             let object_id = activity
@@ -1450,11 +1679,21 @@ async fn process_remote_actor_lifecycle(
                     "remote actor Update does not match signer".to_owned(),
                 ));
             }
-            let refreshed = discovery::refresh_remote_actor_by_id(state, object_id).await?;
             let txn = state.db.begin().await?;
-            roosty_db::record_processed_inbox_activity(&txn, activity_id, refreshed.id).await?;
+            if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
+                txn.commit().await?;
+                return Ok(None);
+            }
+            let refreshed =
+                discovery::refresh_remote_actor_by_id_in_transaction(state, object_id, &txn)
+                    .await?;
             txn.commit().await?;
-            Ok(())
+            if let Err(error) =
+                crate::media::enqueue_remote_profile_media_fetches(state, refreshed.id).await
+            {
+                tracing::warn!(%error, remote_actor_id = %refreshed.id.0, "could not queue refreshed profile media");
+            }
+            Ok(None)
         }
         Some("Delete") => {
             let delete: InboundDeleteActivity =
@@ -1472,9 +1711,16 @@ async fn process_remote_actor_lifecycle(
                 ));
             }
             let txn = state.db.begin().await?;
-            roosty_db::process_remote_actor_delete(&txn, activity_id, remote_actor.id).await?;
+            if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
+                txn.commit().await?;
+                return Ok(None);
+            }
+            let repair = roosty_db::process_remote_actor_delete(&txn, remote_actor.id).await?;
             txn.commit().await?;
-            Ok(())
+            if repair.is_some() {
+                ACTOR_DELETE_REPAIR.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(repair)
         }
         Some("Move") => {
             let movement: InboundMoveActivity =
@@ -1492,10 +1738,13 @@ async fn process_remote_actor_lifecycle(
             }
             let target = discovery::resolve_remote_move_target(state, &target, &source).await?;
             let txn = state.db.begin().await?;
-            roosty_db::process_remote_actor_move(&txn, activity_id, remote_actor.id, target.id)
-                .await?;
+            if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
+                txn.commit().await?;
+                return Ok(None);
+            }
+            roosty_db::process_remote_actor_move(&txn, remote_actor.id, target.id).await?;
             txn.commit().await?;
-            Ok(())
+            Ok(None)
         }
         _ => Err(RoostyError::InvalidInput(
             "unsupported remote actor lifecycle activity".to_owned(),
@@ -1513,8 +1762,8 @@ enum RemoteStatusChange {
         Vec<roosty_db::LocalNotification>,
         Option<roosty_db::DirectConversationRefresh>,
     ),
-    /// A removed Note with its internal API ID.
-    Delete(String, Option<roosty_db::DirectConversationRefresh>),
+    /// Removed status-like projections and repaired conversations.
+    Delete(roosty_db::RemoteDeleteRepair),
 }
 
 /// Resolve a canonical local Note URL without accepting look-alike remote URLs.
@@ -1564,12 +1813,12 @@ async fn process_remote_status_activity(
     match activity.get("type").and_then(JsonValue::as_str) {
         Some("Create") | Some("Update") => {
             let activity_type = activity.get("type").and_then(JsonValue::as_str);
-            let activity: InboundStatusActivity = serde_json::from_value(activity.clone())
-                .map_err(|_| {
+            let inbound: InboundStatusActivity =
+                serde_json::from_value(activity.clone()).map_err(|_| {
                     RoostyError::InvalidInput("remote status activity is invalid".to_owned())
                 })?;
             if !matches!(
-                (activity_type, activity.r#type),
+                (activity_type, inbound.r#type),
                 (Some("Create"), InboundStatusType::Create)
                     | (Some("Update"), InboundStatusType::Update)
             ) {
@@ -1577,10 +1826,10 @@ async fn process_remote_status_activity(
                     "remote status activity type is invalid".to_owned(),
                 ));
             }
-            let is_create = matches!(activity.r#type, InboundStatusType::Create);
-            let object = serde_json::to_value(&activity.object)
+            let is_create = matches!(inbound.r#type, InboundStatusType::Create);
+            let object = serde_json::to_value(&inbound.object)
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-            let note = activity.object;
+            let note = inbound.object;
             let attachments = note
                 .attachment
                 .iter()
@@ -1602,7 +1851,7 @@ async fn process_remote_status_activity(
                 .filter(|tag| tag.r#type == InboundTagType::Mention)
                 .filter_map(|tag| tag.href.clone())
                 .collect::<Vec<_>>();
-            if activity.actor != remote_actor.activitypub_id
+            if inbound.actor != remote_actor.activitypub_id
                 || note.attributed_to != remote_actor.activitypub_id
                 || note.r#type != "Note"
                 || !note.id.starts_with("https://")
@@ -1653,11 +1902,13 @@ async fn process_remote_status_activity(
             notification_recipients.sort_by_key(|id| id.0);
             notification_recipients.dedup();
             let txn = state.db.begin().await?;
+            if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
+                txn.commit().await?;
+                return Ok(RemoteStatusChange::Ignored);
+            }
             roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
             let status = roosty_db::process_remote_status_upsert(
                 &txn,
-                activity_id,
-                remote_actor.id,
                 roosty_db::NewRemoteStatus {
                     activitypub_id: note.id,
                     remote_actor_id: remote_actor.id,
@@ -1676,78 +1927,65 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
-            let direct_conversation_refresh = if let Some(status) = &status {
-                if let Some(recipients) = direct_recipients.as_deref() {
-                    Some(
-                        roosty_db::attach_remote_direct_status_to_conversation(
-                            &txn,
-                            status.id,
-                            status.in_reply_to_local_status_id,
-                            status.in_reply_to_remote_status_id,
-                            recipients,
-                            &direct_participants,
-                            is_create,
-                        )
-                        .await?,
+            let direct_conversation_refresh = if let Some(recipients) = direct_recipients.as_deref()
+            {
+                Some(
+                    roosty_db::attach_remote_direct_status_to_conversation(
+                        &txn,
+                        status.id,
+                        status.in_reply_to_local_status_id,
+                        status.in_reply_to_remote_status_id,
+                        recipients,
+                        &direct_participants,
+                        is_create,
                     )
-                } else {
-                    roosty_db::clear_remote_direct_status_recipients(&txn, status.id).await?;
-                    roosty_db::repair_direct_conversation_after_delete(&txn, status.conversation_id)
-                        .await?
-                }
+                    .await?,
+                )
             } else {
-                None
+                roosty_db::clear_remote_direct_status_recipients(&txn, status.id).await?;
+                roosty_db::repair_direct_conversation_after_delete(&txn, status.conversation_id)
+                    .await?
             };
             let mut notifications = Vec::new();
-            if let Some(status) = &status {
-                for account_id in notification_recipients {
-                    if let Some(notification) = roosty_db::notify_remote_status_mention(
-                        &txn,
-                        account_id,
-                        remote_actor.id,
-                        status.id,
-                    )
-                    .await?
-                    {
-                        notifications.push(notification);
-                    }
+            for account_id in notification_recipients {
+                if let Some(notification) = roosty_db::notify_remote_status_mention(
+                    &txn,
+                    account_id,
+                    remote_actor.id,
+                    status.id,
+                )
+                .await?
+                {
+                    notifications.push(notification);
                 }
             }
-            if let Some(status) = &status {
-                let has_local_recipients =
-                    !direct_recipients.as_deref().unwrap_or_default().is_empty();
-                let has_local_followers =
-                    !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
-                        .await?
-                        .is_empty();
-                if has_local_recipients || has_local_followers {
-                    crate::media::enqueue_remote_status_media_fetches_in_transaction(
-                        &txn, status.id,
-                    )
+            let has_local_recipients = !direct_recipients.as_deref().unwrap_or_default().is_empty();
+            let has_local_followers =
+                !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
+                    .await?
+                    .is_empty();
+            if has_local_recipients || has_local_followers {
+                crate::media::enqueue_remote_status_media_fetches_in_transaction(&txn, status.id)
                     .await?;
-                }
             }
             txn.commit().await?;
-            Ok(match status {
-                Some(status) => RemoteStatusChange::Upsert(
-                    Box::new(status),
-                    notifications,
-                    direct_conversation_refresh,
-                ),
-                None => RemoteStatusChange::Ignored,
-            })
+            Ok(RemoteStatusChange::Upsert(
+                Box::new(status),
+                notifications,
+                direct_conversation_refresh,
+            ))
         }
         Some("Delete") => {
-            let activity: InboundDeleteActivity = serde_json::from_value(activity.clone())
-                .map_err(|_| {
+            let inbound: InboundDeleteActivity =
+                serde_json::from_value(activity.clone()).map_err(|_| {
                     RoostyError::InvalidInput("remote Delete activity is invalid".to_owned())
                 })?;
-            if activity.actor != remote_actor.activitypub_id {
+            if inbound.actor != remote_actor.activitypub_id {
                 return Err(RoostyError::InvalidInput(
                     "remote Delete actor does not match signer".to_owned(),
                 ));
             }
-            let object_id = match activity.object {
+            let object_id = match inbound.object {
                 InboundDeleteObject::Id(id) | InboundDeleteObject::Tombstone { id } => id,
             };
             if !object_id.starts_with("https://") {
@@ -1761,28 +1999,18 @@ async fn process_remote_status_activity(
                 ));
             }
             let txn = state.db.begin().await?;
-            let deleted = roosty_db::process_remote_status_delete(
-                &txn,
-                activity_id,
-                remote_actor.id,
-                &object_id,
-            )
-            .await?;
-            let conversation_id = match deleted {
-                Some(status_id) => {
-                    roosty_db::repair_direct_conversation_after_delete(
-                        &txn,
-                        roosty_db::remote_status_conversation_id(&txn, status_id).await?,
-                    )
-                    .await?
-                }
-                None => None,
-            };
+            if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
+                txn.commit().await?;
+                return Ok(RemoteStatusChange::Ignored);
+            }
+            let deleted =
+                roosty_db::process_remote_status_delete(&txn, remote_actor.id, &object_id).await?;
             txn.commit().await?;
+            if deleted.is_some() {
+                STATUS_DELETE_REPAIR.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(match deleted {
-                Some(status_id) => {
-                    RemoteStatusChange::Delete(status_id.0.to_string(), conversation_id)
-                }
+                Some(repair) => RemoteStatusChange::Delete(repair),
                 None => RemoteStatusChange::Ignored,
             })
         }
@@ -1849,32 +2077,66 @@ async fn publish_remote_status_change(
                 .await?;
             }
         }
-        RemoteStatusChange::Delete(status_id, refresh) if !status_id.is_empty() => {
-            if !recipients.is_empty() {
-                state.streaming_events.publish_home_delete(
-                    &status_id,
-                    remote_actor_id,
-                    &recipients,
-                );
-            }
-            if let Some(refresh) = refresh {
-                state.streaming_events.publish_delete(
-                    &status_id,
-                    remote_actor_id,
-                    "direct",
-                    &refresh.removed_account_ids,
-                );
-                crate::conversations::publish_conversation_updates(
-                    state,
-                    refresh.conversation_id,
-                    &refresh.updated_account_ids,
-                )
-                .await?;
-            }
-        }
-        RemoteStatusChange::Delete(_, _) => {}
+        RemoteStatusChange::Delete(repair) => publish_delete_repair(state, repair).await?,
     }
     Ok(())
+}
+
+/// Publish captured delete projections only after their repair transaction commits.
+async fn publish_delete_repair(
+    state: &AppState,
+    repair: roosty_db::RemoteDeleteRepair,
+) -> Result<(), RoostyError> {
+    for projection in repair.projections {
+        if !projection.home_recipient_ids.is_empty() {
+            state.streaming_events.publish_home_delete(
+                &projection.status_id,
+                projection.actor_id,
+                &projection.home_recipient_ids,
+            );
+        }
+        if !projection.direct_recipient_ids.is_empty() {
+            state.streaming_events.publish_delete(
+                &projection.status_id,
+                projection.actor_id,
+                "direct",
+                &projection.direct_recipient_ids,
+            );
+        }
+    }
+    for refresh in repair.conversation_refreshes {
+        crate::conversations::publish_conversation_updates(
+            state,
+            refresh.conversation_id,
+            &refresh.updated_account_ids,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Render bounded-label process-local federation counters for `/metrics`.
+pub(crate) fn metrics_text() -> String {
+    format!(
+        concat!(
+            "# HELP roosty_federation_inbox_total Durable inbox activity outcomes.\n",
+            "# TYPE roosty_federation_inbox_total counter\n",
+            "roosty_federation_inbox_total{{outcome=\"accepted\"}} {}\n",
+            "roosty_federation_inbox_total{{outcome=\"duplicate\"}} {}\n",
+            "roosty_federation_inbox_total{{outcome=\"conflict\"}} {}\n",
+            "roosty_federation_inbox_total{{outcome=\"invalid_id\"}} {}\n",
+            "# HELP roosty_federation_delete_repair_total Signed federation deletion repairs.\n",
+            "# TYPE roosty_federation_delete_repair_total counter\n",
+            "roosty_federation_delete_repair_total{{kind=\"status\"}} {}\n",
+            "roosty_federation_delete_repair_total{{kind=\"actor\"}} {}\n"
+        ),
+        INBOX_ACCEPTED.load(Ordering::Relaxed),
+        INBOX_DUPLICATE.load(Ordering::Relaxed),
+        INBOX_CONFLICT.load(Ordering::Relaxed),
+        INBOX_INVALID_ID.load(Ordering::Relaxed),
+        STATUS_DELETE_REPAIR.load(Ordering::Relaxed),
+        ACTOR_DELETE_REPAIR.load(Ordering::Relaxed),
+    )
 }
 
 /// Return a Mastodon visibility only for ActivityPub's public and unlisted audiences.
@@ -3393,14 +3655,31 @@ mod tests {
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
         InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
         MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
-        actor_profile_fields, is_remote_actor_lifecycle_activity, local_actor_type, parse_acct,
-        remote_status_visibility, same_url_origin,
+        actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
+        local_actor_type, parse_acct, remote_status_visibility, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
     /// Serializes scenarios which share the in-process recipient registry.
     static FEDERATION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Object key order is insignificant while array order remains part of replay identity.
+    #[test]
+    fn canonical_activity_digest_sorts_objects_and_preserves_arrays() {
+        let left = json!({"z": [{"b": 2, "a": 1}, 3], "a": true});
+        let reordered = json!({"a": true, "z": [{"a": 1, "b": 2}, 3]});
+        let array_changed = json!({"a": true, "z": [3, {"a": 1, "b": 2}]});
+
+        assert_eq!(
+            canonical_activity_digest(&left).unwrap(),
+            canonical_activity_digest(&reordered).unwrap()
+        );
+        assert_ne!(
+            canonical_activity_digest(&left).unwrap(),
+            canonical_activity_digest(&array_changed).unwrap()
+        );
+    }
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
     #[test]

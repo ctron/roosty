@@ -56,6 +56,27 @@ use entity::{
 /// Shared database connection type used across Roosty crates.
 pub type DbConnection = DatabaseConnection;
 
+/// Result of registering a durable inbound ActivityPub identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboxReplayResult {
+    /// This activity identity was not previously observed.
+    New,
+    /// The signer and canonical payload match an existing marker.
+    Duplicate,
+    /// The activity identity was reused by another signer or payload.
+    Conflict,
+}
+
+/// Immutable metadata stored for a processed inbound ActivityPub activity.
+#[derive(Clone, Copy, Debug)]
+pub struct InboxActivityMetadata<'a> {
+    pub activity_id: &'a str,
+    pub remote_actor_id: AccountId,
+    pub payload_digest: &'a [u8; 32],
+    pub activity_type: &'a str,
+    pub outcome: &'a str,
+}
+
 /// A durable job to be inserted as part of a larger database operation.
 ///
 /// Callers use this to implement the transactional-outbox pattern: the state
@@ -661,54 +682,103 @@ pub async fn count_remote_following(db: &DbConnection, account_id: AccountId) ->
 /// Tombstone a remote actor and hide its cached public activity without purging audit data.
 pub async fn process_remote_actor_delete(
     txn: &DatabaseTransaction,
-    activity_id: &str,
     remote_actor_id: AccountId,
-) -> Result<bool> {
-    if !record_processed_inbox_activity(txn, activity_id, remote_actor_id).await? {
-        return Ok(false);
-    }
+) -> Result<Option<RemoteDeleteRepair>> {
+    let subscribers = accepted_local_followers_of_remote_actor(txn, remote_actor_id).await?;
     let now = OffsetDateTime::now_utc();
     let Some(actor) = remote_actor::Entity::find_by_id(remote_actor_id.0)
         .one(txn)
         .await?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut actor = actor.into_active_model();
     actor.deleted_at = Set(Some(now));
     actor.updated_at = Set(now);
     actor.update(txn).await?;
-    remote_status::Entity::update_many()
-        .col_expr(
-            remote_status::Column::DeletedAt,
-            sea_orm::sea_query::Expr::value(now),
-        )
+    let statuses = remote_status::Entity::find()
         .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status::Column::DeletedAt.is_null())
+        .all(txn)
+        .await?;
+    let mut repair = RemoteDeleteRepair::default();
+    for status in statuses {
+        let status_repair = repair_one_remote_status_delete(txn, status).await?;
+        repair.projections.extend(status_repair.projections);
+        repair
+            .conversation_refreshes
+            .extend(status_repair.conversation_refreshes);
+        repair.deleted_status_count += status_repair.deleted_status_count;
+    }
+
+    let actor_reblogs = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
+        .all(txn)
+        .await?;
+    repair
+        .projections
+        .extend(actor_reblogs.iter().map(|reblog| DeleteStreamProjection {
+            status_id: reblog.id.to_string(),
+            actor_id: remote_actor_id,
+            home_recipient_ids: subscribers.clone(),
+            direct_recipient_ids: Vec::new(),
+        }));
+    remote_status_reblog::Entity::delete_many()
+        .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
         .exec(txn)
         .await?;
-    remote_following::Entity::update_many()
-        .col_expr(
-            remote_following::Column::DeactivatedAt,
-            sea_orm::sea_query::Expr::value(now),
-        )
+    remote_status_favourite::Entity::delete_many()
+        .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
+        .exec(txn)
+        .await?;
+    local_notification::Entity::delete_many()
+        .filter(local_notification::Column::RemoteActorId.eq(remote_actor_id.0))
+        .exec(txn)
+        .await?;
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .exec(txn)
+        .await?;
+    remote_following::Entity::delete_many()
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
-        .filter(remote_following::Column::DeactivatedAt.is_null())
         .exec(txn)
         .await?;
-    Ok(true)
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE job SET completed_at = $2, locked_at = NULL, locked_by = NULL, claim_id = NULL, last_error = 'remote actor deleted' WHERE completed_at IS NULL AND payload->>'remote_actor_id' = $1",
+        vec![remote_actor_id.0.to_string().into(), now.into()],
+    ))
+    .await?;
+    let mut consolidated = Vec::<DirectConversationRefresh>::new();
+    for refresh in repair.conversation_refreshes.drain(..) {
+        if let Some(existing) = consolidated
+            .iter_mut()
+            .find(|existing| existing.conversation_id == refresh.conversation_id)
+        {
+            existing
+                .updated_account_ids
+                .extend(refresh.updated_account_ids);
+            existing
+                .removed_account_ids
+                .extend(refresh.removed_account_ids);
+            existing.updated_account_ids.sort_by_key(|id| id.0);
+            existing.updated_account_ids.dedup();
+            existing.removed_account_ids.sort_by_key(|id| id.0);
+            existing.removed_account_ids.dedup();
+        } else {
+            consolidated.push(refresh);
+        }
+    }
+    repair.conversation_refreshes = consolidated;
+    Ok(Some(repair))
 }
 
 /// Record a verified ActivityPub account migration without retargeting follows.
 pub async fn process_remote_actor_move(
     txn: &DatabaseTransaction,
-    activity_id: &str,
     remote_actor_id: AccountId,
     target_actor_id: AccountId,
 ) -> Result<bool> {
-    if !record_processed_inbox_activity(txn, activity_id, remote_actor_id).await? {
-        return Ok(false);
-    }
     let Some(actor) = remote_actor::Entity::find_by_id(remote_actor_id.0)
         .one(txn)
         .await?
@@ -1098,7 +1168,7 @@ pub async fn mark_remote_profile_media_failed(
 
 /// Mark the locally initiated Follow identified by its activity ID as accepted.
 pub async fn accept_remote_following(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
     activity_id: &str,
 ) -> Result<bool> {
@@ -1108,7 +1178,7 @@ pub async fn accept_remote_following(
 
 /// Remove a rejected local-to-remote Follow by the original activity identity.
 pub async fn reject_remote_following(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
     activity_id: &str,
 ) -> Result<bool> {
@@ -1225,26 +1295,12 @@ where
 /// Record an inbound Create or Update and cache its Note atomically.
 pub async fn process_remote_status_upsert(
     txn: &sea_orm::DatabaseTransaction,
-    activity_id: &str,
-    remote_actor_id: AccountId,
     status: NewRemoteStatus,
     attachments: &[NewRemoteMediaAttachment],
-) -> Result<Option<RemoteStatus>> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(None);
-    }
+) -> Result<RemoteStatus> {
     let status = upsert_remote_status_on(txn, status).await?;
     replace_remote_media_attachments(txn, status.id, attachments).await?;
-    Ok(Some(status))
+    Ok(status)
 }
 
 /// Soft-delete a remote Note only when its verified author owns it.
@@ -1271,35 +1327,115 @@ pub async fn delete_remote_status(
 /// Record an inbound Delete and soft-delete its cached Note atomically.
 pub async fn process_remote_status_delete(
     txn: &sea_orm::DatabaseTransaction,
-    activity_id: &str,
     remote_actor_id: AccountId,
     activitypub_id: &str,
-) -> Result<Option<StatusId>> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(None);
-    }
+) -> Result<Option<RemoteDeleteRepair>> {
     let status = remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
         .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status::Column::DeletedAt.is_null())
         .one(txn)
         .await?;
-    let result = status.as_ref().map(|status| StatusId(status.id));
-    if let Some(status) = status {
-        let mut active = status.into_active_model();
-        active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
-        active.update(txn).await?;
+    match status {
+        Some(status) => repair_one_remote_status_delete(txn, status).await.map(Some),
+        None => Ok(None),
     }
-    Ok(result)
+}
+
+/// Remove all live projections that point at one cached remote Note.
+async fn repair_one_remote_status_delete(
+    txn: &DatabaseTransaction,
+    status: remote_status::Model,
+) -> Result<RemoteDeleteRepair> {
+    let status_id = StatusId(status.id);
+    let author_id = AccountId(status.remote_actor_id);
+    let home_recipient_ids = accepted_local_followers_of_remote_actor(txn, author_id).await?;
+    let direct_recipient_ids = remote_status_local_recipient::Entity::find()
+        .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status.id))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|recipient| AccountId(recipient.account_id))
+        .collect::<Vec<_>>();
+
+    let local_reblogs = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status.id))
+        .all(txn)
+        .await?;
+    let inbound_reblogs = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteStatusId.eq(status.id))
+        .all(txn)
+        .await?;
+    let mut projections = vec![DeleteStreamProjection {
+        status_id: status.id.to_string(),
+        actor_id: author_id,
+        home_recipient_ids,
+        direct_recipient_ids,
+    }];
+    projections.extend(local_reblogs.iter().map(|reblog| DeleteStreamProjection {
+        status_id: reblog.id.to_string(),
+        actor_id: AccountId(reblog.local_account_id),
+        home_recipient_ids: vec![AccountId(reblog.local_account_id)],
+        direct_recipient_ids: Vec::new(),
+    }));
+    for reblog in &inbound_reblogs {
+        let actor_id = AccountId(reblog.remote_actor_id);
+        projections.push(DeleteStreamProjection {
+            status_id: reblog.id.to_string(),
+            actor_id,
+            home_recipient_ids: accepted_local_followers_of_remote_actor(txn, actor_id).await?,
+            direct_recipient_ids: Vec::new(),
+        });
+    }
+
+    let mut active = status.into_active_model();
+    active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
+    active.update(txn).await?;
+    local_notification::Entity::delete_many()
+        .filter(local_notification::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    local_remote_status_favourite::Entity::delete_many()
+        .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    local_remote_status_reblog::Entity::delete_many()
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    remote_status_reblog::Entity::delete_many()
+        .filter(remote_status_reblog::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    remote_status::Entity::update_many()
+        .col_expr(
+            remote_status::Column::InReplyToRemoteStatusId,
+            sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+        )
+        .filter(remote_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+    local_status::Entity::update_many()
+        .col_expr(
+            local_status::Column::InReplyToRemoteStatusId,
+            sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+        )
+        .filter(local_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+
+    let conversation_refreshes = repair_direct_conversation_after_delete(
+        txn,
+        remote_status_conversation_id(txn, status_id).await?,
+    )
+    .await?
+    .into_iter()
+    .collect();
+    Ok(RemoteDeleteRepair {
+        projections,
+        conversation_refreshes,
+        deleted_status_count: 1,
+    })
 }
 
 /// Find a remote actor by its canonical ActivityPub ID.
@@ -1688,6 +1824,23 @@ pub struct DirectConversationRefresh {
     pub updated_account_ids: Vec<AccountId>,
     /// Accounts whose view no longer has any visible status and was removed.
     pub removed_account_ids: Vec<AccountId>,
+}
+
+/// One status-like streaming projection removed by federation delete repair.
+#[derive(Clone, Debug)]
+pub struct DeleteStreamProjection {
+    pub status_id: String,
+    pub actor_id: AccountId,
+    pub home_recipient_ids: Vec<AccountId>,
+    pub direct_recipient_ids: Vec<AccountId>,
+}
+
+/// Durable state repaired by one signed remote status or actor deletion.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteDeleteRepair {
+    pub projections: Vec<DeleteStreamProjection>,
+    pub conversation_refreshes: Vec<DirectConversationRefresh>,
+    pub deleted_status_count: usize,
 }
 
 /// A remote participant retained for a direct conversation.
@@ -2130,19 +2283,6 @@ pub async fn upsert_processed_remote_follow_with_response_job(
     activity: JsonValue,
     response_job: RemoteFollowResponseJob,
 ) -> Result<bool> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(false);
-    }
-
     remote_follow::Entity::insert(remote_follow::ActiveModel {
         id: Set(Uuid::now_v7()),
         remote_actor_id: Set(remote_actor_id.0),
@@ -2180,18 +2320,6 @@ pub async fn upsert_processed_pending_remote_follow(
     activity_id: &str,
     activity: JsonValue,
 ) -> Result<bool> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(false);
-    }
     remote_follow::Entity::insert(remote_follow::ActiveModel {
         id: Set(Uuid::now_v7()),
         remote_actor_id: Set(remote_actor_id.0),
@@ -2289,21 +2417,8 @@ pub async fn delete_remote_follow_by_activity(
 pub async fn process_remote_undo_follow(
     txn: &sea_orm::DatabaseTransaction,
     remote_actor_id: AccountId,
-    activity_id: &str,
     original_activity_id: &str,
 ) -> Result<bool> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(false);
-    }
     remote_follow::Entity::delete_many()
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_follow::Column::ActivityId.eq(original_activity_id))
@@ -2397,7 +2512,63 @@ pub async fn remote_actor_follows_local_account(
     Ok(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT 1 FROM remote_follow WHERE remote_actor_id = $1 AND local_account_id = $2 AND state = 'accepted'", vec![remote_actor_id.0.into(), local_account_id.0.into()])).await?.is_some())
 }
 
-/// Record a successfully validated inbox activity, returning false for duplicates.
+/// Classify and durably register a canonical inbound activity.
+///
+/// The insert and conflict read run on the caller's transaction, so concurrent
+/// deliveries serialize on the activity primary key. Legacy rows with no digest
+/// remain duplicate markers for the same signer.
+pub async fn register_inbox_activity(
+    db: &impl ConnectionTrait,
+    metadata: InboxActivityMetadata<'_>,
+) -> Result<InboxReplayResult> {
+    let inserted =
+        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
+            activity_id: Set(metadata.activity_id.to_owned()),
+            remote_actor_id: Set(metadata.remote_actor_id.0),
+            payload_digest: Set(Some(metadata.payload_digest.to_vec())),
+            activity_type: Set(Some(metadata.activity_type.to_owned())),
+            outcome: Set(Some(metadata.outcome.to_owned())),
+            processed_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(db)
+        .await?;
+    if matches!(inserted, TryInsertResult::Inserted(_)) {
+        return Ok(InboxReplayResult::New);
+    }
+
+    classify_inbox_activity(db, metadata)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("inbox replay marker disappeared".to_owned()))
+}
+
+/// Classify an existing replay marker without creating a new one.
+pub async fn classify_inbox_activity(
+    db: &impl ConnectionTrait,
+    metadata: InboxActivityMetadata<'_>,
+) -> Result<Option<InboxReplayResult>> {
+    let Some(existing) = processed_inbox_activity::Entity::find_by_id(metadata.activity_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if existing.remote_actor_id != metadata.remote_actor_id.0 {
+        return Ok(Some(InboxReplayResult::Conflict));
+    }
+    let Some(existing_digest) = existing.payload_digest else {
+        return Ok(Some(InboxReplayResult::Duplicate));
+    };
+    if existing_digest == metadata.payload_digest
+        && existing.activity_type.as_deref() == Some(metadata.activity_type)
+    {
+        Ok(Some(InboxReplayResult::Duplicate))
+    } else {
+        Ok(Some(InboxReplayResult::Conflict))
+    }
+}
+
+/// Record a legacy inbox marker, returning false for a pre-existing identity.
 pub async fn record_processed_inbox_activity(
     db: &impl ConnectionTrait,
     activity_id: &str,
@@ -5454,18 +5625,6 @@ pub async fn process_remote_like(
     activity_id: &str,
     recipient_account_id: AccountId,
 ) -> Result<Option<LocalNotification>> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(None);
-    }
     let inserted = remote_status_favourite::Entity::insert(remote_status_favourite::ActiveModel {
         id: Set(Uuid::now_v7()),
         remote_actor_id: Set(remote_actor_id.0),
@@ -5505,21 +5664,8 @@ pub async fn unfavourite_local_status_by_remote_actor(
 pub async fn process_remote_undo_like(
     txn: &sea_orm::DatabaseTransaction,
     remote_actor_id: AccountId,
-    activity_id: &str,
     original_activity_id: &str,
 ) -> Result<bool> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(false);
-    }
     remote_status_favourite::Entity::delete_many()
         .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_favourite::Column::ActivityId.eq(original_activity_id))
@@ -6093,21 +6239,8 @@ pub async fn unreblog_status_by_remote_actor(
 pub async fn process_remote_undo_reblog(
     txn: &sea_orm::DatabaseTransaction,
     remote_actor_id: AccountId,
-    activity_id: &str,
     original_activity_id: &str,
 ) -> Result<Option<RemoteStatusReblog>> {
-    let processed =
-        processed_inbox_activity::Entity::insert(processed_inbox_activity::ActiveModel {
-            activity_id: Set(activity_id.to_owned()),
-            remote_actor_id: Set(remote_actor_id.0),
-            processed_at: Set(OffsetDateTime::now_utc()),
-        })
-        .on_conflict_do_nothing()
-        .exec(txn)
-        .await?;
-    if matches!(processed, TryInsertResult::Conflicted) {
-        return Ok(None);
-    }
     let model = remote_status_reblog::Entity::find()
         .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_reblog::Column::ActivityId.eq(original_activity_id))

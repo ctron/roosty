@@ -133,7 +133,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 /// Render Prometheus-compatible process and configuration metrics.
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let federation_enabled = u8::from(state.config.federation_enabled);
-    let body = format!(
+    let mut body = format!(
         concat!(
             "# HELP roosty_process_up Process liveness marker.\n",
             "# TYPE roosty_process_up gauge\n",
@@ -144,6 +144,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         ),
         federation_enabled
     );
+    body.push_str(&crate::federation::metrics_text());
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

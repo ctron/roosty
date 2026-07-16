@@ -164,6 +164,28 @@ pub async fn refresh_remote_actor_by_id(
     state: &AppState,
     activitypub_id: &str,
 ) -> Result<RemoteActor> {
+    let (actor, icon, image) = fetch_remote_actor_by_id(state, activitypub_id).await?;
+    store_remote_actor(state, actor, icon, image).await
+}
+
+/// Fetch and store a signed actor refresh inside an inbox-owned transaction.
+pub async fn refresh_remote_actor_by_id_in_transaction(
+    state: &AppState,
+    activitypub_id: &str,
+    txn: &sea_orm::DatabaseTransaction,
+) -> Result<RemoteActor> {
+    let (actor, icon, image) = fetch_remote_actor_by_id(state, activitypub_id).await?;
+    store_remote_actor_on(txn, actor, icon, image).await
+}
+
+async fn fetch_remote_actor_by_id(
+    state: &AppState,
+    activitypub_id: &str,
+) -> Result<(
+    RemoteActor,
+    Option<RemoteActorImage>,
+    Option<RemoteActorImage>,
+)> {
     let actor_url =
         Url::parse(activitypub_id).map_err(|_| invalid("remote actor ID is invalid"))?;
     let domain = actor_url
@@ -190,8 +212,7 @@ pub async fn refresh_remote_actor_by_id(
     {
         return Err(invalid("remote actor inbox is outside its actor domain"));
     }
-    store_remote_actor(
-        state,
+    Ok((
         RemoteActor {
             id: AccountId(Uuid::now_v7()),
             activitypub_id: document.id,
@@ -212,8 +233,7 @@ pub async fn refresh_remote_actor_by_id(
         },
         document.icon,
         document.image,
-    )
-    .await
+    ))
 }
 
 /// Resolve a Move target only when it reciprocally declares the source actor.
@@ -282,26 +302,7 @@ async fn store_remote_actor(
     image: Option<RemoteActorImage>,
 ) -> Result<RemoteActor> {
     let txn = state.db.begin().await?;
-    let actor = roosty_db::upsert_remote_actor(&txn, &actor).await?;
-    let emojis = crate::accounts::remote_custom_emojis(&actor.emojis)
-        .into_iter()
-        .filter_map(|emoji| {
-            Some(NewRemoteCustomEmoji {
-                shortcode: emoji.get("shortcode")?.as_str()?.to_owned(),
-                remote_url: emoji.get("url")?.as_str()?.to_owned(),
-            })
-        })
-        .collect::<Vec<_>>();
-    roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
-    roosty_db::replace_remote_profile_media(
-        &txn,
-        actor.id,
-        NewRemoteProfileMedia {
-            avatar_url: icon.map(RemoteActorImage::into_url),
-            header_url: image.map(RemoteActorImage::into_url),
-        },
-    )
-    .await?;
+    let actor = store_remote_actor_on(&txn, actor, icon, image).await?;
     txn.commit().await?;
     let read_txn = state
         .db
@@ -315,6 +316,35 @@ async fn store_remote_actor(
     if has_accepted_followers {
         crate::media::enqueue_remote_profile_media_fetches(state, actor.id).await?;
     }
+    Ok(actor)
+}
+
+async fn store_remote_actor_on(
+    txn: &sea_orm::DatabaseTransaction,
+    actor: RemoteActor,
+    icon: Option<RemoteActorImage>,
+    image: Option<RemoteActorImage>,
+) -> Result<RemoteActor> {
+    let actor = roosty_db::upsert_remote_actor(txn, &actor).await?;
+    let emojis = crate::accounts::remote_custom_emojis(&actor.emojis)
+        .into_iter()
+        .filter_map(|emoji| {
+            Some(NewRemoteCustomEmoji {
+                shortcode: emoji.get("shortcode")?.as_str()?.to_owned(),
+                remote_url: emoji.get("url")?.as_str()?.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    roosty_db::upsert_remote_custom_emojis(txn, &emojis).await?;
+    roosty_db::replace_remote_profile_media(
+        txn,
+        actor.id,
+        NewRemoteProfileMedia {
+            avatar_url: icon.map(RemoteActorImage::into_url),
+            header_url: image.map(RemoteActorImage::into_url),
+        },
+    )
+    .await?;
     Ok(actor)
 }
 

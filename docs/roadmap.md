@@ -32,7 +32,7 @@
 - [x] Deliver and process public/unlisted favourites (`Like`/`Undo`), including remote counters, local notifications, and mixed favourites collections.
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
 - [x] Commit supported inbox side effects, idempotency markers, and durable follow/favourite/boost delivery jobs atomically; publish streams only after commit.
-- [ ] Repair cached-status timelines and notification references after signed remote Deletes.
+- [x] Repair cached-status timelines, interactions, notifications, reply links, and direct-conversation projections atomically after signed remote status and actor Deletes.
 - [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
 - [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
 - [ ] Federate follow, mention, reply, favourite, and boost notifications to remote recipients.
@@ -46,7 +46,7 @@
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
 - [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
 - [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, and account migration metadata.
-- [ ] Add replay protection for reused or absent remote activity IDs beyond current canonical-ID idempotency.
+- [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [ ] Support multi-process streaming fan-out and federation-worker coordination.
 
 ## Long Term
@@ -68,7 +68,7 @@
 ## Short Term
 
 - [x] Harden inbound remote follow handling with signed HTTP `Date` freshness checks and activity-ID idempotency.
-- [ ] Add replay protection beyond activity-ID idempotency where remote actors reuse or omit canonical activity IDs.
+- [x] Add canonical-payload replay protection for reused IDs and reject ID-less, non-HTTPS, or cross-origin durable activities.
 - [x] Add cursor pagination and `Link` headers to remote follow-request listing.
 - [x] Retry federation deliveries with exponential backoff until the operator-configured `ROOSTY_FEDERATION_DELIVERY_MAX_AGE` horizon, then record permanent failures and emit diagnostics.
 - [x] Add signed two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, Undo, public-status fan-out, and failed-delivery retry scheduling.
