@@ -568,6 +568,11 @@ async fn show_status(
             status_with_author_response(&state, status, viewer_id).await
         }
         StatusContextItem::Remote(status) => {
+            match remote_status_available(&state, &status).await {
+                Ok(true) => {}
+                Ok(false) => return not_found(),
+                Err(error) => return server_error(error),
+            }
             match remote_status_response_for_viewer(&state, status, viewer_id).await {
                 Ok(status) => Json(status).into_response(),
                 Err(error) => server_error(error),
@@ -1825,6 +1830,23 @@ async fn filter_stream_recipients(
     visible
 }
 
+/// Remove viewers who mute or block the remote actor producing a stream event.
+async fn filter_remote_stream_recipients(
+    state: &AppState,
+    actor_id: AccountId,
+    recipients: Vec<AccountId>,
+) -> Vec<AccountId> {
+    let mut visible = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        match roosty_db::remote_account_is_hidden_for_viewer(&state.db, recipient, actor_id).await {
+            Ok(false) => visible.push(recipient),
+            Ok(true) => {}
+            Err(error) => warn!(%error, "failed to filter moderated remote stream recipient"),
+        }
+    }
+    visible
+}
+
 /// Return mixed local and remote boost actors with Mastodon cursor pagination.
 async fn reblogged_by_response(
     state: &AppState,
@@ -1999,10 +2021,28 @@ async fn home_timeline_models(
                 }
             }
             roosty_db::HomeTimelineItem::RemoteStatus(status) => {
+                if !remote_status_available(state, &status).await? {
+                    continue;
+                }
                 response
                     .push(remote_status_response_for_viewer(state, status, Some(viewer)).await?);
             }
             roosty_db::HomeTimelineItem::LocalRemoteReblog(reblog) => {
+                let Some(original) =
+                    roosty_db::find_remote_status_by_id(&state.db, reblog.remote_status_id).await?
+                else {
+                    continue;
+                };
+                if !remote_status_available(state, &original).await?
+                    || roosty_db::remote_account_is_hidden_for_viewer(
+                        &state.db,
+                        viewer,
+                        original.remote_actor_id,
+                    )
+                    .await?
+                {
+                    continue;
+                }
                 if let Some(reblog_response) =
                     local_remote_reblog_response(state, reblog, Some(viewer)).await?
                 {
@@ -2142,6 +2182,15 @@ pub(crate) async fn remote_reblog_response(
     let actor = roosty_db::find_remote_actor_by_id(&state.db, reblog.remote_actor_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("remote boost actor does not exist".to_owned()))?;
+    if state.config.federation_domain_is_blocked(&actor.domain) {
+        return Ok(None);
+    }
+    if let Some(viewer) = viewer
+        && roosty_db::remote_account_is_hidden_for_viewer(&state.db, viewer, reblog.remote_actor_id)
+            .await?
+    {
+        return Ok(None);
+    }
     let original = match reblog.target {
         roosty_db::RemoteStatusReblogTarget::Local(status_id) => {
             let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
@@ -2223,6 +2272,7 @@ pub(crate) async fn publish_remote_reblog_update(
     };
     let recipients =
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+    let recipients = filter_remote_stream_recipients(state, remote_actor_id, recipients).await;
     if let Some(response) =
         remote_reblog_response(state, reblog, recipients.first().copied()).await?
     {
@@ -2241,6 +2291,7 @@ pub(crate) async fn publish_remote_reblog_delete(
 ) -> Result<(), RoostyError> {
     let recipients =
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+    let recipients = filter_remote_stream_recipients(state, remote_actor_id, recipients).await;
     state.streaming_events.publish_home_delete(
         &reblog_id.to_string(),
         remote_actor_id,
@@ -2330,6 +2381,17 @@ async fn remote_status_response_for_viewer(
         reblog: None,
         application: None,
     })
+}
+
+async fn remote_status_available(
+    state: &AppState,
+    status: &roosty_db::RemoteStatus,
+) -> Result<bool, RoostyError> {
+    Ok(
+        roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
+            .await?
+            .is_some_and(|actor| !state.config.federation_domain_is_blocked(&actor.domain)),
+    )
 }
 
 /// Project cached ActivityPub Mention tags without resolving new remote identities.

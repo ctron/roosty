@@ -38,8 +38,8 @@
 - [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
 - [ ] Federate follow, mention, reply, favourite, and boost notifications to remote recipients.
 - [ ] Add grouped notifications and Web Push integration.
-- [ ] Apply local mute/block and domain-policy decisions consistently to discovery, inbox processing, delivery, and notifications.
-- [ ] Deliver remote mute/block activities and project their relationship state.
+- [x] Apply local mute/block and suspend-level domain-policy decisions to discovery, inbox processing, delivery, timelines, conversations, streams, and notifications.
+- [x] Deliver remote Block/Undo activities, accept validated inbound Block/Undo, and project remote mute/block relationship state.
 - [x] Complete remote direct conversations: persist mixed local/remote participants, support replies to cached direct Notes, and repair conversation state after remote updates/deletes.
 - [x] Add recipient-scoped direct-message audiences, per-account last-status projection, local/remote deletion repair, and transactional notification creation.
 - [x] Finish transactional remote notifications for Follow and Announce flows, matching the existing transactional mention/reply and Like handling.
@@ -75,7 +75,7 @@
 - [x] Add signed two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, Undo, public-status fan-out, and failed-delivery retry scheduling.
 - [x] Add end-to-end worker tests for permanent-failure classification and expired-claim recovery.
 - [ ] Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
-- [ ] Apply local mute/block policy to remote follow requests and remote follow notifications.
+- [x] Apply bilateral block and local mute policy to remote follow requests and remote notifications.
 - [ ] Enrich remote account projections with remote relationship/status counts as those data become available.
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.

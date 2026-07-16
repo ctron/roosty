@@ -38,6 +38,9 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_account_block").await);
     assert!(table_exists(database.connection(), "local_account_mute").await);
     assert!(table_exists(database.connection(), "remote_actor").await);
+    assert!(table_exists(database.connection(), "local_remote_account_block").await);
+    assert!(table_exists(database.connection(), "remote_local_account_block").await);
+    assert!(table_exists(database.connection(), "local_remote_account_mute").await);
     assert!(table_exists(database.connection(), "streaming_event").await);
     assert!(column_exists(database.connection(), "streaming_event", "sequence").await);
     assert!(
@@ -236,8 +239,8 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back the streaming-log migration and the followers URL migration.
-    Migrator::down(database.connection(), Some(2))
+    // Roll back remote moderation, the streaming log, and the followers URL migration.
+    Migrator::down(database.connection(), Some(3))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);

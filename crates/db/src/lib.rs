@@ -3,7 +3,9 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
-use roosty_core::{AccountId, JobClaimId, JobId, Result, RoostyError, StatusId};
+use roosty_core::{
+    AccountId, AccountRelationshipError, JobClaimId, JobId, Result, RoostyError, StatusId,
+};
 use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult,
@@ -76,12 +78,13 @@ mod entity;
 use entity::{
     job, local_account, local_account_block, local_account_mute, local_actor_key,
     local_conversation, local_conversation_account, local_conversation_remote_participant,
-    local_follow, local_media_attachment, local_notification, local_remote_status_favourite,
-    local_remote_status_reblog, local_status, local_status_bookmark, local_status_favourite,
-    local_status_local_recipient, local_status_reblog, local_status_remote_mention,
-    local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
-    oauth_application, oauth_authorization_code, processed_inbox_activity, remote_actor,
-    remote_custom_emoji, remote_follow, remote_following, remote_media_attachment,
+    local_follow, local_media_attachment, local_notification, local_remote_account_block,
+    local_remote_account_mute, local_remote_status_favourite, local_remote_status_reblog,
+    local_status, local_status_bookmark, local_status_favourite, local_status_local_recipient,
+    local_status_reblog, local_status_remote_mention, local_status_tag, local_tag,
+    local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
+    oauth_authorization_code, processed_inbox_activity, remote_actor, remote_custom_emoji,
+    remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
     remote_profile_media, remote_status, remote_status_favourite, remote_status_local_recipient,
     remote_status_reblog, remote_status_remote_recipient, streaming_event,
 };
@@ -712,6 +715,10 @@ pub async fn create_remote_following_with_job(
     activity_id: &str,
     job: NewJob,
 ) -> Result<RemoteFollowing> {
+    lock_local_remote_relation(txn, local_account_id, remote_actor_id).await?;
+    if local_remote_accounts_are_blocked(txn, local_account_id, remote_actor_id).await? {
+        return Err(AccountRelationshipError::FollowBlocked.into());
+    }
     let row = remote_following::ActiveModel {
         id: Set(Uuid::now_v7()),
         local_account_id: Set(local_account_id.0),
@@ -746,15 +753,20 @@ pub async fn accepted_local_followers_of_remote_actor(
     db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
 ) -> Result<Vec<AccountId>> {
-    Ok(remote_following::Entity::find()
+    let follows = remote_following::Entity::find()
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_following::Column::State.eq("accepted"))
         .filter(remote_following::Column::DeactivatedAt.is_null())
         .all(db)
-        .await?
-        .into_iter()
-        .map(|follow| AccountId(follow.local_account_id))
-        .collect())
+        .await?;
+    let mut accounts = Vec::with_capacity(follows.len());
+    for follow in follows {
+        let local = AccountId(follow.local_account_id);
+        if !local_remote_accounts_are_blocked(db, local, remote_actor_id).await? {
+            accounts.push(local);
+        }
+    }
+    Ok(accounts)
 }
 
 /// Return a page of local and remote accounts following one local account.
@@ -2470,6 +2482,8 @@ pub enum JobKind {
     FederationReblogDelivery,
     /// Deliver a local actor profile update to accepted remote followers.
     FederationActorUpdateDelivery,
+    /// Deliver a locally initiated Block or Undo(Block).
+    FederationModerationDelivery,
     /// Safely fetch one remote media attachment into the local cache.
     FederationRemoteMediaFetch,
 }
@@ -2520,6 +2534,10 @@ pub async fn upsert_processed_remote_follow_with_response_job(
     activity: JsonValue,
     response_job: RemoteFollowResponseJob,
 ) -> Result<bool> {
+    lock_local_remote_relation(txn, local_account_id, remote_actor_id).await?;
+    if local_remote_accounts_are_blocked(txn, local_account_id, remote_actor_id).await? {
+        return Ok(false);
+    }
     remote_follow::Entity::insert(remote_follow::ActiveModel {
         id: Set(Uuid::now_v7()),
         remote_actor_id: Set(remote_actor_id.0),
@@ -2557,6 +2575,10 @@ pub async fn upsert_processed_pending_remote_follow(
     activity_id: &str,
     activity: JsonValue,
 ) -> Result<bool> {
+    lock_local_remote_relation(txn, local_account_id, remote_actor_id).await?;
+    if local_remote_accounts_are_blocked(txn, local_account_id, remote_actor_id).await? {
+        return Ok(false);
+    }
     remote_follow::Entity::insert(remote_follow::ActiveModel {
         id: Set(Uuid::now_v7()),
         remote_actor_id: Set(remote_actor_id.0),
@@ -2852,6 +2874,9 @@ pub async fn notify_remote_actor_follow(
     remote_actor_id: AccountId,
     notification_type: LocalNotificationType,
 ) -> Result<Option<LocalNotification>> {
+    if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
     if !matches!(
         notification_type,
         LocalNotificationType::Follow | LocalNotificationType::FollowRequest
@@ -2931,6 +2956,9 @@ pub async fn notify_remote_actor_reblog(
     remote_actor_id: AccountId,
     status_id: StatusId,
 ) -> Result<Option<LocalNotification>> {
+    if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq("reblog"))
@@ -2968,6 +2996,9 @@ pub async fn notify_remote_status_mention<C>(
 where
     C: ConnectionTrait,
 {
+    if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq("mention"))
@@ -3059,6 +3090,24 @@ pub struct LocalAccountMute {
     /// Whether the mute suppresses notifications as well as statuses.
     pub notifications: bool,
     /// Optional timestamp when the mute stops applying.
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// Stored local moderation relationship targeting a cached remote actor.
+#[derive(Clone, Debug)]
+pub struct LocalRemoteAccountBlock {
+    pub local_account_id: AccountId,
+    pub remote_actor_id: AccountId,
+    /// Stable ID of the outbound ActivityPub `Block` activity.
+    pub activity_id: String,
+}
+
+/// Stored local-only mute targeting a cached remote actor.
+#[derive(Clone, Debug)]
+pub struct LocalRemoteAccountMute {
+    pub local_account_id: AccountId,
+    pub remote_actor_id: AccountId,
+    pub notifications: bool,
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -3220,8 +3269,8 @@ pub async fn search_accounts(
                   )
                   AND actor.deleted_at IS NULL
                   AND NOT EXISTS (
-                    SELECT 1 FROM local_account_block block
-                    WHERE block.account_id = $1 AND block.target_account_id = actor.id
+                    SELECT 1 FROM local_remote_account_block block
+                    WHERE block.local_account_id = $1 AND block.remote_actor_id = actor.id
                   )
             )
             SELECT account_kind, id
@@ -3371,22 +3420,16 @@ pub async fn follow_local_account(
     notify: bool,
 ) -> Result<LocalFollow> {
     if follower_account_id == followed_account_id {
-        return Err(RoostyError::InvalidInput(
-            "accounts cannot follow themselves".to_owned(),
-        ));
+        return Err(AccountRelationshipError::SelfFollow.into());
     }
     if find_local_account_by_id(db, followed_account_id)
         .await?
         .is_none()
     {
-        return Err(RoostyError::InvalidInput(
-            "followed account does not exist".to_owned(),
-        ));
+        return Err(AccountRelationshipError::FollowTargetNotFound.into());
     }
     if local_accounts_are_blocked(db, follower_account_id, followed_account_id).await? {
-        return Err(RoostyError::InvalidInput(
-            "follow is blocked by an account relationship".to_owned(),
-        ));
+        return Err(AccountRelationshipError::FollowBlocked.into());
     }
 
     let now = OffsetDateTime::now_utc();
@@ -3476,11 +3519,14 @@ pub async fn block_local_account(
 }
 
 /// Remove a local account block when it exists.
-pub async fn unblock_local_account(
-    db: &DbConnection,
+pub async fn unblock_local_account<C>(
+    db: &C,
     account_id: AccountId,
     target_account_id: AccountId,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
     if let Some(model) =
         local_account_block::Entity::find_by_id((account_id.0, target_account_id.0))
             .one(db)
@@ -3493,13 +3539,16 @@ pub async fn unblock_local_account(
 }
 
 /// Mute a local account, replacing notification and duration settings when it already exists.
-pub async fn mute_local_account(
-    db: &DbConnection,
+pub async fn mute_local_account<C>(
+    db: &C,
     account_id: AccountId,
     target_account_id: AccountId,
     notifications: bool,
     duration_seconds: u64,
-) -> Result<LocalAccountMute> {
+) -> Result<LocalAccountMute>
+where
+    C: ConnectionTrait,
+{
     ensure_local_relation_target(db, account_id, target_account_id).await?;
     let now = OffsetDateTime::now_utc();
     let expires_at = if duration_seconds == 0 {
@@ -3539,11 +3588,14 @@ pub async fn mute_local_account(
 }
 
 /// Remove a local account mute when it exists.
-pub async fn unmute_local_account(
-    db: &DbConnection,
+pub async fn unmute_local_account<C>(
+    db: &C,
     account_id: AccountId,
     target_account_id: AccountId,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
     if let Some(model) = local_account_mute::Entity::find_by_id((account_id.0, target_account_id.0))
         .one(db)
         .await?
@@ -3766,6 +3818,503 @@ pub async fn blocked_local_accounts_for_account(
     })
 }
 
+/// Atomically create a local-to-remote block, sever bilateral follows, dismiss
+/// prior notifications from the actor, and enqueue its first delivery.
+///
+/// Returns `true` only for the request that inserted the relationship. This
+/// makes concurrent repeated block requests share one stable activity.
+pub async fn block_remote_account<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+    job: NewJob,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    lock_local_remote_relation(db, local_account_id, remote_actor_id).await?;
+    if remote_actor::Entity::find_by_id(remote_actor_id.0)
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Err(AccountRelationshipError::ModerationTargetNotFound.into());
+    }
+    let now = OffsetDateTime::now_utc();
+    let inserted = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO local_remote_account_block
+           (id, local_account_id, remote_actor_id, activity_id, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $5)
+           ON CONFLICT (local_account_id, remote_actor_id) DO NOTHING
+           RETURNING id"#,
+            vec![
+                Uuid::now_v7().into(),
+                local_account_id.0.into(),
+                remote_actor_id.0.into(),
+                activity_id.to_owned().into(),
+                now.into(),
+            ],
+        ))
+        .await?
+        .is_some();
+
+    remote_following::Entity::delete_many()
+        .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .exec(db)
+        .await?;
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .exec(db)
+        .await?;
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE local_notification SET dismissed_at = $3 WHERE account_id = $1 AND remote_actor_id = $2 AND dismissed_at IS NULL",
+        vec![local_account_id.0.into(), remote_actor_id.0.into(), now.into()],
+    )).await?;
+    if inserted {
+        enqueue_job_on_connection(db, job).await?;
+    }
+    Ok(inserted)
+}
+
+/// Find a local account's block of a remote actor.
+pub async fn find_local_remote_account_block<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<Option<LocalRemoteAccountBlock>>
+where
+    C: ConnectionTrait,
+{
+    Ok(
+        local_remote_account_block::Entity::find_by_id((local_account_id.0, remote_actor_id.0))
+            .one(db)
+            .await?
+            .map(|row| LocalRemoteAccountBlock {
+                local_account_id: AccountId(row.local_account_id),
+                remote_actor_id: AccountId(row.remote_actor_id),
+                activity_id: row.activity_id,
+            }),
+    )
+}
+
+/// Delete a local-to-remote block and enqueue its `Undo` in the same transaction.
+pub async fn unblock_remote_account<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    job: NewJob,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    lock_local_remote_relation(db, local_account_id, remote_actor_id).await?;
+    let result =
+        local_remote_account_block::Entity::delete_by_id((local_account_id.0, remote_actor_id.0))
+            .exec(db)
+            .await?;
+    if result.rows_affected == 1 {
+        enqueue_job_on_connection(db, job).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Create or update a local-only mute of a remote actor.
+pub async fn mute_remote_account<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    notifications: bool,
+    duration_seconds: u64,
+) -> Result<LocalRemoteAccountMute>
+where
+    C: ConnectionTrait,
+{
+    if remote_actor::Entity::find_by_id(remote_actor_id.0)
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Err(AccountRelationshipError::ModerationTargetNotFound.into());
+    }
+    let now = OffsetDateTime::now_utc();
+    let expires_at =
+        if duration_seconds == 0 {
+            None
+        } else {
+            Some(
+                now + Duration::seconds(i64::try_from(duration_seconds).map_err(|_| {
+                    RoostyError::InvalidInput("mute duration is too large".to_owned())
+                })?),
+            )
+        };
+    let row = match local_remote_account_mute::Entity::find_by_id((
+        local_account_id.0,
+        remote_actor_id.0,
+    ))
+    .one(db)
+    .await?
+    {
+        Some(row) => {
+            let mut active = row.into_active_model();
+            active.notifications = Set(notifications);
+            active.expires_at = Set(expires_at);
+            active.updated_at = Set(now);
+            active.update(db).await?
+        }
+        None => {
+            local_remote_account_mute::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                local_account_id: Set(local_account_id.0),
+                remote_actor_id: Set(remote_actor_id.0),
+                notifications: Set(notifications),
+                expires_at: Set(expires_at),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(db)
+            .await?
+        }
+    };
+    Ok(local_remote_account_mute_from_model(row))
+}
+
+/// Remove a local-only mute of a remote actor.
+pub async fn unmute_remote_account<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    local_remote_account_mute::Entity::delete_by_id((local_account_id.0, remote_actor_id.0))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Return an unexpired remote mute.
+pub async fn active_local_remote_account_mute<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<Option<LocalRemoteAccountMute>>
+where
+    C: ConnectionTrait,
+{
+    let row =
+        local_remote_account_mute::Entity::find_by_id((local_account_id.0, remote_actor_id.0))
+            .filter(
+                Condition::any()
+                    .add(local_remote_account_mute::Column::ExpiresAt.is_null())
+                    .add(
+                        local_remote_account_mute::Column::ExpiresAt.gt(OffsetDateTime::now_utc()),
+                    ),
+            )
+            .one(db)
+            .await?;
+    Ok(row.map(local_remote_account_mute_from_model))
+}
+
+/// Return whether either side has blocked the local/remote relationship.
+pub async fn local_remote_accounts_are_blocked<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    Ok(
+        find_local_remote_account_block(db, local_account_id, remote_actor_id)
+            .await?
+            .is_some()
+            || remote_local_account_block::Entity::find_by_id((
+                remote_actor_id.0,
+                local_account_id.0,
+            ))
+            .one(db)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Return whether a remote actor directly blocks a local account.
+pub async fn remote_actor_blocks_local_account<C>(
+    db: &C,
+    remote_actor_id: AccountId,
+    local_account_id: AccountId,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    Ok(
+        remote_local_account_block::Entity::find_by_id((remote_actor_id.0, local_account_id.0))
+            .one(db)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Return whether a remote actor is hidden from a viewer's personalized surfaces.
+pub async fn remote_account_is_hidden_for_viewer<C>(
+    db: &C,
+    viewer: AccountId,
+    actor: AccountId,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    Ok(find_local_remote_account_block(db, viewer, actor)
+        .await?
+        .is_some()
+        || active_local_remote_account_mute(db, viewer, actor)
+            .await?
+            .is_some())
+}
+
+/// Return active remote actors hidden from personalized surfaces for one viewer.
+pub async fn hidden_remote_actor_ids_for_account<C>(
+    db: &C,
+    account_id: AccountId,
+) -> Result<Vec<AccountId>>
+where
+    C: ConnectionTrait,
+{
+    let now = OffsetDateTime::now_utc();
+    let blocks = local_remote_account_block::Entity::find()
+        .filter(local_remote_account_block::Column::LocalAccountId.eq(account_id.0))
+        .all(db)
+        .await?;
+    let mutes = local_remote_account_mute::Entity::find()
+        .filter(local_remote_account_mute::Column::LocalAccountId.eq(account_id.0))
+        .filter(
+            Condition::any()
+                .add(local_remote_account_mute::Column::ExpiresAt.is_null())
+                .add(local_remote_account_mute::Column::ExpiresAt.gt(now)),
+        )
+        .all(db)
+        .await?;
+    let mut ids = blocks
+        .into_iter()
+        .map(|row| AccountId(row.remote_actor_id))
+        .chain(mutes.into_iter().map(|row| AccountId(row.remote_actor_id)))
+        .collect::<Vec<_>>();
+    ids.sort_unstable_by_key(|id| id.0);
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Reconcile cached actors covered by operator domain suspension.
+///
+/// Cached actors and statuses are retained, while follows are permanently
+/// severed, notifications dismissed, and pending deliveries completed.
+pub async fn reconcile_suspended_remote_domains<C>(db: &C, domains: &[String]) -> Result<u64>
+where
+    C: ConnectionTrait,
+{
+    if domains.is_empty() {
+        return Ok(0);
+    }
+    let actors = remote_actor::Entity::find().all(db).await?;
+    let actor_ids = actors
+        .into_iter()
+        .filter(|actor| {
+            domains.iter().any(|blocked| {
+                actor.domain == *blocked
+                    || actor
+                        .domain
+                        .strip_suffix(blocked)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            })
+        })
+        .map(|actor| actor.id)
+        .collect::<Vec<_>>();
+    if actor_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = OffsetDateTime::now_utc();
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::RemoteActorId.is_in(actor_ids.clone()))
+        .exec(db)
+        .await?;
+    remote_following::Entity::delete_many()
+        .filter(remote_following::Column::RemoteActorId.is_in(actor_ids.clone()))
+        .exec(db)
+        .await?;
+    db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "UPDATE local_notification SET dismissed_at = $2 WHERE remote_actor_id = ANY($1) AND dismissed_at IS NULL",
+        vec![actor_ids.clone().into(), now.into()])).await?;
+    let actor_id_strings = actor_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
+    db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "UPDATE job SET completed_at = $2, locked_at = NULL, locked_by = NULL, claim_id = NULL, last_error = 'remote domain suspended' WHERE completed_at IS NULL AND payload->>'remote_actor_id' = ANY($1)",
+        vec![actor_id_strings.into(), now.into()])).await?;
+    Ok(actor_ids.len() as u64)
+}
+
+/// Return whether a remote actor may create a notification for a local account.
+pub async fn remote_account_allows_notification<C>(
+    db: &C,
+    recipient: AccountId,
+    actor: AccountId,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    if local_remote_accounts_are_blocked(db, recipient, actor).await? {
+        return Ok(false);
+    }
+    Ok(!active_local_remote_account_mute(db, recipient, actor)
+        .await?
+        .is_some_and(|mute| mute.notifications))
+}
+
+/// Persist a validated inbound block and sever all relationships for its pair.
+pub async fn process_remote_block<C>(
+    db: &C,
+    remote_actor_id: AccountId,
+    local_account_id: AccountId,
+    activity_id: &str,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    lock_local_remote_relation(db, local_account_id, remote_actor_id).await?;
+    let inserted = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        r#"INSERT INTO remote_local_account_block (id, remote_actor_id, local_account_id, activity_id)
+           VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING id"#,
+        vec![Uuid::now_v7().into(), remote_actor_id.0.into(), local_account_id.0.into(), activity_id.to_owned().into()])).await?.is_some();
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
+        .exec(db)
+        .await?;
+    remote_following::Entity::delete_many()
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
+        .exec(db)
+        .await?;
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE local_notification SET dismissed_at = now() WHERE account_id = $1 AND remote_actor_id = $2 AND dismissed_at IS NULL",
+        vec![local_account_id.0.into(), remote_actor_id.0.into()],
+    )).await?;
+    Ok(inserted)
+}
+
+/// Serialize block/follow changes for one local/remote pair across processes.
+async fn lock_local_remote_relation<C>(db: &C, local: AccountId, remote: AccountId) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let key = format!("{}:{}", local.0, remote.0);
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![key.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Remove an inbound block only when the Undo names its currently stored activity.
+pub async fn process_remote_undo_block<C>(
+    db: &C,
+    remote_actor_id: AccountId,
+    local_account_id: AccountId,
+    activity_id: &str,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    lock_local_remote_relation(db, local_account_id, remote_actor_id).await?;
+    let result = remote_local_account_block::Entity::delete_many()
+        .filter(remote_local_account_block::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_local_account_block::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_local_account_block::Column::ActivityId.eq(activity_id))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
+/// Resolve the local target of a currently active inbound block by activity identity.
+pub async fn find_remote_local_block_by_activity<C>(
+    db: &C,
+    remote_actor_id: AccountId,
+    activity_id: &str,
+) -> Result<Option<AccountId>>
+where
+    C: ConnectionTrait,
+{
+    Ok(remote_local_account_block::Entity::find()
+        .filter(remote_local_account_block::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_local_account_block::Column::ActivityId.eq(activity_id))
+        .one(db)
+        .await?
+        .map(|row| AccountId(row.local_account_id)))
+}
+
+/// List local and remote block targets in one UUIDv7 cursor order.
+pub async fn blocked_accounts_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    follow_collection_page(
+        db,
+        local_account_block::Entity::find()
+            .filter(local_account_block::Column::AccountId.eq(account_id.0)),
+        local_remote_account_block::Entity::find()
+            .filter(local_remote_account_block::Column::LocalAccountId.eq(account_id.0)),
+        limit,
+        cursor,
+        |row| (row.id, AccountId(row.target_account_id)),
+        |row| (row.id, AccountId(row.remote_actor_id)),
+    )
+    .await
+}
+
+/// List active local and remote mute targets in one UUIDv7 cursor order.
+pub async fn muted_accounts_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    let now = OffsetDateTime::now_utc();
+    follow_collection_page(
+        db,
+        local_account_mute::Entity::find()
+            .filter(local_account_mute::Column::AccountId.eq(account_id.0))
+            .filter(
+                Condition::any()
+                    .add(local_account_mute::Column::ExpiresAt.is_null())
+                    .add(local_account_mute::Column::ExpiresAt.gt(now)),
+            ),
+        local_remote_account_mute::Entity::find()
+            .filter(local_remote_account_mute::Column::LocalAccountId.eq(account_id.0))
+            .filter(
+                Condition::any()
+                    .add(local_remote_account_mute::Column::ExpiresAt.is_null())
+                    .add(local_remote_account_mute::Column::ExpiresAt.gt(now)),
+            ),
+        limit,
+        cursor,
+        |row| (row.id, AccountId(row.target_account_id)),
+        |row| (row.id, AccountId(row.remote_actor_id)),
+    )
+    .await
+}
+
 /// Validate that a local relation has an existing, distinct target account.
 async fn ensure_local_relation_target(
     db: &impl ConnectionTrait,
@@ -3773,18 +4322,14 @@ async fn ensure_local_relation_target(
     target_account_id: AccountId,
 ) -> Result<()> {
     if account_id == target_account_id {
-        return Err(RoostyError::InvalidInput(
-            "accounts cannot moderate themselves".to_owned(),
-        ));
+        return Err(AccountRelationshipError::SelfModeration.into());
     }
     if local_account::Entity::find_by_id(target_account_id.0)
         .one(db)
         .await?
         .is_none()
     {
-        return Err(RoostyError::InvalidInput(
-            "target account does not exist".to_owned(),
-        ));
+        return Err(AccountRelationshipError::ModerationTargetNotFound.into());
     }
 
     Ok(())
@@ -3850,6 +4395,14 @@ pub async fn local_notifications_for_account(
         .apply_collection_cursor(cursor)
         .order_by_desc(local_notification::Column::Id)
         .limit(page_query_limit(limit));
+
+    let hidden_remote_ids = hidden_remote_actor_ids_for_account(db, account_id).await?;
+    if !hidden_remote_ids.is_empty() {
+        query = query.filter(
+            local_notification::Column::RemoteActorId
+                .is_not_in(hidden_remote_ids.into_iter().map(|id| id.0)),
+        );
+    }
 
     if !filter.include_types.is_empty() {
         query = query.filter(
@@ -5750,6 +6303,12 @@ pub async fn remote_status_visible_to_account(
     status: &RemoteStatus,
     account_id: AccountId,
 ) -> Result<bool> {
+    if find_local_remote_account_block(db, account_id, status.remote_actor_id)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
     if matches!(
         status.visibility,
         StatusVisibility::Public | StatusVisibility::Unlisted
@@ -6152,6 +6711,9 @@ pub async fn process_remote_like(
     activity_id: &str,
     recipient_account_id: AccountId,
 ) -> Result<Option<LocalNotification>> {
+    if local_remote_accounts_are_blocked(txn, recipient_account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
     let inserted = remote_status_favourite::Entity::insert(remote_status_favourite::ActiveModel {
         id: Set(Uuid::now_v7()),
         remote_actor_id: Set(remote_actor_id.0),
@@ -6162,7 +6724,9 @@ pub async fn process_remote_like(
     .on_conflict_do_nothing()
     .exec(txn)
     .await?;
-    let notification = if matches!(inserted, TryInsertResult::Inserted(_)) {
+    let notification = if matches!(inserted, TryInsertResult::Inserted(_))
+        && remote_account_allows_notification(txn, recipient_account_id, remote_actor_id).await?
+    {
         Some(
             notify_remote_actor_favourite(txn, recipient_account_id, remote_actor_id, status_id)
                 .await?,
@@ -7232,6 +7796,11 @@ pub async fn home_timeline_for_account(
         .into_iter()
         .map(|account_id| account_id.0)
         .collect::<Vec<_>>();
+    let hidden_remote_actor_ids = hidden_remote_actor_ids_for_account(db, account_id)
+        .await?
+        .into_iter()
+        .map(|actor_id| actor_id.0)
+        .collect::<Vec<_>>();
     let follows = local_follow::Entity::find()
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .all(db)
@@ -7370,6 +7939,11 @@ pub async fn home_timeline_for_account(
                 ),
         )
         .filter(remote_status::Column::DeletedAt.is_null());
+    if !hidden_remote_actor_ids.is_empty() {
+        remote_query = remote_query.filter(
+            remote_status::Column::RemoteActorId.is_not_in(hidden_remote_actor_ids.clone()),
+        );
+    }
     if let Some(max_id) = cursor.max_id {
         remote_query = remote_query.filter(remote_status::Column::Id.lt(max_id.0));
     }
@@ -7395,6 +7969,10 @@ pub async fn home_timeline_for_account(
                 .to_owned(),
         ),
     );
+    if !hidden_remote_actor_ids.is_empty() {
+        remote_reblog_query = remote_reblog_query
+            .filter(remote_status_reblog::Column::RemoteActorId.is_not_in(hidden_remote_actor_ids));
+    }
     if let Some(max_id) = cursor.max_id {
         remote_reblog_query =
             remote_reblog_query.filter(remote_status_reblog::Column::Id.lt(max_id.0));
@@ -8087,6 +8665,17 @@ fn local_account_mute_from_model(mute: local_account_mute::Model) -> LocalAccoun
     LocalAccountMute {
         account_id: AccountId(mute.account_id),
         target_account_id: AccountId(mute.target_account_id),
+        notifications: mute.notifications,
+        expires_at: mute.expires_at,
+    }
+}
+
+fn local_remote_account_mute_from_model(
+    mute: local_remote_account_mute::Model,
+) -> LocalRemoteAccountMute {
+    LocalRemoteAccountMute {
+        local_account_id: AccountId(mute.local_account_id),
+        remote_actor_id: AccountId(mute.remote_actor_id),
         notifications: mute.notifications,
         expires_at: mute.expires_at,
     }

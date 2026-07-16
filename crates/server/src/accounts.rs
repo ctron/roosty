@@ -6,7 +6,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use roosty_core::{AccountId, FederationDiscoveryError, RoostyError, StatusId};
+use roosty_core::{
+    AccountId, AccountRelationshipError, FederationDiscoveryError, RoostyError, StatusId,
+};
 use roosty_db::{LocalNotificationType, RemoteActor, RemoteProfileMediaKind};
 use sea_orm::{AccessMode, TransactionTrait};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -195,6 +197,7 @@ async fn lookup_account(
         match roosty_db::find_remote_actor_by_handle(&state.db, &username, &domain).await {
             Ok(Some(actor))
                 if actor.deleted_at.is_none()
+                    && !state.config.federation_domain_is_blocked(&actor.domain)
                     && (!params.resolve.unwrap_or(false)
                         || actor.expires_at > time::OffsetDateTime::now_utc()) =>
             {
@@ -385,7 +388,10 @@ async fn show_account(State(state): State<AppState>, Path(path): Path<AccountPat
             Err(error) => server_error(error),
         },
         Ok(None) => match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
-            Ok(Some(actor)) if actor.deleted_at.is_none() => {
+            Ok(Some(actor))
+                if actor.deleted_at.is_none()
+                    && !state.config.federation_domain_is_blocked(&actor.domain) =>
+            {
                 match remote_account_response(&state, actor).await {
                     Ok(response) => Json(response).into_response(),
                     Err(error) => server_error(error),
@@ -422,7 +428,9 @@ async fn account_statuses(
     };
     if !local {
         match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
-            Ok(Some(actor)) if actor.deleted_at.is_none() => {}
+            Ok(Some(actor))
+                if actor.deleted_at.is_none()
+                    && !state.config.federation_domain_is_blocked(&actor.domain) => {}
             Ok(_) => return not_found(),
             Err(error) => return server_error(error),
         }
@@ -502,8 +510,15 @@ async fn follow(
         .await
         .ok()
         .flatten()
-        .is_some()
+        .is_some_and(|actor| state.config.federation_domain_is_allowed(&actor.domain))
     {
+        match roosty_db::local_remote_accounts_are_blocked(&state.db, account.id, target_id).await {
+            Ok(true) => {
+                return forbidden(&AccountRelationshipError::FollowBlocked.to_string());
+            }
+            Ok(false) => {}
+            Err(error) => return server_error(error),
+        }
         let (activity_id, job) =
             match crate::federation::prepare_remote_follow(&state, account.id, target_id).await {
                 Ok(prepared) => prepared,
@@ -526,6 +541,9 @@ async fn follow(
                 Ok(()) => relationship_response(&state, account.id, target_id).await,
                 Err(error) => server_error(error.into()),
             },
+            Err(RoostyError::AccountRelationship(AccountRelationshipError::FollowBlocked)) => {
+                forbidden(&AccountRelationshipError::FollowBlocked.to_string())
+            }
             Err(error) => server_error(error),
         };
     }
@@ -553,14 +571,13 @@ async fn follow(
             }
             relationship_response(&state, account.id, target_id).await
         }
-        Err(RoostyError::InvalidInput(error)) if error == "followed account does not exist" => {
+        Err(RoostyError::AccountRelationship(AccountRelationshipError::FollowTargetNotFound)) => {
             not_found()
         }
-        Err(RoostyError::InvalidInput(error))
-            if error == "follow is blocked by an account relationship" =>
-        {
-            forbidden(&error)
+        Err(RoostyError::AccountRelationship(AccountRelationshipError::FollowBlocked)) => {
+            forbidden(&AccountRelationshipError::FollowBlocked.to_string())
         }
+        Err(RoostyError::AccountRelationship(error)) => bad_request(&error.to_string()),
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
@@ -573,6 +590,40 @@ async fn block(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let target_id = AccountId(path.account_id);
+    match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
+        Ok(Some(actor)) if !state.config.federation_domain_is_blocked(&actor.domain) => {
+            let (activity_id, job) = match crate::federation::prepare_remote_block(
+                &state, account.id, target_id,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return server_error(error),
+            };
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return server_error(error.into()),
+            };
+            return match roosty_db::block_remote_account(
+                &txn,
+                account.id,
+                target_id,
+                &activity_id,
+                job,
+            )
+            .await
+            {
+                Ok(_) => match txn.commit().await {
+                    Ok(()) => relationship_response(&state, account.id, target_id).await,
+                    Err(error) => server_error(error.into()),
+                },
+                Err(error) => server_error(error),
+            };
+        }
+        Ok(Some(_)) => return not_found(),
+        Ok(None) => {}
+        Err(error) => return server_error(error),
+    }
     let txn = match state.db.begin().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
@@ -582,9 +633,10 @@ async fn block(
             Ok(()) => relationship_response(&state, account.id, target_id).await,
             Err(error) => server_error(error.into()),
         },
-        Err(RoostyError::InvalidInput(error)) if error == "target account does not exist" => {
-            not_found()
-        }
+        Err(RoostyError::AccountRelationship(
+            AccountRelationshipError::ModerationTargetNotFound,
+        )) => not_found(),
+        Err(RoostyError::AccountRelationship(error)) => bad_request(&error.to_string()),
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
@@ -597,8 +649,36 @@ async fn unblock(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let target_id = AccountId(path.account_id);
-    match roosty_db::unblock_local_account(&state.db, account.id, target_id).await {
-        Ok(()) => relationship_response(&state, account.id, target_id).await,
+    match roosty_db::find_local_remote_account_block(&state.db, account.id, target_id).await {
+        Ok(Some(block)) => {
+            let job = match crate::federation::prepare_remote_unblock(&state, &block).await {
+                Ok(job) => job,
+                Err(error) => return server_error(error),
+            };
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return server_error(error.into()),
+            };
+            return match roosty_db::unblock_remote_account(&txn, account.id, target_id, job).await {
+                Ok(_) => match txn.commit().await {
+                    Ok(()) => relationship_response(&state, account.id, target_id).await,
+                    Err(error) => server_error(error.into()),
+                },
+                Err(error) => server_error(error),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return server_error(error),
+    }
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::unblock_local_account(&txn, account.id, target_id).await {
+        Ok(()) => match txn.commit().await {
+            Ok(()) => relationship_response(&state, account.id, target_id).await,
+            Err(error) => server_error(error.into()),
+        },
         Err(error) => server_error(error),
     }
 }
@@ -615,8 +695,38 @@ async fn mute(
         Err(error) => return bad_request(&error),
     };
     let target_id = AccountId(path.account_id);
+    match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
+        Ok(Some(actor)) if !state.config.federation_domain_is_blocked(&actor.domain) => {
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return server_error(error.into()),
+            };
+            return match roosty_db::mute_remote_account(
+                &txn,
+                account.id,
+                target_id,
+                input.notifications.unwrap_or(true),
+                input.duration.unwrap_or(0),
+            )
+            .await
+            {
+                Ok(_) => match txn.commit().await {
+                    Ok(()) => relationship_response(&state, account.id, target_id).await,
+                    Err(error) => server_error(error.into()),
+                },
+                Err(error) => server_error(error),
+            };
+        }
+        Ok(Some(_)) => return not_found(),
+        Ok(None) => {}
+        Err(error) => return server_error(error),
+    }
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
     match roosty_db::mute_local_account(
-        &state.db,
+        &txn,
         account.id,
         target_id,
         input.notifications.unwrap_or(true),
@@ -624,10 +734,14 @@ async fn mute(
     )
     .await
     {
-        Ok(_) => relationship_response(&state, account.id, target_id).await,
-        Err(RoostyError::InvalidInput(error)) if error == "target account does not exist" => {
-            not_found()
-        }
+        Ok(_) => match txn.commit().await {
+            Ok(()) => relationship_response(&state, account.id, target_id).await,
+            Err(error) => server_error(error.into()),
+        },
+        Err(RoostyError::AccountRelationship(
+            AccountRelationshipError::ModerationTargetNotFound,
+        )) => not_found(),
+        Err(RoostyError::AccountRelationship(error)) => bad_request(&error.to_string()),
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
@@ -640,8 +754,32 @@ async fn unmute(
     Path(path): Path<AccountPath>,
 ) -> Response {
     let target_id = AccountId(path.account_id);
-    match roosty_db::unmute_local_account(&state.db, account.id, target_id).await {
-        Ok(()) => relationship_response(&state, account.id, target_id).await,
+    match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
+        Ok(Some(_)) => {
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return server_error(error.into()),
+            };
+            return match roosty_db::unmute_remote_account(&txn, account.id, target_id).await {
+                Ok(()) => match txn.commit().await {
+                    Ok(()) => relationship_response(&state, account.id, target_id).await,
+                    Err(error) => server_error(error.into()),
+                },
+                Err(error) => server_error(error),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return server_error(error),
+    }
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::unmute_local_account(&txn, account.id, target_id).await {
+        Ok(()) => match txn.commit().await {
+            Ok(()) => relationship_response(&state, account.id, target_id).await,
+            Err(error) => server_error(error.into()),
+        },
         Err(error) => server_error(error),
     }
 }
@@ -874,28 +1012,20 @@ async fn account_collection(
                 })
         }
         AccountCollection::Blocks => {
-            roosty_db::blocked_local_accounts_for_account(&state.db, account_id, limit, cursor)
+            roosty_db::blocked_accounts_for_account(&state.db, account_id, limit, cursor)
                 .await
                 .map(|page| roosty_db::CollectionPage {
-                    items: page
-                        .items
-                        .into_iter()
-                        .map(roosty_db::FollowCollectionAccount::Local)
-                        .collect(),
+                    items: page.items.into_iter().map(|entry| entry.account).collect(),
                     first_cursor: page.first_cursor,
                     last_cursor: page.last_cursor,
                     has_more: page.has_more,
                 })
         }
         AccountCollection::Mutes => {
-            roosty_db::muted_local_accounts_for_account(&state.db, account_id, limit, cursor)
+            roosty_db::muted_accounts_for_account(&state.db, account_id, limit, cursor)
                 .await
                 .map(|page| roosty_db::CollectionPage {
-                    items: page
-                        .items
-                        .into_iter()
-                        .map(roosty_db::FollowCollectionAccount::Local)
-                        .collect(),
+                    items: page.items.into_iter().map(|entry| entry.account).collect(),
                     first_cursor: page.first_cursor,
                     last_cursor: page.last_cursor,
                     has_more: page.has_more,
@@ -942,6 +1072,11 @@ async fn account_responses(
 ) -> roosty_core::Result<Vec<CollectionAccountResponse>> {
     let mut responses = Vec::with_capacity(accounts.len());
     for account in accounts {
+        if let roosty_db::FollowCollectionAccount::Remote(actor) = &account
+            && state.config.federation_domain_is_blocked(&actor.domain)
+        {
+            continue;
+        }
         responses.push(match account {
             roosty_db::FollowCollectionAccount::Local(account) => {
                 CollectionAccountResponse::Local(Box::new(account_response(state, account).await?))
@@ -978,9 +1113,26 @@ async fn relationship_model(
     let followed_by = roosty_db::local_follow_relationship(&state.db, target_id, source_id).await?;
     let remote_followed_by =
         roosty_db::remote_actor_follows_local_account(&state.db, target_id, source_id).await?;
-    let blocking = roosty_db::local_account_blocks(&state.db, source_id, target_id).await?;
-    let blocked_by = roosty_db::local_account_blocks(&state.db, target_id, source_id).await?;
-    let mute = roosty_db::active_local_account_mute(&state.db, source_id, target_id).await?;
+    let remote_target = roosty_db::find_remote_actor_by_id(&state.db, target_id)
+        .await?
+        .is_some();
+    let (blocking, blocked_by, mute, remote_mute) = if remote_target {
+        (
+            roosty_db::find_local_remote_account_block(&state.db, source_id, target_id)
+                .await?
+                .is_some(),
+            roosty_db::remote_actor_blocks_local_account(&state.db, target_id, source_id).await?,
+            None,
+            roosty_db::active_local_remote_account_mute(&state.db, source_id, target_id).await?,
+        )
+    } else {
+        (
+            roosty_db::local_account_blocks(&state.db, source_id, target_id).await?,
+            roosty_db::local_account_blocks(&state.db, target_id, source_id).await?,
+            roosty_db::active_local_account_mute(&state.db, source_id, target_id).await?,
+            None,
+        )
+    };
 
     Ok(RelationshipResponse {
         id: target_id.0.to_string(),
@@ -993,10 +1145,12 @@ async fn relationship_model(
         followed_by: followed_by.is_some() || remote_followed_by,
         blocking,
         blocked_by,
-        muting: mute.is_some(),
-        muting_notifications: mute.as_ref().is_some_and(|mute| mute.notifications),
+        muting: mute.is_some() || remote_mute.is_some(),
+        muting_notifications: mute.as_ref().is_some_and(|mute| mute.notifications)
+            || remote_mute.as_ref().is_some_and(|mute| mute.notifications),
         muting_expires_at: mute
             .and_then(|mute| mute.expires_at)
+            .or_else(|| remote_mute.and_then(|mute| mute.expires_at))
             .map(crate::statuses::format_timestamp),
         requested: remote_following
             .as_ref()
@@ -1174,6 +1328,7 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_migration::Migrator;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1795,6 +1950,81 @@ mod tests {
         assert_eq!(json_body(notifications).await[0]["type"], "mention");
     }
 
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Given a cached remote actor, block and mute endpoints preserve Mastodon response shapes and idempotency.
+    async fn remote_block_and_mute_lifecycle(context: &mut AccountContext) {
+        context.config.federation_allowed_domains = vec!["*".to_owned()];
+        context.state = AppState::new(context.config.clone(), context.db.clone());
+        let (alice_id, alice_token) = context
+            .create_account("alice_remote_mod", "alice-remote-mod@example.com")
+            .await;
+        let remote_id = context
+            .create_remote_follow_request(alice_id, "remote_mod", "accepted")
+            .await;
+
+        let block = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/block", remote_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(block.status(), StatusCode::OK);
+        assert_eq!(json_body(block).await["blocking"], true);
+
+        let repeated = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/block", remote_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let row = context
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS count FROM job WHERE kind = 'federation_moderation_delivery'",
+                Vec::new(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "count").unwrap(), 1);
+
+        let blocks = context
+            .authenticated_get("/api/v1/blocks", &alice_token)
+            .await;
+        assert_eq!(account_usernames(&json_body(blocks).await), ["remote_mod"]);
+
+        let unblock = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/unblock", remote_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(json_body(unblock).await["blocking"], false);
+
+        let mute = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/mute", remote_id.0),
+                &alice_token,
+                json!({"notifications": false, "duration": 0}),
+            )
+            .await;
+        let mute = json_body(mute).await;
+        assert_eq!(mute["muting"], true);
+        assert_eq!(mute["muting_notifications"], false);
+        assert_eq!(mute["muting_expires_at"], Value::Null);
+        let mutes = context
+            .authenticated_get("/api/v1/mutes", &alice_token)
+            .await;
+        assert_eq!(account_usernames(&json_body(mutes).await), ["remote_mod"]);
+    }
+
     /// Extract account usernames from a Mastodon account collection response.
     fn account_usernames(body: &Value) -> Vec<&str> {
         body.as_array()
@@ -2027,7 +2257,7 @@ mod tests {
             local_account_id: AccountId,
             username: &str,
             state: &str,
-        ) {
+        ) -> AccountId {
             let actor = roosty_db::RemoteActor {
                 id: AccountId(uuid::Uuid::now_v7()),
                 activitypub_id: format!("https://remote.test/users/{username}"),
@@ -2060,6 +2290,7 @@ mod tests {
             )
             .await
             .unwrap();
+            actor.id
         }
 
         /// Create a local status through the HTTP API and return its JSON response.

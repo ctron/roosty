@@ -223,6 +223,7 @@ async fn serve(
         info!("running database migrations before server startup");
         run_migrations(&db).await?;
     }
+    reconcile_domain_suspensions(&db, &config).await?;
 
     let state = AppState::new(config.clone(), db.clone());
     state.streaming_events.initialize_listener().await?;
@@ -270,11 +271,26 @@ async fn serve(
 async fn worker() -> Result<()> {
     let config = Config::from_env(None)?;
     let db = roosty_db::connect(&config.database_url).await?;
+    reconcile_domain_suspensions(&db, &config).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
     let result = worker_pool(db, config, shutdown_rx).await;
     shutdown_task.abort();
     result
+}
+
+/// Apply configured domain suspensions before this process becomes ready.
+async fn reconcile_domain_suspensions(db: &roosty_db::DbConnection, config: &Config) -> Result<()> {
+    use sea_orm::TransactionTrait;
+    let txn = db.begin().await?;
+    let reconciled =
+        roosty_db::reconcile_suspended_remote_domains(&txn, &config.federation_blocked_domains)
+            .await?;
+    txn.commit().await?;
+    if reconciled > 0 {
+        info!(reconciled, "reconciled suspended remote-domain actors");
+    }
+    Ok(())
 }
 
 async fn serve_router(
@@ -402,6 +418,9 @@ async fn worker_iteration(
         }
         "federation_actor_update_delivery" => {
             federation::deliver_actor_update(&state, job.payload.clone()).await
+        }
+        "federation_moderation_delivery" => {
+            federation::deliver_moderation_activity(&state, job.payload.clone()).await
         }
         "federation_remote_media_fetch" => {
             media::fetch_remote_media(&state, job.payload.clone()).await

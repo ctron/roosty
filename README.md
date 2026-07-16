@@ -230,3 +230,16 @@ URL from the second request. To allow followers from any public instance, set
 precedence. Keep the federation key-encryption secret and PostgreSQL data
 persistent across deployments so Roosty can continue signing Accept and status
 delivery activities.
+
+Blocked-domain configuration uses suspend-level semantics for the named domain
+and its subdomains. Cached actors become unavailable, inbound federation is
+rejected, queued and future delivery is dropped, and startup reconciliation
+permanently severs follows and dismisses notifications. Cached content is
+retained; removing the configuration can expose it again, but relationships are
+not restored.
+
+Mastodon-compatible block and mute endpoints accept local accounts and cached
+remote actors. Remote blocks transactionally sever bilateral follows, dismiss
+prior notifications, and queue a signed ActivityPub `Block` or `Undo(Block)`.
+Remote mutes are local-only, preserve follows, support expiry, hide feed and
+conversation content, and optionally suppress notifications.

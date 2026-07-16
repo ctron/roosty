@@ -15,6 +15,21 @@ pub enum FederationDiscoveryError {
     PolicyRejected(Cow<'static, str>),
 }
 
+/// Typed account-relationship failures translated at API boundaries.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum AccountRelationshipError {
+    #[error("accounts cannot follow themselves")]
+    SelfFollow,
+    #[error("followed account does not exist")]
+    FollowTargetNotFound,
+    #[error("follow is blocked by an account relationship")]
+    FollowBlocked,
+    #[error("accounts cannot moderate themselves")]
+    SelfModeration,
+    #[error("target account does not exist")]
+    ModerationTargetNotFound,
+}
+
 #[derive(Debug, Error)]
 pub enum RoostyError {
     #[error("configuration error: {0}")]
@@ -25,6 +40,9 @@ pub enum RoostyError {
 
     #[error(transparent)]
     FederationDiscovery(#[from] FederationDiscoveryError),
+
+    #[error(transparent)]
+    AccountRelationship(#[from] AccountRelationshipError),
 
     #[error("invalid input: {0}")]
     InvalidInput(String),

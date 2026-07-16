@@ -219,10 +219,18 @@ impl Config {
         self.federation_allowed_domains
             .iter()
             .any(|allowed| allowed == "*" || allowed == &domain)
-            && !self
-                .federation_blocked_domains
-                .iter()
-                .any(|blocked| blocked == &domain)
+            && !self.federation_domain_is_blocked(&domain)
+    }
+
+    /// Suspend a configured domain and every subdomain below it.
+    pub fn federation_domain_is_blocked(&self, domain: &str) -> bool {
+        let domain = domain.to_ascii_lowercase();
+        self.federation_blocked_domains.iter().any(|blocked| {
+            domain == *blocked
+                || domain
+                    .strip_suffix(blocked)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     }
 }
 
@@ -413,6 +421,8 @@ mod tests {
         assert!(config.federation_domain_is_allowed("remote.example"));
         assert!(config.federation_domain_is_allowed("REMOTE.EXAMPLE"));
         assert!(!config.federation_domain_is_allowed("blocked.example"));
+        assert!(!config.federation_domain_is_allowed("media.blocked.example"));
+        assert!(config.federation_domain_is_allowed("notblocked.example"));
     }
 
     #[test]

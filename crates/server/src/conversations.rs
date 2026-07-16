@@ -141,6 +141,9 @@ async fn conversation_page_response(
     .header_value();
     let mut conversations = Vec::with_capacity(page.items.len());
     for conversation in page.items {
+        if conversation_is_hidden(state, account_id, &conversation.account).await {
+            continue;
+        }
         match conversation_response(state, account_id, conversation).await {
             Ok(response) => conversations.push(response),
             Err(error) => return server_error(error),
@@ -151,6 +154,31 @@ async fn conversation_page_response(
         response.headers_mut().insert(header::LINK, link_header);
     }
     response
+}
+
+async fn conversation_is_hidden(
+    state: &AppState,
+    account_id: AccountId,
+    view: &roosty_db::LocalConversationAccount,
+) -> bool {
+    let Some(status_id) = view.last_remote_status_id else {
+        return false;
+    };
+    let Ok(Some(status)) = roosty_db::find_remote_status_by_id(&state.db, status_id).await else {
+        return false;
+    };
+    if roosty_db::remote_account_is_hidden_for_viewer(&state.db, account_id, status.remote_actor_id)
+        .await
+        .unwrap_or(true)
+    {
+        return true;
+    }
+    let Ok(Some(actor)) =
+        roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await
+    else {
+        return true;
+    };
+    state.config.federation_domain_is_blocked(&actor.domain)
 }
 
 async fn conversation_response(
@@ -228,6 +256,14 @@ async fn conversation_accounts(
     }
 
     for participant in participants.remote_accounts {
+        if let Some(id) = participant.remote_actor_id
+            && (roosty_db::remote_account_is_hidden_for_viewer(&state.db, account_id, id).await?
+                || roosty_db::find_remote_actor_by_id(&state.db, id)
+                    .await?
+                    .is_some_and(|actor| state.config.federation_domain_is_blocked(&actor.domain)))
+        {
+            continue;
+        }
         let response = match participant.remote_actor_id {
             Some(id) => match roosty_db::find_remote_actor_by_id(&state.db, id).await? {
                 Some(actor) => remote_account_response(state, actor).await?,

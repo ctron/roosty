@@ -34,9 +34,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | Domain policy | Remote discovery and delivery use an operator allow/block policy. It supports exact domains or `*` for all public domains, with blocks taking precedence. |
+| 🟢 | Domain policy | Remote discovery and delivery use an operator allow/block policy. Configured blocks suspend a domain and its subdomains, including cached exposure, startup relationship reconciliation, and queued-delivery dropping. |
 | 🟢 | SSRF protections | Remote discovery and delivery require HTTPS, reject unsafe resolved addresses, disable redirects, and enforce timeouts and response limits. |
-| 🔴 | Federation moderation | No remote report, reject, or suspend flow yet. |
+| 🟡 | Federation moderation | Per-account signed Block/Undo is delivered and accepted with replay-safe identity matching. Configured domain suspension is enforced; reports and administrative moderation APIs remain out of scope. |
 
 ## Mastodon API
 
@@ -71,7 +71,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns statuses authorized for the viewer, including cached follower-only posts for current followers and explicit mentions, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state; pinned statuses are missing. |
 | 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote graph fetching remains missing. |
 | 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
-| 🟡 | Mutes and blocks | Local mute/unmute, block/unblock, relationship state, mute duration, and paginated collections work; remote and domain policy are missing. |
+| 🟢 | Mutes and blocks | Local and remote mute/unmute and block/unblock, relationship state, mute duration/expiry, and mixed cursor-paginated collections work. Remote mutes remain local-only; blocks federate. |
 
 ### Search
 
@@ -153,8 +153,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Inbound status lifecycle | Signed public/unlisted/follower-only `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, exact audiences, reply references, and author ownership checks. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
 | 🟢 | Remote timeline fan-out | Cached remote posts are pushed to authorized home streams; follower-only access follows current accepted relationships and explicit audiences, with no polling or backfill. |
-| 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed for public/unlisted statuses. Remote mutes and blocks remain missing. |
-| 🟡 | Remote conversations and moderation | Signed remote direct Notes, mixed participant projection, direct replies, personal-inbox delivery, and remote media fetching work. Account migration and domain-policy moderation remain missing. |
+| 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed subject to bilateral block and notification-mute policy. |
+| 🟡 | Remote conversations and moderation | Signed remote direct Notes, mixed participant projection, direct replies, personal-inbox delivery, remote media fetching, per-account moderation, and domain suspension work. Account migration remains missing. |
 
 ## TODO
 
@@ -163,11 +163,11 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add signed inbound Follow, Undo, Accept, Reject, and locked-account follow-request processing.
 - [ ] Add signed outbound Follow, Undo, Accept, Reject, Create, Update, and Delete delivery with retries.
 - [x] Add remote follower home-timeline fan-out, repair jobs, and follower-only visibility semantics.
-- [ ] Add remote mutes, blocks, and broader recipient notification federation. Signed remote delete repair is implemented.
-- [ ] Add federated direct-message media fetching, account migration, and domain-policy moderation.
+- [x] Add remote mutes and blocks with notification and recipient filtering. Signed remote delete repair is implemented.
+- [ ] Add federated direct-message media fetching and account migration.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote hashtag support.
 - [ ] Add grouped notifications, push integration, and remote notification events.
 - [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.
-- [ ] Add moderation APIs and domain policy.
+- [x] Add per-account moderation APIs and configured suspend-level domain policy.

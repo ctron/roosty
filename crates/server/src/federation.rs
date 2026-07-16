@@ -196,6 +196,36 @@ struct InboundUndoFollowActivity {
     object: InboundUndoFollowObject,
 }
 
+/// ActivityPub Block target accepted from a signed remote actor.
+#[derive(Deserialize)]
+struct InboundBlockActivity {
+    actor: String,
+    object: InboundActorReference,
+}
+
+/// ActivityPub Undo object forms accepted for a prior Block activity.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundUndoBlockObject {
+    Id(String),
+    Block { id: String, r#type: String },
+}
+
+impl InboundUndoBlockObject {
+    fn block_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Block { id, r#type } if r#type == "Block" => Some(id),
+            Self::Block { .. } => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct InboundUndoBlockActivity {
+    object: InboundUndoBlockObject,
+}
+
 /// ActivityPub Like fields accepted from a signed remote inbox.
 #[derive(Deserialize)]
 struct InboundLikeActivity {
@@ -1026,6 +1056,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 | "Announce"
                 | "Undo"
                 | "Move"
+                | "Block"
         )
     );
     if !supported {
@@ -1086,6 +1117,78 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 StatusCode::ACCEPTED.into_response()
             }
         };
+    }
+    if activity_type == Some("Block") {
+        let block: InboundBlockActivity = match serde_json::from_value(activity.clone()) {
+            Ok(block) => block,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        if block.actor != remote_actor.activitypub_id {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let target_url = block.object.id();
+        let Some(local_account) = local_account_from_actor_url(state, &target_url).await else {
+            return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+        };
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(error) => return internal_error(error),
+        };
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if is_new
+            && let Err(error) = roosty_db::process_remote_block(
+                &txn,
+                remote_actor.id,
+                local_account.id,
+                &activity_id,
+            )
+            .await
+        {
+            return internal_error(error);
+        }
+        return match txn.commit().await {
+            Ok(()) => StatusCode::ACCEPTED.into_response(),
+            Err(error) => internal_error(error),
+        };
+    }
+    if activity_type == Some("Undo")
+        && let Ok(undo) = serde_json::from_value::<InboundUndoBlockActivity>(activity.clone())
+        && let Some(original_id) = undo.object.block_id()
+    {
+        let row = match roosty_db::find_remote_local_block_by_activity(
+            &state.db,
+            remote_actor.id,
+            &original_id,
+        )
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => return internal_error(error),
+        };
+        if let Some(row) = row {
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return internal_error(error),
+            };
+            let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+                Ok(is_new) => is_new,
+                Err(error) => return internal_error(error),
+            };
+            if is_new
+                && let Err(error) =
+                    roosty_db::process_remote_undo_block(&txn, remote_actor.id, row, &original_id)
+                        .await
+            {
+                return internal_error(error);
+            }
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
     }
     if matches!(
         activity.get("type").and_then(JsonValue::as_str),
@@ -2119,6 +2222,19 @@ async fn publish_remote_status_change(
                 recipients.sort_by_key(|id| id.0);
                 recipients.dedup();
             }
+            let mut filtered = Vec::with_capacity(recipients.len());
+            for recipient in recipients {
+                if !roosty_db::remote_account_is_hidden_for_viewer(
+                    &state.db,
+                    recipient,
+                    remote_actor_id,
+                )
+                .await?
+                {
+                    filtered.push(recipient);
+                }
+            }
+            let recipients = filtered;
             let response =
                 crate::statuses::remote_status_response(state, (*status).clone()).await?;
             if let Some(refresh) = refresh {
@@ -2575,6 +2691,14 @@ struct ReblogDelivery {
     activity: JsonValue,
 }
 
+/// Durable payload for a local Block or Undo(Block) delivery.
+#[derive(Deserialize, Serialize)]
+struct ModerationDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+}
+
 /// Closed ActivityStreams activity types emitted for boost federation.
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -2998,6 +3122,86 @@ pub(crate) async fn deliver_follow_activity(
     .await
 }
 
+/// Build a stable outbound Block and its transactional delivery job.
+pub(crate) async fn prepare_remote_block(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+) -> Result<(String, roosty_db::NewJob), RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local block actor does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote block target does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#block-{}", Uuid::now_v7());
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Block", "actor": actor, "object": remote.activitypub_id});
+    Ok((
+        id.clone(),
+        moderation_delivery_job(local_account_id, remote_actor_id, activity, &id)?,
+    ))
+}
+
+/// Build an Undo that references the stable Block identity stored with the relationship.
+pub(crate) async fn prepare_remote_unblock(
+    state: &AppState,
+    block: &roosty_db::LocalRemoteAccountBlock,
+) -> Result<roosty_db::NewJob, RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, block.local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local block actor does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, block.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote block target does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#undo-block-{}", Uuid::now_v7());
+    let original = serde_json::json!({"id": block.activity_id, "type": "Block", "actor": actor, "object": remote.activitypub_id});
+    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": original});
+    moderation_delivery_job(block.local_account_id, block.remote_actor_id, activity, &id)
+}
+
+fn moderation_delivery_job(
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activity: JsonValue,
+    activity_id: &str,
+) -> Result<roosty_db::NewJob, RoostyError> {
+    let payload = serde_json::to_value(ModerationDelivery {
+        local_account_id,
+        remote_actor_id,
+        activity,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    Ok(roosty_db::NewJob {
+        kind: roosty_db::JobKind::FederationModerationDelivery,
+        payload,
+        deduplication_key: Some(activity_id.to_owned()),
+        run_after: OffsetDateTime::now_utc(),
+    })
+}
+
+/// Deliver moderation activities to the actor's personal inbox.
+pub(crate) async fn deliver_moderation_activity(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: ModerationDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid moderation delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+        true,
+    )
+    .await
+}
+
 /// Queue a public or unlisted local status activity for every accepted remote follower.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_status_activity(
@@ -3374,6 +3578,26 @@ async fn deliver_activity(
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote delivery actor does not exist".to_owned())
         })?;
+    if !state.config.federation_domain_is_allowed(&remote.domain) {
+        // Domain suspension intentionally drops already queued work without retrying.
+        return Ok(());
+    }
+    let moderation_activity = activity.get("type").and_then(JsonValue::as_str) == Some("Block")
+        || activity
+            .get("object")
+            .and_then(|object| object.get("type"))
+            .and_then(JsonValue::as_str)
+            == Some("Block");
+    if !moderation_activity
+        && roosty_db::local_remote_accounts_are_blocked(
+            &state.db,
+            local_account_id,
+            remote_actor_id,
+        )
+        .await?
+    {
+        return Ok(());
+    }
     let key = roosty_db::find_local_actor_key(&state.db, local.id)
         .await?
         .ok_or_else(|| {
@@ -3675,6 +3899,23 @@ fn activity_response<T: Serialize>(value: T) -> Response {
 fn actor_url(state: &AppState, username: &str) -> String {
     public_url(state, &format!("users/{username}"))
 }
+
+async fn local_account_from_actor_url(
+    state: &AppState,
+    target_url: &str,
+) -> Option<roosty_db::LocalAccount> {
+    let username = target_url
+        .rsplit('/')
+        .next()
+        .filter(|username| !username.is_empty())?;
+    if target_url != actor_url(state, username) {
+        return None;
+    }
+    roosty_db::find_local_account_by_username(&state.db, username)
+        .await
+        .ok()
+        .flatten()
+}
 fn status_url(state: &AppState, username: &str, status_id: StatusId) -> String {
     public_url(state, &format!("users/{username}/statuses/{}", status_id.0))
 }
@@ -3770,10 +4011,10 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundUndoAnnounceActivity, InboundUndoFollowActivity, MentionTag,
-        MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
-        actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
-        local_actor_type, parse_acct, same_url_origin,
+        InboundFollowActivity, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
+        InboundUndoFollowActivity, MentionTag, MentionType, Note, NoteType, OrderedCollection,
+        PublicKey, actor_context, actor_profile_fields, canonical_activity_digest,
+        is_remote_actor_lifecycle_activity, local_actor_type, parse_acct, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -3869,6 +4110,30 @@ mod tests {
             Some("https://remote.test/follows/1")
         );
         assert_eq!(invalid.object.follow_id(), None);
+    }
+
+    /// Undo(Block) accepts a link or a correctly typed embedded Block.
+    #[test]
+    fn parses_block_undo_reference_forms() {
+        let string: InboundUndoBlockActivity =
+            serde_json::from_str(r#"{"object":"https://remote.test/blocks/1"}"#).unwrap();
+        let embedded: InboundUndoBlockActivity = serde_json::from_str(
+            r#"{"object":{"id":"https://remote.test/blocks/1","type":"Block"}}"#,
+        )
+        .unwrap();
+        let invalid: InboundUndoBlockActivity = serde_json::from_str(
+            r#"{"object":{"id":"https://remote.test/blocks/1","type":"Follow"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            string.object.block_id().as_deref(),
+            Some("https://remote.test/blocks/1")
+        );
+        assert_eq!(
+            embedded.object.block_id().as_deref(),
+            Some("https://remote.test/blocks/1")
+        );
+        assert_eq!(invalid.object.block_id(), None);
     }
 
     /// Undo accepts a link or a correctly typed embedded Announce, never another activity type.
@@ -4790,6 +5055,11 @@ mod tests {
             }
             roosty_db::JobKind::FederationActorUpdateDelivery => {
                 super::deliver_actor_update(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationModerationDelivery => {
+                super::deliver_moderation_activity(state, job.payload.clone())
                     .await
                     .unwrap();
             }
