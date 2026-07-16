@@ -6,7 +6,7 @@ The project is early. The current local setup brings up the Rust server, Postgre
 
 ## Builds and Releases
 
-Every commit pushed to `main` publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
+Every commit pushed to `main` that passes CI publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
 
 ## Local Development
 

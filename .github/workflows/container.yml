@@ -1,7 +1,11 @@
 name: Container
 
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
 
@@ -14,29 +18,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check Rust workspace
-        run: cargo check --workspace --all-targets --locked
-
-      - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets --locked
-
   build:
-    needs: validate
+    if: github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +35,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -132,5 +117,5 @@ jobs:
           done
           docker buildx imagetools create \
             --tag "ghcr.io/${{ github.repository }}:main" \
-            --tag "ghcr.io/${{ github.repository }}:sha-${{ github.sha }}" \
+            --tag "ghcr.io/${{ github.repository }}:sha-${{ github.event.workflow_run.head_sha }}" \
             "${references[@]}"
