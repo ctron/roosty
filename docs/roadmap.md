@@ -28,7 +28,7 @@
 - [ ] Implement remote visibility semantics beyond public/unlisted Notes, including replies and follower-only addressing.
 - [ ] Fetch and expose paginated remote followers/following collection contents.
 - [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
-- [ ] Build remote reply contexts and conversation/thread traversal across cached local and remote parents.
+- [x] Build cache-only remote reply contexts and conversation/thread traversal across local and cached remote parents, with Mastodon-compatible access limits and no outbox backfill.
 - [ ] Support remote reply delivery and addressing for non-public visibility, including follower-only replies.
 - [x] Deliver and process public/unlisted favourites (`Like`/`Undo`), including remote counters, local notifications, and mixed favourites collections.
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.

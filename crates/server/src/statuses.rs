@@ -10,9 +10,10 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    LocalNotificationType, RemoteConversationParticipant, RemoteStatus, StatusVisibility,
+    LocalNotificationType, RemoteConversationParticipant, RemoteStatus, StatusContextItem,
+    StatusContextParent, StatusVisibility,
 };
-use sea_orm::{DatabaseTransaction, TransactionTrait};
+use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -35,6 +36,10 @@ use crate::{
 
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 40;
+const PUBLIC_CONTEXT_ANCESTORS_LIMIT: usize = 40;
+const PUBLIC_CONTEXT_DESCENDANTS_LIMIT: usize = 60;
+const PUBLIC_CONTEXT_DESCENDANTS_DEPTH: usize = 20;
+const AUTHENTICATED_CONTEXT_LIMIT: usize = 4_096;
 const MAX_STATUS_CHARS: usize = 500;
 const MAX_MEDIA_ATTACHMENTS: u64 = 4;
 
@@ -531,14 +536,37 @@ async fn show_status(
     Path(path): Path<StatusPath>,
 ) -> Response {
     let viewer_id = viewer.as_ref().map(|account| account.id);
-    match roosty_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await {
-        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer_id).await {
-            Ok(true) => status_with_author_response(&state, status, viewer_id).await,
-            Ok(false) => not_found(),
-            Err(error) => server_error(error),
-        },
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
+    let txn = match state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await
+    {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let item = match find_status_context_item(&txn, StatusId(path.status_id)).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+    match status_context_item_visible(&txn, &item, viewer_id).await {
+        Ok(true) => {}
+        Ok(false) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match item {
+        StatusContextItem::Local(status) => {
+            status_with_author_response(&state, status, viewer_id).await
+        }
+        StatusContextItem::Remote(status) => {
+            match remote_status_response_for_viewer(&state, status, viewer_id).await {
+                Ok(status) => Json(status).into_response(),
+                Err(error) => server_error(error),
+            }
+        }
     }
 }
 
@@ -816,29 +844,42 @@ async fn status_context(
 ) -> Response {
     let status_id = StatusId(path.status_id);
     let viewer = viewer.as_ref().map(|account| account.id);
-    let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer).await {
-            Ok(true) => status,
-            Ok(false) => return not_found(),
-            Err(error) => return server_error(error),
-        },
+    let txn = match state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await
+    {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let status = match find_status_context_item(&txn, status_id).await {
+        Ok(Some(status)) => status,
         Ok(None) => return not_found(),
         Err(error) => return server_error(error),
     };
+    match status_context_item_visible(&txn, &status, viewer).await {
+        Ok(true) => {}
+        Ok(false) => return not_found(),
+        Err(error) => return server_error(error),
+    }
 
-    let ancestors = match status_ancestors(&state, &status, viewer).await {
+    let limits = StatusContextLimits::for_viewer(viewer);
+    let ancestors = match status_ancestors(&txn, &status, viewer, limits).await {
         Ok(ancestors) => ancestors,
         Err(error) => return server_error(error),
     };
-    let descendants = match status_descendants(&state, status.id, viewer).await {
+    let descendants = match status_descendants(&txn, &status, viewer, limits).await {
         Ok(descendants) => descendants,
         Err(error) => return server_error(error),
     };
-    let ancestors = match status_models(&state, ancestors, viewer).await {
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    let ancestors = match status_context_models(&state, ancestors, viewer).await {
         Ok(ancestors) => ancestors,
         Err(error) => return server_error(error),
     };
-    let descendants = match status_models(&state, descendants, viewer).await {
+    let descendants = match status_context_models(&state, descendants, viewer).await {
         Ok(descendants) => descendants,
         Err(error) => return server_error(error),
     };
@@ -2125,6 +2166,9 @@ async fn remote_status_response_for_viewer(
     status: roosty_db::RemoteStatus,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
+    let replies_count =
+        roosty_db::count_status_context_replies(&state.db, StatusContextParent::Remote(status.id))
+            .await?;
     let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
         .await?
         .ok_or_else(|| {
@@ -2178,7 +2222,7 @@ async fn remote_status_response_for_viewer(
         emojis: remote_custom_emojis(&status.object),
         reblogs_count: 0,
         favourites_count: 0,
-        replies_count: 0,
+        replies_count,
         favourited: match viewer {
             Some(account_id) => {
                 roosty_db::is_remote_status_favourited(&state.db, account_id, status.id).await?
@@ -2437,7 +2481,9 @@ async fn status_response_for_viewer(
         mentions.insert(0, MentionResponse::remote(&actor));
     }
     let tags = status_tags(state, status.id).await?;
-    let replies_count = roosty_db::count_local_replies(&state.db, status.id).await?;
+    let replies_count =
+        roosty_db::count_status_context_replies(&state.db, StatusContextParent::Local(status.id))
+            .await?;
     let reblogs_count = roosty_db::count_local_reblogs(&state.db, status.id).await?;
     let favourites_count = roosty_db::count_local_favourites(&state.db, status.id).await?;
     let favourited = match viewer {
@@ -2613,29 +2659,140 @@ async fn visible_status_for_account(
     }
 }
 
-/// Walk visible local parent statuses from root ancestor to direct parent.
-async fn status_ancestors(
-    state: &AppState,
-    status: &roosty_db::LocalStatus,
+#[derive(Clone, Copy)]
+struct StatusContextLimits {
+    ancestors: usize,
+    descendants: usize,
+    descendants_depth: Option<usize>,
+}
+
+impl StatusContextLimits {
+    fn for_viewer(viewer: Option<AccountId>) -> Self {
+        if viewer.is_some() {
+            Self {
+                ancestors: AUTHENTICATED_CONTEXT_LIMIT,
+                descendants: AUTHENTICATED_CONTEXT_LIMIT,
+                descendants_depth: None,
+            }
+        } else {
+            Self {
+                ancestors: PUBLIC_CONTEXT_ANCESTORS_LIMIT,
+                descendants: PUBLIC_CONTEXT_DESCENDANTS_LIMIT,
+                descendants_depth: Some(PUBLIC_CONTEXT_DESCENDANTS_DEPTH),
+            }
+        }
+    }
+}
+
+async fn find_status_context_item(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Option<StatusContextItem>, RoostyError> {
+    if let Some(status) = roosty_db::find_local_status_by_id(db, status_id).await? {
+        return Ok(Some(StatusContextItem::Local(status)));
+    }
+    Ok(roosty_db::find_remote_status_by_id(db, status_id)
+        .await?
+        .map(StatusContextItem::Remote))
+}
+
+fn status_context_parent(item: &StatusContextItem) -> Option<StatusContextParent> {
+    match item {
+        StatusContextItem::Local(status) => status
+            .in_reply_to_id
+            .map(StatusContextParent::Local)
+            .or_else(|| {
+                status
+                    .in_reply_to_remote_status_id
+                    .map(StatusContextParent::Remote)
+            }),
+        StatusContextItem::Remote(status) => status
+            .in_reply_to_local_status_id
+            .map(StatusContextParent::Local)
+            .or_else(|| {
+                status
+                    .in_reply_to_remote_status_id
+                    .map(StatusContextParent::Remote)
+            }),
+    }
+}
+
+async fn find_status_context_parent(
+    db: &impl ConnectionTrait,
+    parent: StatusContextParent,
+) -> Result<Option<StatusContextItem>, RoostyError> {
+    match parent {
+        StatusContextParent::Local(status_id) => {
+            Ok(roosty_db::find_local_status_by_id(db, status_id)
+                .await?
+                .map(StatusContextItem::Local))
+        }
+        StatusContextParent::Remote(status_id) => {
+            Ok(roosty_db::find_remote_status_by_id(db, status_id)
+                .await?
+                .map(StatusContextItem::Remote))
+        }
+    }
+}
+
+async fn status_context_item_visible(
+    db: &impl ConnectionTrait,
+    item: &StatusContextItem,
     viewer: Option<AccountId>,
-) -> Result<Vec<roosty_db::LocalStatus>, RoostyError> {
+) -> Result<bool, RoostyError> {
+    match item {
+        StatusContextItem::Local(status) => status_visible_to_viewer_on(db, status, viewer).await,
+        StatusContextItem::Remote(status) => match viewer {
+            Some(viewer) => roosty_db::remote_status_visible_to_account(db, status, viewer).await,
+            None => Ok(matches!(
+                status.visibility,
+                StatusVisibility::Public | StatusVisibility::Unlisted
+            )),
+        },
+    }
+}
+
+async fn status_context_models(
+    state: &AppState,
+    items: Vec<StatusContextItem>,
+    viewer: Option<AccountId>,
+) -> Result<Vec<StatusResponse>, RoostyError> {
+    let mut responses = Vec::with_capacity(items.len());
+    for item in items {
+        responses.push(match item {
+            StatusContextItem::Local(status) => status_with_author(state, status, viewer).await?,
+            StatusContextItem::Remote(status) => {
+                remote_status_response_for_viewer(state, status, viewer).await?
+            }
+        });
+    }
+    Ok(responses)
+}
+
+/// Walk visible cached parent statuses from root ancestor to direct parent.
+async fn status_ancestors(
+    db: &impl ConnectionTrait,
+    status: &StatusContextItem,
+    viewer: Option<AccountId>,
+    limits: StatusContextLimits,
+) -> Result<Vec<StatusContextItem>, RoostyError> {
     let mut ancestors = Vec::new();
     let mut seen = HashSet::new();
-    let mut next_id = status.in_reply_to_id;
+    let mut next = status_context_parent(status);
 
-    while let Some(status_id) = next_id {
-        if !seen.insert(status_id) {
+    while let Some(parent_id) = next {
+        if ancestors.len() >= limits.ancestors || !seen.insert(parent_id) {
             break;
         }
 
-        let Some(parent) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
+        let Some(parent) = find_status_context_parent(db, parent_id).await? else {
             break;
         };
-        if !status_visible_to_viewer(state, &parent, viewer).await? {
+        if !status_context_item_visible(db, &parent, viewer).await? {
             break;
         }
 
-        next_id = parent.in_reply_to_id;
+        next = status_context_parent(&parent);
         ancestors.push(parent);
     }
 
@@ -2643,27 +2800,45 @@ async fn status_ancestors(
     Ok(ancestors)
 }
 
-/// Collect visible local replies below a status in conversation order.
+/// Collect visible cached replies below a status in conversation order.
 async fn status_descendants(
-    state: &AppState,
-    status_id: StatusId,
+    db: &impl ConnectionTrait,
+    status: &StatusContextItem,
     viewer: Option<AccountId>,
-) -> Result<Vec<roosty_db::LocalStatus>, RoostyError> {
+    limits: StatusContextLimits,
+) -> Result<Vec<StatusContextItem>, RoostyError> {
     let mut descendants = Vec::new();
     let mut seen = HashSet::new();
-    let mut queue = VecDeque::from([status_id]);
+    let root = match status {
+        StatusContextItem::Local(status) => StatusContextParent::Local(status.id),
+        StatusContextItem::Remote(status) => StatusContextParent::Remote(status.id),
+    };
+    let mut queue = VecDeque::from([(root, 0_usize)]);
 
-    while let Some(parent_id) = queue.pop_front() {
+    while let Some((parent_id, depth)) = queue.pop_front() {
         if !seen.insert(parent_id) {
             continue;
         }
+        if limits
+            .descendants_depth
+            .is_some_and(|maximum| depth >= maximum)
+        {
+            continue;
+        }
 
-        let replies = roosty_db::local_replies_to_status(&state.db, parent_id).await?;
+        let replies = roosty_db::status_context_replies(db, parent_id).await?;
         for reply in replies {
-            if !status_visible_to_viewer(state, &reply, viewer).await? {
+            if descendants.len() >= limits.descendants {
+                return Ok(descendants);
+            }
+            let reply_id = match &reply {
+                StatusContextItem::Local(status) => StatusContextParent::Local(status.id),
+                StatusContextItem::Remote(status) => StatusContextParent::Remote(status.id),
+            };
+            if seen.contains(&reply_id) || !status_context_item_visible(db, &reply, viewer).await? {
                 continue;
             }
-            queue.push_back(reply.id);
+            queue.push_back((reply_id, depth + 1));
             descendants.push(reply);
         }
     }
@@ -2794,11 +2969,19 @@ pub(crate) async fn status_visible_to_viewer(
     status: &roosty_db::LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<bool, RoostyError> {
+    status_visible_to_viewer_on(&state.db, status, viewer).await
+}
+
+async fn status_visible_to_viewer_on(
+    db: &impl ConnectionTrait,
+    status: &roosty_db::LocalStatus,
+    viewer: Option<AccountId>,
+) -> Result<bool, RoostyError> {
     let Some(viewer) = viewer else {
         return Ok(can_view_status(status, viewer));
     };
     if viewer != status.account_id
-        && roosty_db::local_accounts_are_blocked(&state.db, viewer, status.account_id).await?
+        && roosty_db::local_accounts_are_blocked(db, viewer, status.account_id).await?
     {
         return Ok(false);
     }
@@ -2806,7 +2989,7 @@ pub(crate) async fn status_visible_to_viewer(
         return Ok(true);
     }
 
-    roosty_db::local_status_visible_to_account(&state.db, status, viewer).await
+    roosty_db::local_status_visible_to_account(db, status, viewer).await
 }
 
 #[cfg(test)]
@@ -3228,20 +3411,39 @@ mod tests {
     };
     use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
-    use roosty_core::AccountId;
+    use roosty_core::{AccountId, StatusId};
+    use roosty_db::{
+        NewRemoteStatus, RemoteActor, RemoteStatus, StatusContextParent, StatusVisibility,
+    };
     use roosty_migration::Migrator;
     use sea_orm_migration::MigratorTrait;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_context::{AsyncTestContext, test_context};
+    use time::{Duration as TimeDuration, OffsetDateTime};
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use super::{
-        escape_html, hashtag_names, mention_usernames, remote_mention_matches, remote_status_tags,
-        status_content_html, timeline_limit,
+        StatusContextLimits, escape_html, hashtag_names, mention_usernames, remote_mention_matches,
+        remote_status_tags, status_content_html, timeline_limit,
     };
     use crate::{config::Config, http::AppState, password};
+
+    #[test]
+    /// Anonymous and authenticated context traversal retain Mastodon's distinct bounds.
+    fn status_context_limits_match_mastodon_access_levels() {
+        let public = StatusContextLimits::for_viewer(None);
+        assert_eq!(public.ancestors, 40);
+        assert_eq!(public.descendants, 60);
+        assert_eq!(public.descendants_depth, Some(20));
+
+        let authenticated = StatusContextLimits::for_viewer(Some(AccountId(Uuid::now_v7())));
+        assert_eq!(authenticated.ancestors, 4_096);
+        assert_eq!(authenticated.descendants, 4_096);
+        assert_eq!(authenticated.descendants_depth, None);
+    }
 
     #[test]
     /// Remote hashtag metadata remains contextual and keeps its source-instance URL.
@@ -3660,6 +3862,105 @@ mod tests {
             )
             .await;
         assert_eq!(missing_reply.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// A cached thread traverses local-to-local, local-to-remote, remote-to-local, and remote-to-remote edges.
+    async fn status_context_traverses_mixed_cached_reply_graph(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let local_root = context
+            .create_status(&token, "local root", None, None)
+            .await;
+        let local_root_id = StatusId(local_root["id"].as_str().unwrap().parse().unwrap());
+        let remote_actor = context.cache_remote_actor("alice").await;
+        let remote_parent = context
+            .cache_remote_status(
+                &remote_actor,
+                "remote parent",
+                Some(StatusContextParent::Local(local_root_id)),
+            )
+            .await;
+
+        let local_child = context
+            .create_status(
+                &token,
+                "local child",
+                None,
+                Some(&remote_parent.id.0.to_string()),
+            )
+            .await;
+        let local_child_id = StatusId(local_child["id"].as_str().unwrap().parse().unwrap());
+        let remote_sibling = context
+            .cache_remote_status(
+                &remote_actor,
+                "remote sibling",
+                Some(StatusContextParent::Remote(remote_parent.id)),
+            )
+            .await;
+        let local_grandchild = context
+            .create_status(
+                &token,
+                "local grandchild",
+                None,
+                Some(&local_child_id.0.to_string()),
+            )
+            .await;
+        let local_grandchild_id = local_grandchild["id"].as_str().unwrap();
+
+        let shown_remote = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{}", remote_parent.id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(shown_remote["id"], remote_parent.id.0.to_string());
+        assert_eq!(shown_remote["account"]["acct"], "alice@remote.test");
+        assert_eq!(shown_remote["replies_count"], 2);
+
+        let shown_root = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{}", local_root_id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(shown_root["replies_count"], 1);
+
+        let remote_context = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{}/context", remote_parent.id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(
+            remote_context["ancestors"][0]["id"],
+            local_root_id.0.to_string()
+        );
+        assert_eq!(
+            remote_context["descendants"][0]["id"],
+            local_child_id.0.to_string()
+        );
+        assert_eq!(
+            remote_context["descendants"][1]["id"],
+            remote_sibling.id.0.to_string()
+        );
+        assert_eq!(remote_context["descendants"][2]["id"], local_grandchild_id);
+
+        let local_context = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{}/context", local_child_id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(
+            local_context["ancestors"][0]["id"],
+            local_root_id.0.to_string()
+        );
+        assert_eq!(
+            local_context["ancestors"][1]["id"],
+            remote_parent.id.0.to_string()
+        );
+        assert_eq!(local_context["descendants"][0]["id"], local_grandchild_id);
     }
 
     #[test_context(StatusContext)]
@@ -5838,6 +6139,81 @@ mod tests {
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
             json_body(response).await
+        }
+
+        async fn cache_remote_actor(&self, username: &str) -> RemoteActor {
+            let now = OffsetDateTime::now_utc();
+            let actor_url = format!("https://remote.test/users/{username}");
+            let actor = RemoteActor {
+                id: AccountId(Uuid::now_v7()),
+                activitypub_id: actor_url.clone(),
+                username: username.to_owned(),
+                domain: "remote.test".to_owned(),
+                display_name: "Remote Alice".to_owned(),
+                summary: String::new(),
+                emojis: json!([]),
+                inbox_url: format!("{actor_url}/inbox"),
+                shared_inbox_url: None,
+                public_key_id: format!("{actor_url}#main-key"),
+                public_key_pem: "test-public-key".to_owned(),
+                expires_at: now + TimeDuration::hours(1),
+                profile_created_at: None,
+                first_seen_at: now,
+                deleted_at: None,
+                moved_to_remote_actor_id: None,
+            };
+            roosty_db::upsert_remote_actor(&self.db, &actor)
+                .await
+                .unwrap()
+        }
+
+        async fn cache_remote_status(
+            &self,
+            actor: &RemoteActor,
+            content: &str,
+            parent: Option<StatusContextParent>,
+        ) -> RemoteStatus {
+            let now = OffsetDateTime::now_utc();
+            let activitypub_id = format!(
+                "https://remote.test/users/{}/statuses/{}",
+                actor.username,
+                Uuid::now_v7()
+            );
+            let (in_reply_to, in_reply_to_local_status_id, in_reply_to_remote_status_id) =
+                match parent {
+                    Some(StatusContextParent::Local(status_id)) => (
+                        Some(format!(
+                            "https://localhost:4000/users/admin/statuses/{}",
+                            status_id.0
+                        )),
+                        Some(status_id),
+                        None,
+                    ),
+                    Some(StatusContextParent::Remote(status_id)) => (
+                        Some(format!("https://remote.test/statuses/{}", status_id.0)),
+                        None,
+                        Some(status_id),
+                    ),
+                    None => (None, None, None),
+                };
+
+            roosty_db::upsert_remote_status(
+                &self.db,
+                NewRemoteStatus {
+                    activitypub_id,
+                    remote_actor_id: actor.id,
+                    content: content.to_owned(),
+                    visibility: StatusVisibility::Public,
+                    published_at: now,
+                    updated_at: now,
+                    in_reply_to,
+                    in_reply_to_local_status_id,
+                    in_reply_to_remote_status_id,
+                    object: json!({}),
+                },
+            )
+            .await
+            .unwrap()
         }
     }
 

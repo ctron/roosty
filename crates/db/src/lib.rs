@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use roosty_core::{AccountId, JobClaimId, JobId, Result, RoostyError, StatusId};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
+    AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult,
     IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set,
     Statement, TransactionTrait, TryInsertResult,
@@ -467,6 +467,32 @@ pub struct RemoteStatus {
     pub object: JsonValue,
 }
 
+/// A status participating in a cached Mastodon thread context.
+#[derive(Clone, Debug)]
+pub enum StatusContextItem {
+    /// A status authored on this instance.
+    Local(LocalStatus),
+    /// A status received and retained in the federation cache.
+    Remote(RemoteStatus),
+}
+
+impl StatusContextItem {
+    /// Return the UUID-backed API identifier shared by both status kinds.
+    pub fn id(&self) -> StatusId {
+        match self {
+            Self::Local(status) => status.id,
+            Self::Remote(status) => status.id,
+        }
+    }
+}
+
+/// Typed parent identity used when loading direct replies across status tables.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StatusContextParent {
+    Local(StatusId),
+    Remote(StatusId),
+}
+
 /// Fields accepted when caching a verified remote Note.
 #[derive(Clone, Debug)]
 pub struct NewRemoteStatus {
@@ -841,7 +867,7 @@ pub async fn find_remote_status_by_activitypub_id(
 
 /// Find one active cached remote Note by its UUID-backed API identifier.
 pub async fn find_remote_status_by_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Option<RemoteStatus>> {
     remote_status::Entity::find_by_id(status_id.0)
@@ -4801,7 +4827,7 @@ pub async fn local_status_has_media(db: &DbConnection, status_id: StatusId) -> R
 
 /// Find a local status by id, excluding soft-deleted statuses.
 pub async fn find_local_status_by_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Option<LocalStatus>> {
     let status = local_status::Entity::find_by_id(status_id.0)
@@ -4876,6 +4902,90 @@ pub async fn count_local_replies(db: &DbConnection, status_id: StatusId) -> Resu
         .filter(local_status::Column::DeletedAt.is_null())
         .count(db)
         .await?)
+}
+
+/// Count active cached local and remote direct replies to one status.
+pub async fn count_status_context_replies(
+    db: &DbConnection,
+    parent: StatusContextParent,
+) -> Result<u64> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let count = match parent {
+        StatusContextParent::Local(status_id) => {
+            local_status::Entity::find()
+                .filter(local_status::Column::InReplyToId.eq(status_id.0))
+                .filter(local_status::Column::DeletedAt.is_null())
+                .count(&txn)
+                .await?
+                + remote_status::Entity::find()
+                    .filter(remote_status::Column::InReplyToLocalStatusId.eq(status_id.0))
+                    .filter(remote_status::Column::DeletedAt.is_null())
+                    .count(&txn)
+                    .await?
+        }
+        StatusContextParent::Remote(status_id) => {
+            local_status::Entity::find()
+                .filter(local_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
+                .filter(local_status::Column::DeletedAt.is_null())
+                .count(&txn)
+                .await?
+                + remote_status::Entity::find()
+                    .filter(remote_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
+                    .filter(remote_status::Column::DeletedAt.is_null())
+                    .count(&txn)
+                    .await?
+        }
+    };
+    txn.commit().await?;
+    Ok(count)
+}
+
+/// List active cached local and remote direct replies, oldest first.
+pub async fn status_context_replies(
+    db: &impl ConnectionTrait,
+    parent: StatusContextParent,
+) -> Result<Vec<StatusContextItem>> {
+    let (locals, remotes) = match parent {
+        StatusContextParent::Local(status_id) => (
+            local_status::Entity::find()
+                .filter(local_status::Column::InReplyToId.eq(status_id.0))
+                .filter(local_status::Column::DeletedAt.is_null())
+                .all(db)
+                .await?,
+            remote_status::Entity::find()
+                .filter(remote_status::Column::InReplyToLocalStatusId.eq(status_id.0))
+                .filter(remote_status::Column::DeletedAt.is_null())
+                .all(db)
+                .await?,
+        ),
+        StatusContextParent::Remote(status_id) => (
+            local_status::Entity::find()
+                .filter(local_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
+                .filter(local_status::Column::DeletedAt.is_null())
+                .all(db)
+                .await?,
+            remote_status::Entity::find()
+                .filter(remote_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
+                .filter(remote_status::Column::DeletedAt.is_null())
+                .all(db)
+                .await?,
+        ),
+    };
+    let mut replies = locals
+        .into_iter()
+        .map(local_status_from_model)
+        .map(|status| status.map(StatusContextItem::Local))
+        .chain(
+            remotes
+                .into_iter()
+                .map(remote_status_from_model)
+                .map(|status| status.map(StatusContextItem::Remote)),
+        )
+        .collect::<Result<Vec<_>>>()?;
+    replies.sort_by_key(|reply| reply.id().0);
+    Ok(replies)
 }
 
 /// List active direct replies to a local status, oldest first.
@@ -5411,7 +5521,7 @@ pub async fn remote_status_conversation_id(
 
 /// Return whether an account participates in a status's direct conversation.
 pub async fn local_status_visible_to_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status: &LocalStatus,
     account_id: AccountId,
 ) -> Result<bool> {
@@ -5435,7 +5545,7 @@ pub async fn local_status_visible_to_account(
 
 /// Return whether a local account participates in a cached remote direct Note's conversation.
 pub async fn remote_status_visible_to_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status: &RemoteStatus,
     account_id: AccountId,
 ) -> Result<bool> {

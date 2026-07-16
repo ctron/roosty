@@ -85,8 +85,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟢 | `POST /api/v1/statuses` | Local text statuses only. |
-| 🟢 | `GET /api/v1/statuses/:id` | Local, non-deleted statuses. |
-| 🟡 | `GET /api/v1/statuses/:id/context` | Local ancestors and descendants only. |
+| 🟢 | `GET /api/v1/statuses/:id` | Visible local and locally cached remote statuses. |
+| 🟢 | `GET /api/v1/statuses/:id/context` | Visible local and cached-remote ancestors and descendants, with Mastodon-compatible anonymous and authenticated traversal limits. Remote context is cache-only and does not fetch or backfill missing posts. |
 | 🟡 | `PUT /api/v1/statuses/:id` | Owner-only local text, sensitivity, spoiler, language, media IDs, and media alt/focus edits; polls and edit history are missing. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
