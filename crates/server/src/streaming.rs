@@ -1,26 +1,202 @@
+use std::{
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use roosty_core::{Result as RoostyResult, RoostyError};
+use roosty_db::{NewStreamingEvent, StatusVisibility, StreamingEventKind};
 use serde::Serialize;
+use sqlx::postgres::PgListener;
 use strum::IntoStaticStr;
-use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use roosty_core::AccountId;
 
-/// In-process event bus for Mastodon streaming API compatibility.
+const STREAMING_CHANNEL: &str = "roosty_streaming_events";
+
+/// Process-local metrics for streaming fan-out and socket lifecycle behavior.
+#[derive(Debug, Default)]
+pub struct StreamingMetrics {
+    active_connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    send_timeouts: AtomicU64,
+    idle_disconnects: AtomicU64,
+    lagged_receivers: AtomicU64,
+    listener_reconnects: AtomicU64,
+    publication_failures: AtomicU64,
+}
+
+impl StreamingMetrics {
+    pub fn connection_opened(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_closed(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_rejected(&self) {
+        self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn send_timed_out(&self) {
+        self.send_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn idle_disconnected(&self) {
+        self.idle_disconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn receiver_lagged(&self) {
+        self.lagged_receivers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Render the streaming metrics in Prometheus's text exposition format.
+    pub fn text(&self) -> String {
+        format!(
+            concat!(
+                "# HELP roosty_streaming_active_connections Active streaming WebSocket connections.\n",
+                "# TYPE roosty_streaming_active_connections gauge\n",
+                "roosty_streaming_active_connections {}\n",
+                "# HELP roosty_streaming_rejected_connections_total Connections rejected by the per-process limit.\n",
+                "# TYPE roosty_streaming_rejected_connections_total counter\n",
+                "roosty_streaming_rejected_connections_total {}\n",
+                "# HELP roosty_streaming_send_timeouts_total Streaming socket sends that exceeded their deadline.\n",
+                "# TYPE roosty_streaming_send_timeouts_total counter\n",
+                "roosty_streaming_send_timeouts_total {}\n",
+                "# HELP roosty_streaming_idle_disconnects_total Streaming sockets closed after no inbound frames.\n",
+                "# TYPE roosty_streaming_idle_disconnects_total counter\n",
+                "roosty_streaming_idle_disconnects_total {}\n",
+                "# HELP roosty_streaming_lagged_receivers_total Events skipped by lagged local broadcast receivers.\n",
+                "# TYPE roosty_streaming_lagged_receivers_total counter\n",
+                "roosty_streaming_lagged_receivers_total {}\n",
+                "# HELP roosty_streaming_listener_reconnects_total PostgreSQL listener reconnections.\n",
+                "# TYPE roosty_streaming_listener_reconnects_total counter\n",
+                "roosty_streaming_listener_reconnects_total {}\n",
+                "# HELP roosty_streaming_publication_failures_total Failed cross-process event publications.\n",
+                "# TYPE roosty_streaming_publication_failures_total counter\n",
+                "roosty_streaming_publication_failures_total {}\n",
+            ),
+            self.active_connections.load(Ordering::Relaxed),
+            self.rejected_connections.load(Ordering::Relaxed),
+            self.send_timeouts.load(Ordering::Relaxed),
+            self.idle_disconnects.load(Ordering::Relaxed),
+            self.lagged_receivers.load(Ordering::Relaxed),
+            self.listener_reconnects.load(Ordering::Relaxed),
+            self.publication_failures.load(Ordering::Relaxed),
+        )
+    }
+}
+
+struct StreamingInner {
+    sender: broadcast::Sender<StreamingEvent>,
+    db: roosty_db::DbConnection,
+    database_url: String,
+    origin_process_id: Uuid,
+    event_retention: Duration,
+    listener_ready: AtomicBool,
+    metrics: Arc<StreamingMetrics>,
+    shutdown_tx: watch::Sender<bool>,
+    publication_tx: OnceLock<mpsc::Sender<NewStreamingEvent>>,
+}
+
+/// Bounded local event bus with PostgreSQL-backed multi-process fan-out.
 #[derive(Clone)]
 pub struct StreamingEvents {
-    sender: broadcast::Sender<StreamingEvent>,
+    inner: Arc<StreamingInner>,
 }
 
 impl StreamingEvents {
     /// Create an empty streaming event bus.
-    pub fn new() -> Self {
+    pub fn new(
+        db: roosty_db::DbConnection,
+        database_url: String,
+        event_retention: Duration,
+    ) -> Self {
         let (sender, _receiver) = broadcast::channel(1024);
-        Self { sender }
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let metrics = Arc::new(StreamingMetrics::default());
+        Self {
+            inner: Arc::new(StreamingInner {
+                sender,
+                db,
+                database_url,
+                origin_process_id: Uuid::now_v7(),
+                event_retention,
+                listener_ready: AtomicBool::new(false),
+                metrics,
+                shutdown_tx,
+                publication_tx: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Establish LISTEN before the process can become ready, then supervise it.
+    pub async fn initialize_listener(&self) -> RoostyResult<()> {
+        let mut listener = connect_listener(&self.inner.database_url).await?;
+        listener
+            .listen(STREAMING_CHANNEL)
+            .await
+            .map_err(sqlx_error)?;
+        // LISTEN is active before the cursor snapshot, so commits racing with
+        // startup are either included in the cursor or queued as notifications.
+        let sequence = roosty_db::latest_streaming_event_sequence(&self.inner.db).await?;
+        let (publication_tx, mut publication_rx) = mpsc::channel(1024);
+        self.inner.publication_tx.set(publication_tx).map_err(|_| {
+            RoostyError::Configuration(
+                "PostgreSQL streaming listener is already initialized".to_owned(),
+            )
+        })?;
+        let publication_db = self.inner.db.clone();
+        let publication_metrics = self.inner.metrics.clone();
+        tokio::spawn(async move {
+            while let Some(event) = publication_rx.recv().await {
+                if let Err(error) = roosty_db::publish_streaming_event(&publication_db, event).await
+                {
+                    publication_metrics
+                        .publication_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(%error, "failed cross-process streaming publication");
+                }
+            }
+        });
+        self.inner.listener_ready.store(true, Ordering::Release);
+        tokio::spawn(listener_loop(
+            self.clone(),
+            listener,
+            sequence,
+            self.inner.shutdown_tx.subscribe(),
+        ));
+        tokio::spawn(cleanup_loop(
+            self.clone(),
+            self.inner.shutdown_tx.subscribe(),
+        ));
+        info!(%sequence, "PostgreSQL streaming listener initialized");
+        Ok(())
+    }
+
+    pub fn listener_is_ready(&self) -> bool {
+        self.inner.listener_ready.load(Ordering::Acquire)
+    }
+
+    pub fn metrics(&self) -> Arc<StreamingMetrics> {
+        self.inner.metrics.clone()
+    }
+
+    /// Stop background listener and cleanup tasks during graceful shutdown.
+    pub fn shutdown(&self) {
+        let _ = self.inner.shutdown_tx.send(true);
+        self.inner.listener_ready.store(false, Ordering::Release);
     }
 
     /// Subscribe a WebSocket client to newly published streaming events.
     pub fn subscribe(&self) -> broadcast::Receiver<StreamingEvent> {
-        self.sender.subscribe()
+        self.inner.sender.subscribe()
     }
 
     /// Publish a Mastodon `update` event for a newly created local status.
@@ -34,10 +210,7 @@ impl StreamingEvents {
         T: Serialize,
     {
         match streaming_update_message(status, author_id, visibility, user_recipient_ids) {
-            Ok(event) => match self.sender.send(event) {
-                Ok(_) => {}
-                Err(error) => debug!(%error, "streaming update had no active receivers"),
-            },
+            Ok(event) => self.publish(event),
             Err(error) => warn!(%error, "failed to serialize streaming update"),
         }
     }
@@ -48,10 +221,7 @@ impl StreamingEvents {
         T: Serialize,
     {
         match streaming_notification_message(notification, recipient_id) {
-            Ok(event) => match self.sender.send(event) {
-                Ok(_) => {}
-                Err(error) => debug!(%error, "streaming notification had no active receivers"),
-            },
+            Ok(event) => self.publish(event),
             Err(error) => warn!(%error, "failed to serialize streaming notification"),
         }
     }
@@ -62,10 +232,7 @@ impl StreamingEvents {
         T: Serialize,
     {
         match streaming_conversation_message(conversation, recipient_id) {
-            Ok(event) => match self.sender.send(event) {
-                Ok(_) => {}
-                Err(error) => debug!(%error, "streaming conversation had no active receivers"),
-            },
+            Ok(event) => self.publish(event),
             Err(error) => warn!(%error, "failed to serialize streaming conversation"),
         }
     }
@@ -79,10 +246,7 @@ impl StreamingEvents {
         user_recipient_ids: &[AccountId],
     ) {
         let event = streaming_delete_message(status_id, author_id, visibility, user_recipient_ids);
-        match self.sender.send(event) {
-            Ok(_) => {}
-            Err(error) => debug!(%error, "streaming delete had no active receivers"),
-        }
+        self.publish(event);
     }
 
     /// Publish a status update exclusively to selected users' home-capable streams.
@@ -102,6 +266,156 @@ impl StreamingEvents {
     ) {
         self.publish_delete(status_id, author_id, "unlisted", recipients);
     }
+
+    fn publish(&self, event: StreamingEvent) {
+        if let Err(error) = self.inner.sender.send(event.clone()) {
+            debug!(%error, "streaming event had no active receivers");
+        }
+        let Some(publication_tx) = self.inner.publication_tx.get() else {
+            return;
+        };
+
+        let Some(persisted) = event.to_persisted(self.inner.origin_process_id) else {
+            self.inner
+                .metrics
+                .publication_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(visibility = %event.visibility, "failed to persist streaming event with invalid visibility");
+            return;
+        };
+        if let Err(error) = publication_tx.try_send(persisted) {
+            self.inner
+                .metrics
+                .publication_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%error, "cross-process streaming publication queue is full or closed");
+        }
+    }
+}
+
+async fn connect_listener(database_url: &str) -> RoostyResult<PgListener> {
+    PgListener::connect(database_url).await.map_err(sqlx_error)
+}
+
+fn sqlx_error(error: sqlx::Error) -> RoostyError {
+    RoostyError::Configuration(format!(
+        "could not initialize PostgreSQL streaming listener: {error}"
+    ))
+}
+
+/// Receive sequence notifications and recover every retained row after the cursor.
+async fn listener_loop(
+    events: StreamingEvents,
+    mut listener: PgListener,
+    mut sequence: i64,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut reconnect_delay = Duration::from_secs(1);
+    loop {
+        let notification = tokio::select! {
+            notification = listener.recv() => notification,
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+                continue;
+            }
+        };
+        match notification {
+            Ok(notification) => {
+                reconnect_delay = Duration::from_secs(1);
+                if notification.payload().parse::<i64>().is_err() {
+                    warn!(
+                        payload = notification.payload(),
+                        "ignored invalid streaming notification"
+                    );
+                    continue;
+                }
+                if let Err(error) = deliver_after(&events, &mut sequence).await {
+                    warn!(%error, "failed to recover retained streaming events");
+                }
+            }
+            Err(error) => {
+                events.inner.listener_ready.store(false, Ordering::Release);
+                warn!(%error, "PostgreSQL streaming listener disconnected");
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(reconnect_delay) => {}
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                    match connect_listener(&events.inner.database_url).await {
+                        Ok(mut reconnected) => {
+                            if let Err(error) = reconnected.listen(STREAMING_CHANNEL).await {
+                                warn!(%error, "failed to restore PostgreSQL streaming LISTEN");
+                            } else {
+                                listener = reconnected;
+                                events
+                                    .inner
+                                    .metrics
+                                    .listener_reconnects
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Err(error) = deliver_after(&events, &mut sequence).await {
+                                    warn!(%error, "failed streaming recovery after reconnect");
+                                }
+                                events.inner.listener_ready.store(true, Ordering::Release);
+                                info!(%sequence, "PostgreSQL streaming listener reconnected");
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "failed to reconnect PostgreSQL streaming listener")
+                        }
+                    }
+                    reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
+}
+
+async fn deliver_after(events: &StreamingEvents, sequence: &mut i64) -> RoostyResult<()> {
+    for retained in roosty_db::streaming_events_after(&events.inner.db, *sequence).await? {
+        *sequence = retained.sequence;
+        if retained.origin_process_id == events.inner.origin_process_id {
+            continue;
+        }
+        let event = StreamingEvent::from_retained(retained);
+        if let Err(error) = events.inner.sender.send(event) {
+            debug!(%error, "remote streaming event had no active receivers");
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_loop(events: StreamingEvents, mut shutdown_rx: watch::Receiver<bool>) {
+    let cleanup_interval = events.inner.event_retention.min(Duration::from_secs(60));
+    let mut interval = tokio::time::interval(cleanup_interval);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+                continue;
+            }
+        }
+        let Ok(retention) = time::Duration::try_from(events.inner.event_retention) else {
+            warn!("streaming retention exceeds supported database duration");
+            return;
+        };
+        let cutoff = time::OffsetDateTime::now_utc() - retention;
+        match roosty_db::delete_streaming_events_before(&events.inner.db, cutoff).await {
+            Ok(deleted) if deleted > 0 => debug!(deleted, "expired retained streaming events"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "failed to expire retained streaming events"),
+        }
+    }
 }
 
 /// Event payload shared with connected WebSocket subscribers.
@@ -115,6 +429,27 @@ pub struct StreamingEvent {
 }
 
 impl StreamingEvent {
+    fn to_persisted(&self, origin_process_id: Uuid) -> Option<NewStreamingEvent> {
+        Some(NewStreamingEvent {
+            origin_process_id,
+            kind: self.event.into(),
+            payload: self.payload.clone(),
+            account_id: self.account_id,
+            recipient_ids: self.user_recipient_ids.clone(),
+            visibility: StatusVisibility::parse(&self.visibility).ok()?,
+        })
+    }
+
+    fn from_retained(event: roosty_db::RetainedStreamingEvent) -> Self {
+        Self {
+            event: event.kind.into(),
+            payload: event.payload,
+            account_id: event.account_id,
+            user_recipient_ids: event.recipient_ids,
+            visibility: event.visibility.to_string(),
+        }
+    }
+
     /// Serialize this event when it belongs to at least one subscribed stream.
     pub fn to_socket_message(
         &self,
@@ -186,6 +521,28 @@ impl StreamingEventType {
     /// Return the Mastodon streaming event name.
     fn as_str(self) -> &'static str {
         self.into()
+    }
+}
+
+impl From<StreamingEventType> for StreamingEventKind {
+    fn from(value: StreamingEventType) -> Self {
+        match value {
+            StreamingEventType::Update => Self::Update,
+            StreamingEventType::Notification => Self::Notification,
+            StreamingEventType::Conversation => Self::Conversation,
+            StreamingEventType::Delete => Self::Delete,
+        }
+    }
+}
+
+impl From<StreamingEventKind> for StreamingEventType {
+    fn from(value: StreamingEventKind) -> Self {
+        match value {
+            StreamingEventKind::Update => Self::Update,
+            StreamingEventKind::Notification => Self::Notification,
+            StreamingEventKind::Conversation => Self::Conversation,
+            StreamingEventKind::Delete => Self::Delete,
+        }
     }
 }
 
@@ -263,14 +620,41 @@ fn streaming_delete_message(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use roosty_core::AccountId;
     use serde_json::Value;
     use uuid::Uuid;
 
     use super::{
-        streaming_conversation_message, streaming_delete_message, streaming_notification_message,
-        streaming_update_message,
+        StreamingMetrics, streaming_conversation_message, streaming_delete_message,
+        streaming_notification_message, streaming_update_message,
     };
+
+    #[test]
+    fn streaming_metrics_render_every_operational_counter() {
+        let metrics = StreamingMetrics::default();
+        metrics.connection_opened();
+        metrics.connection_rejected();
+        metrics.send_timed_out();
+        metrics.idle_disconnected();
+        metrics.receiver_lagged();
+        metrics.listener_reconnects.fetch_add(1, Ordering::Relaxed);
+        metrics.publication_failures.fetch_add(1, Ordering::Relaxed);
+
+        let text = metrics.text();
+        for metric in [
+            "roosty_streaming_active_connections 1",
+            "roosty_streaming_rejected_connections_total 1",
+            "roosty_streaming_send_timeouts_total 1",
+            "roosty_streaming_idle_disconnects_total 1",
+            "roosty_streaming_lagged_receivers_total 1",
+            "roosty_streaming_listener_reconnects_total 1",
+            "roosty_streaming_publication_failures_total 1",
+        ] {
+            assert!(text.contains(metric));
+        }
+    }
 
     #[test]
     /// Verifies streaming status payloads stay JSON-encoded strings.

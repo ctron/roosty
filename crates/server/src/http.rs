@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use axum::{
     Router,
@@ -22,17 +23,26 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Database connection pool.
     pub db: roosty_db::DbConnection,
-    /// In-process Mastodon streaming event bus.
+    /// Bounded local and cross-process Mastodon streaming event bus.
     pub streaming_events: StreamingEvents,
+    /// Per-process permit pool held for each upgraded streaming socket.
+    pub streaming_connections: Arc<Semaphore>,
 }
 
 impl AppState {
     /// Create shared application state from config and database connection.
     pub fn new(config: Config, db: roosty_db::DbConnection) -> Self {
+        let streaming_events = StreamingEvents::new(
+            db.clone(),
+            config.database_url.clone(),
+            config.streaming.event_retention,
+        );
+        let streaming_connections = Arc::new(Semaphore::new(config.streaming.max_connections));
         Self {
             config: Arc::new(config),
             db,
-            streaming_events: StreamingEvents::new(),
+            streaming_events,
+            streaming_connections,
         }
     }
 }
@@ -120,6 +130,13 @@ async fn healthz() -> &'static str {
 
 /// Check whether the server can reach its configured database.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.streaming_events.listener_is_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "streaming listener unavailable\n",
+        )
+            .into_response();
+    }
     match roosty_db::ping(&state.db).await {
         Ok(()) => (StatusCode::OK, "ok\n").into_response(),
         Err(error) => (
@@ -145,6 +162,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         federation_enabled
     );
     body.push_str(&crate::federation::metrics_text());
+    body.push_str(&state.streaming_events.metrics().text());
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

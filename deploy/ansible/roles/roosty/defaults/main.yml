@@ -9,3 +9,8 @@ roosty_docker_packages:
   - docker-compose-v2
   - openssl
 roosty_worker_concurrency: 4
+roosty_streaming_max_connections: 1000
+roosty_streaming_send_timeout: 10s
+roosty_streaming_ping_interval: 30s
+roosty_streaming_idle_timeout: 90s
+roosty_streaming_event_retention: 1h

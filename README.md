@@ -165,7 +165,28 @@ After Rust code or manifest changes, run:
 ```sh
 cargo fmt --all
 cargo clippy --all-targets
+cargo test
 ```
+
+## Streaming configuration
+
+Streaming events are delivered locally immediately and coordinated between
+Roosty server processes through PostgreSQL. These startup-only environment
+variables control each process; durations accept `humantime` values such as
+`10s`, `90s`, and `1h`.
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `ROOSTY_STREAMING_MAX_CONNECTIONS` | `1000` | Positive per-process WebSocket connection ceiling. |
+| `ROOSTY_STREAMING_SEND_TIMEOUT` | `10s` | Maximum duration for any outbound WebSocket frame. |
+| `ROOSTY_STREAMING_PING_INTERVAL` | `30s` | Interval between server ping frames. |
+| `ROOSTY_STREAMING_IDLE_TIMEOUT` | `90s` | Maximum time without an inbound frame; must exceed the ping interval. |
+| `ROOSTY_STREAMING_EVENT_RETENTION` | `1h` | Retention for the PostgreSQL recovery log. |
+
+The readiness endpoint remains unavailable until the PostgreSQL streaming
+listener has initialized, and becomes unavailable while that listener is
+reconnecting. Capacity is per process, so a multi-process deployment's total
+connection capacity is the sum of its process limits.
 
 ## Federation
 

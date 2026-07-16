@@ -38,6 +38,17 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_account_block").await);
     assert!(table_exists(database.connection(), "local_account_mute").await);
     assert!(table_exists(database.connection(), "remote_actor").await);
+    assert!(table_exists(database.connection(), "streaming_event").await);
+    assert!(column_exists(database.connection(), "streaming_event", "sequence").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "streaming_event",
+            "origin_process_id"
+        )
+        .await
+    );
+    assert!(column_exists(database.connection(), "streaming_event", "recipient_ids").await);
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
@@ -225,7 +236,8 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    Migrator::down(database.connection(), Some(1))
+    // Roll back the streaming-log migration and the followers URL migration.
+    Migrator::down(database.connection(), Some(2))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -256,6 +268,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_timeline_marker").await);
     assert!(table_exists(database.connection(), "local_account_block").await);
     assert!(table_exists(database.connection(), "local_account_mute").await);
+    assert!(table_exists(database.connection(), "streaming_event").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
@@ -276,6 +289,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_timeline_marker").await);
     assert!(!table_exists(database.connection(), "local_account_block").await);
     assert!(!table_exists(database.connection(), "local_account_mute").await);
+    assert!(!table_exists(database.connection(), "streaming_event").await);
 }
 
 /// A legacy ID-only replay marker survives the payload-aware ledger upgrade.

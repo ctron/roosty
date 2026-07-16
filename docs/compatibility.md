@@ -134,14 +134,14 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/streaming` | WebSocket auth works; in-process only. |
+| 🟢 | `GET /api/v1/streaming` | Authenticated WebSockets use bounded, PostgreSQL-backed multi-process fan-out with connection, send, ping, and idle limits. |
 | 🟡 | `GET /api/v1/streaming/direct` | Local and accepted remote direct conversation updates emit recipient-scoped `conversation` events. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
 | 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
 | 🟡 | `notification` events | Local `mention`, `favourite`, and `follow` notifications are emitted to recipient `user` and `user:notification` streams. |
 | 🟡 | `delete` events | Emitted for local status deletes and removed local boost timeline entries. |
-| 🔴 | Multi-process fan-out | No Redis/Postgres pub-sub backend yet. |
+| 🟢 | Multi-process fan-out | PostgreSQL notifications and a retained ordered event log provide reconnect recovery without startup replay. |
 
 ## Federation
 
@@ -168,6 +168,6 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Expand conversation support beyond local direct messages.
 - [ ] Add remote hashtag support.
 - [ ] Add grouped notifications, push integration, and remote notification events.
-- [ ] Support multiple Roosty processes with shared streaming fan-out and cross-process coordination.
+- [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [ ] Add moderation APIs and domain policy.

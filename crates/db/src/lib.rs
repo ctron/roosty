@@ -31,6 +31,39 @@ pub enum StatusVisibility {
     Direct,
 }
 
+/// Closed event names persisted in the cross-process streaming log.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum StreamingEventKind {
+    Update,
+    Notification,
+    Conversation,
+    Delete,
+}
+
+/// A streaming event ready to be persisted and announced to other processes.
+#[derive(Clone, Debug)]
+pub struct NewStreamingEvent {
+    pub origin_process_id: Uuid,
+    pub kind: StreamingEventKind,
+    pub payload: String,
+    pub account_id: AccountId,
+    pub recipient_ids: Vec<AccountId>,
+    pub visibility: StatusVisibility,
+}
+
+/// One ordered event recovered from the retained cross-process log.
+#[derive(Clone, Debug)]
+pub struct RetainedStreamingEvent {
+    pub sequence: i64,
+    pub origin_process_id: Uuid,
+    pub kind: StreamingEventKind,
+    pub payload: String,
+    pub account_id: AccountId,
+    pub recipient_ids: Vec<AccountId>,
+    pub visibility: StatusVisibility,
+}
+
 impl StatusVisibility {
     /// Parse a persisted visibility without accepting unknown values.
     pub fn parse(value: &str) -> Result<Self> {
@@ -50,7 +83,7 @@ use entity::{
     oauth_application, oauth_authorization_code, processed_inbox_activity, remote_actor,
     remote_custom_emoji, remote_follow, remote_following, remote_media_attachment,
     remote_profile_media, remote_status, remote_status_favourite, remote_status_local_recipient,
-    remote_status_reblog, remote_status_remote_recipient,
+    remote_status_reblog, remote_status_remote_recipient, streaming_event,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -217,6 +250,103 @@ pub async fn ping(db: &DbConnection) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Persist one streaming event and notify listeners with only its sequence.
+///
+/// PostgreSQL delivers the notification at commit, so listeners never observe
+/// a sequence before its row is queryable.
+pub async fn publish_streaming_event(db: &DbConnection, event: NewStreamingEvent) -> Result<i64> {
+    let transaction = db.begin().await?;
+    let recipient_ids = event
+        .recipient_ids
+        .iter()
+        .map(|account_id| account_id.0)
+        .collect::<Vec<_>>();
+    let model = streaming_event::ActiveModel {
+        sequence: ActiveValue::NotSet,
+        origin_process_id: Set(event.origin_process_id),
+        event_kind: Set(event.kind.to_string()),
+        payload: Set(event.payload),
+        account_id: Set(event.account_id.0),
+        recipient_ids: Set(serde_json::json!(recipient_ids)),
+        visibility: Set(event.visibility.to_string()),
+        created_at: ActiveValue::NotSet,
+    }
+    .insert(&transaction)
+    .await?;
+    transaction
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_notify('roosty_streaming_events', $1)",
+            [model.sequence.to_string().into()],
+        ))
+        .await?;
+    transaction.commit().await?;
+
+    Ok(model.sequence)
+}
+
+/// Return the newest retained streaming sequence, or zero for an empty log.
+pub async fn latest_streaming_event_sequence(db: &DbConnection) -> Result<i64> {
+    Ok(streaming_event::Entity::find()
+        .order_by_desc(streaming_event::Column::Sequence)
+        .one(db)
+        .await?
+        .map_or(0, |event| event.sequence))
+}
+
+/// Fetch retained streaming events after a cursor in global sequence order.
+pub async fn streaming_events_after(
+    db: &DbConnection,
+    sequence: i64,
+) -> Result<Vec<RetainedStreamingEvent>> {
+    streaming_event::Entity::find()
+        .filter(streaming_event::Column::Sequence.gt(sequence))
+        .order_by_asc(streaming_event::Column::Sequence)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(retained_streaming_event)
+        .collect()
+}
+
+/// Delete streaming coordination rows older than the retention cutoff.
+pub async fn delete_streaming_events_before(
+    db: &DbConnection,
+    cutoff: OffsetDateTime,
+) -> Result<u64> {
+    Ok(streaming_event::Entity::delete_many()
+        .filter(streaming_event::Column::CreatedAt.lt(cutoff))
+        .exec(db)
+        .await?
+        .rows_affected)
+}
+
+fn retained_streaming_event(model: streaming_event::Model) -> Result<RetainedStreamingEvent> {
+    let recipient_ids = serde_json::from_value::<Vec<Uuid>>(model.recipient_ids)
+        .map_err(|error| {
+            RoostyError::InvalidInput(format!("invalid streaming recipients: {error}"))
+        })?
+        .into_iter()
+        .map(AccountId)
+        .collect();
+    let kind = StreamingEventKind::from_str(&model.event_kind).map_err(|_| {
+        RoostyError::InvalidInput(format!(
+            "invalid streaming event kind: {}",
+            model.event_kind
+        ))
+    })?;
+
+    Ok(RetainedStreamingEvent {
+        sequence: model.sequence,
+        origin_process_id: model.origin_process_id,
+        kind,
+        payload: model.payload,
+        account_id: AccountId(model.account_id),
+        recipient_ids,
+        visibility: StatusVisibility::parse(&model.visibility)?,
+    })
 }
 
 /// Create the first local administrator account.

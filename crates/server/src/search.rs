@@ -533,6 +533,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };

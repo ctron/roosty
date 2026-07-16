@@ -38,3 +38,4 @@ pub mod remote_status_favourite;
 pub mod remote_status_local_recipient;
 pub mod remote_status_reblog;
 pub mod remote_status_remote_recipient;
+pub mod streaming_event;

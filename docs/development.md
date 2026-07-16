@@ -53,3 +53,25 @@ http://localhost:3001/metrics
 ```
 
 Roosty stores uploaded media in the `roosty-media` compose volume. Elk stores local client settings in the `elk-data` compose volume. The backend does not serve, package, or embed Elk.
+
+## Streaming controls
+
+Streaming uses PostgreSQL for ordered, best-effort fan-out between server
+processes. The local bounded channel remains the immediate delivery path, so a
+database publication failure does not delay the publishing request. Retained
+events are recovery metadata rather than a permanent message queue.
+
+| Environment variable | Default | Validation |
+| --- | ---: | --- |
+| `ROOSTY_STREAMING_MAX_CONNECTIONS` | `1000` | Positive integer, per process. |
+| `ROOSTY_STREAMING_SEND_TIMEOUT` | `10s` | Non-zero `humantime` duration. |
+| `ROOSTY_STREAMING_PING_INTERVAL` | `30s` | Non-zero `humantime` duration. |
+| `ROOSTY_STREAMING_IDLE_TIMEOUT` | `90s` | Non-zero duration greater than the ping interval. |
+| `ROOSTY_STREAMING_EVENT_RETENTION` | `1h` | Non-zero `humantime` duration. |
+
+Configuration is read at startup. Stalled sends and clients that do not send
+any frames (including pong frames) before the idle deadline are disconnected.
+`/readyz` requires both database access and an initialized PostgreSQL listener.
+The `/metrics` output includes active/rejected sockets, send timeouts, idle
+disconnects, lagged receivers, listener reconnects, and failed cross-process
+publications.

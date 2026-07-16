@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -12,14 +12,16 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use tracing::{debug, warn};
 
 use roosty_core::AccountId;
 
 use crate::{
     auth::{self, AuthenticatedAccount},
+    config::StreamingConfig,
     http::AppState,
-    streaming::StreamingEvents,
+    streaming::{StreamingEvents, StreamingMetrics},
 };
 
 /// Build compatibility routes probed by Mastodon browser clients.
@@ -110,9 +112,26 @@ async fn streaming_response(
         Err(response) => return response,
     };
 
+    let permit = match state.streaming_connections.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            state.streaming_events.metrics().connection_rejected();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Streaming connection limit reached".to_owned(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
     let events = state.streaming_events.clone();
+    let config = state.config.streaming.clone();
     websocket
-        .on_upgrade(move |socket| handle_streaming_socket(socket, account.id, stream, events))
+        .on_upgrade(move |socket| {
+            handle_streaming_socket(socket, account.id, stream, events, config, permit)
+        })
         .into_response()
 }
 
@@ -122,22 +141,36 @@ async fn handle_streaming_socket(
     account_id: AccountId,
     initial_stream: Option<String>,
     events: StreamingEvents,
+    config: StreamingConfig,
+    _permit: OwnedSemaphorePermit,
 ) {
+    let metrics = events.metrics();
+    let _connection = ActiveConnection::new(metrics.clone());
     let mut streams = initial_stream.map_or_else(|| vec!["user".to_owned()], |stream| vec![stream]);
     debug!(?streams, "streaming client subscribed");
 
     let mut receiver = events.subscribe();
+    let mut ping_interval = tokio::time::interval(config.ping_interval);
+    ping_interval.tick().await;
+    let idle_timer = tokio::time::sleep(config.idle_timeout);
+    tokio::pin!(idle_timer);
     loop {
         tokio::select! {
             message = socket.recv() => {
                 let Some(message) = message else {
                     break;
                 };
+                idle_timer.as_mut().reset(Instant::now() + config.idle_timeout);
                 match message {
                     Ok(Message::Text(text)) => handle_streaming_text(&text, &mut streams),
                     Ok(Message::Close(_)) => break,
                     Ok(Message::Ping(payload)) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
+                        if !send_socket_message(
+                            &mut socket,
+                            Message::Pong(payload),
+                            config.send_timeout,
+                            &metrics,
+                        ).await {
                             break;
                         }
                     }
@@ -159,11 +192,17 @@ async fn handle_streaming_socket(
                                 continue;
                             }
                         };
-                        if socket.send(Message::Text(message.into())).await.is_err() {
+                        if !send_socket_message(
+                            &mut socket,
+                            Message::Text(message.into()),
+                            config.send_timeout,
+                            &metrics,
+                        ).await {
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        metrics.receiver_lagged();
                         warn!(skipped, "streaming websocket receiver lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -171,6 +210,62 @@ async fn handle_streaming_socket(
                     }
                 }
             }
+            _ = ping_interval.tick() => {
+                if !send_socket_message(
+                    &mut socket,
+                    Message::Ping(Vec::new().into()),
+                    config.send_timeout,
+                    &metrics,
+                ).await {
+                    break;
+                }
+            }
+            () = idle_timer.as_mut() => {
+                metrics.idle_disconnected();
+                let _ = send_socket_message(
+                    &mut socket,
+                    Message::Close(None),
+                    config.send_timeout,
+                    &metrics,
+                ).await;
+                break;
+            }
+        }
+    }
+}
+
+struct ActiveConnection(Arc<StreamingMetrics>);
+
+impl ActiveConnection {
+    fn new(metrics: Arc<StreamingMetrics>) -> Self {
+        metrics.connection_opened();
+        Self(metrics)
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
+/// Apply the configured deadline to every server-to-client frame.
+async fn send_socket_message(
+    socket: &mut WebSocket,
+    message: Message,
+    timeout: std::time::Duration,
+    metrics: &StreamingMetrics,
+) -> bool {
+    match tokio::time::timeout(timeout, socket.send(message)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            debug!(%error, "streaming socket send failed");
+            false
+        }
+        Err(_) => {
+            metrics.send_timed_out();
+            warn!(?timeout, "streaming socket send timed out");
+            false
         }
     }
 }
@@ -422,6 +517,91 @@ mod tests {
         assert_eq!(&body[..], b"OK");
     }
 
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    /// Given two initialized processes, when all event kinds are published, then the remote process receives each once without startup replay.
+    async fn streaming_events_cross_process_once_without_startup_replay(
+        context: &mut CompatContext,
+    ) {
+        let alpha = AppState::new(context.config.clone(), context.db.clone());
+        alpha.streaming_events.initialize_listener().await.unwrap();
+        alpha
+            .streaming_events
+            .publish_delete("before-startup", context.account_id, "public", &[]);
+        wait_for_streaming_sequence(&context.db, 1).await;
+
+        let beta = AppState::new(context.config.clone(), context.db.clone());
+        beta.streaming_events.initialize_listener().await.unwrap();
+        let mut receiver = beta.streaming_events.subscribe();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            roosty_db::delete_streaming_events_before(
+                &context.db,
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(1),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        alpha.streaming_events.publish_status_update(
+            &serde_json::json!({"id": "update"}),
+            context.account_id,
+            "public",
+            &[],
+        );
+        alpha.streaming_events.publish_notification(
+            &serde_json::json!({"id": "notification"}),
+            context.account_id,
+        );
+        alpha.streaming_events.publish_conversation(
+            &serde_json::json!({"id": "conversation"}),
+            context.account_id,
+        );
+        alpha
+            .streaming_events
+            .publish_delete("deleted-status", context.account_id, "public", &[]);
+
+        let streams = [
+            "user".to_owned(),
+            "user:notification".to_owned(),
+            "direct".to_owned(),
+            "public".to_owned(),
+        ];
+        let mut event_names = Vec::new();
+        for _ in 0..4 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let message = event
+                .to_socket_message(context.account_id, &streams)
+                .unwrap()
+                .unwrap();
+            event_names.push(serde_json::from_str::<Value>(&message).unwrap()["event"].clone());
+        }
+        assert_eq!(
+            event_names,
+            ["update", "notification", "conversation", "delete"]
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        alpha.streaming_events.shutdown();
+        beta.streaming_events.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(alpha);
+        drop(beta);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     #[test]
     fn streaming_token_accepts_browser_compatible_locations() {
         // Browser WebSocket clients cannot set arbitrary Authorization headers,
@@ -547,6 +727,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
@@ -643,6 +824,23 @@ mod tests {
     async fn json_body(response: axum::http::Response<Body>) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn wait_for_streaming_sequence(db: &roosty_db::DbConnection, expected: i64) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if roosty_db::latest_streaming_event_sequence(db)
+                    .await
+                    .unwrap()
+                    >= expected
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     fn unique_name() -> String {

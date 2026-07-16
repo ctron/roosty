@@ -48,7 +48,7 @@
 - [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
 - [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, and account migration metadata.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
-- [ ] Support multi-process streaming fan-out and federation-worker coordination.
+- [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
 
 ## Long Term
 

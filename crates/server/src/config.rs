@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use roosty_core::{Result, RoostyError};
 use url::Url;
@@ -8,6 +8,85 @@ const DEFAULT_MEDIA_ROOT: &str = "./media";
 const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
 const DEFAULT_WORKER_CONCURRENCY: &str = "4";
+
+/// Per-process limits and timers for Mastodon-compatible streaming sockets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamingConfig {
+    pub max_connections: usize,
+    pub send_timeout: Duration,
+    pub ping_interval: Duration,
+    pub idle_timeout: Duration,
+    pub event_retention: Duration,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 1_000,
+            send_timeout: Duration::from_secs(10),
+            ping_interval: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(90),
+            event_retention: Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+impl StreamingConfig {
+    fn from_env() -> Result<Self> {
+        let max_connections = parse_env("ROOSTY_STREAMING_MAX_CONNECTIONS", "1000")?;
+        let send_timeout = nonzero_duration_env("ROOSTY_STREAMING_SEND_TIMEOUT", "10s")?;
+        let ping_interval = nonzero_duration_env("ROOSTY_STREAMING_PING_INTERVAL", "30s")?;
+        let idle_timeout = nonzero_duration_env("ROOSTY_STREAMING_IDLE_TIMEOUT", "90s")?;
+        let event_retention = nonzero_duration_env("ROOSTY_STREAMING_EVENT_RETENTION", "1h")?;
+        Self::validated(
+            max_connections,
+            send_timeout,
+            ping_interval,
+            idle_timeout,
+            event_retention,
+        )
+    }
+
+    fn validated(
+        max_connections: usize,
+        send_timeout: Duration,
+        ping_interval: Duration,
+        idle_timeout: Duration,
+        event_retention: Duration,
+    ) -> Result<Self> {
+        if max_connections == 0 {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_STREAMING_MAX_CONNECTIONS must be positive".to_owned(),
+            ));
+        }
+        for (name, duration) in [
+            ("ROOSTY_STREAMING_SEND_TIMEOUT", send_timeout),
+            ("ROOSTY_STREAMING_PING_INTERVAL", ping_interval),
+            ("ROOSTY_STREAMING_IDLE_TIMEOUT", idle_timeout),
+            ("ROOSTY_STREAMING_EVENT_RETENTION", event_retention),
+        ] {
+            if duration.is_zero() {
+                return Err(RoostyError::Configuration(format!(
+                    "{name} must be a non-zero humantime duration, such as 10s, 90s, or 1h"
+                )));
+            }
+        }
+        if idle_timeout <= ping_interval {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_STREAMING_IDLE_TIMEOUT must be greater than ROOSTY_STREAMING_PING_INTERVAL"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(Self {
+            max_connections,
+            send_timeout,
+            ping_interval,
+            idle_timeout,
+            event_retention,
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -38,6 +117,7 @@ pub struct Config {
     pub remote_media_fetch_concurrency: usize,
     /// Number of durable job loops to run in this process; zero in configuration uses available CPUs.
     pub worker_concurrency: usize,
+    pub streaming: StreamingConfig,
     pub instance_name: String,
     pub instance_description: Option<String>,
 }
@@ -125,6 +205,7 @@ impl Config {
             remote_media_max_bytes,
             remote_media_fetch_concurrency,
             worker_concurrency,
+            streaming: StreamingConfig::from_env()?,
             instance_name: required_env("ROOSTY_INSTANCE_NAME")?,
             instance_description: optional_env("ROOSTY_INSTANCE_DESCRIPTION"),
         })
@@ -173,19 +254,28 @@ fn resolve_worker_concurrency(configured: usize) -> Result<usize> {
 }
 
 fn optional_humantime_duration_env(name: &str, default: &str) -> Result<time::Duration> {
+    let duration = nonzero_duration_env(name, default)?;
+    time::Duration::try_from(duration)
+        .map_err(|_| RoostyError::Configuration(format!("{name} is too large")))
+}
+
+fn nonzero_duration_env(name: &str, default: &str) -> Result<Duration> {
     let value = optional_env(name).unwrap_or_else(|| default.to_owned());
-    let duration = humantime::parse_duration(&value).map_err(|_| {
+    nonzero_duration(name, &value)
+}
+
+fn nonzero_duration(name: &str, value: &str) -> Result<Duration> {
+    let duration = humantime::parse_duration(value).map_err(|_| {
         RoostyError::Configuration(format!(
-            "{name} must be a positive human-readable duration, such as 7d or 12h"
+            "{name} must be a non-zero humantime duration, such as 10s, 90s, or 1h"
         ))
     })?;
     if duration.is_zero() {
         return Err(RoostyError::Configuration(format!(
-            "{name} must be a positive human-readable duration"
+            "{name} must be a non-zero humantime duration, such as 10s, 90s, or 1h"
         )));
     }
-    time::Duration::try_from(duration)
-        .map_err(|_| RoostyError::Configuration(format!("{name} is too large")))
+    Ok(duration)
 }
 
 /// Parse a comma-separated list of DNS host names or the `*` federation wildcard.
@@ -315,6 +405,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            streaming: StreamingConfig::default(),
             instance_name: "Roosty Test".to_owned(),
             instance_description: None,
         };
@@ -331,6 +422,91 @@ mod tests {
             resolve_worker_concurrency(0).unwrap(),
             std::thread::available_parallelism().unwrap().get()
         );
+    }
+
+    #[test]
+    fn nonzero_durations_accept_humantime_forms() {
+        assert_eq!(
+            nonzero_duration("ROOSTY_STREAMING_SEND_TIMEOUT", "1500ms").unwrap(),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            nonzero_duration("ROOSTY_STREAMING_EVENT_RETENTION", "1h").unwrap(),
+            Duration::from_secs(3_600)
+        );
+    }
+
+    #[test]
+    fn nonzero_durations_name_invalid_configuration() {
+        for value in ["0s", "tomorrow"] {
+            let error = nonzero_duration("ROOSTY_STREAMING_IDLE_TIMEOUT", value).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("ROOSTY_STREAMING_IDLE_TIMEOUT"));
+            assert!(message.contains("10s"));
+        }
+    }
+
+    #[test]
+    fn streaming_defaults_match_documented_operational_values() {
+        assert_eq!(
+            StreamingConfig::default(),
+            StreamingConfig {
+                max_connections: 1_000,
+                send_timeout: Duration::from_secs(10),
+                ping_interval: Duration::from_secs(30),
+                idle_timeout: Duration::from_secs(90),
+                event_retention: Duration::from_secs(3_600),
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_validation_rejects_zero_connections_and_short_idle_timeout() {
+        assert!(
+            StreamingConfig::validated(
+                0,
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(90),
+                Duration::from_secs(3_600),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ROOSTY_STREAMING_MAX_CONNECTIONS")
+        );
+        for zero_duration_index in 0..4 {
+            let mut durations = [
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(90),
+                Duration::from_secs(3_600),
+            ];
+            durations[zero_duration_index] = Duration::ZERO;
+            assert!(
+                StreamingConfig::validated(
+                    1,
+                    durations[0],
+                    durations[1],
+                    durations[2],
+                    durations[3],
+                )
+                .is_err()
+            );
+        }
+        for idle_seconds in [29, 30] {
+            assert!(
+                StreamingConfig::validated(
+                    1,
+                    Duration::from_secs(10),
+                    Duration::from_secs(30),
+                    Duration::from_secs(idle_seconds),
+                    Duration::from_secs(3_600),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("ROOSTY_STREAMING_IDLE_TIMEOUT")
+            );
+        }
     }
 
     fn optional_bool_value(value: &str) -> Result<bool> {

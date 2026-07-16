@@ -225,6 +225,7 @@ async fn serve(
     }
 
     let state = AppState::new(config.clone(), db.clone());
+    state.streaming_events.initialize_listener().await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
@@ -246,13 +247,15 @@ async fn serve(
     if let Some(infra_listen_addr) = config.infra_listen_addr {
         let infra_server = serve_router(
             infra_listen_addr,
-            http::infra_router(state),
+            http::infra_router(state.clone()),
             shutdown_rx.clone(),
         );
         tokio::try_join!(main_server, infra_server)?;
     } else {
         main_server.await?;
     }
+
+    state.streaming_events.shutdown();
 
     if let Some(worker_task) = worker_task {
         worker_task
@@ -861,6 +864,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            streaming: crate::config::StreamingConfig::default(),
             instance_name: "Worker test".to_owned(),
             instance_description: None,
         }

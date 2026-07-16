@@ -3089,6 +3089,7 @@ dependencies = [
  "serde_qs",
  "serde_urlencoded",
  "sha2 0.10.9",
+ "sqlx 0.8.6",
  "strum 0.27.2",
  "tempfile",
  "test-context",
