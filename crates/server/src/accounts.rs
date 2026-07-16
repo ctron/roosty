@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use roosty_core::{AccountId, RoostyError, StatusId};
+use roosty_core::{AccountId, FederationDiscoveryError, RoostyError, StatusId};
 use roosty_db::{LocalNotificationType, RemoteActor, RemoteProfileMediaKind};
 use sea_orm::{AccessMode, TransactionTrait};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -187,6 +187,27 @@ async fn lookup_account(
         };
     }
 
+    if let Some((username, domain)) = params
+        .acct
+        .as_deref()
+        .and_then(crate::federation::discovery::exact_remote_handle)
+    {
+        match roosty_db::find_remote_actor_by_handle(&state.db, &username, &domain).await {
+            Ok(Some(actor))
+                if actor.deleted_at.is_none()
+                    && (!params.resolve.unwrap_or(false)
+                        || actor.expires_at > time::OffsetDateTime::now_utc()) =>
+            {
+                return match remote_account_response(&state, actor).await {
+                    Ok(response) => Json(response).into_response(),
+                    Err(error) => server_error(error),
+                };
+            }
+            Ok(_) => {}
+            Err(error) => return server_error(error),
+        }
+    }
+
     if !params.resolve.unwrap_or(false) || !state.config.federation_enabled {
         return not_found();
     }
@@ -199,6 +220,9 @@ async fn lookup_account(
             Ok(response) => Json(response).into_response(),
             Err(error) => server_error(error),
         },
+        Err(RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_))) => {
+            not_found()
+        }
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     }
@@ -209,6 +233,10 @@ pub(crate) async fn remote_account_response(
     state: &AppState,
     actor: RemoteActor,
 ) -> roosty_core::Result<RemoteAccountResponse> {
+    let statuses_count = roosty_db::count_remote_statuses_by_account(&state.db, actor.id).await?;
+    let last_status_at = roosty_db::last_remote_status_at(&state.db, actor.id)
+        .await?
+        .map(crate::statuses::format_timestamp);
     let txn = state
         .db
         .begin_with_config(None, Some(AccessMode::ReadOnly))
@@ -226,6 +254,8 @@ pub(crate) async fn remote_account_response(
     let header = media_url(RemoteProfileMediaKind::Header);
     let moved_to_remote_actor_id = actor.moved_to_remote_actor_id;
     let mut response = remote_account_response_from_media(actor, avatar, header);
+    response.statuses_count = statuses_count;
+    response.last_status_at = last_status_at;
     if let Some(moved_to_remote_actor_id) = moved_to_remote_actor_id
         && let Some(mut moved) =
             roosty_db::find_remote_actor_by_id(&state.db, moved_to_remote_actor_id).await?
@@ -348,12 +378,22 @@ pub(crate) fn remote_custom_emojis(tags: &Value) -> Vec<Value> {
 
 /// Return a public local account profile by account id.
 async fn show_account(State(state): State<AppState>, Path(path): Path<AccountPath>) -> Response {
-    match roosty_db::find_local_account_by_id(&state.db, AccountId(path.account_id)).await {
+    let account_id = AccountId(path.account_id);
+    match roosty_db::find_local_account_by_id(&state.db, account_id).await {
         Ok(Some(account)) => match account_response(&state, account).await {
             Ok(response) => Json(response).into_response(),
             Err(error) => server_error(error),
         },
-        Ok(None) => not_found(),
+        Ok(None) => match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
+            Ok(Some(actor)) if actor.deleted_at.is_none() => {
+                match remote_account_response(&state, actor).await {
+                    Ok(response) => Json(response).into_response(),
+                    Err(error) => server_error(error),
+                }
+            }
+            Ok(_) => not_found(),
+            Err(error) => server_error(error),
+        },
         Err(error) => server_error(error),
     }
 }
@@ -375,10 +415,42 @@ async fn account_statuses(
         Err(()) => return bad_request("status id is invalid"),
     };
     let limit = crate::statuses::timeline_limit(params.limit);
-    match roosty_db::find_local_account_by_id(&state.db, account_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return not_found(),
+    let local = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
         Err(error) => return server_error(error),
+    };
+    if !local {
+        match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
+            Ok(Some(actor)) if actor.deleted_at.is_none() => {}
+            Ok(_) => return not_found(),
+            Err(error) => return server_error(error),
+        }
+        return match roosty_db::remote_statuses_by_account(
+            &state.db,
+            account_id,
+            limit,
+            cursor,
+            roosty_db::AccountStatusTimelineOptions {
+                exclude_replies: params.exclude_replies.unwrap_or(false),
+                only_media: params.only_media.unwrap_or(false),
+                tagged: params.tagged.clone().filter(|tag| !tag.trim().is_empty()),
+            },
+        )
+        .await
+        {
+            Ok(page) => {
+                crate::statuses::remote_timeline_response(
+                    &state,
+                    page,
+                    limit,
+                    &format!("/api/v1/accounts/{}/statuses", account_id.0),
+                    viewer.as_ref().map(|account| account.id),
+                )
+                .await
+            }
+            Err(error) => server_error(error),
+        };
     }
 
     match roosty_db::local_statuses_by_account(

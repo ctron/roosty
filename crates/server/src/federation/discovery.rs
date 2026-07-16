@@ -2,6 +2,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -9,9 +10,9 @@ use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE},
 };
-use roosty_core::{AccountId, Result, RoostyError};
+use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
 use roosty_db::{NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor};
-use sea_orm::{AccessMode, TransactionTrait};
+use sea_orm::{AccessMode, ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -21,6 +22,10 @@ use uuid::Uuid;
 use crate::{federation::ActorType, http::AppState};
 
 const MAX_FEDERATION_RESPONSE_BYTES: usize = 1_048_576;
+static DISCOVERY_CACHE_HIT: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_RESOLVED: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_POLICY_REJECTED: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_FAILED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
 struct WebFingerResponse {
@@ -95,10 +100,17 @@ struct RemotePublicKey {
 pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<RemoteActor> {
     let (username, domain) = parse_remote_handle(handle)?;
     let domain = domain.to_ascii_lowercase();
-    if let Some(actor) =
-        roosty_db::find_remote_actor_by_handle(&state.db, username, &domain).await?
+    let lock = state.db.begin().await?;
+    lock.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("remote-account:{username}@{domain}").into()],
+    ))
+    .await?;
+    if let Some(actor) = roosty_db::find_remote_actor_by_handle(&lock, username, &domain).await?
         && actor.expires_at > OffsetDateTime::now_utc()
     {
+        lock.commit().await?;
         return Ok(actor);
     }
     let resource = format!("acct:{username}@{domain}");
@@ -142,7 +154,95 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         deleted_at: None,
         moved_to_remote_actor_id: None,
     };
-    store_remote_actor(state, actor, document.icon, document.image).await
+    let actor = store_remote_actor_on(&lock, actor, document.icon, document.image).await?;
+    lock.commit().await?;
+    enqueue_profile_media_if_followed(state, actor.id).await?;
+    Ok(actor)
+}
+
+/// Resolve an exact remote handle for account search with policy-aware failure semantics.
+pub async fn resolve_remote_actor_for_search(
+    state: &AppState,
+    handle: &str,
+) -> Result<RemoteActor> {
+    let Some((username, domain)) = exact_remote_handle(handle) else {
+        DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
+        return Err(invalid("remote account handle is invalid"));
+    };
+    if !state.config.federation_domain_is_allowed(&domain) {
+        DISCOVERY_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(FederationDiscoveryError::PolicyRejected(domain.into()).into());
+    }
+    let cached = match roosty_db::find_remote_actor_by_handle(&state.db, &username, &domain).await {
+        Ok(cached) => cached,
+        Err(error) => {
+            DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+    };
+    let fresh = cached
+        .as_ref()
+        .is_some_and(|actor| actor.expires_at > OffsetDateTime::now_utc());
+    match resolve_remote_actor(state, &format!("{username}@{domain}")).await {
+        Ok(actor) => {
+            if fresh {
+                DISCOVERY_CACHE_HIT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DISCOVERY_RESOLVED.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(actor)
+        }
+        Err(
+            error @ RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_)),
+        ) => {
+            DISCOVERY_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+        Err(error) => {
+            DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+    }
+}
+
+/// Parse only account-address syntax; URLs and local shorthand are deliberately excluded.
+pub fn exact_remote_handle(handle: &str) -> Option<(String, String)> {
+    let handle = handle.trim().strip_prefix('@').unwrap_or(handle.trim());
+    let (username, domain) = handle.rsplit_once('@')?;
+    if username.is_empty()
+        || domain.is_empty()
+        || username.contains('@')
+        || !username
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
+        || domain.contains(':')
+        || domain.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let domain = match url::Host::parse(domain).ok()? {
+        url::Host::Domain(domain) => domain.to_ascii_lowercase(),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => return None,
+    };
+    Some((username.to_owned(), domain))
+}
+
+/// Render bounded-label remote discovery counters for `/metrics`.
+pub(crate) fn metrics_text() -> String {
+    format!(
+        concat!(
+            "# HELP roosty_federation_discovery_total Remote account discovery outcomes.\n",
+            "# TYPE roosty_federation_discovery_total counter\n",
+            "roosty_federation_discovery_total{{outcome=\"cache_hit\"}} {}\n",
+            "roosty_federation_discovery_total{{outcome=\"resolved\"}} {}\n",
+            "roosty_federation_discovery_total{{outcome=\"policy_rejected\"}} {}\n",
+            "roosty_federation_discovery_total{{outcome=\"failed\"}} {}\n"
+        ),
+        DISCOVERY_CACHE_HIT.load(Ordering::Relaxed),
+        DISCOVERY_RESOLVED.load(Ordering::Relaxed),
+        DISCOVERY_POLICY_REJECTED.load(Ordering::Relaxed),
+        DISCOVERY_FAILED.load(Ordering::Relaxed),
+    )
 }
 
 /// Resolve an actor by canonical ActivityPub ID for an authenticated inbox activity.
@@ -304,19 +404,24 @@ async fn store_remote_actor(
     let txn = state.db.begin().await?;
     let actor = store_remote_actor_on(&txn, actor, icon, image).await?;
     txn.commit().await?;
+    enqueue_profile_media_if_followed(state, actor.id).await?;
+    Ok(actor)
+}
+
+async fn enqueue_profile_media_if_followed(state: &AppState, actor_id: AccountId) -> Result<()> {
     let read_txn = state
         .db
         .begin_with_config(None, Some(AccessMode::ReadOnly))
         .await?;
     let has_accepted_followers =
-        !roosty_db::accepted_local_followers_of_remote_actor(&read_txn, actor.id)
+        !roosty_db::accepted_local_followers_of_remote_actor(&read_txn, actor_id)
             .await?
             .is_empty();
     read_txn.commit().await?;
     if has_accepted_followers {
-        crate::media::enqueue_remote_profile_media_fetches(state, actor.id).await?;
+        crate::media::enqueue_remote_profile_media_fetches(state, actor_id).await?;
     }
-    Ok(actor)
+    Ok(())
 }
 
 async fn store_remote_actor_on(
@@ -424,7 +529,7 @@ pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<S
         .ok_or_else(|| invalid("remote URL has no host"))?
         .to_ascii_lowercase();
     if !state.config.federation_domain_is_allowed(&host) {
-        return Err(invalid("remote domain is disallowed by federation policy"));
+        return Err(FederationDiscoveryError::PolicyRejected(host.into()).into());
     }
     if host.parse::<IpAddr>().is_ok() {
         return Err(invalid(

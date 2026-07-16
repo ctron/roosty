@@ -1,10 +1,19 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub type Result<T, E = RoostyError> = std::result::Result<T, E>;
+
+/// Typed failures produced while applying remote federation discovery policy.
+#[derive(Debug, Error)]
+pub enum FederationDiscoveryError {
+    #[error("federation policy rejects remote domain {0}")]
+    PolicyRejected(Cow<'static, str>),
+}
 
 #[derive(Debug, Error)]
 pub enum RoostyError {
@@ -13,6 +22,9 @@ pub enum RoostyError {
 
     #[error("database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error(transparent)]
+    FederationDiscovery(#[from] FederationDiscoveryError),
 
     #[error("invalid input: {0}")]
     InvalidInput(String),

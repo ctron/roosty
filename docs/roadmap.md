@@ -9,13 +9,14 @@
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
+- Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
 - Signed inbound remote-follow handling: `Follow` and `Undo(Follow)` update remote-follower state, with durable `Accept`/`Reject` responses for local actors.
 - Signed outbound delivery of local public and unlisted status lifecycle activities (`Create`, `Update`, and `Delete`) plus local actor profile `Update` activities to accepted remote followers.
 
 ### Federation gaps
 
-- [ ] Refresh cached remote actors before expiry, with bounded retries and observability.
-- [ ] Include cached and resolved remote accounts in Mastodon account search, with pagination and ranking.
+- [x] Refresh expired cached remote actors during exact-handle resolution, with bounded discovery observability and cross-process deduplication.
+- [x] Include cached and resolved remote accounts in Mastodon account search, with pagination and deterministic ranking.
 - [x] Add signed outbound `Follow` and `Undo(Follow)` delivery, including durable delivery jobs, destination deduplication, retries, and permanent-failure diagnostics.
 - [x] Process inbound `Accept` and `Reject` for locally initiated remote follows; signed inbound `Follow`/`Undo(Follow)` and locked-account requests are available.
 - [x] Persist local-to-remote follow/relationship state and expose accepted local and remote relationships through Mastodon and ActivityPub follower/following collections.
@@ -23,7 +24,7 @@
 - [x] Verify signed inbound public/unlisted `Create`, `Update`, and `Delete` activities and cache remote Notes by canonical object ID.
 - [x] Project cached remote Notes into local home timelines.
 - [x] Stream cached remote Note create/update/delete events to local home timelines.
-- [ ] Repair remote home timelines after missed delivery, cache expiry, deletion, and follow-state changes.
+- [x] Match Mastodon's push-based federation behavior: missed inbox deliveries are not backfilled by polling remote outboxes; deletion and follow-state cache repairs remain local operations.
 - [ ] Implement remote visibility semantics beyond public/unlisted Notes, including replies and follower-only addressing.
 - [ ] Fetch and expose paginated remote followers/following collection contents.
 - [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
@@ -82,10 +83,11 @@
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [ ] Improve local account administration now that multiple local users can be operator-created.
-- [ ] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
-- [ ] Add cursor pagination for account status collections.
+- [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
+- [x] Add cursor pagination for local and cached-remote account status collections.
 - [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.
+- [ ] Replace manually formatted Prometheus metrics and global atomic counters with standardized instrumentation and an exporter; evaluate OpenTelemetry for correlated metrics and traces.
 - [x] Expose persisted local account creation dates through Mastodon account responses.
 - [x] Harden local and remote avatar/header processing with MIME/byte validation, signed Actor `Update` delivery assertions, and stale-while-refresh proxy caching.

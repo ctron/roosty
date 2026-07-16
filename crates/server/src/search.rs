@@ -4,11 +4,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    auth::{AccountResponse, AuthenticatedAccount, account_response},
+    accounts::{RemoteAccountResponse, remote_account_response},
+    auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
     http::AppState,
     statuses::TagResponse,
 };
@@ -37,9 +39,17 @@ struct SearchParams {
 
 #[derive(Serialize)]
 struct SearchResponse {
-    accounts: Vec<AccountResponse>,
+    accounts: Vec<SearchAccountResponse>,
     statuses: Vec<Value>,
     hashtags: Vec<TagResponse>,
+}
+
+/// Untagged Mastodon account shape shared by local and cached remote search results.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SearchAccountResponse {
+    Local(Box<AccountResponse>),
+    Remote(Box<RemoteAccountResponse>),
 }
 
 #[derive(Serialize)]
@@ -50,11 +60,23 @@ struct ErrorResponse {
 
 async fn search(
     State(state): State<AppState>,
-    AuthenticatedAccount(account): AuthenticatedAccount,
+    OptionalAuthenticatedAccount(account): OptionalAuthenticatedAccount,
     Query(params): Query<SearchParams>,
 ) -> Response {
+    let privileged = params.resolve.unwrap_or(false)
+        || params.following.unwrap_or(false)
+        || params.offset.unwrap_or(0) != 0;
+    if privileged && account.is_none() {
+        return unauthorized();
+    }
     let accounts = if matches!(params.search_type.as_deref(), None | Some("accounts")) {
-        search_accounts(&state, account.id, &params, MAX_SEARCH_LIMIT).await
+        search_accounts(
+            &state,
+            account.as_ref().map(|account| account.id),
+            &params,
+            MAX_SEARCH_LIMIT,
+        )
+        .await
     } else {
         Ok(Vec::new())
     };
@@ -80,7 +102,7 @@ async fn account_search(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<SearchParams>,
 ) -> Response {
-    match search_accounts(&state, account.id, &params, MAX_ACCOUNT_SEARCH_LIMIT).await {
+    match search_accounts(&state, Some(account.id), &params, MAX_ACCOUNT_SEARCH_LIMIT).await {
         Ok(accounts) => Json(accounts).into_response(),
         Err(error) => server_error(error),
     }
@@ -89,36 +111,69 @@ async fn account_search(
 /// Search local accounts and convert them to Mastodon account responses.
 async fn search_accounts(
     state: &AppState,
-    account_id: roosty_core::AccountId,
+    account_id: Option<AccountId>,
     params: &SearchParams,
     max_limit: u64,
-) -> roosty_core::Result<Vec<AccountResponse>> {
-    let _resolve = params.resolve.unwrap_or(false);
-    let _following = params.following.unwrap_or(false);
-    let Some(query) = normalized_local_query(state, params.q.as_deref()) else {
+) -> Result<Vec<SearchAccountResponse>> {
+    let Some(query) = normalized_account_query(params.q.as_deref()) else {
         return Ok(Vec::new());
     };
+    if params.resolve.unwrap_or(false)
+        && state.config.federation_enabled
+        && crate::federation::discovery::exact_remote_handle(&query).is_some()
+    {
+        match crate::federation::discovery::resolve_remote_actor_for_search(state, &query).await {
+            Ok(_)
+            | Err(RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_))) => {
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let limit = params
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, max_limit);
     let offset = params.offset.unwrap_or(0);
-    let accounts =
-        roosty_db::search_local_accounts(&state.db, account_id, &query, limit, offset).await?;
+    let viewer = account_id.unwrap_or(AccountId(uuid::Uuid::nil()));
+    let local_domain = state.config.public_base_url.host_str().unwrap_or_default();
+    let accounts = roosty_db::search_accounts(
+        &state.db,
+        roosty_db::AccountSearchOptions {
+            viewer_account_id: viewer,
+            query: &query,
+            local_domain,
+            following_only: params.following.unwrap_or(false),
+            include_remote: state.config.federation_enabled,
+            allow_all_remote_domains: state
+                .config
+                .federation_allowed_domains
+                .iter()
+                .any(|domain| domain == "*"),
+            allowed_remote_domains: &state.config.federation_allowed_domains,
+            blocked_remote_domains: &state.config.federation_blocked_domains,
+            limit,
+            offset,
+        },
+    )
+    .await?;
     let mut responses = Vec::with_capacity(accounts.len());
 
     for account in accounts {
-        responses.push(account_response(state, account).await?);
+        responses.push(match account {
+            roosty_db::AccountSearchResult::Local(account) => {
+                SearchAccountResponse::Local(Box::new(account_response(state, account).await?))
+            }
+            roosty_db::AccountSearchResult::Remote(actor) => SearchAccountResponse::Remote(
+                Box::new(remote_account_response(state, actor).await?),
+            ),
+        });
     }
 
     Ok(responses)
 }
 
 /// Search local hashtags and include recent usage history in Mastodon tag responses.
-async fn search_hashtags(
-    state: &AppState,
-    params: &SearchParams,
-) -> roosty_core::Result<Vec<TagResponse>> {
+async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<TagResponse>> {
     let Some(query) = normalized_tag_query(params.q.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -138,18 +193,10 @@ async fn search_hashtags(
 }
 
 /// Normalize local mention-style search terms and reject remote account queries.
-fn normalized_local_query(state: &AppState, query: Option<&str>) -> Option<String> {
+fn normalized_account_query(query: Option<&str>) -> Option<String> {
     let trimmed = query?.trim().trim_start_matches('@');
     if trimmed.is_empty() {
         return None;
-    }
-
-    if let Some((username, domain)) = trimmed.split_once('@') {
-        let local_host = state.config.public_base_url.host_str()?;
-        if domain != local_host {
-            return None;
-        }
-        return non_empty(username);
     }
 
     non_empty(trimmed)
@@ -165,12 +212,28 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn server_error(error: roosty_core::RoostyError) -> Response {
+fn server_error(error: RoostyError) -> Response {
+    let status = if matches!(error, RoostyError::InvalidInput(_)) {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    };
     (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        status,
         Json(ErrorResponse {
             error: "server_error",
             error_description: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn unauthorized() -> Response {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: "unauthorized",
+            error_description: "This method requires an authenticated user".to_owned(),
         }),
     )
         .into_response()
@@ -222,6 +285,107 @@ mod tests {
         assert_eq!(body["accounts"][0]["username"], "alice");
         assert_eq!(body["statuses"], serde_json::json!([]));
         assert_eq!(body["hashtags"], serde_json::json!([]));
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
+    /// Given no token, basic v2 search remains public while privileged parameters require a user.
+    async fn v2_search_authenticates_only_privileged_parameters(context: &mut SearchContext) {
+        context
+            .create_account("alice", "alice@example.com", "Alice Example")
+            .await;
+
+        let public = context.get("/api/v2/search?type=accounts&q=alice").await;
+        let offset = context
+            .get("/api/v2/search?type=accounts&q=alice&offset=1")
+            .await;
+        let following = context
+            .get("/api/v2/search?type=accounts&q=alice&following=true")
+            .await;
+        let resolve = context
+            .get("/api/v2/search?type=accounts&q=alice@example.test&resolve=true")
+            .await;
+
+        assert_eq!(public.status(), StatusCode::OK);
+        assert_eq!(json_body(public).await["accounts"][0]["username"], "alice");
+        assert_eq!(offset.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(following.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resolve.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
+    /// Given a fresh cached actor, exact account search returns its navigable remote projection.
+    async fn search_returns_cached_remote_accounts(context: &mut SearchContext) {
+        context.config.federation_enabled = true;
+        context.config.federation_allowed_domains = vec!["*".to_owned()];
+        let token = context.access_token().await;
+        let actor = context.cache_remote_actor("alice", "remote.test").await;
+        let now = time::OffsetDateTime::now_utc();
+        for number in 1..=2 {
+            roosty_db::upsert_remote_status(
+                &context.db,
+                roosty_db::NewRemoteStatus {
+                    activitypub_id: format!("https://remote.test/statuses/{number}"),
+                    remote_actor_id: actor.id,
+                    content: format!("remote status {number}"),
+                    visibility: StatusVisibility::Public,
+                    published_at: now + time::Duration::seconds(number),
+                    updated_at: now + time::Duration::seconds(number),
+                    in_reply_to: None,
+                    in_reply_to_local_status_id: None,
+                    in_reply_to_remote_status_id: None,
+                    object: serde_json::json!({
+                        "tag": [{"type": "Hashtag", "name": "#remote"}]
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let response = context
+            .authenticated_get(
+                "/api/v1/accounts/search?q=alice%40remote.test&limit=1",
+                &token,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body[0]["id"], actor.id.0.to_string());
+        assert_eq!(body[0]["acct"], "alice@remote.test");
+
+        let lookup = context
+            .get("/api/v1/accounts/lookup?acct=alice%40remote.test")
+            .await;
+        assert_eq!(json_body(lookup).await["statuses_count"], 2);
+        let show = context
+            .get(&format!("/api/v1/accounts/{}", actor.id.0))
+            .await;
+        assert_eq!(json_body(show).await["acct"], "alice@remote.test");
+        let statuses = context
+            .get(&format!(
+                "/api/v1/accounts/{}/statuses?limit=1&tagged=remote",
+                actor.id.0
+            ))
+            .await;
+        assert_eq!(statuses.status(), StatusCode::OK);
+        assert!(statuses.headers().contains_key(header::LINK));
+        assert_eq!(json_body(statuses).await.as_array().unwrap().len(), 1);
+
+        context.config.federation_blocked_domains = vec!["remote.test".to_owned()];
+        let blocked = context
+            .authenticated_get("/api/v1/accounts/search?q=alice%40remote.test", &token)
+            .await;
+        assert_eq!(json_body(blocked).await, serde_json::json!([]));
+
+        context.config.federation_enabled = false;
+        context.config.federation_blocked_domains.clear();
+        let disabled = context
+            .authenticated_get("/api/v1/accounts/search?q=alice%40remote.test", &token)
+            .await;
+        assert_eq!(json_body(disabled).await, serde_json::json!([]));
     }
 
     #[test_context(SearchContext)]
@@ -456,6 +620,30 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+
+        async fn cache_remote_actor(&self, username: &str, domain: &str) -> roosty_db::RemoteActor {
+            let actor = roosty_db::RemoteActor {
+                id: AccountId(uuid::Uuid::now_v7()),
+                activitypub_id: format!("https://{domain}/users/{username}"),
+                username: username.to_owned(),
+                domain: domain.to_owned(),
+                display_name: "Remote Alice".to_owned(),
+                summary: String::new(),
+                emojis: serde_json::json!([]),
+                inbox_url: format!("https://{domain}/users/{username}/inbox"),
+                shared_inbox_url: None,
+                public_key_id: format!("https://{domain}/users/{username}#main-key"),
+                public_key_pem: "test-public-key".to_owned(),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                profile_created_at: None,
+                first_seen_at: time::OffsetDateTime::now_utc(),
+                deleted_at: None,
+                moved_to_remote_actor_id: None,
+            };
+            roosty_db::upsert_remote_actor(&self.db, &actor)
+                .await
+                .unwrap()
         }
     }
 

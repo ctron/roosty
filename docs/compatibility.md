@@ -63,12 +63,12 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics, avatar/header images, and posting defaults. |
 | 🟢 | `GET /auth/edit`, `PUT/PATCH /auth` | Signed-in users can change their password through Mastodon's browser settings flow. |
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
-| 🟡 | `GET /api/v1/accounts/search` | Local username/display-name search only. |
-| 🟡 | `GET /api/v1/accounts/lookup` | Local username/address lookup only; no WebFinger resolution. |
-| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, and remote avatar/header fields use locally cached proxy URLs when advertised. |
+| 🟢 | `GET /api/v1/accounts/search` | Authenticated mixed local/cached-remote account search with deterministic ranking, follow filtering, pagination, and exact-handle resolution. |
+| 🟢 | `GET /api/v1/accounts/lookup` | Public local and cached-remote address lookup; `resolve=true` performs policy-controlled WebFinger resolution. |
+| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, remote status metadata reflects active locally cached posts, and remote avatar/header fields use locally cached proxy URLs when advertised. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
-| 🟢 | `GET /api/v1/accounts/:id` | Public local account lookup. |
-| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses with media and hashtag filters; pinned statuses are missing. |
+| 🟢 | `GET /api/v1/accounts/:id` | Public local and active cached-remote account lookup. |
+| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses and the locally cached public/unlisted subset for remote actors, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state; pinned statuses are missing. |
 | 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote graph fetching remains missing. |
 | 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
 | 🟡 | Mutes and blocks | Local mute/unmute, block/unblock, relationship state, mute duration, and paginated collections work; remote and domain policy are missing. |
@@ -77,8 +77,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v2/search` | Local account results and local hashtag prefix results; status search and remote resolution are missing. |
-| 🔴 | Remote account resolution | `resolve=true` does not fetch remote accounts until WebFinger exists. |
+| 🟡 | `GET /api/v2/search` | Public basic mixed account and local hashtag search. A user token is required for exact-handle `resolve=true`, nonzero `offset`, or `following=true`; status search remains missing. |
+| 🟢 | Remote account resolution | Exact remote handles can be resolved synchronously through policy-controlled WebFinger and validated actor fetching, with cross-process advisory-lock deduplication. URLs are not resolved. |
 
 ### Statuses
 
@@ -148,7 +148,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
-| 🟡 | Remote discovery and profile projections | `resolve=true` lookup performs policy-controlled WebFinger discovery, validates and caches HTTPS actor documents, and returns UUID-backed remote account projections with proxied actor avatar/header images. Search integration and refresh jobs are missing. |
+| 🟢 | Remote discovery and profile projections | Lookup and account search perform policy-controlled WebFinger discovery, validate/cache HTTPS actor documents, refresh expired actors, and return navigable UUID-backed remote account projections with proxied actor avatar/header images. |
 | 🟡 | Outbound public status lifecycle | Public and unlisted local status creates, edits, and deletes are queued as signed ActivityPub deliveries to accepted remote followers. |
 | 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, reply references, and author ownership checks. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
@@ -159,7 +159,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 ## TODO
 
 - [x] Add opt-in WebFinger, actor documents, public Notes, outbox, and public follower/following collection metadata.
-- [ ] Add safe remote actor discovery/cache refresh and remote profile projections.
+- [x] Add safe remote actor discovery/cache refresh and remote profile projections.
 - [ ] Add signed inbound Follow, Undo, Accept, Reject, and locked-account follow-request processing.
 - [ ] Add signed outbound Follow, Undo, Accept, Reject, Create, Update, and Delete delivery with retries.
 - [ ] Add remote follower home-timeline fan-out, repair jobs, and visibility semantics.

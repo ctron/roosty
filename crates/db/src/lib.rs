@@ -403,6 +403,39 @@ pub struct RemoteActor {
     pub moved_to_remote_actor_id: Option<AccountId>,
 }
 
+/// One account returned by the unified Mastodon account search.
+#[derive(Clone, Debug)]
+pub enum AccountSearchResult {
+    /// A local account hosted by this instance.
+    Local(LocalAccount),
+    /// An active actor held in the federation cache.
+    Remote(RemoteActor),
+}
+
+/// Inputs controlling unified local and cached-remote account search.
+pub struct AccountSearchOptions<'a> {
+    /// Authenticated viewer, or a sentinel ID for public v2 search.
+    pub viewer_account_id: AccountId,
+    /// Normalized account search text.
+    pub query: &'a str,
+    /// Host used to rank exact local account addresses.
+    pub local_domain: &'a str,
+    /// Restrict results to accepted follows by the viewer.
+    pub following_only: bool,
+    /// Include active actors from the federation cache.
+    pub include_remote: bool,
+    /// Permit every domain except those explicitly blocked.
+    pub allow_all_remote_domains: bool,
+    /// Exact remote domains allowed by operator policy.
+    pub allowed_remote_domains: &'a [String],
+    /// Exact remote domains denied by operator policy.
+    pub blocked_remote_domains: &'a [String],
+    /// Maximum number of combined results.
+    pub limit: u64,
+    /// Number of combined ranked results to skip.
+    pub offset: u64,
+}
+
 /// Public or unlisted Note cached from a remote ActivityPub actor.
 #[derive(Clone, Debug)]
 pub struct RemoteStatus {
@@ -1463,7 +1496,7 @@ where
 
 /// Find a remote actor by its canonical WebFinger handle.
 pub async fn find_remote_actor_by_handle(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     username: &str,
     domain: &str,
 ) -> Result<Option<RemoteActor>> {
@@ -1473,6 +1506,34 @@ pub async fn find_remote_actor_by_handle(
         .one(db)
         .await?
         .map(remote_actor_from_model))
+}
+
+/// Count active cached statuses for a remote actor profile.
+pub async fn count_remote_statuses_by_account(
+    db: &DbConnection,
+    actor_id: AccountId,
+) -> Result<u64> {
+    Ok(remote_status::Entity::find()
+        .filter(remote_status::Column::RemoteActorId.eq(actor_id.0))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .filter(remote_status::Column::Visibility.is_in(["public", "unlisted"]))
+        .count(db)
+        .await?)
+}
+
+/// Return the newest active cached status date for a remote actor profile.
+pub async fn last_remote_status_at(
+    db: &DbConnection,
+    actor_id: AccountId,
+) -> Result<Option<OffsetDateTime>> {
+    Ok(remote_status::Entity::find()
+        .filter(remote_status::Column::RemoteActorId.eq(actor_id.0))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .filter(remote_status::Column::Visibility.is_in(["public", "unlisted"]))
+        .order_by_desc(remote_status::Column::PublishedAt)
+        .one(db)
+        .await?
+        .map(|status| status.published_at))
 }
 
 /// Insert or refresh a remote actor cache entry by canonical actor ID.
@@ -2903,6 +2964,121 @@ pub async fn search_local_accounts(
         .await?;
 
     accounts.into_iter().map(local_account_from_model).collect()
+}
+
+/// Search local and cached remote accounts with one stable Mastodon-compatible ranking.
+pub async fn search_accounts(
+    db: &DbConnection,
+    options: AccountSearchOptions<'_>,
+) -> Result<Vec<AccountSearchResult>> {
+    if options.query.trim().is_empty() || options.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            WITH candidates AS (
+                SELECT 'local'::text AS account_kind, account.id,
+                       lower(account.username) AS username,
+                       lower(account.display_name) AS display_name,
+                       lower(account.username || '@' || $3) AS address,
+                       EXISTS (
+                           SELECT 1 FROM local_follow follow
+                           WHERE follow.follower_account_id = $1
+                             AND follow.followed_account_id = account.id
+                       ) AS followed
+                FROM local_account account
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM local_account_block block
+                    WHERE block.account_id = $1 AND block.target_account_id = account.id
+                )
+                UNION ALL
+                SELECT 'remote'::text AS account_kind, actor.id,
+                       lower(actor.username), lower(actor.display_name),
+                       lower(actor.username || '@' || actor.domain),
+                       EXISTS (
+                           SELECT 1 FROM remote_following follow
+                           WHERE follow.local_account_id = $1
+                             AND follow.remote_actor_id = actor.id
+                             AND follow.state = 'accepted'
+                             AND follow.deactivated_at IS NULL
+                       ) AS followed
+                FROM remote_actor actor
+                WHERE $4
+                  AND ($8 OR actor.domain IN (
+                    SELECT jsonb_array_elements_text($9::jsonb)
+                  ))
+                  AND actor.domain NOT IN (
+                    SELECT jsonb_array_elements_text($10::jsonb)
+                  )
+                  AND actor.deleted_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM local_account_block block
+                    WHERE block.account_id = $1 AND block.target_account_id = actor.id
+                  )
+            )
+            SELECT account_kind, id
+            FROM candidates
+            WHERE ($5 = false OR followed)
+              AND (username LIKE '%' || lower($2) || '%'
+                   OR display_name LIKE '%' || lower($2) || '%'
+                   OR address LIKE '%' || lower($2) || '%')
+            ORDER BY
+              CASE WHEN address = lower($2) THEN 0 ELSE 1 END,
+              followed DESC,
+              CASE
+                WHEN username = lower($2) THEN 0
+                WHEN username LIKE lower($2) || '%' THEN 1
+                WHEN display_name LIKE lower($2) || '%' THEN 2
+                ELSE 3
+              END,
+              id ASC
+            LIMIT $6 OFFSET $7
+            "#,
+            vec![
+                options.viewer_account_id.0.into(),
+                options.query.to_owned().into(),
+                options.local_domain.to_ascii_lowercase().into(),
+                options.include_remote.into(),
+                options.following_only.into(),
+                (options.limit as i64).into(),
+                (options.offset as i64).into(),
+                options.allow_all_remote_domains.into(),
+                serde_json::to_string(options.allowed_remote_domains)
+                    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?
+                    .into(),
+                serde_json::to_string(options.blocked_remote_domains)
+                    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?
+                    .into(),
+            ],
+        ))
+        .await?;
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind: String = row.try_get("", "account_kind")?;
+        let id = AccountId(row.try_get("", "id")?);
+        match kind.as_str() {
+            "local" => {
+                if let Some(account) = find_local_account_by_id(db, id).await? {
+                    results.push(AccountSearchResult::Local(account));
+                }
+            }
+            "remote" => {
+                if let Some(actor) = find_remote_actor_by_id(db, id).await?
+                    && actor.deleted_at.is_none()
+                {
+                    results.push(AccountSearchResult::Remote(actor));
+                }
+            }
+            _ => {
+                return Err(RoostyError::InvalidInput(
+                    "unknown account search kind".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// Count local accounts following this account.
@@ -6538,6 +6714,88 @@ pub async fn local_statuses_by_account(
         last_cursor,
         has_more,
     })
+}
+
+/// List the locally cached public or unlisted statuses on a remote actor profile.
+pub async fn remote_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: TimelineCursor,
+    options: AccountStatusTimelineOptions,
+) -> Result<TimelinePage<RemoteStatus>> {
+    let mut query = remote_status::Entity::find()
+        .filter(remote_status::Column::RemoteActorId.eq(account_id.0))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .filter(remote_status::Column::Visibility.is_in(["public", "unlisted"]));
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(remote_status::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(remote_status::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(remote_status::Column::Id.gt(min_id.0));
+    }
+    if options.exclude_replies {
+        query = query.filter(remote_status::Column::InReplyTo.is_null());
+    }
+    if options.only_media {
+        query = query.filter(
+            remote_status::Column::Id.in_subquery(
+                Query::select()
+                    .column(remote_media_attachment::Column::RemoteStatusId)
+                    .from(remote_media_attachment::Entity)
+                    .to_owned(),
+            ),
+        );
+    }
+    query = query.order_by_desc(remote_status::Column::Id);
+    if options.tagged.is_none() {
+        query = query.limit(page_query_limit(limit));
+    }
+    let statuses = query
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_status_from_model)
+        .collect::<Result<Vec<_>>>()?;
+    let mut statuses = if let Some(tag) = options.tagged {
+        let tag = tag.trim_start_matches('#');
+        statuses
+            .into_iter()
+            .filter(|status| remote_status_has_tag(&status.object, tag))
+            .collect()
+    } else {
+        statuses
+    };
+    let has_more = statuses.len() > limit as usize;
+    if has_more {
+        statuses.truncate(limit as usize);
+    }
+    let first_cursor = statuses.first().map(|status| status.id.0);
+    let last_cursor = statuses.last().map(|status| status.id.0);
+    Ok(TimelinePage {
+        items: statuses,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+fn remote_status_has_tag(object: &JsonValue, expected: &str) -> bool {
+    object
+        .get("tag")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .any(|tag| {
+            tag.get("type").and_then(JsonValue::as_str) == Some("Hashtag")
+                && tag
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|name| name.trim_start_matches('#').eq_ignore_ascii_case(expected))
+        })
 }
 
 /// List statuses authored by the account and followed local accounts.

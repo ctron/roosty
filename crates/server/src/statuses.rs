@@ -1955,6 +1955,29 @@ pub(crate) async fn timeline_response(
     response
 }
 
+/// Build a Mastodon timeline response from cached remote statuses and viewer state.
+pub(crate) async fn remote_timeline_response(
+    state: &AppState,
+    page: roosty_db::TimelinePage<roosty_db::RemoteStatus>,
+    limit: u64,
+    path: &str,
+    viewer: Option<AccountId>,
+) -> Response {
+    let link_header = timeline_link_header(&page, limit, path);
+    let mut items = Vec::with_capacity(page.items.len());
+    for status in page.items {
+        match remote_status_response_for_viewer(state, status, viewer).await {
+            Ok(status) => items.push(status),
+            Err(error) => return server_error(error),
+        }
+    }
+    let mut response = Json(items).into_response();
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
+}
+
 async fn status_with_author_response(
     state: &AppState,
     status: roosty_db::LocalStatus,
@@ -2673,8 +2696,8 @@ fn collection_cursor(params: &CollectionParams) -> Result<roosty_db::CollectionC
     })
 }
 
-fn timeline_link_header(
-    page: &roosty_db::TimelinePage<roosty_db::LocalStatus>,
+fn timeline_link_header<T>(
+    page: &roosty_db::TimelinePage<T>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {

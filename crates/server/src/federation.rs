@@ -2117,7 +2117,7 @@ async fn publish_delete_repair(
 
 /// Render bounded-label process-local federation counters for `/metrics`.
 pub(crate) fn metrics_text() -> String {
-    format!(
+    let mut metrics = format!(
         concat!(
             "# HELP roosty_federation_inbox_total Durable inbox activity outcomes.\n",
             "# TYPE roosty_federation_inbox_total counter\n",
@@ -2136,7 +2136,9 @@ pub(crate) fn metrics_text() -> String {
         INBOX_INVALID_ID.load(Ordering::Relaxed),
         STATUS_DELETE_REPAIR.load(Ordering::Relaxed),
         ACTOR_DELETE_REPAIR.load(Ordering::Relaxed),
-    )
+    );
+    metrics.push_str(&discovery::metrics_text());
+    metrics
 }
 
 /// Return a Mastodon visibility only for ActivityPub's public and unlisted audiences.
