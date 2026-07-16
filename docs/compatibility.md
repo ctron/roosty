@@ -27,8 +27,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟢 | Inbox integrity | Every supported durable signed activity requires an absolute HTTPS ID at the verified actor origin. Canonical-JSON SHA-256 replay records make exact deliveries idempotent and ignore reused IDs with a different signer or payload. Transient ID-less activities are intentionally unsupported. |
 | 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
-| 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. |
-| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted Note caching are available; profile creation dates use actor `published` when supplied and fall back to first-seen time. Discovered remote avatar/header URLs are cached through a same-origin proxy, eagerly for followed accounts and lazily on request for other actors. Profile images must be supported, decodable raster images and refresh stale-while-serving. Remote status images are validated, cached with PNG previews and Mastodon metadata, and refreshed stale-while-serving; video/audio remain proxy-only. Signed Actor `Update`, `Delete`, and reciprocal `Move` activities refresh, tombstone, or redirect cached profiles; moves do not migrate follows. |
+| 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted/follower-only local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. Follower-only activities also reach explicitly mentioned remote actors. |
+| 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted/follower-only Note caching are available; follower-only acceptance uses the actor's validated exact `followers` URL and requires a current local follower or explicit local mention. Profile creation dates use actor `published` when supplied and fall back to first-seen time. Discovered remote avatar/header URLs are cached through a same-origin proxy, eagerly for followed accounts and lazily on request for other actors. Profile images must be supported, decodable raster images and refresh stale-while-serving. Remote status images are validated, cached with PNG previews and Mastodon metadata, and refreshed stale-while-serving; video/audio remain proxy-only. Signed Actor `Update`, `Delete`, and reciprocal `Move` activities refresh, tombstone, or redirect cached profiles; moves do not migrate follows. Missing private deliveries are never fetched or backfilled. |
 
 ### Moderation and Safety
 
@@ -68,7 +68,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, remote status metadata reflects active locally cached posts, and remote avatar/header fields use locally cached proxy URLs when advertised. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local and active cached-remote account lookup. |
-| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns local account statuses and the locally cached public/unlisted subset for remote actors, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state; pinned statuses are missing. |
+| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns statuses authorized for the viewer, including cached follower-only posts for current followers and explicit mentions, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state; pinned statuses are missing. |
 | 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote graph fetching remains missing. |
 | 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
 | 🟡 | Mutes and blocks | Local mute/unmute, block/unblock, relationship state, mute duration, and paginated collections work; remote and domain policy are missing. |
@@ -92,19 +92,19 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local `@username` mentions render as links, populate `mentions`, and create local notifications; remote mentions are missing. |
 | 🟡 | Hashtags | Local `#tag` text is stored, linked in rendered status HTML, and returned in status `tags`. Cached remote Notes expose valid ActivityPub Hashtag tags with their origin URLs; remote discovery, timelines, and follows are missing. |
-| 🟡 | Conversations | Direct-message conversations list/read/delete and direct stream events support recipient-scoped local/cached-remote direct Notes, mention-audience replacement on edits, unresolved remote participant IDs, replies to cached direct Notes, remote media fetching, and local/remote update/delete repair. Conversation deletion is account-local, and the direct stream emits only complete `conversation` payloads. Broader private visibility remains missing. |
-| 🟡 | Visibility semantics | Public/unlisted URL reads work; direct reads work for local conversation participants; private remains owner-only until follow graph support exists. |
+| 🟡 | Conversations | Direct-message conversations list/read/delete and direct stream events support recipient-scoped local/cached-remote direct Notes, mention-audience replacement on edits, unresolved remote participant IDs, replies to cached direct Notes, remote media fetching, and local/remote update/delete repair. Conversation deletion is account-local, and the direct stream emits only complete `conversation` payloads. |
+| 🟢 | Visibility semantics | Public/unlisted reads work; follower-only local and cached remote posts and replies are visible to owners, current followers, and explicitly mentioned accounts; direct reads remain recipient-scoped. Anonymous and unrelated access returns `404`, and inaccessible thread nodes stop cache-only traversal. |
 | 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local and cached-remote favourites with cursor pagination. |
-| 🟡 | Favourites | Public/unlisted local and cached remote statuses support favourite/unfavourite. Signed ActivityPub `Like`/`Undo` updates local counts and notifications; remote favourite counts are not fetched. |
+| 🟡 | Favourites | Authorized public/unlisted/follower-only local and cached remote statuses support favourite/unfavourite. Signed ActivityPub `Like`/`Undo` updates local counts and notifications; remote favourite counts are not fetched. |
 | 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
-| 🟡 | Boosts | Public/unlisted local and cached-remote statuses support reblog/unreblog. Signed ActivityPub `Announce`/`Undo` is delivered and processed, with remote boost counters, mixed `reblogged_by`, home timeline entries, and local notifications; quote posts and private boosts are missing. |
+| 🟡 | Boosts | Public/unlisted local and cached-remote statuses support reblog/unreblog. Follower-only boosts are rejected except for author self-boosts representable by the existing model. Signed ActivityPub `Announce`/`Undo` supports public/unlisted statuses; quote posts are missing. |
 | 🟢 | Bookmarks | Bookmark/unbookmark APIs are implemented for local statuses. |
 
 ### Timelines
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed local public/unlisted statuses, local boosts, cached remote statuses, and inbound remote boosts. |
+| 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed and explicitly addressed local/cached-remote follower-only statuses, public/unlisted followed statuses, local boosts, and inbound remote boosts. |
 | 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
 | 🟡 | `GET /api/v1/timelines/tag/:tag` | Local public hashtag timeline with `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, and `Link` headers; remote hashtag timelines are missing. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
@@ -149,10 +149,10 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
 | 🟢 | Remote discovery and profile projections | Lookup and account search perform policy-controlled WebFinger discovery, validate/cache HTTPS actor documents, refresh expired actors, and return navigable UUID-backed remote account projections with proxied actor avatar/header images. |
-| 🟡 | Outbound public status lifecycle | Public and unlisted local status creates, edits, and deletes are queued as signed ActivityPub deliveries to accepted remote followers. |
-| 🟡 | Inbound public status lifecycle | Signed public/unlisted `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, reply references, and author ownership checks. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
+| 🟡 | Outbound status lifecycle | Public, unlisted, and follower-only local status creates, edits, replies, and deletes are queued as signed ActivityPub deliveries to accepted remote followers and explicit remote mentions. |
+| 🟡 | Inbound status lifecycle | Signed public/unlisted/follower-only `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, exact audiences, reply references, and author ownership checks. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
-| 🔴 | Remote timeline fan-out | Remote home-timeline delivery, repair, and remote visibility semantics are missing. |
+| 🟢 | Remote timeline fan-out | Cached remote posts are pushed to authorized home streams; follower-only access follows current accepted relationships and explicit audiences, with no polling or backfill. |
 | 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed for public/unlisted statuses. Remote mutes and blocks remain missing. |
 | 🟡 | Remote conversations and moderation | Signed remote direct Notes, mixed participant projection, direct replies, personal-inbox delivery, and remote media fetching work. Account migration and domain-policy moderation remain missing. |
 
@@ -162,7 +162,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [x] Add safe remote actor discovery/cache refresh and remote profile projections.
 - [ ] Add signed inbound Follow, Undo, Accept, Reject, and locked-account follow-request processing.
 - [ ] Add signed outbound Follow, Undo, Accept, Reject, Create, Update, and Delete delivery with retries.
-- [ ] Add remote follower home-timeline fan-out, repair jobs, and visibility semantics.
+- [x] Add remote follower home-timeline fan-out, repair jobs, and follower-only visibility semantics.
 - [ ] Add remote mutes, blocks, and broader recipient notification federation. Signed remote delete repair is implemented.
 - [ ] Add federated direct-message media fetching, account migration, and domain-policy moderation.
 - [ ] Expand conversation support beyond local direct messages.

@@ -269,6 +269,9 @@ async fn notification_response(
             else {
                 return Ok(None);
             };
+            if !crate::statuses::status_visible_to_viewer(state, &status, Some(viewer_id)).await? {
+                return Ok(None);
+            }
             Some(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?)
         }
         (None, Some(status_id)) => {
@@ -276,6 +279,9 @@ async fn notification_response(
             else {
                 return Ok(None);
             };
+            if !roosty_db::remote_status_visible_to_account(&state.db, &status, viewer_id).await? {
+                return Ok(None);
+            }
             Some(crate::statuses::remote_status_response(state, status).await?)
         }
         (None, None) => None,

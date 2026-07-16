@@ -62,6 +62,8 @@ struct RemoteActorDocument {
     published: Option<String>,
     inbox: String,
     #[serde(default)]
+    followers: Option<String>,
+    #[serde(default)]
     endpoints: RemoteEndpoints,
     public_key: RemotePublicKey,
 }
@@ -136,6 +138,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
     let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
     validate_actor_document(&document, &actor_url, username, &domain)?;
     let profile_created_at = remote_profile_created_at(&document)?;
+    let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let actor = RemoteActor {
         id: AccountId(Uuid::now_v7()),
         activitypub_id: document.id,
@@ -146,6 +149,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         emojis: JsonValue::Array(document.tag),
         inbox_url: document.inbox,
         shared_inbox_url: document.endpoints.shared_inbox,
+        followers_url,
         public_key_id: document.public_key.id,
         public_key_pem: document.public_key.public_key_pem,
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -303,6 +307,7 @@ async fn fetch_remote_actor_by_id(
         return Err(invalid("remote actor document is invalid"));
     }
     let profile_created_at = remote_profile_created_at(&document)?;
+    let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let inbox =
         Url::parse(&document.inbox).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
     if inbox.scheme() != "https"
@@ -323,6 +328,7 @@ async fn fetch_remote_actor_by_id(
             emojis: JsonValue::Array(document.tag),
             inbox_url: document.inbox,
             shared_inbox_url: document.endpoints.shared_inbox,
+            followers_url,
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -368,6 +374,7 @@ pub async fn resolve_remote_move_target(
         return Err(invalid("remote actor inbox is outside its actor domain"));
     }
     let profile_created_at = remote_profile_created_at(&document)?;
+    let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     store_remote_actor(
         state,
         RemoteActor {
@@ -380,6 +387,7 @@ pub async fn resolve_remote_move_target(
             emojis: JsonValue::Array(document.tag),
             inbox_url: document.inbox,
             shared_inbox_url: document.endpoints.shared_inbox,
+            followers_url,
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -463,6 +471,22 @@ fn remote_profile_created_at(document: &RemoteActorDocument) -> Result<Option<Of
                 .map_err(|_| invalid("remote actor published timestamp is invalid"))
         })
         .transpose()
+}
+
+/// Validate a declared followers collection without synthesizing one when absent.
+fn validated_followers_url(actor_id: &str, followers: Option<&str>) -> Result<Option<String>> {
+    let Some(followers) = followers else {
+        return Ok(None);
+    };
+    let actor = Url::parse(actor_id).map_err(|_| invalid("remote actor ID is invalid"))?;
+    let followers =
+        Url::parse(followers).map_err(|_| invalid("remote actor followers URL is invalid"))?;
+    if followers.scheme() != "https" || followers.origin() != actor.origin() {
+        return Err(invalid(
+            "remote actor followers URL is outside its actor origin",
+        ));
+    }
+    Ok(Some(followers.into()))
 }
 
 /// Fetch a JSON document with policy revalidation before every request.
@@ -675,7 +699,7 @@ mod tests {
 
     use super::{
         RemoteActorDocument, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
-        parse_remote_handle, remote_profile_created_at,
+        parse_remote_handle, remote_profile_created_at, validated_followers_url,
     };
 
     #[test]
@@ -821,5 +845,22 @@ mod tests {
             "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\""
         ));
         assert!(!is_activitypub_media_type("application/jrd+json"));
+    }
+
+    /// Only an explicitly declared same-origin HTTPS followers collection is cached.
+    #[test]
+    fn validates_declared_followers_collection() {
+        let actor = "https://social.example/users/alice";
+        assert_eq!(validated_followers_url(actor, None).unwrap(), None);
+        assert_eq!(
+            validated_followers_url(actor, Some("https://social.example/users/alice/followers"))
+                .unwrap()
+                .as_deref(),
+            Some("https://social.example/users/alice/followers")
+        );
+        assert!(
+            validated_followers_url(actor, Some("https://attacker.example/followers")).is_err()
+        );
+        assert!(validated_followers_url(actor, Some("http://social.example/followers")).is_err());
     }
 }

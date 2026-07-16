@@ -429,6 +429,7 @@ async fn account_statuses(
         return match roosty_db::remote_statuses_by_account(
             &state.db,
             account_id,
+            viewer.as_ref().map(|account| account.id),
             limit,
             cursor,
             roosty_db::AccountStatusTimelineOptions {
@@ -1198,6 +1199,7 @@ mod tests {
             emojis: json!([]),
             inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
             shared_inbox_url: None,
+            followers_url: None,
             public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
             public_key_pem: "test-public-key".to_owned(),
             expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
@@ -1248,6 +1250,7 @@ mod tests {
             emojis: json!([]),
             inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
             shared_inbox_url: None,
+            followers_url: None,
             public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
             public_key_pem: "test-public-key".to_owned(),
             expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
@@ -2034,6 +2037,7 @@ mod tests {
                 emojis: json!([]),
                 inbox_url: format!("https://remote.test/users/{username}/inbox"),
                 shared_inbox_url: None,
+                followers_url: None,
                 public_key_id: format!("https://remote.test/users/{username}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),

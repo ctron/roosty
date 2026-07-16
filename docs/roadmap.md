@@ -11,7 +11,7 @@
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
 - Signed inbound remote-follow handling: `Follow` and `Undo(Follow)` update remote-follower state, with durable `Accept`/`Reject` responses for local actors.
-- Signed outbound delivery of local public and unlisted status lifecycle activities (`Create`, `Update`, and `Delete`) plus local actor profile `Update` activities to accepted remote followers.
+- Signed outbound delivery of local public, unlisted, and follower-only status lifecycle activities (`Create`, `Update`, and `Delete`) plus local actor profile `Update` activities to accepted remote followers and explicit mentions.
 
 ### Federation gaps
 
@@ -25,11 +25,11 @@
 - [x] Project cached remote Notes into local home timelines.
 - [x] Stream cached remote Note create/update/delete events to local home timelines.
 - [x] Match Mastodon's push-based federation behavior: missed inbox deliveries are not backfilled by polling remote outboxes; deletion and follow-state cache repairs remain local operations.
-- [ ] Implement remote visibility semantics beyond public/unlisted Notes, including replies and follower-only addressing.
+- [x] Implement remote follower-only Notes and replies using validated actor collection URLs, current follow relationships, explicit mentions, and cache-only traversal.
 - [ ] Fetch and expose paginated remote followers/following collection contents.
 - [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
 - [x] Build cache-only remote reply contexts and conversation/thread traversal across local and cached remote parents, with Mastodon-compatible access limits and no outbox backfill.
-- [ ] Support remote reply delivery and addressing for non-public visibility, including follower-only replies.
+- [x] Support remote reply delivery and addressing for follower-only visibility.
 - [x] Deliver and process public/unlisted favourites (`Like`/`Undo`), including remote counters, local notifications, and mixed favourites collections.
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
 - [x] Commit supported inbox side effects, idempotency markers, and durable follow/favourite/boost delivery jobs atomically; publish streams only after commit.

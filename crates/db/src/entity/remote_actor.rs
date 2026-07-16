@@ -15,6 +15,7 @@ pub struct Model {
     pub emojis: Json,
     pub inbox_url: String,
     pub shared_inbox_url: Option<String>,
+    pub followers_url: Option<String>,
     pub public_key_id: String,
     pub public_key_pem: String,
     pub fetched_at: OffsetDateTime,

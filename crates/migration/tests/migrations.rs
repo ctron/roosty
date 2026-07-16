@@ -124,6 +124,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_account_mute", "notifications").await);
     assert!(column_exists(database.connection(), "local_account_mute", "expires_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "profile_created_at").await);
+    assert!(column_exists(database.connection(), "remote_actor", "followers_url").await);
     assert!(
         column_exists(
             database.connection(),
@@ -181,6 +182,54 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_status_tag", "tag_id").await);
     assert!(column_exists(database.connection(), "local_tag_follow", "account_id").await);
     assert!(column_exists(database.connection(), "local_tag_follow", "tag_id").await);
+}
+
+/// Existing cached actors retain an unknown followers collection across the nullable upgrade.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
+    database: &mut EmbeddedDatabase,
+) {
+    Migrator::up(database.connection(), Some(46)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000047',
+                'https://remote.test/users/legacy', 'legacy', 'remote.test',
+                'https://remote.test/inbox',
+                'https://remote.test/users/legacy#main-key', 'key', now() + interval '1 day'
+            )
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), None).await.unwrap();
+    let row = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT followers_url FROM remote_actor WHERE username = 'legacy'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.try_get::<Option<String>>("", "followers_url")
+            .unwrap()
+            .is_none()
+    );
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
+    assert!(table_exists(database.connection(), "remote_actor").await);
 }
 
 #[test_context(EmbeddedDatabase)]

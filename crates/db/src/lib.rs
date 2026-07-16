@@ -387,6 +387,8 @@ pub struct RemoteActor {
     pub inbox_url: String,
     /// Optional shared inbox URL.
     pub shared_inbox_url: Option<String>,
+    /// Exact followers collection URL validated from the actor document.
+    pub followers_url: Option<String>,
     /// Public key identity URL.
     pub public_key_id: String,
     /// Public signing key PEM.
@@ -1408,14 +1410,30 @@ async fn repair_one_remote_status_delete(
 ) -> Result<RemoteDeleteRepair> {
     let status_id = StatusId(status.id);
     let author_id = AccountId(status.remote_actor_id);
-    let home_recipient_ids = accepted_local_followers_of_remote_actor(txn, author_id).await?;
-    let direct_recipient_ids = remote_status_local_recipient::Entity::find()
+    let explicit_recipient_ids = remote_status_local_recipient::Entity::find()
         .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status.id))
         .all(txn)
         .await?
         .into_iter()
         .map(|recipient| AccountId(recipient.account_id))
         .collect::<Vec<_>>();
+    let visibility = StatusVisibility::parse(&status.visibility)?;
+    let mut home_recipient_ids = match visibility {
+        StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Private => {
+            accepted_local_followers_of_remote_actor(txn, author_id).await?
+        }
+        StatusVisibility::Direct => Vec::new(),
+    };
+    if visibility == StatusVisibility::Private {
+        home_recipient_ids.extend(explicit_recipient_ids.iter().copied());
+        home_recipient_ids.sort_by_key(|id| id.0);
+        home_recipient_ids.dedup();
+    }
+    let direct_recipient_ids = if visibility == StatusVisibility::Direct {
+        explicit_recipient_ids
+    } else {
+        Vec::new()
+    };
 
     let local_reblogs = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status.id))
@@ -1581,6 +1599,7 @@ pub async fn upsert_remote_actor(
         active.emojis = Set(actor.emojis.clone());
         active.inbox_url = Set(actor.inbox_url.clone());
         active.shared_inbox_url = Set(actor.shared_inbox_url.clone());
+        active.followers_url = Set(actor.followers_url.clone());
         active.public_key_id = Set(actor.public_key_id.clone());
         active.public_key_pem = Set(actor.public_key_pem.clone());
         active.fetched_at = Set(now);
@@ -1601,6 +1620,7 @@ pub async fn upsert_remote_actor(
             emojis: Set(actor.emojis.clone()),
             inbox_url: Set(actor.inbox_url.clone()),
             shared_inbox_url: Set(actor.shared_inbox_url.clone()),
+            followers_url: Set(actor.followers_url.clone()),
             public_key_id: Set(actor.public_key_id.clone()),
             public_key_pem: Set(actor.public_key_pem.clone()),
             fetched_at: Set(now),
@@ -2597,6 +2617,36 @@ pub async fn remote_actor_follows_local_account(
     local_account_id: AccountId,
 ) -> Result<bool> {
     Ok(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT 1 FROM remote_follow WHERE remote_actor_id = $1 AND local_account_id = $2 AND state = 'accepted'", vec![remote_actor_id.0.into(), local_account_id.0.into()])).await?.is_some())
+}
+
+/// Return whether a remote actor may interact with a local private status.
+pub async fn local_private_status_visible_to_remote_actor(
+    db: &impl ConnectionTrait,
+    status: &LocalStatus,
+    remote_actor_id: AccountId,
+) -> Result<bool> {
+    if status.visibility != StatusVisibility::Private {
+        return Ok(matches!(
+            status.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted
+        ));
+    }
+    if remote_follow::Entity::find()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::LocalAccountId.eq(status.account_id.0))
+        .filter(remote_follow::Column::State.eq("accepted"))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(local_status_remote_mention::Entity::find()
+        .filter(local_status_remote_mention::Column::StatusId.eq(status.id.0))
+        .filter(local_status_remote_mention::Column::RemoteActorId.eq(remote_actor_id.0))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 /// Classify and durably register a canonical inbound activity.
@@ -5296,10 +5346,11 @@ pub async fn attach_remote_direct_status_to_conversation(
         .ok_or_else(|| RoostyError::InvalidInput("conversation refresh is missing".to_owned()))
 }
 
-/// Remove cached direct-audience rows when a replacement Note is no longer direct.
-pub async fn clear_remote_direct_status_recipients(
+/// Replace explicit local recipients for a cached non-public Note.
+pub async fn replace_remote_status_local_recipients(
     txn: &DatabaseTransaction,
     status_id: StatusId,
+    account_ids: &[AccountId],
 ) -> Result<()> {
     remote_status_local_recipient::Entity::delete_many()
         .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status_id.0))
@@ -5309,6 +5360,16 @@ pub async fn clear_remote_direct_status_recipients(
         .filter(remote_status_remote_recipient::Column::RemoteStatusId.eq(status_id.0))
         .exec(txn)
         .await?;
+    let now = OffsetDateTime::now_utc();
+    for account_id in account_ids {
+        remote_status_local_recipient::ActiveModel {
+            remote_status_id: Set(status_id.0),
+            account_id: Set(account_id.0),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
     Ok(())
 }
 
@@ -5532,7 +5593,17 @@ pub async fn local_status_visible_to_account(
     {
         return Ok(true);
     }
-    if status.visibility != StatusVisibility::Direct {
+    if status.visibility == StatusVisibility::Private {
+        let follows = local_follow::Entity::find()
+            .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
+            .filter(local_follow::Column::FollowedAccountId.eq(status.account_id.0))
+            .one(db)
+            .await?
+            .is_some();
+        if follows {
+            return Ok(true);
+        }
+    } else if status.visibility != StatusVisibility::Direct {
         return Ok(false);
     }
     Ok(local_status_local_recipient::Entity::find()
@@ -5555,7 +5626,19 @@ pub async fn remote_status_visible_to_account(
     ) {
         return Ok(true);
     }
-    if status.visibility != StatusVisibility::Direct {
+    if status.visibility == StatusVisibility::Private {
+        let follows = remote_following::Entity::find()
+            .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
+            .filter(remote_following::Column::RemoteActorId.eq(status.remote_actor_id.0))
+            .filter(remote_following::Column::State.eq("accepted"))
+            .filter(remote_following::Column::DeactivatedAt.is_null())
+            .one(db)
+            .await?
+            .is_some();
+        if follows {
+            return Ok(true);
+        }
+    } else if status.visibility != StatusVisibility::Direct {
         return Ok(false);
     }
     Ok(remote_status_local_recipient::Entity::find()
@@ -5564,6 +5647,34 @@ pub async fn remote_status_visible_to_account(
         .one(db)
         .await?
         .is_some())
+}
+
+/// List local accounts explicitly addressed by a cached non-public Note.
+pub async fn remote_status_local_recipients(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    Ok(remote_status_local_recipient::Entity::find()
+        .filter(remote_status_local_recipient::Column::RemoteStatusId.eq(status_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|recipient| AccountId(recipient.account_id))
+        .collect())
+}
+
+/// List local accounts explicitly addressed by a local non-public status.
+pub async fn local_status_local_recipients(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    Ok(local_status_local_recipient::Entity::find()
+        .filter(local_status_local_recipient::Column::StatusId.eq(status_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|recipient| AccountId(recipient.account_id))
+        .collect())
 }
 
 /// Return the exact audience of the direct status selected for a conversation view.
@@ -6786,7 +6897,41 @@ pub async fn local_statuses_by_account(
         .filter(local_status::Column::AccountId.eq(account_id.0))
         .filter(local_status::Column::DeletedAt.is_null());
     if !owner {
-        query = query.filter(local_status::Column::Visibility.is_in(["public", "unlisted"]));
+        let mut visible =
+            Condition::any().add(local_status::Column::Visibility.is_in(["public", "unlisted"]));
+        if let Some(viewer) = viewer {
+            visible = visible.add(
+                Condition::all()
+                    .add(local_status::Column::Visibility.eq("private"))
+                    .add(
+                        Condition::any()
+                            .add(
+                                local_status::Column::Id.in_subquery(
+                                    Query::select()
+                                        .column(local_status_local_recipient::Column::StatusId)
+                                        .from(local_status_local_recipient::Entity)
+                                        .and_where(
+                                            local_status_local_recipient::Column::AccountId
+                                                .eq(viewer.0),
+                                        )
+                                        .to_owned(),
+                                ),
+                            )
+                            .add(
+                                local_status::Column::AccountId.in_subquery(
+                                    Query::select()
+                                        .column(local_follow::Column::FollowedAccountId)
+                                        .from(local_follow::Entity)
+                                        .and_where(
+                                            local_follow::Column::FollowerAccountId.eq(viewer.0),
+                                        )
+                                        .to_owned(),
+                                ),
+                            ),
+                    ),
+            );
+        }
+        query = query.filter(visible);
     }
     if options.exclude_replies {
         query = query.filter(local_status::Column::InReplyToId.is_null());
@@ -6830,14 +6975,51 @@ pub async fn local_statuses_by_account(
 pub async fn remote_statuses_by_account(
     db: &DbConnection,
     account_id: AccountId,
+    viewer: Option<AccountId>,
     limit: u64,
     cursor: TimelineCursor,
     options: AccountStatusTimelineOptions,
 ) -> Result<TimelinePage<RemoteStatus>> {
     let mut query = remote_status::Entity::find()
         .filter(remote_status::Column::RemoteActorId.eq(account_id.0))
-        .filter(remote_status::Column::DeletedAt.is_null())
-        .filter(remote_status::Column::Visibility.is_in(["public", "unlisted"]));
+        .filter(remote_status::Column::DeletedAt.is_null());
+    let mut visible =
+        Condition::any().add(remote_status::Column::Visibility.is_in(["public", "unlisted"]));
+    if let Some(viewer) = viewer {
+        visible = visible.add(
+            Condition::all()
+                .add(remote_status::Column::Visibility.eq("private"))
+                .add(
+                    Condition::any()
+                        .add(
+                            remote_status::Column::Id.in_subquery(
+                                Query::select()
+                                    .column(remote_status_local_recipient::Column::RemoteStatusId)
+                                    .from(remote_status_local_recipient::Entity)
+                                    .and_where(
+                                        remote_status_local_recipient::Column::AccountId
+                                            .eq(viewer.0),
+                                    )
+                                    .to_owned(),
+                            ),
+                        )
+                        .add(
+                            remote_status::Column::RemoteActorId.in_subquery(
+                                Query::select()
+                                    .column(remote_following::Column::RemoteActorId)
+                                    .from(remote_following::Entity)
+                                    .and_where(
+                                        remote_following::Column::LocalAccountId.eq(viewer.0),
+                                    )
+                                    .and_where(remote_following::Column::State.eq("accepted"))
+                                    .and_where(remote_following::Column::DeactivatedAt.is_null())
+                                    .to_owned(),
+                            ),
+                        ),
+                ),
+        );
+    }
+    query = query.filter(visible);
     if let Some(max_id) = cursor.max_id {
         query = query.filter(remote_status::Column::Id.lt(max_id.0));
     }
@@ -6946,8 +7128,21 @@ pub async fn home_timeline_for_account(
         .add(
             Condition::all()
                 .add(local_status::Column::AccountId.is_in(followed_ids.clone()))
-                .add(local_status::Column::Visibility.is_in(["public", "unlisted"])),
+                .add(local_status::Column::Visibility.is_in(["public", "unlisted", "private"])),
         );
+    status_condition = status_condition.add(
+        Condition::all()
+            .add(local_status::Column::Visibility.eq("private"))
+            .add(
+                local_status::Column::Id.in_subquery(
+                    Query::select()
+                        .column(local_status_local_recipient::Column::StatusId)
+                        .from(local_status_local_recipient::Entity)
+                        .and_where(local_status_local_recipient::Column::AccountId.eq(account_id.0))
+                        .to_owned(),
+                ),
+            ),
+    );
     if !followed_tag_ids.is_empty() {
         status_condition = status_condition.add(
             Condition::all()
@@ -7006,17 +7201,43 @@ pub async fn home_timeline_for_account(
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
+    let followed_remote_actors = Query::select()
+        .column(remote_following::Column::RemoteActorId)
+        .from(remote_following::Entity)
+        .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
+        .and_where(remote_following::Column::State.eq("accepted"))
+        .and_where(remote_following::Column::DeactivatedAt.is_null())
+        .to_owned();
     let mut remote_query = remote_status::Entity::find()
         .filter(
-            remote_status::Column::RemoteActorId.in_subquery(
-                Query::select()
-                    .column(remote_following::Column::RemoteActorId)
-                    .from(remote_following::Entity)
-                    .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
-                    .and_where(remote_following::Column::State.eq("accepted"))
-                    .and_where(remote_following::Column::DeactivatedAt.is_null())
-                    .to_owned(),
-            ),
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(
+                            remote_status::Column::RemoteActorId
+                                .in_subquery(followed_remote_actors),
+                        )
+                        .add(
+                            remote_status::Column::Visibility
+                                .is_in(["public", "unlisted", "private"]),
+                        ),
+                )
+                .add(
+                    Condition::all()
+                        .add(remote_status::Column::Visibility.eq("private"))
+                        .add(
+                            remote_status::Column::Id.in_subquery(
+                                Query::select()
+                                    .column(remote_status_local_recipient::Column::RemoteStatusId)
+                                    .from(remote_status_local_recipient::Entity)
+                                    .and_where(
+                                        remote_status_local_recipient::Column::AccountId
+                                            .eq(account_id.0),
+                                    )
+                                    .to_owned(),
+                            ),
+                        ),
+                ),
         )
         .filter(remote_status::Column::DeletedAt.is_null());
     if let Some(max_id) = cursor.max_id {
@@ -7615,6 +7836,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         emojis: actor.emojis,
         inbox_url: actor.inbox_url,
         shared_inbox_url: actor.shared_inbox_url,
+        followers_url: actor.followers_url,
         public_key_id: actor.public_key_id,
         public_key_pem: actor.public_key_pem,
         expires_at: actor.expires_at,

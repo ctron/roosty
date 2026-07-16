@@ -1,6 +1,10 @@
 //! ActivityPub discovery and public-object endpoints for local actors.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub(crate) mod discovery;
 #[cfg(test)]
@@ -30,6 +34,7 @@ use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -45,6 +50,56 @@ static INBOX_CONFLICT: AtomicU64 = AtomicU64::new(0);
 static INBOX_INVALID_ID: AtomicU64 = AtomicU64::new(0);
 static STATUS_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
 static ACTOR_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
+
+/// Mastodon visibility and explicit local recipients derived from a remote Note audience.
+#[derive(Debug, Eq, PartialEq)]
+enum InboundAudience {
+    Public,
+    Unlisted,
+    Private(Vec<AccountId>),
+    Direct(Vec<AccountId>),
+}
+
+impl InboundAudience {
+    fn visibility(&self) -> StatusVisibility {
+        match self {
+            Self::Public => StatusVisibility::Public,
+            Self::Unlisted => StatusVisibility::Unlisted,
+            Self::Private(_) => StatusVisibility::Private,
+            Self::Direct(_) => StatusVisibility::Direct,
+        }
+    }
+
+    fn explicit_recipients(&self) -> &[AccountId] {
+        match self {
+            Self::Private(recipients) | Self::Direct(recipients) => recipients,
+            Self::Public | Self::Unlisted => &[],
+        }
+    }
+}
+
+/// Stable validation failures for inbound ActivityPub audiences.
+#[derive(Debug, Error)]
+enum InboundAudienceError {
+    #[error("{0}")]
+    Unsupported(Cow<'static, str>),
+    #[error("{0}")]
+    NoEligibleRecipient(Cow<'static, str>),
+    #[error(transparent)]
+    Database(#[from] RoostyError),
+}
+
+impl From<InboundAudienceError> for RoostyError {
+    fn from(error: InboundAudienceError) -> Self {
+        match error {
+            InboundAudienceError::Database(error) => error,
+            InboundAudienceError::Unsupported(message)
+            | InboundAudienceError::NoEligibleRecipient(message) => {
+                Self::InvalidInput(message.into_owned())
+            }
+        }
+    }
+}
 
 /// ActivityStreams actor types accepted and emitted by Roosty.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1118,17 +1173,23 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         };
         let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-            Ok(Some(status))
-                if matches!(
-                    status.visibility,
-                    StatusVisibility::Public | StatusVisibility::Unlisted
-                ) =>
-            {
-                status
-            }
+            Ok(Some(status)) => status,
             Ok(_) => return finish_ignored_inbox_activity(state, &activity, &remote_actor).await,
             Err(error) => return internal_error(error),
         };
+        match roosty_db::local_private_status_visible_to_remote_actor(
+            &state.db,
+            &status,
+            remote_actor.id,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+            }
+            Err(error) => return internal_error(error),
+        }
         let txn = match state.db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
@@ -1206,7 +1267,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                         if matches!(
                             status.visibility,
                             StatusVisibility::Public | StatusVisibility::Unlisted
-                        ) =>
+                        ) || (status.visibility == StatusVisibility::Private
+                            && status.remote_actor_id == remote_actor.id) =>
                     {
                         roosty_db::RemoteStatusReblogTarget::Remote(status.id)
                     }
@@ -1861,14 +1923,12 @@ async fn process_remote_status_activity(
                     "remote status activity has an invalid actor or object".to_owned(),
                 ));
             }
-            let direct_recipients = remote_direct_recipients(state, &note).await?;
-            let direct_participants =
-                remote_direct_participants(state, &note, remote_actor).await?;
-            let visibility = remote_status_visibility(&note)
-                .or_else(|| direct_recipients.as_ref().map(|_| "direct"))
-                .ok_or_else(|| {
-                    RoostyError::InvalidInput("remote Note audience is unsupported".to_owned())
-                })?;
+            let audience = classify_remote_audience(state, &note, remote_actor).await?;
+            let direct_participants = if audience.visibility() == StatusVisibility::Direct {
+                remote_direct_participants(state, &note, remote_actor).await?
+            } else {
+                Vec::new()
+            };
             let published_at = OffsetDateTime::parse(&note.published, &Rfc3339).map_err(|_| {
                 RoostyError::InvalidInput("remote Note published timestamp is invalid".to_owned())
             })?;
@@ -1896,9 +1956,7 @@ async fn process_remote_status_activity(
             {
                 notification_recipients.push(parent.account_id);
             }
-            if let Some(recipients) = direct_recipients.as_ref() {
-                notification_recipients.extend(recipients.iter().copied());
-            }
+            notification_recipients.extend(audience.explicit_recipients().iter().copied());
             notification_recipients.sort_by_key(|id| id.0);
             notification_recipients.dedup();
             let txn = state.db.begin().await?;
@@ -1913,7 +1971,7 @@ async fn process_remote_status_activity(
                     activitypub_id: note.id,
                     remote_actor_id: remote_actor.id,
                     content: note.content,
-                    visibility: StatusVisibility::parse(visibility)?,
+                    visibility: audience.visibility(),
                     published_at,
                     updated_at,
                     in_reply_to: note.in_reply_to.clone(),
@@ -1927,22 +1985,26 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
-            let direct_conversation_refresh = if let Some(recipients) = direct_recipients.as_deref()
-            {
+            let direct_conversation_refresh = if audience.visibility() == StatusVisibility::Direct {
                 Some(
                     roosty_db::attach_remote_direct_status_to_conversation(
                         &txn,
                         status.id,
                         status.in_reply_to_local_status_id,
                         status.in_reply_to_remote_status_id,
-                        recipients,
+                        audience.explicit_recipients(),
                         &direct_participants,
                         is_create,
                     )
                     .await?,
                 )
             } else {
-                roosty_db::clear_remote_direct_status_recipients(&txn, status.id).await?;
+                roosty_db::replace_remote_status_local_recipients(
+                    &txn,
+                    status.id,
+                    audience.explicit_recipients(),
+                )
+                .await?;
                 roosty_db::repair_direct_conversation_after_delete(&txn, status.conversation_id)
                     .await?
             };
@@ -1959,7 +2021,7 @@ async fn process_remote_status_activity(
                     notifications.push(notification);
                 }
             }
-            let has_local_recipients = !direct_recipients.as_deref().unwrap_or_default().is_empty();
+            let has_local_recipients = !audience.explicit_recipients().is_empty();
             let has_local_followers =
                 !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
                     .await?
@@ -2037,11 +2099,26 @@ async fn publish_remote_status_change(
     remote_actor_id: AccountId,
     change: RemoteStatusChange,
 ) -> Result<(), RoostyError> {
-    let recipients =
+    let followers =
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
     match change {
         RemoteStatusChange::Ignored => {}
         RemoteStatusChange::Upsert(status, notifications, refresh) => {
+            let mut recipients = match status.visibility {
+                StatusVisibility::Public
+                | StatusVisibility::Unlisted
+                | StatusVisibility::Private => followers,
+                StatusVisibility::Direct => Vec::new(),
+            };
+            if matches!(
+                status.visibility,
+                StatusVisibility::Private | StatusVisibility::Direct
+            ) {
+                recipients
+                    .extend(roosty_db::remote_status_local_recipients(&state.db, status.id).await?);
+                recipients.sort_by_key(|id| id.0);
+                recipients.dedup();
+            }
             let response =
                 crate::statuses::remote_status_response(state, (*status).clone()).await?;
             if let Some(refresh) = refresh {
@@ -2165,59 +2242,48 @@ fn remote_custom_emoji_definitions(tags: &[InboundTag]) -> Vec<NewRemoteCustomEm
         .collect()
 }
 
-fn remote_status_visibility(note: &InboundNote) -> Option<&'static str> {
-    if note.to.iter().any(|audience| audience == PUBLIC_AUDIENCE) {
-        Some("public")
-    } else if note.cc.iter().any(|audience| audience == PUBLIC_AUDIENCE) {
-        Some("unlisted")
-    } else {
-        None
-    }
-}
-
-/// Return addressed local actors only for Mastodon-compatible direct Notes.
-async fn remote_direct_recipients(
+/// Classify a verified Note using exact actor and collection identifiers.
+async fn classify_remote_audience(
     state: &AppState,
     note: &InboundNote,
-) -> Result<Option<Vec<AccountId>>, RoostyError> {
-    if note
-        .to
-        .iter()
-        .chain(&note.cc)
-        .any(|value| value == PUBLIC_AUDIENCE)
-    {
-        return Ok(None);
+    author: &roosty_db::RemoteActor,
+) -> Result<InboundAudience, InboundAudienceError> {
+    if note.to.iter().any(|address| address == PUBLIC_AUDIENCE) {
+        return Ok(InboundAudience::Public);
+    }
+    if note.cc.iter().any(|address| address == PUBLIC_AUDIENCE) {
+        return Ok(InboundAudience::Unlisted);
     }
     let mentions = note
         .tag
         .iter()
         .filter(|tag| tag.r#type == InboundTagType::Mention)
         .filter_map(|tag| tag.href.as_deref())
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<HashSet<_>>();
     if note
         .tag
         .iter()
         .any(|tag| tag.r#type == InboundTagType::Mention && tag.href.is_none())
     {
-        return Ok(None);
+        return Err(InboundAudienceError::Unsupported(
+            "remote Note has a malformed mention".into(),
+        ));
     }
     let audience = note.to.iter().chain(&note.cc).collect::<Vec<_>>();
-    if audience.is_empty()
-        || audience
-            .iter()
-            .any(|address| !mentions.contains(address.as_str()))
-        || mentions
-            .iter()
-            .any(|mention| !audience.iter().any(|address| address.as_str() == *mention))
-    {
-        return Ok(None);
+    if audience.is_empty() {
+        return Err(InboundAudienceError::Unsupported(
+            "remote Note audience is empty".into(),
+        ));
     }
     let prefix = format!(
         "{}/users/",
         state.config.public_base_url.as_str().trim_end_matches('/')
     );
     let mut recipients = Vec::new();
-    for address in audience {
+    for address in &audience {
+        if !mentions.contains(address.as_str()) {
+            continue;
+        }
         if let Some(username) = address.strip_prefix(&prefix)
             && !username.contains('/')
             && let Some(account) =
@@ -2228,7 +2294,43 @@ async fn remote_direct_recipients(
     }
     recipients.sort_by_key(|id| id.0);
     recipients.dedup();
-    Ok((!recipients.is_empty()).then_some(recipients))
+
+    let addresses_followers = author
+        .followers_url
+        .as_deref()
+        .is_some_and(|followers| audience.iter().any(|address| address.as_str() == followers));
+    let supported = audience.iter().all(|address| {
+        mentions.contains(address.as_str())
+            || author
+                .followers_url
+                .as_deref()
+                .is_some_and(|followers| address.as_str() == followers)
+    });
+    if !supported {
+        return Err(InboundAudienceError::Unsupported(
+            "remote Note audience contains an unknown collection".into(),
+        ));
+    }
+    if addresses_followers {
+        let follows =
+            roosty_db::accepted_local_followers_of_remote_actor(&state.db, author.id).await?;
+        if follows.is_empty() && recipients.is_empty() {
+            return Err(InboundAudienceError::NoEligibleRecipient(
+                "remote private Note has no eligible local recipient".into(),
+            ));
+        }
+        return Ok(InboundAudience::Private(recipients));
+    }
+    if recipients.is_empty()
+        || mentions
+            .iter()
+            .any(|mention| !audience.iter().any(|address| address.as_str() == *mention))
+    {
+        return Err(InboundAudienceError::NoEligibleRecipient(
+            "remote direct Note has no eligible local recipient".into(),
+        ));
+    }
+    Ok(InboundAudience::Direct(recipients))
 }
 
 /// Retain every remote direct-message participant without fetching unknown actors.
@@ -2906,7 +3008,10 @@ pub(crate) async fn enqueue_status_activity(
     if !state.config.federation_enabled
         || !matches!(
             status.visibility,
-            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+            StatusVisibility::Public
+                | StatusVisibility::Unlisted
+                | StatusVisibility::Private
+                | StatusVisibility::Direct
         )
     {
         return Ok(());
@@ -2960,7 +3065,10 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
     if !state.config.federation_enabled
         || !matches!(
             status.visibility,
-            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+            StatusVisibility::Public
+                | StatusVisibility::Unlisted
+                | StatusVisibility::Private
+                | StatusVisibility::Direct
         )
     {
         return Ok(());
@@ -3464,7 +3572,7 @@ async fn note_object(
     status: roosty_db::LocalStatus,
 ) -> Result<Note, RoostyError> {
     let id = status_url(state, username, status.id);
-    let (to, cc) = status_audience(state, username, (&status.visibility).into());
+    let (to, cc) = status_audience(state, username, status.visibility);
     let in_reply_to = match status.in_reply_to_remote_status_id {
         Some(id) => roosty_db::find_remote_status_by_id(&state.db, id)
             .await?
@@ -3505,7 +3613,7 @@ async fn note_object(
             name: format!("@{}@{}", actor.username, actor.domain),
         });
     }
-    let (to, cc) = if status.visibility == StatusVisibility::Direct {
+    let (to, mut cc) = if status.visibility == StatusVisibility::Direct {
         (
             tag.iter().map(|mention| mention.href.clone()).collect(),
             Vec::new(),
@@ -3513,6 +3621,11 @@ async fn note_object(
     } else {
         (to, cc)
     };
+    if status.visibility == StatusVisibility::Private {
+        cc.extend(tag.iter().map(|mention| mention.href.clone()));
+        cc.sort();
+        cc.dedup();
+    }
     let attachment = roosty_db::local_media_attachments_for_status(&state.db, status.id)
         .await?
         .into_iter()
@@ -3542,12 +3655,14 @@ async fn note_object(
 fn status_audience(
     state: &AppState,
     username: &str,
-    visibility: &str,
+    visibility: StatusVisibility,
 ) -> (Vec<String>, Vec<String>) {
     let followers = format!("{}/followers", actor_url(state, username));
     match visibility {
-        "unlisted" => (vec![followers], vec![PUBLIC_AUDIENCE.to_owned()]),
-        _ => (vec![PUBLIC_AUDIENCE.to_owned()], vec![followers]),
+        StatusVisibility::Unlisted => (vec![followers], vec![PUBLIC_AUDIENCE.to_owned()]),
+        StatusVisibility::Private => (vec![followers], Vec::new()),
+        StatusVisibility::Direct => (Vec::new(), Vec::new()),
+        StatusVisibility::Public => (vec![PUBLIC_AUDIENCE.to_owned()], vec![followers]),
     }
 }
 fn activity_response<T: Serialize>(value: T) -> Response {
@@ -3655,10 +3770,10 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundNote, InboundUndoAnnounceActivity, InboundUndoFollowActivity,
-        MentionTag, MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
+        InboundFollowActivity, InboundUndoAnnounceActivity, InboundUndoFollowActivity, MentionTag,
+        MentionType, Note, NoteType, OrderedCollection, PublicKey, actor_context,
         actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
-        local_actor_type, parse_acct, remote_status_visibility, same_url_origin,
+        local_actor_type, parse_acct, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -3849,6 +3964,35 @@ mod tests {
             .is_some()
         );
 
+        let private = create_test_status(
+            &context.alpha,
+            author.id,
+            "followers-only delivery",
+            StatusVisibility::Private,
+        )
+        .await;
+        super::enqueue_status_activity(&context.alpha, &private, super::StatusActivityKind::Create)
+            .await
+            .unwrap();
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
+        let cached_private = roosty_db::find_remote_status_by_activitypub_id(
+            &context.beta.db,
+            &super::status_url(&context.alpha, "author", private.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cached_private.visibility, StatusVisibility::Private);
+        assert!(
+            roosty_db::remote_status_visible_to_account(
+                &context.beta.db,
+                &cached_private,
+                follower.id,
+            )
+            .await
+            .unwrap()
+        );
+
         let following =
             roosty_db::delete_remote_following(&context.beta.db, follower.id, alpha_remote.id)
                 .await
@@ -3863,6 +4007,15 @@ mod tests {
                 &context.alpha.db,
                 beta_remote.id,
                 author.id,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !roosty_db::remote_status_visible_to_account(
+                &context.beta.db,
+                &cached_private,
+                follower.id,
             )
             .await
             .unwrap()
@@ -4227,35 +4380,6 @@ mod tests {
         context.teardown().await;
     }
 
-    /// Public is addressed in `to`, while unlisted retains the public audience in `cc`.
-    #[test]
-    fn classifies_only_public_and_unlisted_remote_notes() {
-        let note = |to: Vec<&str>, cc: Vec<&str>| InboundNote {
-            id: "https://remote.example/notes/1".to_owned(),
-            r#type: "Note".to_owned(),
-            attributed_to: "https://remote.example/users/alice".to_owned(),
-            content: "hello".to_owned(),
-            published: "2026-07-13T12:00:00Z".to_owned(),
-            updated: None,
-            to: to.into_iter().map(str::to_owned).collect(),
-            cc: cc.into_iter().map(str::to_owned).collect(),
-            in_reply_to: None,
-            tag: Vec::new(),
-            attachment: Vec::new(),
-        };
-        let public = "https://www.w3.org/ns/activitystreams#Public";
-
-        assert_eq!(
-            remote_status_visibility(&note(vec![public], vec![])),
-            Some("public")
-        );
-        assert_eq!(
-            remote_status_visibility(&note(vec![], vec![public])),
-            Some("unlisted")
-        );
-        assert_eq!(remote_status_visibility(&note(vec![], vec![])), None);
-    }
-
     #[test]
     /// Given signed activity identifiers, when origins are compared, then only the signer's
     /// HTTPS origin is accepted regardless of path.
@@ -4561,6 +4685,7 @@ mod tests {
             emojis: json!([]),
             inbox_url: format!("https://{domain}/inbox"),
             shared_inbox_url: None,
+            followers_url: Some(format!("https://{domain}/users/{username}/followers")),
             public_key_id: format!("https://{domain}/users/{username}#main-key"),
             public_key_pem,
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -4579,12 +4704,21 @@ mod tests {
         account_id: AccountId,
         content: &str,
     ) -> roosty_db::LocalStatus {
+        create_test_status(state, account_id, content, StatusVisibility::Public).await
+    }
+
+    async fn create_test_status(
+        state: &AppState,
+        account_id: AccountId,
+        content: &str,
+        visibility: StatusVisibility,
+    ) -> roosty_db::LocalStatus {
         roosty_db::create_local_status(
             &state.db,
             roosty_db::NewLocalStatus {
                 account_id,
                 content: content.to_owned(),
-                visibility: StatusVisibility::Public,
+                visibility,
                 sensitive: false,
                 spoiler_text: String::new(),
                 language: None,

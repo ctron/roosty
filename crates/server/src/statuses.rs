@@ -404,11 +404,17 @@ async fn create_status(
     };
 
     let author_id = account.id;
-    let is_direct = new_status.visibility == StatusVisibility::Direct;
+    let has_explicit_audience = matches!(
+        new_status.visibility,
+        StatusVisibility::Private | StatusVisibility::Direct
+    );
     let remote_mentions = if state.config.federation_enabled
         && matches!(
             new_status.visibility,
-            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+            StatusVisibility::Public
+                | StatusVisibility::Unlisted
+                | StatusVisibility::Private
+                | StatusVisibility::Direct
         ) {
         resolve_remote_mentions(&state, &new_status.content).await
     } else {
@@ -434,7 +440,7 @@ async fn create_status(
         roosty_db::LocalStatusMetadata {
             tag_names,
             remote_actor_ids: remote_mention_ids,
-            local_recipient_ids: if is_direct {
+            local_recipient_ids: if has_explicit_audience {
                 notification_recipients
                     .iter()
                     .map(|account| account.id)
@@ -625,7 +631,10 @@ async fn update_status(
     let remote_mentions = if state.config.federation_enabled
         && matches!(
             existing.visibility,
-            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Direct
+            StatusVisibility::Public
+                | StatusVisibility::Unlisted
+                | StatusVisibility::Private
+                | StatusVisibility::Direct
         ) {
         resolve_remote_mentions(&state, &final_content).await
     } else {
@@ -635,7 +644,10 @@ async fn update_status(
         .iter()
         .map(|actor| actor.id)
         .collect::<Vec<_>>();
-    let local_recipient_ids = if existing.visibility == StatusVisibility::Direct {
+    let local_recipient_ids = if matches!(
+        existing.visibility,
+        StatusVisibility::Private | StatusVisibility::Direct
+    ) {
         match local_text_mentions(&state, &final_content).await {
             Ok(accounts) => accounts.into_iter().map(|account| account.id).collect(),
             Err(error) => return server_error(error),
@@ -954,8 +966,12 @@ async fn reblogged_by(
     let viewer_id = viewer.as_ref().map(|account| account.id);
     let status_id = StatusId(path.status_id);
     match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) if can_view_status(&status, viewer_id) => {}
-        Ok(Some(_)) | Ok(None) => return not_found(),
+        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer_id).await {
+            Ok(true) => {}
+            Ok(false) => return not_found(),
+            Err(error) => return server_error(error),
+        },
+        Ok(None) => return not_found(),
         Err(error) => return server_error(error),
     }
 
@@ -1457,17 +1473,26 @@ async fn status_collection_action(
         Ok(Some(status)) => status,
         Ok(None) => {
             let remote = match roosty_db::find_remote_status_by_id(&state.db, status_id).await {
-                Ok(Some(status))
-                    if matches!(
-                        status.visibility,
-                        StatusVisibility::Public | StatusVisibility::Unlisted
-                    ) =>
+                Ok(Some(status)) => match roosty_db::remote_status_visible_to_account(
+                    &state.db, &status, account_id,
+                )
+                .await
                 {
-                    status
-                }
-                Ok(_) => return not_found(),
+                    Ok(true) => status,
+                    Ok(false) => return not_found(),
+                    Err(error) => return server_error(error),
+                },
+                Ok(None) => return not_found(),
                 Err(error) => return server_error(error),
             };
+            if remote.visibility == StatusVisibility::Private
+                && matches!(
+                    action,
+                    StatusCollectionAction::Reblog | StatusCollectionAction::Unreblog
+                )
+            {
+                return bad_request("private statuses cannot be boosted");
+            }
             return match action {
                 StatusCollectionAction::Favourite => {
                     let result = favourite_remote_status(state, account_id, &remote).await;
@@ -1636,6 +1661,16 @@ async fn status_collection_action(
         Err(error) => return server_error(error),
     };
 
+    if status.visibility == StatusVisibility::Private
+        && status.account_id != account_id
+        && matches!(
+            action,
+            StatusCollectionAction::Reblog | StatusCollectionAction::Unreblog
+        )
+    {
+        return bad_request("private statuses cannot be boosted");
+    }
+
     let reblog = if matches!(action, StatusCollectionAction::Reblog) {
         match roosty_db::reblog_local_status(&state.db, account_id, status_id).await {
             Ok(reblog) => Some(reblog),
@@ -1739,14 +1774,21 @@ async fn status_stream_recipients(
     state: &AppState,
     status: &roosty_db::LocalStatus,
 ) -> Vec<AccountId> {
-    if !matches!(
-        status.visibility,
-        StatusVisibility::Public | StatusVisibility::Unlisted
-    ) {
+    if status.visibility == StatusVisibility::Direct {
         return Vec::new();
     }
     match roosty_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
-        Ok(recipients) => filter_stream_recipients(state, status.account_id, recipients).await,
+        Ok(mut recipients) => {
+            if status.visibility == StatusVisibility::Private {
+                match roosty_db::local_status_local_recipients(&state.db, status.id).await {
+                    Ok(explicit) => recipients.extend(explicit),
+                    Err(error) => warn!(%error, "failed to resolve explicit status recipients"),
+                }
+                recipients.sort_by_key(|id| id.0);
+                recipients.dedup();
+            }
+            filter_stream_recipients(state, status.account_id, recipients).await
+        }
         Err(error) => {
             warn!(%error, "failed to resolve status stream recipients");
             Vec::new()
@@ -1886,16 +1928,9 @@ async fn favourites_response(
             .header_value();
             let mut responses = Vec::with_capacity(page.items.len());
             for status in page.items {
-                let response = match status {
-                    roosty_db::FavouriteStatus::Local(status) => {
-                        status_with_author(state, status, Some(account_id)).await
-                    }
-                    roosty_db::FavouriteStatus::Remote(status) => {
-                        remote_status_response_for_viewer(state, status, Some(account_id)).await
-                    }
-                };
-                match response {
-                    Ok(response) => responses.push(response),
+                match favourite_status_response(state, status, account_id).await {
+                    Ok(Some(response)) => responses.push(response),
+                    Ok(None) => {}
                     Err(error) => return server_error(error),
                 }
             }
@@ -1909,6 +1944,29 @@ async fn favourites_response(
     }
 }
 
+async fn favourite_status_response(
+    state: &AppState,
+    status: roosty_db::FavouriteStatus,
+    viewer: AccountId,
+) -> Result<Option<StatusResponse>, RoostyError> {
+    match status {
+        roosty_db::FavouriteStatus::Local(status) => {
+            if !status_visible_to_viewer(state, &status, Some(viewer)).await? {
+                return Ok(None);
+            }
+            Ok(Some(status_with_author(state, status, Some(viewer)).await?))
+        }
+        roosty_db::FavouriteStatus::Remote(status) => {
+            if !roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await? {
+                return Ok(None);
+            }
+            Ok(Some(
+                remote_status_response_for_viewer(state, status, Some(viewer)).await?,
+            ))
+        }
+    }
+}
+
 async fn status_models(
     state: &AppState,
     statuses: Vec<roosty_db::LocalStatus>,
@@ -1916,7 +1974,9 @@ async fn status_models(
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let mut response = Vec::with_capacity(statuses.len());
     for status in statuses {
-        response.push(status_with_author(state, status, viewer).await?);
+        if status_visible_to_viewer(state, &status, viewer).await? {
+            response.push(status_with_author(state, status, viewer).await?);
+        }
     }
 
     Ok(response)
@@ -1939,7 +1999,8 @@ async fn home_timeline_models(
                 }
             }
             roosty_db::HomeTimelineItem::RemoteStatus(status) => {
-                response.push(remote_status_response(state, status).await?);
+                response
+                    .push(remote_status_response_for_viewer(state, status, Some(viewer)).await?);
             }
             roosty_db::HomeTimelineItem::LocalRemoteReblog(reblog) => {
                 if let Some(reblog_response) =
@@ -2007,6 +2068,20 @@ pub(crate) async fn remote_timeline_response(
     let link_header = timeline_link_header(&page, limit, path);
     let mut items = Vec::with_capacity(page.items.len());
     for status in page.items {
+        let visible = match viewer {
+            Some(viewer) => {
+                roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await
+            }
+            None => Ok(matches!(
+                status.visibility,
+                StatusVisibility::Public | StatusVisibility::Unlisted
+            )),
+        };
+        match visible {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => return server_error(error),
+        }
         match remote_status_response_for_viewer(state, status, viewer).await {
             Ok(status) => items.push(status),
             Err(error) => return server_error(error),
@@ -2073,7 +2148,7 @@ pub(crate) async fn remote_reblog_response(
             else {
                 return Ok(None);
             };
-            if !can_view_status(&status, viewer) {
+            if !status_visible_to_viewer(state, &status, viewer).await? {
                 return Ok(None);
             }
             Box::new(status_with_author(state, status, viewer).await?)
@@ -2083,6 +2158,18 @@ pub(crate) async fn remote_reblog_response(
             else {
                 return Ok(None);
             };
+            let visible = match viewer {
+                Some(viewer) => {
+                    roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await?
+                }
+                None => matches!(
+                    status.visibility,
+                    StatusVisibility::Public | StatusVisibility::Unlisted
+                ),
+            };
+            if !visible {
+                return Ok(None);
+            }
             Box::new(remote_status_response_for_viewer(state, status, viewer).await?)
         }
     };
@@ -2136,7 +2223,9 @@ pub(crate) async fn publish_remote_reblog_update(
     };
     let recipients =
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
-    if let Some(response) = remote_reblog_response(state, reblog, None).await? {
+    if let Some(response) =
+        remote_reblog_response(state, reblog, recipients.first().copied()).await?
+    {
         state
             .streaming_events
             .publish_home_update(&response, remote_actor_id, &recipients);
@@ -2331,7 +2420,7 @@ async fn reblog_response(
     else {
         return Ok(None);
     };
-    if !can_view_status(&original, viewer) {
+    if !status_visible_to_viewer(state, &original, viewer).await? {
         return Ok(None);
     }
     let Some(account) = roosty_db::find_local_account_by_id(&state.db, reblog.account_id).await?
@@ -5470,6 +5559,60 @@ mod tests {
             .await;
         assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
 
+        let other = roosty_db::find_local_account_by_username(&context.db, "other")
+            .await
+            .unwrap()
+            .unwrap();
+        roosty_db::follow_local_account(&context.db, other.id, context.account_id, true, false)
+            .await
+            .unwrap();
+        let follower_favourite = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &other_token,
+            )
+            .await;
+        assert_eq!(follower_favourite.status(), StatusCode::OK);
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home", &other_token)
+                .await,
+        )
+        .await;
+        assert!(
+            home.as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == status_id)
+        );
+        let profile = json_body(
+            context
+                .authenticated_get(
+                    &format!("/api/v1/accounts/{}/statuses", context.account_id.0),
+                    &other_token,
+                )
+                .await,
+        )
+        .await;
+        assert!(
+            profile
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == status_id)
+        );
+        roosty_db::unfollow_local_account(&context.db, other.id, context.account_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{status_id}"), &other_token)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
         let owner = context
             .authenticated_empty(
                 "POST",
@@ -5479,6 +5622,71 @@ mod tests {
             .await;
         assert_eq!(owner.status(), StatusCode::OK);
         assert_eq!(json_body(owner).await["favourited"], true);
+    }
+
+    /// Explicitly mentioned accounts retain follower-only access without following the author.
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    async fn private_mentions_are_visible_in_lookup_profile_and_home(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let mentioned_token = context
+            .access_token_for("mentionedprivate", "mentioned-private@example.com")
+            .await;
+        let unrelated_token = context
+            .access_token_for("unrelated-private", "unrelated-private@example.com")
+            .await;
+        let status = context
+            .create_status(
+                &owner_token,
+                "hello @mentionedprivate",
+                Some("private"),
+                None,
+            )
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{status_id}"), &mentioned_token)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let profile = json_body(
+            context
+                .authenticated_get(
+                    &format!("/api/v1/accounts/{}/statuses", context.account_id.0),
+                    &mentioned_token,
+                )
+                .await,
+        )
+        .await;
+        assert!(
+            profile
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == status_id)
+        );
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home", &mentioned_token)
+                .await,
+        )
+        .await;
+        assert!(
+            home.as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == status_id)
+        );
+        assert_eq!(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{status_id}"), &unrelated_token)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test_context(StatusContext)]
@@ -5493,6 +5701,14 @@ mod tests {
             .create_status(&owner_token, "private boost", Some("private"), None)
             .await;
         let status_id = status["id"].as_str().unwrap();
+
+        let other = roosty_db::find_local_account_by_username(&context.db, "other-reblog")
+            .await
+            .unwrap()
+            .unwrap();
+        roosty_db::follow_local_account(&context.db, other.id, context.account_id, true, false)
+            .await
+            .unwrap();
 
         let forbidden = context
             .authenticated_empty(
@@ -5512,7 +5728,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+        assert_eq!(forbidden.status(), StatusCode::BAD_REQUEST);
         assert_eq!(anonymous_reblogged_by.status(), StatusCode::NOT_FOUND);
         assert_eq!(owner.status(), StatusCode::OK);
         assert_eq!(json_body(owner).await["reblogged"], true);
@@ -6154,6 +6370,7 @@ mod tests {
                 emojis: json!([]),
                 inbox_url: format!("{actor_url}/inbox"),
                 shared_inbox_url: None,
+                followers_url: Some(format!("{actor_url}/followers")),
                 public_key_id: format!("{actor_url}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: now + TimeDuration::hours(1),
