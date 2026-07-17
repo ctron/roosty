@@ -108,6 +108,7 @@ fn public_cors_layer() -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -174,7 +175,10 @@ mod tests {
         body::Body,
         http::{
             Request, StatusCode,
-            header::{ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN},
+            header::{
+                ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+                ACCESS_CONTROL_REQUEST_METHOD, ORIGIN,
+            },
         },
     };
     use tower::ServiceExt;
@@ -200,6 +204,36 @@ mod tests {
         assert_eq!(
             response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "*"
+        );
+    }
+
+    /// Given a browser preflight for a status edit, the public API permits PUT.
+    #[tokio::test]
+    async fn cors_preflight_allows_put_requests() {
+        let response = public_test_router()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/v1/statuses/status-id")
+                    .header(ORIGIN, "https://localhost:4001")
+                    .header(ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        let allowed_methods = response
+            .headers()
+            .get(ACCESS_CONTROL_ALLOW_METHODS)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            allowed_methods
+                .split(',')
+                .any(|method| method.trim() == "PUT")
         );
     }
 
