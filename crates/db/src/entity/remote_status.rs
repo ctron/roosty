@@ -20,6 +20,8 @@ pub struct Model {
     pub conversation_id: Option<Uuid>,
     pub object: Json,
     pub created_at: OffsetDateTime,
+    pub quote_automatic_policy: Json,
+    pub quote_manual_policy: Json,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

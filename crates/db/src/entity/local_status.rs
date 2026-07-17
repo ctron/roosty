@@ -19,6 +19,7 @@ pub struct Model {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub deleted_at: Option<OffsetDateTime>,
+    pub quote_approval_policy: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

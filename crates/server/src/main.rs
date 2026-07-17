@@ -407,6 +407,9 @@ async fn worker_iteration(
         "federation_status_delivery" => {
             federation::deliver_status_activity(&state, job.payload.clone()).await
         }
+        "federation_quote_delivery" => {
+            federation::deliver_quote_activity(&state, job.payload.clone()).await
+        }
         "federation_follow_delivery" => {
             federation::deliver_follow_activity(&state, job.payload.clone()).await
         }

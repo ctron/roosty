@@ -103,8 +103,56 @@ use entity::{
     remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
     remote_profile_media, remote_status, remote_status_edit, remote_status_edit_media,
     remote_status_favourite, remote_status_local_mention, remote_status_local_recipient,
-    remote_status_reblog, remote_status_remote_recipient, remote_status_tag, streaming_event,
+    remote_status_reblog, remote_status_remote_recipient, remote_status_tag, status_quote,
+    streaming_event,
 };
+
+/// Quote policy values authored by Mastodon-compatible clients.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum QuoteApprovalPolicy {
+    Public,
+    Followers,
+    Nobody,
+}
+
+impl QuoteApprovalPolicy {
+    pub fn parse(value: &str) -> Result<Self> {
+        Self::from_str(value).map_err(Into::into)
+    }
+}
+
+/// Durable consent state for one quote edge.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum QuoteState {
+    Pending,
+    Accepted,
+    Rejected,
+    Revoked,
+    Deleted,
+}
+
+/// A local or cached-remote status identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusReference {
+    Local(StatusId),
+    Remote(StatusId),
+}
+
+/// Stored quote edge and its authorization lifecycle.
+#[derive(Clone, Debug)]
+pub struct StatusQuote {
+    pub id: Uuid,
+    pub quoting_status: StatusReference,
+    pub quoted_status: Option<StatusReference>,
+    pub quoted_activitypub_id: String,
+    pub state: QuoteState,
+    pub quote_request_id: Option<String>,
+    pub authorization_id: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
 
 /// Shared database connection type used across Roosty crates.
 pub type DbConnection = DatabaseConnection;
@@ -704,6 +752,10 @@ pub struct RemoteStatus {
     pub conversation_id: Option<Uuid>,
     /// Original Note object retained for future projection fields.
     pub object: JsonValue,
+    /// Automatic quote audiences advertised through FEP-044f.
+    pub quote_automatic_policy: Vec<String>,
+    /// Manual quote audiences advertised through FEP-044f.
+    pub quote_manual_policy: Vec<String>,
 }
 
 /// A status participating in a cached Mastodon thread context.
@@ -757,6 +809,10 @@ pub struct NewRemoteStatus {
     pub object: JsonValue,
     /// Validated, normalized hashtag names derived from the Note.
     pub tag_names: Vec<String>,
+    /// FEP-044f automatic-approval audience IRIs.
+    pub quote_automatic_policy: Vec<String>,
+    /// FEP-044f manual-approval audience IRIs.
+    pub quote_manual_policy: Vec<String>,
 }
 
 /// A local actor's relationship to a remote actor.
@@ -1185,7 +1241,7 @@ pub async fn process_remote_actor_move(
 
 /// Find one cached remote Note by its canonical ActivityPub ID.
 pub async fn find_remote_status_by_activitypub_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     activitypub_id: &str,
 ) -> Result<Option<RemoteStatus>> {
     remote_status::Entity::find()
@@ -1645,6 +1701,8 @@ async fn upsert_remote_status_on<C>(db: &C, status: NewRemoteStatus) -> Result<R
 where
     C: ConnectionTrait,
 {
+    let quote_automatic_policy = status.quote_automatic_policy.clone();
+    let quote_manual_policy = status.quote_manual_policy.clone();
     let existing = remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(&status.activitypub_id))
         .one(db)
@@ -1666,6 +1724,10 @@ where
         active.in_reply_to_remote_status_id =
             Set(status.in_reply_to_remote_status_id.map(|id| id.0));
         active.object = Set(status.object);
+        active.quote_automatic_policy = Set(serde_json::to_value(&quote_automatic_policy)
+            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?);
+        active.quote_manual_policy = Set(serde_json::to_value(&quote_manual_policy)
+            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?);
         active.update(db).await?
     } else {
         remote_status::ActiveModel {
@@ -1682,6 +1744,10 @@ where
             in_reply_to_remote_status_id: Set(status.in_reply_to_remote_status_id.map(|id| id.0)),
             conversation_id: Set(None),
             object: Set(status.object),
+            quote_automatic_policy: Set(serde_json::to_value(quote_automatic_policy)
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?),
+            quote_manual_policy: Set(serde_json::to_value(quote_manual_policy)
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?),
             ..Default::default()
         }
         .insert(db)
@@ -1730,7 +1796,16 @@ pub async fn process_remote_status_upsert(
     let projection_changed = existing.content != status.content
         || existing.object.get("summary") != status.object.get("summary")
         || existing.object.get("sensitive") != status.object.get("sensitive")
-        || existing.object.get("tag") != status.object.get("tag");
+        || existing.object.get("tag") != status.object.get("tag")
+        || existing.object.get("quote") != status.object.get("quote")
+        || existing.object.get("quoteUri") != status.object.get("quoteUri")
+        || existing.object.get("quoteAuthorization") != status.object.get("quoteAuthorization")
+        || existing.quote_automatic_policy
+            != serde_json::to_value(&status.quote_automatic_policy)
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?
+        || existing.quote_manual_policy
+            != serde_json::to_value(&status.quote_manual_policy)
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     if status.updated_at <= existing.updated_at || (!projection_changed && !media_changed) {
         return Ok(RemoteStatusUpsertResult::Unchanged(
             remote_status_from_model(existing)?,
@@ -2350,6 +2425,8 @@ pub struct LocalStatus {
     pub updated_at: OffsetDateTime,
     /// Soft-delete timestamp.
     pub deleted_at: Option<OffsetDateTime>,
+    /// Per-status quote consent policy.
+    pub quote_approval_policy: QuoteApprovalPolicy,
 }
 
 /// Stored local hashtag metadata.
@@ -2395,6 +2472,8 @@ pub struct NewLocalStatus {
     pub in_reply_to_id: Option<StatusId>,
     /// Optional cached remote parent status.
     pub in_reply_to_remote_status_id: Option<StatusId>,
+    /// Per-status quote consent policy.
+    pub quote_approval_policy: QuoteApprovalPolicy,
 }
 
 /// Stored local direct-message conversation.
@@ -2713,6 +2792,10 @@ pub enum LocalNotificationType {
     Status,
     /// A status boosted by the recipient was edited.
     Update,
+    /// Someone published an accepted quote of the recipient's status.
+    Quote,
+    /// A status quoted by the recipient was edited.
+    QuotedUpdate,
 }
 
 /// Stored local boost relationship between an account and a status.
@@ -2902,6 +2985,8 @@ pub enum JobKind {
     FederationFollowResponse,
     /// Deliver a public or unlisted local status lifecycle activity.
     FederationStatusDelivery,
+    /// Deliver FEP-044f quote requests and authorization lifecycle activities.
+    FederationQuoteDelivery,
     /// Deliver a locally initiated Follow or Undo(Follow).
     FederationFollowDelivery,
     /// Deliver a locally initiated Like or Undo(Like).
@@ -5319,6 +5404,7 @@ pub async fn create_local_status(
         created_at: Set(created_at),
         updated_at: Set(created_at),
         deleted_at: Set(None),
+        quote_approval_policy: Set(new_status.quote_approval_policy.to_string()),
     }
     .insert(db)
     .await?;
@@ -5373,6 +5459,7 @@ pub async fn create_local_status_with_media(
         created_at: Set(created_at),
         updated_at: Set(created_at),
         deleted_at: Set(None),
+        quote_approval_policy: Set(new_status.quote_approval_policy.to_string()),
     }
     .insert(txn)
     .await?;
@@ -6798,6 +6885,405 @@ pub async fn find_local_status_by_id(
         .await?;
 
     status.map(local_status_from_model).transpose()
+}
+
+/// Attach one immutable quote target to a newly-created local status.
+pub async fn create_local_status_quote(
+    txn: &DatabaseTransaction,
+    quoting_status_id: StatusId,
+    quoted_status: StatusReference,
+    quoted_activitypub_id: &str,
+    state: QuoteState,
+    quote_request_id: Option<&str>,
+    authorization_id: Option<&str>,
+) -> Result<StatusQuote> {
+    local_status::Entity::find_by_id(quoting_status_id.0)
+        .lock_exclusive()
+        .one(txn)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("quoting status does not exist".to_owned()))?;
+    let (quoted_local_status_id, quoted_remote_status_id) = match quoted_status {
+        StatusReference::Local(id) => (Some(id.0), None),
+        StatusReference::Remote(id) => (None, Some(id.0)),
+    };
+    let model = status_quote::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        local_quoting_status_id: Set(Some(quoting_status_id.0)),
+        remote_quoting_status_id: Set(None),
+        quoted_local_status_id: Set(quoted_local_status_id),
+        quoted_remote_status_id: Set(quoted_remote_status_id),
+        quoted_activitypub_id: Set(quoted_activitypub_id.to_owned()),
+        state: Set(state.to_string()),
+        quote_request_id: Set(quote_request_id.map(ToOwned::to_owned)),
+        authorization_id: Set(authorization_id.map(ToOwned::to_owned)),
+        ..Default::default()
+    }
+    .insert(txn)
+    .await?;
+    status_quote_from_model(model)
+}
+
+/// Attach or refresh a quote discovered on a verified remote status.
+pub async fn upsert_remote_status_quote(
+    txn: &DatabaseTransaction,
+    quoting_status_id: StatusId,
+    quoted_status: StatusReference,
+    quoted_activitypub_id: &str,
+    state: QuoteState,
+    authorization_id: Option<&str>,
+) -> Result<StatusQuote> {
+    remote_status::Entity::find_by_id(quoting_status_id.0)
+        .lock_exclusive()
+        .one(txn)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote quoting status does not exist".to_owned())
+        })?;
+    if let Some(existing) = status_quote::Entity::find()
+        .filter(status_quote::Column::RemoteQuotingStatusId.eq(quoting_status_id.0))
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    {
+        if existing.quoted_activitypub_id != quoted_activitypub_id {
+            return Err(RoostyError::InvalidInput(
+                "a remote quote target cannot change".to_owned(),
+            ));
+        }
+        let mut active = existing.into_active_model();
+        active.state = Set(state.to_string());
+        active.authorization_id = Set(authorization_id.map(ToOwned::to_owned));
+        active.updated_at = Set(OffsetDateTime::now_utc());
+        return status_quote_from_model(active.update(txn).await?);
+    }
+    let (quoted_local_status_id, quoted_remote_status_id) = match quoted_status {
+        StatusReference::Local(id) => (Some(id.0), None),
+        StatusReference::Remote(id) => (None, Some(id.0)),
+    };
+    status_quote_from_model(
+        status_quote::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_quoting_status_id: Set(None),
+            remote_quoting_status_id: Set(Some(quoting_status_id.0)),
+            quoted_local_status_id: Set(quoted_local_status_id),
+            quoted_remote_status_id: Set(quoted_remote_status_id),
+            quoted_activitypub_id: Set(quoted_activitypub_id.to_owned()),
+            state: Set(state.to_string()),
+            quote_request_id: Set(None),
+            authorization_id: Set(authorization_id.map(ToOwned::to_owned)),
+            ..Default::default()
+        }
+        .insert(txn)
+        .await?,
+    )
+}
+
+/// Create an idempotent quote notification caused by a verified remote actor.
+pub async fn notify_remote_actor_quote(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<Option<LocalNotification>> {
+    if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
+    if let Some(existing) = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq("quote"))
+        .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
+        .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
+        .one(db)
+        .await?
+    {
+        return Ok(Some(local_notification_from_model(existing)));
+    }
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("quote".to_owned()),
+        actor_account_id: Set(None),
+        remote_actor_id: Set(Some(remote_actor_id.0)),
+        status_id: Set(None),
+        remote_status_id: Set(Some(remote_status_id.0)),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(Some(local_notification_from_model(model)))
+}
+
+/// Load the quote attached to a local or cached-remote status.
+pub async fn quote_for_status(
+    db: &impl ConnectionTrait,
+    status: StatusReference,
+) -> Result<Option<StatusQuote>> {
+    let query = status_quote::Entity::find();
+    let query = match status {
+        StatusReference::Local(id) => {
+            query.filter(status_quote::Column::LocalQuotingStatusId.eq(id.0))
+        }
+        StatusReference::Remote(id) => {
+            query.filter(status_quote::Column::RemoteQuotingStatusId.eq(id.0))
+        }
+    };
+    query
+        .one(db)
+        .await?
+        .map(status_quote_from_model)
+        .transpose()
+}
+
+/// Resolve a pending local quote by its durable QuoteRequest identity.
+pub async fn quote_by_request_id(
+    db: &impl ConnectionTrait,
+    request_id: &str,
+) -> Result<Option<StatusQuote>> {
+    status_quote::Entity::find()
+        .filter(status_quote::Column::QuoteRequestId.eq(request_id))
+        .one(db)
+        .await?
+        .map(status_quote_from_model)
+        .transpose()
+}
+
+pub async fn quote_by_authorization_id(
+    db: &impl ConnectionTrait,
+    authorization_id: &str,
+) -> Result<Option<StatusQuote>> {
+    status_quote::Entity::find()
+        .filter(status_quote::Column::AuthorizationId.eq(authorization_id))
+        .one(db)
+        .await?
+        .map(status_quote_from_model)
+        .transpose()
+}
+
+/// Apply an idempotent response to a pending QuoteRequest under a row lock.
+pub async fn transition_quote_request(
+    txn: &DatabaseTransaction,
+    request_id: &str,
+    state: QuoteState,
+    authorization_id: Option<&str>,
+) -> Result<Option<StatusQuote>> {
+    let Some(model) = status_quote::Entity::find()
+        .filter(status_quote::Column::QuoteRequestId.eq(request_id))
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if model.state != "pending" {
+        return status_quote_from_model(model).map(Some);
+    }
+    let mut active = model.into_active_model();
+    active.state = Set(state.to_string());
+    active.authorization_id = Set(authorization_id.map(ToOwned::to_owned));
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    status_quote_from_model(active.update(txn).await?).map(Some)
+}
+
+pub async fn revoke_quote_authorization(
+    txn: &DatabaseTransaction,
+    authorization_id: &str,
+) -> Result<Option<StatusQuote>> {
+    let Some(model) = status_quote::Entity::find()
+        .filter(status_quote::Column::AuthorizationId.eq(authorization_id))
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if model.state == "revoked" {
+        return status_quote_from_model(model).map(Some);
+    }
+    let mut active = model.into_active_model();
+    active.state = Set(QuoteState::Revoked.to_string());
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    status_quote_from_model(active.update(txn).await?).map(Some)
+}
+
+/// Count currently accepted quotes of a status.
+pub async fn count_accepted_quotes(
+    db: &impl ConnectionTrait,
+    status: StatusReference,
+) -> Result<u64> {
+    let query = status_quote::Entity::find().filter(status_quote::Column::State.eq("accepted"));
+    let query = match status {
+        StatusReference::Local(id) => {
+            query.filter(status_quote::Column::QuotedLocalStatusId.eq(id.0))
+        }
+        StatusReference::Remote(id) => {
+            query.filter(status_quote::Column::QuotedRemoteStatusId.eq(id.0))
+        }
+    };
+    Ok(query.count(db).await?)
+}
+
+/// List accepted quoting statuses newest-first using UUIDv7 cursors.
+pub async fn accepted_quotes_for_status(
+    db: &impl ConnectionTrait,
+    status: StatusReference,
+    max_id: Option<Uuid>,
+    since_id: Option<Uuid>,
+    limit: u64,
+) -> Result<Vec<StatusQuote>> {
+    let query = status_quote::Entity::find().filter(status_quote::Column::State.eq("accepted"));
+    let mut query = match status {
+        StatusReference::Local(id) => {
+            query.filter(status_quote::Column::QuotedLocalStatusId.eq(id.0))
+        }
+        StatusReference::Remote(id) => {
+            query.filter(status_quote::Column::QuotedRemoteStatusId.eq(id.0))
+        }
+    };
+    if let Some(id) = max_id {
+        query = query.filter(status_quote::Column::Id.lt(id));
+    }
+    if let Some(id) = since_id {
+        query = query.filter(status_quote::Column::Id.gt(id));
+    }
+    query
+        .order_by_desc(status_quote::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(status_quote_from_model)
+        .collect()
+}
+
+/// Revoke an accepted quote while holding both affected rows for update.
+pub async fn revoke_status_quote(
+    txn: &DatabaseTransaction,
+    quoted_status: StatusReference,
+    quoting_status: StatusReference,
+) -> Result<Option<StatusQuote>> {
+    let query = status_quote::Entity::find();
+    let query = match quoting_status {
+        StatusReference::Local(id) => {
+            query.filter(status_quote::Column::LocalQuotingStatusId.eq(id.0))
+        }
+        StatusReference::Remote(id) => {
+            query.filter(status_quote::Column::RemoteQuotingStatusId.eq(id.0))
+        }
+    };
+    let Some(model) = query.lock_exclusive().one(txn).await? else {
+        return Ok(None);
+    };
+    let target_matches = match quoted_status {
+        StatusReference::Local(id) => model.quoted_local_status_id == Some(id.0),
+        StatusReference::Remote(id) => model.quoted_remote_status_id == Some(id.0),
+    };
+    if !target_matches {
+        return Ok(None);
+    }
+    if model.state == "revoked" {
+        return status_quote_from_model(model).map(Some);
+    }
+    let mut active = model.into_active_model();
+    active.state = Set(QuoteState::Revoked.to_string());
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    status_quote_from_model(active.update(txn).await?).map(Some)
+}
+
+/// Mark every quote of a soft-deleted target unavailable inside the delete transaction.
+pub async fn mark_quotes_target_deleted(
+    txn: &DatabaseTransaction,
+    target: StatusReference,
+) -> Result<()> {
+    let filter = match target {
+        StatusReference::Local(id) => status_quote::Column::QuotedLocalStatusId.eq(id.0),
+        StatusReference::Remote(id) => status_quote::Column::QuotedRemoteStatusId.eq(id.0),
+    };
+    status_quote::Entity::update_many()
+        .col_expr(
+            status_quote::Column::State,
+            sea_orm::sea_query::Expr::value("deleted"),
+        )
+        .col_expr(
+            status_quote::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(OffsetDateTime::now_utc()),
+        )
+        .filter(filter)
+        .filter(status_quote::Column::State.eq("accepted"))
+        .exec(txn)
+        .await?;
+    Ok(())
+}
+
+/// Notify local authors whose accepted quote references an edited local status.
+pub async fn notify_local_quoted_status_update(
+    txn: &DatabaseTransaction,
+    edited_status: &LocalStatus,
+) -> Result<Vec<LocalNotification>> {
+    let quotes = status_quote::Entity::find()
+        .filter(status_quote::Column::QuotedLocalStatusId.eq(edited_status.id.0))
+        .filter(status_quote::Column::State.eq("accepted"))
+        .all(txn)
+        .await?;
+    let mut notifications = Vec::new();
+    for quote in quotes {
+        let Some(quoting_id) = quote.local_quoting_status_id else {
+            continue;
+        };
+        let Some(quoting) = local_status::Entity::find_by_id(quoting_id)
+            .one(txn)
+            .await?
+        else {
+            continue;
+        };
+        if quoting.account_id == edited_status.account_id.0 {
+            continue;
+        }
+        notifications.push(
+            notify_local_account(
+                txn,
+                AccountId(quoting.account_id),
+                LocalNotificationType::QuotedUpdate,
+                edited_status.account_id,
+                Some(StatusId(quoting_id)),
+            )
+            .await?,
+        );
+    }
+    Ok(notifications)
+}
+
+/// Change the policy on an owned status while serializing concurrent updates.
+pub async fn update_local_status_quote_policy(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    account_id: AccountId,
+    policy: QuoteApprovalPolicy,
+) -> Result<Option<LocalStatus>> {
+    let Some(model) = local_status::Entity::find_by_id(status_id.0)
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let effective = if matches!(
+        StatusVisibility::parse(&model.visibility)?,
+        StatusVisibility::Private | StatusVisibility::Direct
+    ) {
+        QuoteApprovalPolicy::Nobody
+    } else {
+        policy
+    };
+    if model.quote_approval_policy == effective.to_string() {
+        return local_status_from_model(model).map(Some);
+    }
+    let mut active = model.into_active_model();
+    active.quote_approval_policy = Set(effective.to_string());
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    local_status_from_model(active.update(txn).await?).map(Some)
 }
 
 /// List an actor's public statuses for its ActivityPub outbox.
@@ -9928,6 +10414,10 @@ fn remote_status_from_model(status: remote_status::Model) -> Result<RemoteStatus
         in_reply_to_remote_status_id: status.in_reply_to_remote_status_id.map(StatusId),
         conversation_id: status.conversation_id,
         object: status.object,
+        quote_automatic_policy: serde_json::from_value(status.quote_automatic_policy)
+            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
+        quote_manual_policy: serde_json::from_value(status.quote_manual_policy)
+            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
     })
 }
 
@@ -10041,6 +10531,44 @@ fn local_status_from_model(status: local_status::Model) -> Result<LocalStatus> {
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
+        quote_approval_policy: QuoteApprovalPolicy::parse(&status.quote_approval_policy)?,
+    })
+}
+
+fn status_quote_from_model(model: status_quote::Model) -> Result<StatusQuote> {
+    let quoting_status = match (
+        model.local_quoting_status_id,
+        model.remote_quoting_status_id,
+    ) {
+        (Some(id), None) => StatusReference::Local(StatusId(id)),
+        (None, Some(id)) => StatusReference::Remote(StatusId(id)),
+        _ => {
+            return Err(RoostyError::InvalidInput(
+                "stored quote origin is invalid".to_owned(),
+            ));
+        }
+    };
+    let quoted_status = match (model.quoted_local_status_id, model.quoted_remote_status_id) {
+        (Some(id), None) => Some(StatusReference::Local(StatusId(id))),
+        (None, Some(id)) => Some(StatusReference::Remote(StatusId(id))),
+        (None, None) => None,
+        _ => {
+            return Err(RoostyError::InvalidInput(
+                "stored quote target is invalid".to_owned(),
+            ));
+        }
+    };
+    Ok(StatusQuote {
+        id: model.id,
+        quoting_status,
+        quoted_status,
+        quoted_activitypub_id: model.quoted_activitypub_id,
+        state: QuoteState::from_str(&model.state)
+            .map_err(|_| RoostyError::InvalidInput("stored quote state is invalid".to_owned()))?,
+        quote_request_id: model.quote_request_id,
+        authorization_id: model.authorization_id,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
     })
 }
 

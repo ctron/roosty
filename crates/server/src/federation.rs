@@ -109,7 +109,7 @@ enum ActorType {
 }
 
 /// ActivityStreams object types emitted for local statuses.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 enum NoteType {
     Note,
 }
@@ -146,6 +146,76 @@ struct InboundStatusActivity {
     r#type: InboundStatusType,
     actor: String,
     object: InboundNote,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundQuoteResponse {
+    actor: String,
+    object: InboundActivityReference,
+    #[serde(default)]
+    result: Option<InboundQuoteAuthorization>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InboundActivityReference {
+    Id(String),
+    Object { id: String },
+}
+
+impl InboundActivityReference {
+    fn id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Object { id } => id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundQuoteAuthorization {
+    id: String,
+    r#type: String,
+    attributed_to: String,
+    interacting_object: String,
+    interaction_target: String,
+}
+
+#[derive(Deserialize)]
+struct InboundQuoteRequest {
+    id: String,
+    actor: String,
+    object: String,
+    instrument: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteAuthorizationObject {
+    id: String,
+    r#type: &'static str,
+    attributed_to: String,
+    interacting_object: String,
+    interaction_target: String,
+}
+
+#[derive(Serialize)]
+struct QuoteRequestResponseActivity {
+    #[serde(rename = "@context")]
+    context: [&'static str; 2],
+    id: String,
+    r#type: &'static str,
+    actor: String,
+    object: InboundActivityReferenceOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<QuoteAuthorizationObject>,
+}
+
+#[derive(Serialize)]
+struct InboundActivityReferenceOutput {
+    id: String,
+    r#type: &'static str,
 }
 
 /// ActivityPub reference forms accepted for a Follow target.
@@ -331,6 +401,159 @@ struct InboundNote {
     tag: Vec<InboundTag>,
     #[serde(default)]
     attachment: Vec<InboundAttachment>,
+    #[serde(default)]
+    interaction_policy: Option<InboundInteractionPolicy>,
+    #[serde(
+        default,
+        alias = "quoteUri",
+        alias = "quoteUrl",
+        alias = "_misskey_quote"
+    )]
+    quote: Option<String>,
+    #[serde(default)]
+    quote_authorization: Option<String>,
+}
+
+struct ResolvedInboundQuote {
+    target: roosty_db::StatusReference,
+    activitypub_id: String,
+    state: roosty_db::QuoteState,
+    authorization_id: Option<String>,
+    local_author_id: Option<AccountId>,
+}
+
+async fn resolve_inbound_quote(
+    state: &AppState,
+    note: &InboundNote,
+    actor: &roosty_db::RemoteActor,
+) -> Result<Option<ResolvedInboundQuote>, RoostyError> {
+    let Some(target_id) = note.quote.as_deref() else {
+        return Ok(None);
+    };
+    if !target_id.starts_with("https://") {
+        return Ok(None);
+    }
+    if let Some(id) = local_status_id_from_url(state, target_id).await?
+        && let Some(target) = roosty_db::find_local_status_by_id(&state.db, id).await?
+    {
+        if target.visibility == StatusVisibility::Direct
+            || roosty_db::local_remote_accounts_are_blocked(&state.db, target.account_id, actor.id)
+                .await?
+        {
+            return Ok(None);
+        }
+        let allowed = match target.quote_approval_policy {
+            roosty_db::QuoteApprovalPolicy::Public => true,
+            roosty_db::QuoteApprovalPolicy::Followers => {
+                roosty_db::remote_actor_follows_local_account(
+                    &state.db,
+                    actor.id,
+                    target.account_id,
+                )
+                .await?
+            }
+            roosty_db::QuoteApprovalPolicy::Nobody => false,
+        };
+        if !allowed {
+            return Ok(None);
+        }
+        return Ok(Some(ResolvedInboundQuote {
+            target: roosty_db::StatusReference::Local(target.id),
+            activitypub_id: target_id.to_owned(),
+            state: roosty_db::QuoteState::Accepted,
+            authorization_id: Some(public_url(
+                state,
+                &format!("quote-authorizations/{}", Uuid::now_v7()),
+            )),
+            local_author_id: Some(target.account_id),
+        }));
+    }
+    let Some(target) =
+        roosty_db::find_remote_status_by_activitypub_id(&state.db, target_id).await?
+    else {
+        return Ok(None);
+    };
+    if target.remote_actor_id != actor.id {
+        let Some(authorization_id) = note.quote_authorization.as_deref() else {
+            return Ok(None);
+        };
+        let target_actor = roosty_db::find_remote_actor_by_id(&state.db, target.remote_actor_id)
+            .await?
+            .ok_or_else(|| {
+                RoostyError::InvalidInput("quoted remote author does not exist".to_owned())
+            })?;
+        if !same_url_origin(authorization_id, &target_actor.activitypub_id) {
+            return Ok(None);
+        }
+        let authorization_url = match reqwest::Url::parse(authorization_id) {
+            Ok(url) => url,
+            Err(_) => return Ok(None),
+        };
+        let authorization: InboundQuoteAuthorization =
+            match discovery::fetch_json(state, authorization_url, None).await {
+                Ok(authorization) => authorization,
+                Err(_) => return Ok(None),
+            };
+        if authorization.id != authorization_id
+            || authorization.r#type != "https://w3id.org/fep/044f#QuoteAuthorization"
+            || authorization.attributed_to != target_actor.activitypub_id
+            || authorization.interacting_object != note.id
+            || authorization.interaction_target != target.activitypub_id
+        {
+            return Ok(None);
+        }
+        return Ok(Some(ResolvedInboundQuote {
+            target: roosty_db::StatusReference::Remote(target.id),
+            activitypub_id: target_id.to_owned(),
+            state: roosty_db::QuoteState::Accepted,
+            authorization_id: Some(authorization.id),
+            local_author_id: None,
+        }));
+    }
+    Ok(Some(ResolvedInboundQuote {
+        target: roosty_db::StatusReference::Remote(target.id),
+        activitypub_id: target_id.to_owned(),
+        state: roosty_db::QuoteState::Accepted,
+        authorization_id: note.quote_authorization.clone(),
+        local_author_id: None,
+    }))
+}
+
+/// FEP-044f interaction policy advertised on a Note.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundInteractionPolicy {
+    #[serde(default)]
+    can_quote: Option<InboundQuotePolicy>,
+}
+
+/// Automatic and manual quote-consent audiences retained as ActivityPub IRIs.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundQuotePolicy {
+    #[serde(default)]
+    automatic_approval: InboundAudienceValues,
+    #[serde(default)]
+    manual_approval: InboundAudienceValues,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(untagged)]
+enum InboundAudienceValues {
+    One(String),
+    Many(Vec<String>),
+    #[default]
+    Missing,
+}
+
+impl InboundAudienceValues {
+    fn values(&self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value.clone()],
+            Self::Many(values) => values.clone(),
+            Self::Missing => Vec::new(),
+        }
+    }
 }
 
 /// Attachment metadata declared by a remote ActivityPub Note.
@@ -442,6 +665,63 @@ pub fn router() -> Router<AppState> {
         .route("/users/{username}/inbox", post(inbox))
         .route("/inbox", post(inbox))
         .route("/users/{username}/statuses/{status_id}", get(note))
+        .route(
+            "/quote-authorizations/{authorization_id}",
+            get(quote_authorization),
+        )
+}
+
+async fn quote_authorization(
+    State(state): State<AppState>,
+    Path(authorization_id): Path<Uuid>,
+) -> Response {
+    if !state.config.federation_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let id = public_url(&state, &format!("quote-authorizations/{authorization_id}"));
+    let quote = match roosty_db::quote_by_authorization_id(&state.db, &id).await {
+        Ok(Some(quote)) if quote.state == roosty_db::QuoteState::Accepted => quote,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    };
+    let Some(roosty_db::StatusReference::Local(target_id)) = quote.quoted_status else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let target = match roosty_db::find_local_status_by_id(&state.db, target_id).await {
+        Ok(Some(status)) => status,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let author = match roosty_db::find_local_account_by_id(&state.db, target.account_id).await {
+        Ok(Some(account)) => account,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let interacting_object = match quote.quoting_status {
+        roosty_db::StatusReference::Local(id) => {
+            let status = match roosty_db::find_local_status_by_id(&state.db, id).await {
+                Ok(Some(status)) => status,
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            let account =
+                match roosty_db::find_local_account_by_id(&state.db, status.account_id).await {
+                    Ok(Some(account)) => account,
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                };
+            status_url(&state, &account.username, status.id)
+        }
+        roosty_db::StatusReference::Remote(id) => {
+            match roosty_db::find_remote_status_by_id(&state.db, id).await {
+                Ok(Some(status)) => status.activitypub_id,
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    };
+    activity_response(QuoteAuthorizationObject {
+        id,
+        r#type: "https://w3id.org/fep/044f#QuoteAuthorization",
+        attributed_to: actor_url(&state, &author.username),
+        interacting_object,
+        interaction_target: quote.quoted_activitypub_id,
+    })
 }
 
 #[derive(Deserialize)]
@@ -552,7 +832,7 @@ enum ActorProfileFieldType {
 #[serde(rename_all = "camelCase")]
 struct Note {
     #[serde(rename = "@context")]
-    context: &'static str,
+    context: NoteContext,
     id: String,
     r#type: NoteType,
     attributed_to: String,
@@ -568,6 +848,34 @@ struct Note {
     to: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cc: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote: Option<String>,
+    #[serde(rename = "quoteUri", skip_serializing_if = "Option::is_none")]
+    quote_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_authorization: Option<String>,
+    interaction_policy: InboundInteractionPolicy,
+}
+
+/// JSON-LD context needed for FEP-044f quote properties.
+#[derive(Serialize)]
+struct NoteContext((String, NoteExtensionsContext));
+
+#[derive(Serialize)]
+struct NoteExtensionsContext {
+    quote: &'static str,
+    #[serde(rename = "quoteUri")]
+    quote_uri: &'static str,
+    #[serde(rename = "quoteAuthorization")]
+    quote_authorization: &'static str,
+    #[serde(rename = "interactionPolicy")]
+    interaction_policy: &'static str,
+    #[serde(rename = "canQuote")]
+    can_quote: &'static str,
+    #[serde(rename = "automaticApproval")]
+    automatic_approval: &'static str,
+    #[serde(rename = "manualApproval")]
+    manual_approval: &'static str,
 }
 
 /// ActivityStreams document attached to a locally authored Note.
@@ -1062,6 +1370,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 | "Undo"
                 | "Move"
                 | "Block"
+                | "https://w3id.org/fep/044f#QuoteRequest"
         )
     );
     if !supported {
@@ -1195,6 +1504,213 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             };
         }
     }
+    if activity_type == Some("https://w3id.org/fep/044f#QuoteRequest") {
+        return Box::pin(async {
+            let request: InboundQuoteRequest = match serde_json::from_value(activity.clone()) {
+                Ok(request) => request,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            if request.actor != remote_actor.activitypub_id || request.id != activity_id {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            let Some(target_id) = (match local_status_id_from_url(state, &request.object).await {
+                Ok(id) => id,
+                Err(error) => return internal_error(error),
+            }) else {
+                return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+            };
+            let target = match roosty_db::find_local_status_by_id(&state.db, target_id).await {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+                }
+                Err(error) => return internal_error(error),
+            };
+            let blocked = match roosty_db::local_remote_accounts_are_blocked(
+                &state.db,
+                target.account_id,
+                remote_actor.id,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => return internal_error(error),
+            };
+            let follows = match roosty_db::remote_actor_follows_local_account(
+                &state.db,
+                remote_actor.id,
+                target.account_id,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => return internal_error(error),
+            };
+            let accepted = !blocked
+                && target.visibility != StatusVisibility::Direct
+                && match target.quote_approval_policy {
+                    roosty_db::QuoteApprovalPolicy::Public => true,
+                    roosty_db::QuoteApprovalPolicy::Followers => follows,
+                    roosty_db::QuoteApprovalPolicy::Nobody => false,
+                };
+            let local =
+                match roosty_db::find_local_account_by_id(&state.db, target.account_id).await {
+                    Ok(Some(account)) => account,
+                    _ => return StatusCode::BAD_REQUEST.into_response(),
+                };
+            let actor = actor_url(state, &local.username);
+            let authorization = accepted.then(|| QuoteAuthorizationObject {
+                id: public_url(state, &format!("quote-authorizations/{}", Uuid::now_v7())),
+                r#type: "https://w3id.org/fep/044f#QuoteAuthorization",
+                attributed_to: actor.clone(),
+                interacting_object: request.instrument.clone(),
+                interaction_target: request.object.clone(),
+            });
+            let response_type = if accepted { "Accept" } else { "Reject" };
+            let authorization_id = authorization
+                .as_ref()
+                .map(|authorization| authorization.id.clone());
+            let response = match serde_json::to_value(QuoteRequestResponseActivity {
+                context: [ACTIVITYSTREAMS_CONTEXT, "https://w3id.org/fep/044f"],
+                id: format!(
+                    "{}#{}-{}",
+                    request.id,
+                    response_type.to_ascii_lowercase(),
+                    Uuid::now_v7()
+                ),
+                r#type: response_type,
+                actor,
+                object: InboundActivityReferenceOutput {
+                    id: request.id.clone(),
+                    r#type: "https://w3id.org/fep/044f#QuoteRequest",
+                },
+                result: authorization,
+            }) {
+                Ok(value) => value,
+                Err(error) => return internal_error(error),
+            };
+            let payload = match serde_json::to_value(StatusDelivery {
+                local_account_id: local.id,
+                remote_actor_id: remote_actor.id,
+                activity: response,
+                personal_inbox: true,
+            }) {
+                Ok(value) => value,
+                Err(error) => return internal_error(error),
+            };
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return internal_error(error),
+            };
+            let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+                Ok(value) => value,
+                Err(error) => return internal_error(error),
+            };
+            if is_new {
+                if let Err(error) = roosty_db::enqueue_job_in_transaction(
+                    &txn,
+                    roosty_db::NewJob {
+                        kind: roosty_db::JobKind::FederationQuoteDelivery,
+                        payload,
+                        deduplication_key: Some(format!("quote-response:{}", request.id)),
+                        run_after: OffsetDateTime::now_utc(),
+                    },
+                )
+                .await
+                {
+                    return internal_error(error);
+                }
+                if let Ok(Some(quoting)) =
+                    roosty_db::find_remote_status_by_activitypub_id(&txn, &request.instrument).await
+                {
+                    if let Err(error) = roosty_db::upsert_remote_status_quote(
+                        &txn,
+                        quoting.id,
+                        roosty_db::StatusReference::Local(target.id),
+                        &request.object,
+                        if accepted {
+                            roosty_db::QuoteState::Accepted
+                        } else {
+                            roosty_db::QuoteState::Rejected
+                        },
+                        authorization_id.as_deref(),
+                    )
+                    .await
+                    {
+                        return internal_error(error);
+                    }
+                    if accepted
+                        && let Err(error) = roosty_db::notify_remote_actor_quote(
+                            &txn,
+                            target.account_id,
+                            remote_actor.id,
+                            quoting.id,
+                        )
+                        .await
+                    {
+                        return internal_error(error);
+                    }
+                }
+            }
+            match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            }
+        })
+        .await;
+    }
+    if activity_type == Some("Delete")
+        && let Ok(delete) = serde_json::from_value::<InboundDeleteActivity>(activity.clone())
+    {
+        let object_id = match delete.object {
+            InboundDeleteObject::Id(id) | InboundDeleteObject::Tombstone { id } => id,
+        };
+        if let Ok(Some(quote)) = roosty_db::quote_by_authorization_id(&state.db, &object_id).await
+            && let Some(roosty_db::StatusReference::Remote(target_id)) = quote.quoted_status
+        {
+            let target_matches = roosty_db::find_remote_status_by_id(&state.db, target_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|target| target.remote_actor_id == remote_actor.id);
+            if !target_matches || delete.actor != remote_actor.activitypub_id {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            let txn = match state.db.begin().await {
+                Ok(txn) => txn,
+                Err(error) => return internal_error(error),
+            };
+            let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+                Ok(value) => value,
+                Err(error) => return internal_error(error),
+            };
+            if is_new {
+                let revoked = match roosty_db::revoke_quote_authorization(&txn, &object_id).await {
+                    Ok(value) => value,
+                    Err(error) => return internal_error(error),
+                };
+                if revoked.is_some()
+                    && let roosty_db::StatusReference::Local(quoting_id) = quote.quoting_status
+                    && let Ok(Some(status)) =
+                        roosty_db::find_local_status_by_id(&txn, quoting_id).await
+                    && let Err(error) = enqueue_status_activity_in_transaction(
+                        state,
+                        &txn,
+                        &status,
+                        StatusActivityKind::Update,
+                        &[],
+                    )
+                    .await
+                {
+                    return internal_error(error);
+                }
+            }
+            return match txn.commit().await {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => internal_error(error),
+            };
+        }
+    }
     if matches!(
         activity.get("type").and_then(JsonValue::as_str),
         Some("Create") | Some("Update") | Some("Delete")
@@ -1220,6 +1736,108 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         activity.get("type").and_then(JsonValue::as_str),
         Some("Accept") | Some("Reject")
     ) {
+        if let Ok(response) = serde_json::from_value::<InboundQuoteResponse>(activity.clone())
+            && let Ok(Some(quote)) =
+                roosty_db::quote_by_request_id(&state.db, response.object.id()).await
+        {
+            return Box::pin(async {
+                if response.actor != remote_actor.activitypub_id {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                let (
+                    roosty_db::StatusReference::Local(quoting_id),
+                    Some(roosty_db::StatusReference::Remote(target_id)),
+                ) = (quote.quoting_status, quote.quoted_status)
+                else {
+                    return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+                };
+                let target = match roosty_db::find_remote_status_by_id(&state.db, target_id).await {
+                    Ok(Some(target)) if target.remote_actor_id == remote_actor.id => target,
+                    _ => {
+                        return finish_ignored_inbox_activity(state, &activity, &remote_actor)
+                            .await;
+                    }
+                };
+                let accepted = activity_type == Some("Accept");
+                let authorization_id = if accepted {
+                    let Some(auth) = response.result else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    let quoting = match roosty_db::find_local_status_by_id(&state.db, quoting_id)
+                        .await
+                    {
+                        Ok(Some(status)) => status,
+                        _ => {
+                            return finish_ignored_inbox_activity(state, &activity, &remote_actor)
+                                .await;
+                        }
+                    };
+                    let local =
+                        match roosty_db::find_local_account_by_id(&state.db, quoting.account_id)
+                            .await
+                        {
+                            Ok(Some(account)) => account,
+                            _ => return StatusCode::BAD_REQUEST.into_response(),
+                        };
+                    if auth.r#type != "https://w3id.org/fep/044f#QuoteAuthorization"
+                        || auth.attributed_to != remote_actor.activitypub_id
+                        || auth.interacting_object != status_url(state, &local.username, quoting.id)
+                        || auth.interaction_target != target.activitypub_id
+                        || !auth.id.starts_with("https://")
+                        || !same_url_origin(&auth.id, &remote_actor.activitypub_id)
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    Some(auth.id)
+                } else {
+                    None
+                };
+                let txn = match state.db.begin().await {
+                    Ok(txn) => txn,
+                    Err(error) => return internal_error(error),
+                };
+                let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+                    Ok(value) => value,
+                    Err(error) => return internal_error(error),
+                };
+                if is_new {
+                    let transitioned = match roosty_db::transition_quote_request(
+                        &txn,
+                        response.object.id(),
+                        if accepted {
+                            roosty_db::QuoteState::Accepted
+                        } else {
+                            roosty_db::QuoteState::Rejected
+                        },
+                        authorization_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => return internal_error(error),
+                    };
+                    if transitioned.is_some()
+                        && let Ok(Some(status)) =
+                            roosty_db::find_local_status_by_id(&txn, quoting_id).await
+                        && let Err(error) = enqueue_status_activity_in_transaction(
+                            state,
+                            &txn,
+                            &status,
+                            StatusActivityKind::Update,
+                            &[],
+                        )
+                        .await
+                    {
+                        return internal_error(error);
+                    }
+                }
+                match txn.commit().await {
+                    Ok(()) => StatusCode::ACCEPTED.into_response(),
+                    Err(error) => internal_error(error),
+                }
+            })
+            .await;
+        }
         let Some(object_id) = activity
             .get("object")
             .and_then(JsonValue::as_object)
@@ -2068,6 +2686,7 @@ async fn process_remote_status_activity(
             notification_recipients.extend(audience.explicit_recipients().iter().copied());
             notification_recipients.sort_by_key(|id| id.0);
             notification_recipients.dedup();
+            let resolved_quote = resolve_inbound_quote(state, &note, remote_actor).await?;
             let txn = state.db.begin().await?;
             if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
                 txn.commit().await?;
@@ -2090,6 +2709,18 @@ async fn process_remote_status_activity(
                     in_reply_to_remote_status_id,
                     object,
                     tag_names,
+                    quote_automatic_policy: note
+                        .interaction_policy
+                        .as_ref()
+                        .and_then(|policy| policy.can_quote.as_ref())
+                        .map(|policy| policy.automatic_approval.values())
+                        .unwrap_or_default(),
+                    quote_manual_policy: note
+                        .interaction_policy
+                        .as_ref()
+                        .and_then(|policy| policy.can_quote.as_ref())
+                        .map(|policy| policy.manual_approval.values())
+                        .unwrap_or_default(),
                 },
                 &attachments,
             )
@@ -2127,6 +2758,30 @@ async fn process_remote_status_activity(
                     .await?
             };
             let mut notifications = Vec::new();
+            if let Some(quote) = resolved_quote {
+                roosty_db::upsert_remote_status_quote(
+                    &txn,
+                    status.id,
+                    quote.target,
+                    &quote.activitypub_id,
+                    quote.state,
+                    quote.authorization_id.as_deref(),
+                )
+                .await?;
+                if !edited
+                    && quote.state == roosty_db::QuoteState::Accepted
+                    && let Some(account_id) = quote.local_author_id
+                    && let Some(notification) = roosty_db::notify_remote_actor_quote(
+                        &txn,
+                        account_id,
+                        remote_actor.id,
+                        status.id,
+                    )
+                    .await?
+                {
+                    notifications.push(notification);
+                }
+            }
             roosty_db::replace_remote_status_local_mentions(
                 &txn,
                 status.id,
@@ -2791,6 +3446,129 @@ struct StatusDelivery {
     activity: JsonValue,
     #[serde(default)]
     personal_inbox: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteRequestActivity {
+    #[serde(rename = "@context")]
+    context: [&'static str; 2],
+    id: String,
+    r#type: &'static str,
+    actor: String,
+    object: String,
+    instrument: String,
+}
+
+/// Atomically enqueue a QuoteRequest for a pending local quote of a remote status.
+pub(crate) async fn enqueue_quote_request_in_transaction(
+    state: &AppState,
+    txn: &sea_orm::DatabaseTransaction,
+    status: &roosty_db::LocalStatus,
+    quote: &roosty_db::StatusQuote,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled || quote.state != roosty_db::QuoteState::Pending {
+        return Ok(());
+    }
+    let Some(roosty_db::StatusReference::Remote(target_id)) = quote.quoted_status else {
+        return Ok(());
+    };
+    let target = roosty_db::find_remote_status_by_id(txn, target_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("quoted remote status does not exist".to_owned())
+        })?;
+    let local = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local quote author does not exist".to_owned()))?;
+    let request_id = quote
+        .quote_request_id
+        .clone()
+        .ok_or_else(|| RoostyError::InvalidInput("pending quote has no request ID".to_owned()))?;
+    let activity = serde_json::to_value(QuoteRequestActivity {
+        context: [ACTIVITYSTREAMS_CONTEXT, "https://w3id.org/fep/044f"],
+        id: request_id.clone(),
+        r#type: "https://w3id.org/fep/044f#QuoteRequest",
+        actor: actor_url(state, &local.username),
+        object: target.activitypub_id,
+        instrument: status_url(state, &local.username, status.id),
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let payload = serde_json::to_value(StatusDelivery {
+        local_account_id: local.id,
+        remote_actor_id: target.remote_actor_id,
+        activity,
+        personal_inbox: true,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::enqueue_job_in_transaction(
+        txn,
+        roosty_db::NewJob {
+            kind: roosty_db::JobKind::FederationQuoteDelivery,
+            payload,
+            deduplication_key: Some(request_id),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Enqueue deletion of a locally-issued QuoteAuthorization in the revocation transaction.
+pub(crate) async fn enqueue_quote_revocation_in_transaction(
+    state: &AppState,
+    txn: &sea_orm::DatabaseTransaction,
+    quoted_status: &roosty_db::LocalStatus,
+    quote: &roosty_db::StatusQuote,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+    let roosty_db::StatusReference::Remote(quoting_id) = quote.quoting_status else {
+        return Ok(());
+    };
+    let Some(authorization_id) = quote.authorization_id.as_ref() else {
+        return Ok(());
+    };
+    let quoting = roosty_db::find_remote_status_by_id(txn, quoting_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote quoting status does not exist".to_owned())
+        })?;
+    let local = roosty_db::find_local_account_by_id(&state.db, quoted_status.account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("quoted status author does not exist".to_owned())
+        })?;
+    let actor = actor_url(state, &local.username);
+    let activity = serde_json::to_value(Delete {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: format!("{authorization_id}#delete-{}", Uuid::now_v7()),
+        r#type: DeleteType::Delete,
+        actor,
+        to: vec![quoting.activitypub_id.clone()],
+        cc: Vec::new(),
+        object: authorization_id.clone(),
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let payload = serde_json::to_value(StatusDelivery {
+        local_account_id: local.id,
+        remote_actor_id: quoting.remote_actor_id,
+        activity,
+        personal_inbox: true,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    roosty_db::enqueue_job_in_transaction(
+        txn,
+        roosty_db::NewJob {
+            kind: roosty_db::JobKind::FederationQuoteDelivery,
+            payload,
+            deduplication_key: Some(format!("quote-revoke:{authorization_id}")),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Durable payload for one local actor Update delivery to an accepted remote follower.
@@ -3676,6 +4454,22 @@ pub(crate) async fn deliver_status_activity(
     .await
 }
 
+pub(crate) async fn deliver_quote_activity(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: StatusDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid quote delivery payload".to_owned()))?;
+    deliver_activity(
+        state,
+        payload.local_account_id,
+        payload.remote_actor_id,
+        &payload.activity,
+        true,
+    )
+    .await
+}
+
 /// Dispatch one durable local actor Update delivery job.
 pub(crate) async fn deliver_actor_update(
     state: &AppState,
@@ -3998,15 +4792,49 @@ async fn note_object(
         })
         .collect();
     let tags = crate::statuses::local_status_content_tag_links(state, &status.content);
-    let content = crate::statuses::status_content_html_with_mentions_and_tags(
+    let mut content = crate::statuses::status_content_html_with_mentions_and_tags(
         state,
         &status.content,
         &local_mentions,
         &remote_mentions,
         &tags,
     );
+    let quote =
+        roosty_db::quote_for_status(&state.db, roosty_db::StatusReference::Local(status.id))
+            .await?;
+    if let Some(quote) = &quote
+        && !content.contains(&quote.quoted_activitypub_id)
+    {
+        content = format!(
+            r#"<p class="quote-inline">RE: <a href="{}">{}</a></p>{content}"#,
+            quote.quoted_activitypub_id, quote.quoted_activitypub_id,
+        );
+    }
+    let automatic_approval = match status.quote_approval_policy {
+        roosty_db::QuoteApprovalPolicy::Public => {
+            InboundAudienceValues::One(PUBLIC_AUDIENCE.to_owned())
+        }
+        roosty_db::QuoteApprovalPolicy::Followers => {
+            InboundAudienceValues::One(format!("{}/followers", actor_url(state, username)))
+        }
+        roosty_db::QuoteApprovalPolicy::Nobody => InboundAudienceValues::Many(Vec::new()),
+    };
+    let quote_id = quote
+        .as_ref()
+        .map(|quote| quote.quoted_activitypub_id.clone());
     Ok(Note {
-        context: ACTIVITYSTREAMS_CONTEXT,
+        context: NoteContext((
+            ACTIVITYSTREAMS_CONTEXT.to_owned(),
+            NoteExtensionsContext {
+                quote: "https://w3id.org/fep/044f#quote",
+                quote_uri: "http://fedibird.com/ns#quoteUri",
+                quote_authorization: "https://w3id.org/fep/044f#quoteAuthorization",
+                interaction_policy: "https://w3id.org/fep/044f#interactionPolicy",
+                can_quote: "https://w3id.org/fep/044f#canQuote",
+                automatic_approval: "https://w3id.org/fep/044f#automaticApproval",
+                manual_approval: "https://w3id.org/fep/044f#manualApproval",
+            },
+        )),
         id,
         r#type: NoteType::Note,
         attributed_to: actor_url(state, username),
@@ -4018,6 +4846,15 @@ async fn note_object(
         attachment,
         to,
         cc,
+        quote: quote_id.clone(),
+        quote_uri: quote_id,
+        quote_authorization: quote.and_then(|quote| quote.authorization_id),
+        interaction_policy: InboundInteractionPolicy {
+            can_quote: Some(InboundQuotePolicy {
+                automatic_approval,
+                manual_approval: InboundAudienceValues::Many(Vec::new()),
+            }),
+        },
     })
 }
 
@@ -4156,11 +4993,11 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundTag, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
-        InboundUndoFollowActivity, MentionTag, MentionType, Note, NoteType, OrderedCollection,
-        PublicKey, actor_context, actor_profile_fields, canonical_activity_digest,
-        is_remote_actor_lifecycle_activity, local_actor_type, parse_acct, remote_hashtag_names,
-        same_url_origin,
+        InboundFollowActivity, InboundInteractionPolicy, InboundTag, InboundUndoAnnounceActivity,
+        InboundUndoBlockActivity, InboundUndoFollowActivity, MentionTag, MentionType, Note,
+        NoteContext, NoteExtensionsContext, NoteType, OrderedCollection, PublicKey, actor_context,
+        actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
+        local_actor_type, parse_acct, remote_hashtag_names, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -4967,7 +5804,18 @@ mod tests {
             },
         };
         let note = Note {
-            context: "https://www.w3.org/ns/activitystreams",
+            context: NoteContext((
+                "https://www.w3.org/ns/activitystreams".to_owned(),
+                NoteExtensionsContext {
+                    quote: "https://w3id.org/fep/044f#quote",
+                    quote_uri: "http://fedibird.com/ns#quoteUri",
+                    quote_authorization: "https://w3id.org/fep/044f#quoteAuthorization",
+                    interaction_policy: "https://w3id.org/fep/044f#interactionPolicy",
+                    can_quote: "https://w3id.org/fep/044f#canQuote",
+                    automatic_approval: "https://w3id.org/fep/044f#automaticApproval",
+                    manual_approval: "https://w3id.org/fep/044f#manualApproval",
+                },
+            )),
             id: "https://example.test/users/alice/statuses/1".to_owned(),
             r#type: NoteType::Note,
             attributed_to: "https://example.test/users/alice".to_owned(),
@@ -4983,6 +5831,10 @@ mod tests {
             attachment: Vec::new(),
             to: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
             cc: Vec::new(),
+            quote: None,
+            quote_uri: None,
+            quote_authorization: None,
+            interaction_policy: InboundInteractionPolicy::default(),
         };
         let collection = OrderedCollection {
             context: "https://www.w3.org/ns/activitystreams",
@@ -5240,6 +6092,7 @@ mod tests {
                 language: None,
                 in_reply_to_id: None,
                 in_reply_to_remote_status_id: None,
+                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
             },
         )
         .await
@@ -5265,6 +6118,8 @@ mod tests {
                 in_reply_to_remote_status_id: None,
                 object: serde_json::json!({}),
                 tag_names: Vec::new(),
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
             },
         )
         .await
@@ -5286,6 +6141,11 @@ mod tests {
             }
             roosty_db::JobKind::FederationStatusDelivery => {
                 super::deliver_status_activity(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationQuoteDelivery => {
+                super::deliver_quote_activity(state, job.payload.clone())
                     .await
                     .unwrap();
             }

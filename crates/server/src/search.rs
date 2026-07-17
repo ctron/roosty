@@ -339,6 +339,8 @@ mod tests {
                         "tag": [{"type": "Hashtag", "name": "#remote"}]
                     }),
                     tag_names: vec!["remote".to_owned()],
+                    quote_automatic_policy: Vec::new(),
+                    quote_manual_policy: Vec::new(),
                 },
             )
             .await
@@ -405,6 +407,7 @@ mod tests {
                 language: None,
                 in_reply_to_id: None,
                 in_reply_to_remote_status_id: None,
+                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
             },
         )
         .await

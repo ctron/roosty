@@ -10,6 +10,7 @@
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
 - Mastodon-compatible safe linkification of explicit web URLs across local API, history, streaming, and outbound ActivityPub projections.
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
+- Mastodon-compatible consent-aware quote posts with transactional policy, authorization, listing, revocation, notifications, and FEP-044f delivery.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
@@ -75,7 +76,7 @@
 
 ## Short Term
 
-- [ ] Add Mastodon-compatible quote posts, including quote approval, API projections, and ActivityPub federation.
+- [x] Add Mastodon-compatible quote posts, including quote approval, API projections, notifications, revocation, and FEP-044f federation.
 - [x] Harden inbound remote follow handling with signed HTTP `Date` freshness checks and activity-ID idempotency.
 - [x] Add canonical-payload replay protection for reused IDs and reject ID-less, non-HTTPS, or cross-origin durable activities.
 - [x] Add cursor pagination and `Link` headers to remote follow-request listing.

@@ -26,9 +26,10 @@ use crate::{
     auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
     conversations::{publish_conversation_update, publish_conversation_updates},
     federation::{
-        StatusActivityKind, enqueue_status_activity_in_transaction, prepare_remote_favourite,
-        prepare_remote_reblog, prepare_remote_unfavourite, prepare_remote_unreblog,
-        resolve_remote_mentions,
+        StatusActivityKind, enqueue_quote_request_in_transaction,
+        enqueue_quote_revocation_in_transaction, enqueue_status_activity_in_transaction,
+        prepare_remote_favourite, prepare_remote_reblog, prepare_remote_unfavourite,
+        prepare_remote_unreblog, resolve_remote_mentions,
     },
     http::AppState,
     media::{
@@ -57,6 +58,15 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/statuses/{status_id}/source", get(status_source))
         .route("/api/v1/statuses/{status_id}/history", get(status_history))
+        .route(
+            "/api/v1/statuses/{status_id}/interaction_policy",
+            axum::routing::put(update_interaction_policy),
+        )
+        .route("/api/v1/statuses/{status_id}/quotes", get(status_quotes))
+        .route(
+            "/api/v1/statuses/{status_id}/quotes/{quoting_status_id}/revoke",
+            post(revoke_quote),
+        )
         .route("/api/v1/statuses/{status_id}/context", get(status_context))
         .route(
             "/api/v1/statuses/{status_id}/favourite",
@@ -116,6 +126,12 @@ enum StatusInputError {
 #[derive(Deserialize)]
 struct StatusPath {
     status_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct QuotePath {
+    status_id: Uuid,
+    quoting_status_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +210,10 @@ struct StatusInput {
     media_ids: Option<Vec<String>>,
     #[serde(default, alias = "mediaAttributes")]
     media_attributes: Vec<MediaAttributeInput>,
+    #[serde(alias = "quotedStatusId")]
+    quoted_status_id: Option<String>,
+    #[serde(alias = "quoteApprovalPolicy")]
+    quote_approval_policy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -225,13 +245,29 @@ pub(crate) struct StatusResponse {
     reblogs_count: u64,
     favourites_count: u64,
     replies_count: u64,
+    quotes_count: u64,
     favourited: bool,
     reblogged: bool,
     muted: bool,
     bookmarked: bool,
     pinned: bool,
     reblog: Option<Box<StatusResponse>>,
+    quote: Option<QuoteResponse>,
+    quote_approval: QuoteApprovalResponse,
     application: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct QuoteResponse {
+    state: String,
+    quoted_status: Option<Box<StatusResponse>>,
+}
+
+#[derive(Serialize)]
+struct QuoteApprovalResponse {
+    automatic: Vec<String>,
+    manual: Vec<String>,
+    current_user: String,
 }
 
 /// Plain-text source fields used to populate Mastodon-compatible status editors.
@@ -252,6 +288,7 @@ struct StatusEditResponse {
     account: StatusAccountResponse,
     media_attachments: Vec<MediaAttachmentResponse>,
     emojis: Vec<Value>,
+    quote: Option<QuoteResponse>,
 }
 
 /// Mastodon account projection for either a local or cached remote status author.
@@ -368,6 +405,181 @@ struct ReplyTarget {
     account: roosty_db::LocalAccount,
 }
 
+struct ResolvedQuoteTarget {
+    target: roosty_db::StatusReference,
+    activitypub_id: String,
+    state: roosty_db::QuoteState,
+    local_author_id: Option<AccountId>,
+    authorization_id: Option<String>,
+    quote_request_id: Option<String>,
+}
+
+async fn resolve_quote_target(
+    state: &AppState,
+    quoting_account: &roosty_db::LocalAccount,
+    raw_id: &str,
+    requested_visibility: StatusVisibility,
+    content: &str,
+) -> Result<(ResolvedQuoteTarget, StatusVisibility), RoostyError> {
+    let target_id = Uuid::parse_str(raw_id)
+        .map(StatusId)
+        .map_err(|_| RoostyError::InvalidInput("quoted status does not exist".to_owned()))?;
+    if let Some(target) = roosty_db::find_local_status_by_id(&state.db, target_id).await? {
+        if !status_visible_to_viewer(state, &target, Some(quoting_account.id)).await?
+            || target.visibility == StatusVisibility::Direct
+            || roosty_db::local_accounts_are_blocked(
+                &state.db,
+                quoting_account.id,
+                target.account_id,
+            )
+            .await?
+        {
+            return Err(RoostyError::InvalidInput(
+                "quoted status does not exist or quoting is denied".to_owned(),
+            ));
+        }
+        let author = roosty_db::find_local_account_by_id(&state.db, target.account_id)
+            .await?
+            .ok_or_else(|| {
+                RoostyError::InvalidInput("quoted status author does not exist".to_owned())
+            })?;
+        let allowed = if target.account_id == quoting_account.id {
+            true
+        } else {
+            match target.quote_approval_policy {
+                roosty_db::QuoteApprovalPolicy::Public => true,
+                roosty_db::QuoteApprovalPolicy::Followers => roosty_db::local_follow_relationship(
+                    &state.db,
+                    quoting_account.id,
+                    target.account_id,
+                )
+                .await?
+                .is_some(),
+                roosty_db::QuoteApprovalPolicy::Nobody => false,
+            }
+        };
+        if !allowed {
+            return Err(RoostyError::InvalidInput(
+                "quoted status does not allow this quote".to_owned(),
+            ));
+        }
+        if requested_visibility == StatusVisibility::Direct
+            && !content.split_whitespace().any(|word| {
+                word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '_')
+                    == format!("@{}", author.username)
+            })
+        {
+            return Err(RoostyError::InvalidInput(
+                "direct quote posts must mention the quoted author".to_owned(),
+            ));
+        }
+        let effective_visibility = if target.visibility == StatusVisibility::Private
+            && matches!(
+                requested_visibility,
+                StatusVisibility::Public | StatusVisibility::Unlisted
+            ) {
+            StatusVisibility::Private
+        } else {
+            requested_visibility
+        };
+        let activitypub_id = public_url(
+            state,
+            &format!("users/{}/statuses/{}", author.username, target.id.0),
+        );
+        let authorization_id = (target.account_id != quoting_account.id)
+            .then(|| public_url(state, &format!("quote-authorizations/{}", Uuid::now_v7())));
+        return Ok((
+            ResolvedQuoteTarget {
+                target: roosty_db::StatusReference::Local(target.id),
+                activitypub_id,
+                state: roosty_db::QuoteState::Accepted,
+                local_author_id: Some(target.account_id),
+                authorization_id,
+                quote_request_id: None,
+            },
+            effective_visibility,
+        ));
+    }
+    let Some(target) = roosty_db::find_remote_status_by_id(&state.db, target_id).await? else {
+        return Err(RoostyError::InvalidInput(
+            "quoted status does not exist".to_owned(),
+        ));
+    };
+    if !roosty_db::remote_status_visible_to_account(&state.db, &target, quoting_account.id).await?
+        || target.visibility == StatusVisibility::Direct
+        || roosty_db::local_remote_accounts_are_blocked(
+            &state.db,
+            quoting_account.id,
+            target.remote_actor_id,
+        )
+        .await?
+    {
+        return Err(RoostyError::InvalidInput(
+            "quoted status does not exist or quoting is denied".to_owned(),
+        ));
+    }
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, target.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("quoted status author does not exist".to_owned())
+        })?;
+    if requested_visibility == StatusVisibility::Direct {
+        let mention = format!("@{}@{}", actor.username, actor.domain);
+        if !content.contains(&mention) {
+            return Err(RoostyError::InvalidInput(
+                "direct quote posts must mention the quoted author".to_owned(),
+            ));
+        }
+    }
+    const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
+    let follows =
+        roosty_db::find_remote_following(&state.db, quoting_account.id, target.remote_actor_id)
+            .await?
+            .is_some_and(|follow| follow.state == "accepted");
+    let audience_matches = |values: &[String]| {
+        values.iter().any(|value| {
+            value == PUBLIC
+                || actor
+                    .followers_url
+                    .as_ref()
+                    .is_some_and(|followers| follows && value == followers)
+        })
+    };
+    let quote_state = if audience_matches(&target.quote_automatic_policy)
+        || audience_matches(&target.quote_manual_policy)
+        || !target.quote_manual_policy.is_empty()
+    {
+        roosty_db::QuoteState::Pending
+    } else {
+        return Err(RoostyError::InvalidInput(
+            "quoted status does not allow this quote".to_owned(),
+        ));
+    };
+    let effective_visibility = if target.visibility == StatusVisibility::Private
+        && matches!(
+            requested_visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted
+        ) {
+        StatusVisibility::Private
+    } else {
+        requested_visibility
+    };
+    Ok((
+        ResolvedQuoteTarget {
+            target: roosty_db::StatusReference::Remote(target.id),
+            activitypub_id: target.activitypub_id,
+            state: quote_state,
+            local_author_id: None,
+            authorization_id: None,
+            quote_request_id: Some(public_url(
+                state,
+                &format!("activities/quote-request/{}", Uuid::now_v7()),
+            )),
+        },
+        effective_visibility,
+    ))
+}
+
 async fn create_status(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
@@ -381,6 +593,9 @@ async fn create_status(
         Ok(media_ids) => media_ids,
         Err(error) => return bad_request(&error.to_string()),
     };
+    if input.quoted_status_id.is_some() && !media_ids.is_empty() {
+        return bad_request("quote posts cannot include media attachments");
+    }
     if let Err(error) = validate_status_text(
         input.status.as_deref().unwrap_or_default(),
         !media_ids.is_empty(),
@@ -391,9 +606,44 @@ async fn create_status(
     let visibility = input
         .visibility
         .unwrap_or_else(|| account.default_visibility.to_string());
-    let visibility = match StatusVisibility::parse(&visibility) {
+    let mut visibility = match StatusVisibility::parse(&visibility) {
         Ok(visibility) => visibility,
         Err(error) => return bad_request(&error.to_string()),
+    };
+    let quote_target = match input.quoted_status_id.as_deref() {
+        Some(id) => match resolve_quote_target(
+            &state,
+            &account,
+            id,
+            visibility,
+            input.status.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            Ok((target, effective_visibility)) => {
+                visibility = effective_visibility;
+                Some(target)
+            }
+            Err(RoostyError::InvalidInput(error)) => return bad_request(&error),
+            Err(error) => return server_error(error),
+        },
+        None => None,
+    };
+    let quote_approval_policy = if matches!(
+        visibility,
+        StatusVisibility::Private | StatusVisibility::Direct
+    ) {
+        roosty_db::QuoteApprovalPolicy::Nobody
+    } else {
+        match roosty_db::QuoteApprovalPolicy::parse(
+            input
+                .quote_approval_policy
+                .as_deref()
+                .unwrap_or(&account.default_quote_policy),
+        ) {
+            Ok(policy) => policy,
+            Err(error) => return bad_request(&error.to_string()),
+        }
     };
     let mut in_reply_to_id = match parse_optional_status_id(input.in_reply_to_id.as_deref()) {
         Ok(status_id) => status_id,
@@ -448,6 +698,7 @@ async fn create_status(
         language: input.language.or(account.default_language.clone()),
         in_reply_to_id,
         in_reply_to_remote_status_id,
+        quote_approval_policy,
     };
 
     let author_id = account.id;
@@ -583,6 +834,44 @@ async fn create_status(
             .await
             {
                 return server_error(error);
+            }
+            if let Some(target) = &quote_target {
+                let quote = match roosty_db::create_local_status_quote(
+                    &txn,
+                    status.id,
+                    target.target,
+                    &target.activitypub_id,
+                    target.state,
+                    target.quote_request_id.as_deref(),
+                    target.authorization_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(quote) => quote,
+                    Err(error) => return server_error(error),
+                };
+                if let Err(error) =
+                    enqueue_quote_request_in_transaction(&state, &txn, &status, &quote).await
+                {
+                    return server_error(error);
+                }
+                if target.state == roosty_db::QuoteState::Accepted
+                    && let Some(recipient) = target.local_author_id
+                    && recipient != author_id
+                {
+                    match roosty_db::notify_local_account(
+                        &txn,
+                        recipient,
+                        LocalNotificationType::Quote,
+                        author_id,
+                        Some(status.id),
+                    )
+                    .await
+                    {
+                        Ok(notification) => notifications.push(notification),
+                        Err(error) => return server_error(error),
+                    }
+                }
             }
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
@@ -767,6 +1056,7 @@ async fn local_status_history_response(
             account: current.account,
             media_attachments: current.media_attachments,
             emojis: current.emojis,
+            quote: current.quote,
         }]);
     }
     let author = roosty_db::find_local_account_by_id(&state.db, status.account_id)
@@ -819,6 +1109,12 @@ async fn local_status_history_response(
                 .map(|media| status_edit_media_response(state, media))
                 .collect(),
             emojis: Vec::new(),
+            quote: status_quote_response(
+                state,
+                roosty_db::StatusReference::Local(status.id),
+                viewer,
+            )
+            .await?,
         });
     }
     Ok(responses)
@@ -844,6 +1140,7 @@ async fn remote_status_history_response(
             account: current.account,
             media_attachments: current.media_attachments,
             emojis: current.emojis,
+            quote: current.quote,
         }]);
     }
     let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
@@ -867,6 +1164,12 @@ async fn remote_status_history_response(
                 .map(|media| status_edit_media_response(state, media))
                 .collect(),
             emojis: remote_custom_emojis(&edit.object),
+            quote: status_quote_response(
+                state,
+                roosty_db::StatusReference::Remote(status.id),
+                viewer,
+            )
+            .await?,
         });
     }
     Ok(responses)
@@ -912,6 +1215,16 @@ async fn update_status(
     let input = match parse_status_input(request).await {
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
+    };
+    if input.quoted_status_id.is_some() {
+        return bad_request("a quote target cannot be added or changed after publication");
+    }
+    let quote_policy_update = match input.quote_approval_policy.as_deref() {
+        Some(value) => match roosty_db::QuoteApprovalPolicy::parse(value) {
+            Ok(policy) => Some(policy),
+            Err(error) => return bad_request(&error.to_string()),
+        },
+        None => None,
     };
     let media_ids = match input.media_ids.as_deref() {
         Some(values) => match parse_media_ids(values) {
@@ -1002,7 +1315,18 @@ async fn update_status(
     )
     .await
     {
-        Ok(Some(roosty_db::LocalStatusUpdateResult::Updated(status))) => {
+        Ok(Some(roosty_db::LocalStatusUpdateResult::Updated(mut status))) => {
+            if let Some(policy) = quote_policy_update {
+                status = match roosty_db::update_local_status_quote_policy(
+                    &txn, status.id, account.id, policy,
+                )
+                .await
+                {
+                    Ok(Some(status)) => status,
+                    Ok(None) => return not_found(),
+                    Err(error) => return server_error(error),
+                };
+            }
             let mut notifications = Vec::new();
             for account_id in &local_mentions {
                 match roosty_db::notify_local_status_mention(
@@ -1022,6 +1346,10 @@ async fn update_status(
                 .await
             {
                 Ok(update_notifications) => notifications.extend(update_notifications),
+                Err(error) => return server_error(error),
+            }
+            match roosty_db::notify_local_quoted_status_update(&txn, &status).await {
+                Ok(quoted_updates) => notifications.extend(quoted_updates),
                 Err(error) => return server_error(error),
             }
             if status.visibility == StatusVisibility::Direct
@@ -1121,7 +1449,32 @@ async fn update_status(
                 Err(error) => server_error(error),
             }
         }
-        Ok(Some(roosty_db::LocalStatusUpdateResult::Unchanged(status))) => {
+        Ok(Some(roosty_db::LocalStatusUpdateResult::Unchanged(mut status))) => {
+            let policy_changed =
+                quote_policy_update.is_some_and(|policy| policy != status.quote_approval_policy);
+            if let Some(policy) = quote_policy_update {
+                status = match roosty_db::update_local_status_quote_policy(
+                    &txn, status.id, account.id, policy,
+                )
+                .await
+                {
+                    Ok(Some(status)) => status,
+                    Ok(None) => return not_found(),
+                    Err(error) => return server_error(error),
+                };
+            }
+            if policy_changed
+                && let Err(error) = enqueue_status_activity_in_transaction(
+                    &state,
+                    &txn,
+                    &status,
+                    StatusActivityKind::Update,
+                    &previous_remote_recipients,
+                )
+                .await
+            {
+                return server_error(error);
+            }
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
@@ -1149,6 +1502,14 @@ async fn delete_status(
     match roosty_db::delete_owned_local_status(&txn, status_id, account.id).await {
         Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
             Ok(response) => {
+                if let Err(error) = roosty_db::mark_quotes_target_deleted(
+                    &txn,
+                    roosty_db::StatusReference::Local(status.id),
+                )
+                .await
+                {
+                    return server_error(error);
+                }
                 let refresh = match roosty_db::repair_direct_conversation_after_delete(
                     &txn,
                     status.conversation_id,
@@ -1209,6 +1570,231 @@ async fn delete_status(
         Ok(None) => not_found(),
         Err(RoostyError::InvalidInput(error)) => forbidden(&error),
         Err(error) => server_error(error),
+    }
+}
+
+async fn update_interaction_policy(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+    request: axum::extract::Request,
+) -> Response {
+    let input = match parse_status_input(request).await {
+        Ok(input) => input,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let Some(raw_policy) = input.quote_approval_policy.as_deref() else {
+        return bad_request("quote_approval_policy is required");
+    };
+    let policy = match roosty_db::QuoteApprovalPolicy::parse(raw_policy) {
+        Ok(policy) => policy,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let status_id = StatusId(path.status_id);
+    let existing = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) if status.account_id == account.id => status,
+        Ok(_) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let updated = match roosty_db::update_local_status_quote_policy(
+        &txn, status_id, account.id, policy,
+    )
+    .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+    if updated.quote_approval_policy != existing.quote_approval_policy
+        && let Err(error) = enqueue_status_activity_in_transaction(
+            &state,
+            &txn,
+            &updated,
+            StatusActivityKind::Update,
+            &[],
+        )
+        .await
+    {
+        return server_error(error);
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match status_response(&state, updated, account).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn status_quotes(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+    Query(params): Query<CollectionParams>,
+) -> Response {
+    let status_id = StatusId(path.status_id);
+    let target = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, Some(account.id)).await
+        {
+            Ok(true) => roosty_db::StatusReference::Local(status.id),
+            Ok(false) => return not_found(),
+            Err(error) => return server_error(error),
+        },
+        Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, status_id).await {
+            Ok(Some(status)) => {
+                match roosty_db::remote_status_visible_to_account(&state.db, &status, account.id)
+                    .await
+                {
+                    Ok(true) => roosty_db::StatusReference::Remote(status.id),
+                    Ok(false) => return not_found(),
+                    Err(error) => return server_error(error),
+                }
+            }
+            Ok(None) => return not_found(),
+            Err(error) => return server_error(error),
+        },
+        Err(error) => return server_error(error),
+    };
+    let limit = timeline_limit(params.limit);
+    let max_id = match parse_optional_uuid(params.max_id.as_deref()) {
+        Ok(value) => value,
+        Err(()) => return bad_request("collection cursor is invalid"),
+    };
+    let since_id = match parse_optional_uuid(params.since_id.as_deref()) {
+        Ok(value) => value,
+        Err(()) => return bad_request("collection cursor is invalid"),
+    };
+    let mut quotes =
+        match roosty_db::accepted_quotes_for_status(&state.db, target, max_id, since_id, limit + 1)
+            .await
+        {
+            Ok(quotes) => quotes,
+            Err(error) => return server_error(error),
+        };
+    let has_more = quotes.len() > limit as usize;
+    quotes.truncate(limit as usize);
+    let first_cursor = quotes.first().map(|quote| quote.id);
+    let last_cursor = quotes.last().map(|quote| quote.id);
+    let mut responses = Vec::with_capacity(quotes.len());
+    for quote in quotes {
+        let response = match quote.quoting_status {
+            roosty_db::StatusReference::Local(id) => {
+                match roosty_db::find_local_status_by_id(&state.db, id).await {
+                    Ok(Some(status)) => {
+                        match status_with_author(&state, status, Some(account.id)).await {
+                            Ok(response) => Some(response),
+                            Err(error) => return server_error(error),
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => return server_error(error),
+                }
+            }
+            roosty_db::StatusReference::Remote(id) => {
+                match roosty_db::find_remote_status_by_id(&state.db, id).await {
+                    Ok(Some(status)) => {
+                        match remote_status_response_for_viewer(&state, status, Some(account.id))
+                            .await
+                        {
+                            Ok(response) => Some(response),
+                            Err(error) => return server_error(error),
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => return server_error(error),
+                }
+            }
+        };
+        if let Some(response) = response {
+            responses.push(response);
+        }
+    }
+    let mut response = Json(responses).into_response();
+    if let Some(value) = CollectionLink::new(
+        limit,
+        first_cursor,
+        last_cursor,
+        has_more,
+        &format!("/api/v1/statuses/{}/quotes", path.status_id),
+    )
+    .header_value()
+    {
+        response.headers_mut().insert(header::LINK, value);
+    }
+    response
+}
+
+async fn revoke_quote(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<QuotePath>,
+) -> Response {
+    let quoted_id = StatusId(path.status_id);
+    let quoted = match roosty_db::find_local_status_by_id(&state.db, quoted_id).await {
+        Ok(Some(status)) if status.account_id == account.id => status,
+        Ok(Some(_)) => return forbidden("This action is not allowed"),
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+    let quoting_id = StatusId(path.quoting_status_id);
+    let quoting =
+        if let Ok(Some(status)) = roosty_db::find_local_status_by_id(&state.db, quoting_id).await {
+            (
+                roosty_db::StatusReference::Local(status.id),
+                Some(StatusContextItem::Local(status)),
+            )
+        } else if let Ok(Some(status)) =
+            roosty_db::find_remote_status_by_id(&state.db, quoting_id).await
+        {
+            (
+                roosty_db::StatusReference::Remote(status.id),
+                Some(StatusContextItem::Remote(status)),
+            )
+        } else {
+            return not_found();
+        };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::revoke_status_quote(
+        &txn,
+        roosty_db::StatusReference::Local(quoted.id),
+        quoting.0,
+    )
+    .await
+    {
+        Ok(Some(quote)) => {
+            if let Err(error) =
+                enqueue_quote_revocation_in_transaction(&state, &txn, &quoted, &quote).await
+            {
+                return server_error(error);
+            }
+        }
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match quoting.1 {
+        Some(StatusContextItem::Local(status)) => {
+            match status_with_author(&state, status, Some(account.id)).await {
+                Ok(response) => Json(response).into_response(),
+                Err(error) => server_error(error),
+            }
+        }
+        Some(StatusContextItem::Remote(status)) => {
+            match remote_status_response_for_viewer(&state, status, Some(account.id)).await {
+                Ok(response) => Json(response).into_response(),
+                Err(error) => server_error(error),
+            }
+        }
+        None => not_found(),
     }
 }
 
@@ -2726,12 +3312,19 @@ pub(crate) async fn remote_reblog_response(
         reblogs_count: 0,
         favourites_count: 0,
         replies_count: 0,
+        quotes_count: 0,
         favourited: false,
         reblogged: false,
         muted: false,
         bookmarked: false,
         pinned: false,
         reblog: Some(original),
+        quote: None,
+        quote_approval: QuoteApprovalResponse {
+            automatic: Vec::new(),
+            manual: Vec::new(),
+            current_user: "denied".to_owned(),
+        },
         application: None,
     }))
 }
@@ -2789,6 +3382,17 @@ async fn remote_status_response_for_viewer(
     status: roosty_db::RemoteStatus,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
+    let status_ref = roosty_db::StatusReference::Remote(status.id);
+    let mut response = remote_status_response_base(state, status, viewer).await?;
+    response.quote = status_quote_response(state, status_ref, viewer).await?;
+    Ok(response)
+}
+
+async fn remote_status_response_base(
+    state: &AppState,
+    status: roosty_db::RemoteStatus,
+    viewer: Option<AccountId>,
+) -> Result<StatusResponse, RoostyError> {
     let replies_count =
         roosty_db::count_status_context_replies(&state.db, StatusContextParent::Remote(status.id))
             .await?;
@@ -2819,6 +3423,10 @@ async fn remote_status_response_for_viewer(
             (None, None)
         };
     let tags = remote_status_tags(state, status.id).await?;
+    let quotes_count =
+        roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Remote(status.id))
+            .await?;
+    let quote_approval = remote_quote_approval(state, &status, viewer).await?;
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.published_at),
@@ -2856,6 +3464,7 @@ async fn remote_status_response_for_viewer(
         reblogs_count: 0,
         favourites_count: 0,
         replies_count,
+        quotes_count,
         favourited: match viewer {
             Some(account_id) => {
                 roosty_db::is_remote_status_favourited(&state.db, account_id, status.id).await?
@@ -2872,6 +3481,8 @@ async fn remote_status_response_for_viewer(
         bookmarked: false,
         pinned: false,
         reblog: None,
+        quote: None,
+        quote_approval,
         application: None,
     })
 }
@@ -2994,12 +3605,19 @@ async fn reblog_response(
         reblogs_count: 0,
         favourites_count: 0,
         replies_count: 0,
+        quotes_count: 0,
         favourited: false,
         reblogged: reblogged_by_viewer,
         muted,
         bookmarked: false,
         pinned: false,
         reblog: Some(original),
+        quote: None,
+        quote_approval: QuoteApprovalResponse {
+            automatic: Vec::new(),
+            manual: Vec::new(),
+            current_user: "denied".to_owned(),
+        },
         application: None,
     }))
 }
@@ -3046,17 +3664,46 @@ async fn local_remote_reblog_response(
         reblogs_count: 0,
         favourites_count: 0,
         replies_count: 0,
+        quotes_count: 0,
         favourited: false,
         reblogged: viewer.is_some_and(|viewer| viewer == reblog.local_account_id),
         muted: false,
         bookmarked: false,
         pinned: false,
         reblog: Some(original),
+        quote: None,
+        quote_approval: QuoteApprovalResponse {
+            automatic: Vec::new(),
+            manual: Vec::new(),
+            current_user: "denied".to_owned(),
+        },
         application: None,
     }))
 }
 
 async fn status_response_for_viewer(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    account: roosty_db::LocalAccount,
+    viewer: Option<AccountId>,
+) -> Result<StatusResponse, RoostyError> {
+    let status_ref = roosty_db::StatusReference::Local(status.id);
+    let mut response = status_response_base(state, status, account, viewer).await?;
+    response.quote = status_quote_response(state, status_ref, viewer).await?;
+    if let Some(quote) = roosty_db::quote_for_status(&state.db, status_ref).await?
+        && !response.content.contains(&quote.quoted_activitypub_id)
+    {
+        response.content = format!(
+            r#"<p class="quote-inline">RE: <a href="{}">{}</a></p>{}"#,
+            escape_html(&quote.quoted_activitypub_id),
+            escape_html(&quote.quoted_activitypub_id),
+            response.content,
+        );
+    }
+    Ok(response)
+}
+
+async fn status_response_base(
     state: &AppState,
     status: roosty_db::LocalStatus,
     account: roosty_db::LocalAccount,
@@ -3137,6 +3784,10 @@ async fn status_response_for_viewer(
         .map(|media| media_response(state, media))
         .collect();
 
+    let quotes_count =
+        roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Local(status.id))
+            .await?;
+    let quote_approval = local_quote_approval(state, &status, viewer).await?;
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.created_at),
@@ -3165,13 +3816,225 @@ async fn status_response_for_viewer(
         reblogs_count,
         favourites_count,
         replies_count,
+        quotes_count,
         favourited,
         reblogged,
         muted,
         bookmarked,
         pinned: false,
         reblog: None,
+        quote: None,
+        quote_approval,
         application: None,
+    })
+}
+
+async fn status_quote_response(
+    state: &AppState,
+    quoting_status: roosty_db::StatusReference,
+    viewer: Option<AccountId>,
+) -> Result<Option<QuoteResponse>, RoostyError> {
+    let Some(quote) = roosty_db::quote_for_status(&state.db, quoting_status).await? else {
+        return Ok(None);
+    };
+    let mut state_name = quote.state.to_string();
+    let quoted_status = if quote.state == roosty_db::QuoteState::Accepted {
+        match quote.quoted_status {
+            Some(roosty_db::StatusReference::Local(id)) => {
+                let Some(status) = roosty_db::find_local_status_by_id(&state.db, id).await? else {
+                    state_name = "deleted".to_owned();
+                    return Ok(Some(QuoteResponse {
+                        state: state_name,
+                        quoted_status: None,
+                    }));
+                };
+                if !status_visible_to_viewer(state, &status, viewer).await? {
+                    state_name = "unauthorized".to_owned();
+                    None
+                } else {
+                    let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+                        .await?
+                        .ok_or_else(|| {
+                            RoostyError::InvalidInput(
+                                "quoted status author does not exist".to_owned(),
+                            )
+                        })?;
+                    if let Some(viewer) = viewer {
+                        if roosty_db::local_accounts_are_blocked(
+                            &state.db,
+                            viewer,
+                            status.account_id,
+                        )
+                        .await?
+                        {
+                            state_name = "blocked_account".to_owned();
+                        } else if roosty_db::active_local_account_mute(
+                            &state.db,
+                            viewer,
+                            status.account_id,
+                        )
+                        .await?
+                        .is_some()
+                        {
+                            state_name = "muted_account".to_owned();
+                        }
+                    }
+                    Some(Box::new(
+                        status_response_base(state, status, account, viewer).await?,
+                    ))
+                }
+            }
+            Some(roosty_db::StatusReference::Remote(id)) => {
+                let Some(status) = roosty_db::find_remote_status_by_id(&state.db, id).await? else {
+                    state_name = "deleted".to_owned();
+                    return Ok(Some(QuoteResponse {
+                        state: state_name,
+                        quoted_status: None,
+                    }));
+                };
+                let actor =
+                    roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?;
+                if actor
+                    .as_ref()
+                    .is_some_and(|actor| state.config.federation_domain_is_blocked(&actor.domain))
+                {
+                    state_name = "blocked_domain".to_owned();
+                } else if let Some(viewer) = viewer {
+                    if roosty_db::local_remote_accounts_are_blocked(
+                        &state.db,
+                        viewer,
+                        status.remote_actor_id,
+                    )
+                    .await?
+                    {
+                        state_name = "blocked_account".to_owned();
+                    } else if roosty_db::active_local_remote_account_mute(
+                        &state.db,
+                        viewer,
+                        status.remote_actor_id,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        state_name = "muted_account".to_owned();
+                    }
+                }
+                let visible = match viewer {
+                    Some(viewer) => {
+                        roosty_db::remote_status_visible_to_account(&state.db, &status, viewer)
+                            .await?
+                    }
+                    None => matches!(
+                        status.visibility,
+                        StatusVisibility::Public | StatusVisibility::Unlisted
+                    ),
+                };
+                if !visible {
+                    state_name = "unauthorized".to_owned();
+                    None
+                } else {
+                    Some(Box::new(
+                        remote_status_response_base(state, status, viewer).await?,
+                    ))
+                }
+            }
+            None => {
+                state_name = "deleted".to_owned();
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(Some(QuoteResponse {
+        state: state_name,
+        quoted_status,
+    }))
+}
+
+async fn local_quote_approval(
+    state: &AppState,
+    status: &roosty_db::LocalStatus,
+    viewer: Option<AccountId>,
+) -> Result<QuoteApprovalResponse, RoostyError> {
+    let automatic = match status.quote_approval_policy {
+        roosty_db::QuoteApprovalPolicy::Public => vec!["public".to_owned()],
+        roosty_db::QuoteApprovalPolicy::Followers => vec!["followers".to_owned()],
+        roosty_db::QuoteApprovalPolicy::Nobody => Vec::new(),
+    };
+    let current_user = match viewer {
+        Some(viewer) if viewer == status.account_id => "automatic",
+        Some(viewer)
+            if roosty_db::local_accounts_are_blocked(&state.db, viewer, status.account_id)
+                .await? =>
+        {
+            "denied"
+        }
+        Some(_) if status.quote_approval_policy == roosty_db::QuoteApprovalPolicy::Public => {
+            "automatic"
+        }
+        Some(viewer)
+            if status.quote_approval_policy == roosty_db::QuoteApprovalPolicy::Followers
+                && roosty_db::local_follow_relationship(&state.db, viewer, status.account_id)
+                    .await?
+                    .is_some() =>
+        {
+            "automatic"
+        }
+        _ => "denied",
+    };
+    Ok(QuoteApprovalResponse {
+        automatic,
+        manual: Vec::new(),
+        current_user: current_user.to_owned(),
+    })
+}
+
+async fn remote_quote_approval(
+    state: &AppState,
+    status: &roosty_db::RemoteStatus,
+    viewer: Option<AccountId>,
+) -> Result<QuoteApprovalResponse, RoostyError> {
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?;
+    let project = |values: &[String]| {
+        let mut projected = Vec::new();
+        for value in values {
+            let category = if value == "https://www.w3.org/ns/activitystreams#Public" {
+                "public"
+            } else if actor
+                .as_ref()
+                .and_then(|actor| actor.followers_url.as_ref())
+                .is_some_and(|url| url == value)
+            {
+                "followers"
+            } else {
+                "unsupported_policy"
+            };
+            if !projected.iter().any(|item| item == category) {
+                projected.push(category.to_owned());
+            }
+        }
+        projected
+    };
+    let automatic = project(&status.quote_automatic_policy);
+    let manual = project(&status.quote_manual_policy);
+    let current_user = if viewer.is_none() {
+        "denied"
+    } else if automatic.iter().any(|value| value == "public") {
+        "automatic"
+    } else if manual.iter().any(|value| value == "public") {
+        "manual"
+    } else if automatic.iter().any(|value| value == "unsupported_policy")
+        || manual.iter().any(|value| value == "unsupported_policy")
+    {
+        "unknown"
+    } else {
+        "denied"
+    };
+    Ok(QuoteApprovalResponse {
+        automatic,
+        manual,
+        current_user: current_user.to_owned(),
     })
 }
 
@@ -4636,6 +5499,8 @@ mod tests {
                     ]
                 }),
                 tag_names: vec!["fediverse".to_owned(), "rust".to_owned()],
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
             },
         )
         .await
@@ -4709,6 +5574,8 @@ mod tests {
                     "tag": [{"type": "Hashtag", "name": "#Rust"}]
                 }),
                 tag_names: vec!["rust".to_owned()],
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
             },
             &[],
         )
@@ -5823,6 +6690,8 @@ mod tests {
                     }]
                 }),
                 tag_names: Vec::new(),
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
             },
             &[NewRemoteMediaAttachment {
                 remote_url: "https://remote.test/media/second.png".to_owned(),
@@ -7503,6 +8372,94 @@ mod tests {
         assert_eq!(json_body(owner).await["bookmarked"], true);
     }
 
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an allowed quote, when it is listed and revoked, then every API projection follows the same transactional state.
+    async fn quote_posts_project_list_and_revoke_consent(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let quoting_token = context
+            .access_token_for("quoter", "quoter@example.com")
+            .await;
+        let target_response = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &author_token,
+                json!({"status":"quote this", "quote_approval_policy":"public"}),
+            )
+            .await;
+        assert_eq!(target_response.status(), StatusCode::OK);
+        let target = json_body(target_response).await;
+        let target_id = target["id"].as_str().unwrap();
+
+        let quote_response = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &quoting_token,
+                json!({"status":"context", "quoted_status_id":target_id}),
+            )
+            .await;
+        assert_eq!(quote_response.status(), StatusCode::OK);
+        let quote = json_body(quote_response).await;
+        let quote_id = quote["id"].as_str().unwrap();
+        assert_eq!(quote["quote"]["state"], "accepted");
+        assert_eq!(quote["quote"]["quoted_status"]["id"], target_id);
+        assert!(quote["content"].as_str().unwrap().contains("quote-inline"));
+
+        let shown = json_body(context.get(&format!("/api/v1/statuses/{target_id}")).await).await;
+        assert_eq!(shown["quotes_count"], 1);
+        let listed = context
+            .authenticated_get(
+                &format!("/api/v1/statuses/{target_id}/quotes"),
+                &author_token,
+            )
+            .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(json_body(listed).await[0]["id"], quote_id);
+
+        let revoked = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{target_id}/quotes/{quote_id}/revoke"),
+                &author_token,
+            )
+            .await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert_eq!(json_body(revoked).await["quote"]["state"], "revoked");
+        let shown = json_body(context.get(&format!("/api/v1/statuses/{target_id}")).await).await;
+        assert_eq!(shown["quotes_count"], 0);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a nobody policy, when another account quotes it, then no status or quote edge is created.
+    async fn quote_posts_enforce_denied_policy(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let quoting_token = context
+            .access_token_for("denied", "denied@example.com")
+            .await;
+        let target_response = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &author_token,
+                json!({"status":"private thought", "quote_approval_policy":"nobody"}),
+            )
+            .await;
+        assert_eq!(target_response.status(), StatusCode::OK);
+        let target = json_body(target_response).await;
+        let response = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &quoting_token,
+                json!({"status":"cannot", "quoted_status_id":target["id"]}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn status_helpers_match_mastodon_compatibility_shapes() {
         // These helpers are intentionally tiny, but they define externally
@@ -8076,6 +9033,8 @@ mod tests {
                     in_reply_to_remote_status_id,
                     object: json!({}),
                     tag_names: Vec::new(),
+                    quote_automatic_policy: Vec::new(),
+                    quote_manual_policy: Vec::new(),
                 },
             )
             .await

@@ -490,7 +490,7 @@ fn validated_followers_url(actor_id: &str, followers: Option<&str>) -> Result<Op
 }
 
 /// Fetch a JSON document with policy revalidation before every request.
-async fn fetch_json<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn fetch_json<T: for<'de> Deserialize<'de>>(
     state: &AppState,
     mut url: Url,
     query: Option<(&str, &str)>,

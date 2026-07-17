@@ -84,7 +84,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟢 | `POST /api/v1/statuses` | Local text statuses only. |
+| 🟢 | `POST /api/v1/statuses` | Local text and consent-aware quote statuses; quote-plus-media is rejected to match Mastodon. |
 | 🟢 | `GET /api/v1/statuses/:id` | Visible local and locally cached remote statuses. |
 | 🟢 | `GET /api/v1/statuses/:id/source` | Authenticated plain-text source lookup for visible local statuses, including content warnings. |
 | 🟢 | `GET /api/v1/statuses/:id/history` | Visible local and cached-remote status revisions, oldest first, with immutable content, warning, sensitivity, emoji, and media projections. Legacy edits expose their known current state because pre-upgrade text cannot be reconstructed. |
@@ -101,7 +101,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Favourites | Authorized public/unlisted/follower-only local and cached remote statuses support favourite/unfavourite. Signed ActivityPub `Like`/`Undo` updates local counts and notifications; remote favourite counts are not fetched. |
 | 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
 | 🟡 | Boosts | Public/unlisted local and cached-remote statuses support reblog/unreblog. Follower-only boosts are rejected except for author self-boosts representable by the existing model. Signed ActivityPub `Announce`/`Undo` supports public/unlisted statuses. |
-| 🔴 | Quote posts | Creating, accepting, federating, and projecting quote posts and quote-approval state are not implemented. |
+| 🟢 | Quote posts | Local and cached-remote targets support per-status policies, viewer-aware `quote`/`quote_approval`/`quotes_count`, edit history, cursor-paginated quote listing, revocation, notifications, FEP-044f QuoteRequest/Accept/Reject, policy-controlled remote authorization dereferencing, dereferenceable local authorizations, durable delivery, and authorization deletion. Remote manual policies stay pending until authorized. |
 | 🟢 | Bookmarks | Bookmark/unbookmark APIs are implemented for local statuses. |
 
 ### Timelines

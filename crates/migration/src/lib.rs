@@ -58,6 +58,7 @@ mod m20260701_000053_add_status_edit_delivery;
 mod m20260701_000054_add_streaming_status_metadata;
 mod m20260701_000055_create_status_edit_history;
 mod m20260701_000056_create_remote_status_tag;
+mod m20260701_000057_create_status_quotes;
 
 pub struct Migrator;
 
@@ -121,6 +122,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000054_add_streaming_status_metadata::Migration),
             Box::new(m20260701_000055_create_status_edit_history::Migration),
             Box::new(m20260701_000056_create_remote_status_tag::Migration),
+            Box::new(m20260701_000057_create_status_quotes::Migration),
         ]
     }
 }
