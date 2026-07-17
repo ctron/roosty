@@ -2656,7 +2656,6 @@ mod tests {
     struct EndpointContext {
         postgresql: PostgreSQL,
         db: roosty_db::DbConnection,
-        database_name: String,
         config: Config,
         _temp_dir: TempDir,
     }
@@ -2721,7 +2720,6 @@ mod tests {
             Self {
                 postgresql,
                 db,
-                database_name,
                 config,
                 _temp_dir: temp_dir,
             }
@@ -2729,10 +2727,6 @@ mod tests {
 
         async fn teardown(self) {
             self.db.close().await.unwrap();
-            self.postgresql
-                .drop_database(&self.database_name)
-                .await
-                .unwrap();
             self.postgresql.stop().await.unwrap();
         }
     }

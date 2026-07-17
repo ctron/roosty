@@ -353,7 +353,6 @@ async fn replay_ledger_upgrade_preserves_legacy_rows(database: &mut EmbeddedData
 struct EmbeddedDatabase {
     postgresql: PostgreSQL,
     connection: DatabaseConnection,
-    database_name: String,
     _temp_dir: TempDir,
 }
 
@@ -387,17 +386,13 @@ impl AsyncTestContext for EmbeddedDatabase {
         Self {
             postgresql,
             connection,
-            database_name,
             _temp_dir: temp_dir,
         }
     }
 
     async fn teardown(self) {
         self.connection.close().await.unwrap();
-        self.postgresql
-            .drop_database(&self.database_name)
-            .await
-            .unwrap();
+        // The temporary directory removes the isolated cluster after the server has stopped.
         self.postgresql.stop().await.unwrap();
     }
 }

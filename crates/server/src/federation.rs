@@ -4804,8 +4804,6 @@ mod tests {
         postgresql: PostgreSQL,
         alpha: AppState,
         beta: AppState,
-        alpha_database: String,
-        beta_database: String,
         _temp_dir: TempDir,
     }
 
@@ -4839,8 +4837,6 @@ mod tests {
                 postgresql,
                 alpha: AppState::new(test_config(alpha_url, "https://alpha.test"), alpha_db),
                 beta: AppState::new(test_config(beta_url, "https://beta.test"), beta_db),
-                alpha_database,
-                beta_database,
                 _temp_dir: temp_dir,
             }
         }
@@ -4849,14 +4845,6 @@ mod tests {
         async fn teardown(self) {
             self.alpha.db.close().await.unwrap();
             self.beta.db.close().await.unwrap();
-            self.postgresql
-                .drop_database(&self.alpha_database)
-                .await
-                .unwrap();
-            self.postgresql
-                .drop_database(&self.beta_database)
-                .await
-                .unwrap();
             self.postgresql.stop().await.unwrap();
         }
     }

@@ -564,7 +564,7 @@ mod tests {
     /// Verifies that operator-created users can be added after bootstrap with role metadata.
     #[tokio::test]
     async fn creates_additional_local_users_with_roles() {
-        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
         let password_hash = password::hash_password("password").unwrap();
 
         roosty_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &password_hash)
@@ -610,14 +610,13 @@ mod tests {
         ));
 
         db.close().await.unwrap();
-        postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
     }
 
     /// Given an existing account, replacing its hash makes only the new password valid.
     #[tokio::test]
     async fn resets_local_account_password_hash() {
-        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
         let old_hash = password::hash_password("old-password").unwrap();
         roosty_db::create_bootstrap_admin(&db, "admin", "admin@example.com", &old_hash)
             .await
@@ -638,7 +637,6 @@ mod tests {
         assert!(missing.is_none());
 
         db.close().await.unwrap();
-        postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
     }
 
@@ -646,7 +644,7 @@ mod tests {
     /// permanent diagnostic and never makes that job claimable again.
     #[tokio::test]
     async fn permanently_fails_expired_delivery_jobs() {
-        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
         let job_id = roosty_db::enqueue_job(
             &db,
             roosty_db::JobKind::FederationFollowDelivery,
@@ -699,7 +697,6 @@ mod tests {
         );
 
         db.close().await.unwrap();
-        postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
     }
 
@@ -707,7 +704,7 @@ mod tests {
     /// reclaims and completes it.
     #[tokio::test]
     async fn recovers_expired_job_claims() {
-        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
         let job_id = uuid::Uuid::now_v7();
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -747,7 +744,6 @@ mod tests {
         assert!(last_error.is_none());
 
         db.close().await.unwrap();
-        postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
     }
 
@@ -755,7 +751,7 @@ mod tests {
     /// job to at most one worker through `FOR UPDATE SKIP LOCKED`.
     #[tokio::test]
     async fn concurrent_workers_claim_distinct_jobs() {
-        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
         for _ in 0..3 {
             roosty_db::enqueue_job(
                 &db,
@@ -785,7 +781,6 @@ mod tests {
         assert_eq!(claims.len(), 3);
 
         db.close().await.unwrap();
-        postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
     }
 
@@ -793,7 +788,7 @@ mod tests {
     /// not override the active claim.
     #[tokio::test]
     async fn stale_worker_outcomes_do_not_override_reclaimed_jobs() {
-        let (postgresql, db, database_name, _temp_dir) = migrated_test_database().await;
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
         let job_id = roosty_db::enqueue_job(
             &db,
             roosty_db::JobKind::FederationFollowDelivery,
@@ -857,7 +852,6 @@ mod tests {
         );
 
         db.close().await.unwrap();
-        postgresql.drop_database(&database_name).await.unwrap();
         postgresql.stop().await.unwrap();
     }
 
@@ -890,7 +884,7 @@ mod tests {
     }
 
     /// Starts a migrated temporary PostgreSQL database for CLI-adjacent DB tests.
-    async fn migrated_test_database() -> (PostgreSQL, roosty_db::DbConnection, String, TempDir) {
+    async fn migrated_test_database() -> (PostgreSQL, roosty_db::DbConnection, TempDir) {
         let temp_dir = tempfile::Builder::new()
             .prefix("roosty-admin-")
             .tempdir()
@@ -917,7 +911,7 @@ mod tests {
         let db = roosty_db::connect(&database_url).await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
-        (postgresql, db, database_name, temp_dir)
+        (postgresql, db, temp_dir)
     }
 
     /// Builds a database name unique enough for parallel embedded PostgreSQL tests.

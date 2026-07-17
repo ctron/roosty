@@ -6188,7 +6188,6 @@ mod tests {
     struct StatusContext {
         postgresql: PostgreSQL,
         db: roosty_db::DbConnection,
-        database_name: String,
         config: Config,
         state: AppState,
         account_id: AccountId,
@@ -6274,7 +6273,6 @@ mod tests {
                 postgresql,
                 state: AppState::new(config.clone(), db.clone()),
                 db,
-                database_name,
                 config,
                 account_id,
                 application_id: application.id,
@@ -6286,7 +6284,6 @@ mod tests {
             let StatusContext {
                 postgresql,
                 db,
-                database_name,
                 state,
                 ..
             } = self;
@@ -6294,7 +6291,6 @@ mod tests {
 
             state_db.close().await.unwrap();
             db.close().await.unwrap();
-            postgresql.drop_database(&database_name).await.unwrap();
             postgresql.stop().await.unwrap();
         }
     }

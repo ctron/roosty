@@ -651,7 +651,6 @@ mod tests {
     struct CompatContext {
         postgresql: PostgreSQL,
         db: roosty_db::DbConnection,
-        database_name: String,
         config: Config,
         account_id: AccountId,
         application_id: uuid::Uuid,
@@ -735,7 +734,6 @@ mod tests {
             Self {
                 postgresql,
                 db,
-                database_name,
                 config,
                 account_id,
                 application_id: application.id,
@@ -745,10 +743,6 @@ mod tests {
 
         async fn teardown(self) {
             self.db.close().await.unwrap();
-            self.postgresql
-                .drop_database(&self.database_name)
-                .await
-                .unwrap();
             self.postgresql.stop().await.unwrap();
         }
     }
