@@ -30,7 +30,10 @@ use crate::{
         resolve_remote_mentions,
     },
     http::AppState,
-    media::{MediaAttachmentResponse, media_response, remote_media_attachment_response},
+    media::{
+        MediaAttachmentResponse, media_response, remote_media_attachment_response,
+        status_edit_media_response,
+    },
     notifications::{create_and_stream_notification, publish_committed_notification},
 };
 
@@ -52,6 +55,7 @@ pub fn router() -> Router<AppState> {
             get(show_status).put(update_status).delete(delete_status),
         )
         .route("/api/v1/statuses/{status_id}/source", get(status_source))
+        .route("/api/v1/statuses/{status_id}/history", get(status_history))
         .route("/api/v1/statuses/{status_id}/context", get(status_context))
         .route(
             "/api/v1/statuses/{status_id}/favourite",
@@ -235,6 +239,18 @@ struct StatusSourceResponse {
     id: String,
     text: String,
     spoiler_text: String,
+}
+
+/// Mastodon-compatible immutable status revision projection.
+#[derive(Serialize)]
+struct StatusEditResponse {
+    content: String,
+    spoiler_text: String,
+    sensitive: bool,
+    created_at: String,
+    account: StatusAccountResponse,
+    media_attachments: Vec<MediaAttachmentResponse>,
+    emojis: Vec<Value>,
 }
 
 /// Mastodon account projection for either a local or cached remote status author.
@@ -657,6 +673,204 @@ async fn show_status(
     }
 }
 
+async fn status_history(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    let viewer_id = viewer.as_ref().map(|account| account.id);
+    let txn = match state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await
+    {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let item = match find_status_context_item(&txn, StatusId(path.status_id)).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+    match status_context_item_visible(&txn, &item, viewer_id).await {
+        Ok(true) => {}
+        Ok(false) => return not_found(),
+        Err(error) => return server_error(error),
+    }
+    let history = match &item {
+        StatusContextItem::Local(status) => roosty_db::local_status_edits(&txn, status.id)
+            .await
+            .map(StoredStatusEdits::Local),
+        StatusContextItem::Remote(status) => roosty_db::remote_status_edits(&txn, status.id)
+            .await
+            .map(StoredStatusEdits::Remote),
+    };
+    let history = match history {
+        Ok(history) => history,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    let response = match (item, history) {
+        (StatusContextItem::Local(status), StoredStatusEdits::Local(edits)) => {
+            local_status_history_response(&state, status, edits, viewer_id).await
+        }
+        (StatusContextItem::Remote(status), StoredStatusEdits::Remote(edits)) => {
+            match remote_status_available(&state, &status).await {
+                Ok(true) => remote_status_history_response(&state, status, edits, viewer_id).await,
+                Ok(false) => return not_found(),
+                Err(error) => return server_error(error),
+            }
+        }
+        _ => unreachable!("status and revision kinds are paired"),
+    };
+    match response {
+        Ok(history) => Json(history).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+enum StoredStatusEdits {
+    Local(Vec<roosty_db::LocalStatusEdit>),
+    Remote(Vec<roosty_db::RemoteStatusEdit>),
+}
+
+async fn local_status_history_response(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    edits: Vec<roosty_db::LocalStatusEdit>,
+    viewer: Option<AccountId>,
+) -> Result<Vec<StatusEditResponse>, RoostyError> {
+    if edits.is_empty() {
+        let current = status_response_for_viewer(
+            state,
+            status.clone(),
+            roosty_db::find_local_account_by_id(&state.db, status.account_id)
+                .await?
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("status author does not exist".to_owned())
+                })?,
+            viewer,
+        )
+        .await?;
+        return Ok(vec![StatusEditResponse {
+            content: current.content,
+            spoiler_text: current.spoiler_text,
+            sensitive: current.sensitive,
+            created_at: format_timestamp(if status.updated_at != status.created_at {
+                status.updated_at
+            } else {
+                status.created_at
+            }),
+            account: current.account,
+            media_attachments: current.media_attachments,
+            emojis: current.emojis,
+        }]);
+    }
+    let author = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("status author does not exist".to_owned()))?;
+    let mut responses = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let mut local_mentions = Vec::new();
+        for account_id in edit.local_mention_ids {
+            if let Some(account) =
+                roosty_db::find_local_account_by_id(&state.db, account_id).await?
+            {
+                local_mentions.push(account);
+            }
+        }
+        let mut remote_mentions = Vec::new();
+        for actor_id in edit.remote_mention_ids {
+            if let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, actor_id).await? {
+                remote_mentions.push(actor);
+            }
+        }
+        let tags = edit
+            .tag_names
+            .into_iter()
+            .map(|name| TagResponse {
+                id: name.clone(),
+                url: public_url(state, &format!("tags/{name}")),
+                name,
+                history: Vec::new(),
+                following: None,
+            })
+            .collect::<Vec<_>>();
+        responses.push(StatusEditResponse {
+            content: status_content_html_with_mentions_and_tags(
+                state,
+                &edit.content,
+                &local_mentions,
+                &remote_mentions,
+                &tags,
+            ),
+            spoiler_text: edit.spoiler_text,
+            sensitive: edit.sensitive,
+            created_at: format_timestamp(edit.created_at),
+            account: StatusAccountResponse::Local(Box::new(
+                account_response(state, author.clone()).await?,
+            )),
+            media_attachments: edit
+                .media
+                .into_iter()
+                .map(|media| status_edit_media_response(state, media))
+                .collect(),
+            emojis: Vec::new(),
+        });
+    }
+    Ok(responses)
+}
+
+async fn remote_status_history_response(
+    state: &AppState,
+    status: roosty_db::RemoteStatus,
+    edits: Vec<roosty_db::RemoteStatusEdit>,
+    viewer: Option<AccountId>,
+) -> Result<Vec<StatusEditResponse>, RoostyError> {
+    if edits.is_empty() {
+        let current = remote_status_response_for_viewer(state, status.clone(), viewer).await?;
+        return Ok(vec![StatusEditResponse {
+            content: current.content,
+            spoiler_text: current.spoiler_text,
+            sensitive: current.sensitive,
+            created_at: format_timestamp(if status.updated_at != status.published_at {
+                status.updated_at
+            } else {
+                status.published_at
+            }),
+            account: current.account,
+            media_attachments: current.media_attachments,
+            emojis: current.emojis,
+        }]);
+    }
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote status author does not exist".to_owned())
+        })?;
+    let mut responses = Vec::with_capacity(edits.len());
+    for edit in edits {
+        responses.push(StatusEditResponse {
+            content: edit.content,
+            spoiler_text: edit.spoiler_text,
+            sensitive: edit.sensitive,
+            created_at: format_timestamp(edit.created_at),
+            account: StatusAccountResponse::Remote(Box::new(
+                remote_account_response(state, actor.clone()).await?,
+            )),
+            media_attachments: edit
+                .media
+                .into_iter()
+                .map(|media| status_edit_media_response(state, media))
+                .collect(),
+            emojis: remote_custom_emojis(&edit.object),
+        });
+    }
+    Ok(responses)
+}
+
 async fn status_source(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
@@ -787,7 +1001,7 @@ async fn update_status(
     )
     .await
     {
-        Ok(Some(status)) => {
+        Ok(Some(roosty_db::LocalStatusUpdateResult::Updated(status))) => {
             let mut notifications = Vec::new();
             for account_id in &local_mentions {
                 match roosty_db::notify_local_status_mention(
@@ -903,6 +1117,15 @@ async fn update_status(
                     );
                     Json(response).into_response()
                 }
+                Err(error) => server_error(error),
+            }
+        }
+        Ok(Some(roosty_db::LocalStatusUpdateResult::Unchanged(status))) => {
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
+            }
+            match status_response(&state, status, account).await {
+                Ok(response) => Json(response).into_response(),
                 Err(error) => server_error(error),
             }
         }
@@ -2575,8 +2798,17 @@ async fn remote_status_response_for_viewer(
             .then(|| format_timestamp(status.updated_at)),
         in_reply_to_id,
         in_reply_to_account_id,
-        sensitive: false,
-        spoiler_text: String::new(),
+        sensitive: status
+            .object
+            .get("sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        spoiler_text: status
+            .object
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         visibility: status.visibility.to_string(),
         language: None,
         uri: status.activitypub_id.clone(),
@@ -5154,6 +5386,187 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given an unedited public status, anonymous history returns one synthetic current revision.
+    async fn unedited_status_history_returns_current_revision(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "original #history", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let response = context
+            .get(&format!("/api/v1/statuses/{status_id}/history"))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let history = json_body(response).await;
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(
+            history[0]["content"],
+            "<p>original <a href=\"https://localhost:4000/tags/history\" class=\"mention hashtag\" rel=\"tag\">#<span>history</span></a></p>"
+        );
+        assert_eq!(history[0]["created_at"], status["created_at"]);
+        assert_eq!(
+            history[0]["account"]["username"],
+            status["account"]["username"]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given repeated edits and a no-op replay, history retains each material state oldest first.
+    async fn status_history_orders_material_revisions_and_ignores_noops(
+        context: &mut StatusContext,
+    ) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "first", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        for text in ["second", "third", "third"] {
+            let response = context
+                .authenticated_json(
+                    "PUT",
+                    &format!("/api/v1/statuses/{status_id}"),
+                    &token,
+                    serde_json::json!({"status": text}),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let history = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{status_id}/history"))
+                .await,
+        )
+        .await;
+
+        assert_eq!(history.as_array().unwrap().len(), 3);
+        assert_eq!(history[0]["content"], "<p>first</p>");
+        assert_eq!(history[1]["content"], "<p>second</p>");
+        assert_eq!(history[2]["content"], "<p>third</p>");
+        assert!(
+            history[0]["created_at"].as_str().unwrap()
+                <= history[1]["created_at"].as_str().unwrap()
+        );
+        assert!(
+            history[1]["created_at"].as_str().unwrap()
+                <= history[2]["created_at"].as_str().unwrap()
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a cached remote Note, a material Update stores its initial and replacement states.
+    async fn remote_status_history_records_material_updates(context: &mut StatusContext) {
+        let actor = context.cache_remote_actor("history").await;
+        let original = context
+            .cache_remote_status(&actor, "remote first", None)
+            .await;
+        let updated_at = original.updated_at + TimeDuration::seconds(1);
+        let txn = context.db.begin().await.unwrap();
+        let outcome = roosty_db::process_remote_status_upsert(
+            &txn,
+            NewRemoteStatus {
+                activitypub_id: original.activitypub_id.clone(),
+                remote_actor_id: actor.id,
+                content: "remote second".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: original.published_at,
+                updated_at,
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({
+                    "summary": "remote warning",
+                    "sensitive": true,
+                    "tag": [{
+                        "type": "Emoji",
+                        "name": ":wave:",
+                        "icon": {"url": "https://remote.test/emoji/wave.png"}
+                    }]
+                }),
+            },
+            &[NewRemoteMediaAttachment {
+                remote_url: "https://remote.test/media/second.png".to_owned(),
+                content_type: Some("image/png".to_owned()),
+                description: Some("second image".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            roosty_db::RemoteStatusUpsertResult::Updated(_)
+        ));
+        txn.commit().await.unwrap();
+
+        let response = context
+            .get(&format!("/api/v1/statuses/{}/history", original.id.0))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let history = json_body(response).await;
+        assert_eq!(history.as_array().unwrap().len(), 2);
+        assert_eq!(history[0]["content"], "remote first");
+        assert_eq!(history[1]["content"], "remote second");
+        assert_eq!(history[1]["spoiler_text"], "remote warning");
+        assert_eq!(history[1]["sensitive"], true);
+        assert_eq!(
+            history[1]["media_attachments"][0]["url"],
+            "https://remote.test/media/second.png"
+        );
+        assert_eq!(history[1]["emojis"][0]["shortcode"], "wave");
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given concurrent edits, the status row lock preserves both ordered replacement revisions.
+    async fn concurrent_status_edits_do_not_lose_revisions(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .create_status(&token, "initial", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let path = format!("/api/v1/statuses/{status_id}");
+
+        let (left, right) = tokio::join!(
+            context.authenticated_json(
+                "PUT",
+                &path,
+                &token,
+                serde_json::json!({"status": "concurrent left"}),
+            ),
+            context.authenticated_json(
+                "PUT",
+                &path,
+                &token,
+                serde_json::json!({"status": "concurrent right"}),
+            )
+        );
+        assert_eq!(left.status(), StatusCode::OK);
+        assert_eq!(right.status(), StatusCode::OK);
+
+        let history = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{status_id}/history"))
+                .await,
+        )
+        .await;
+        let contents = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|revision| revision["content"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0], "<p>initial</p>");
+        assert!(contents.contains(&"<p>concurrent left</p>"));
+        assert!(contents.contains(&"<p>concurrent right</p>"));
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Given a local follower subscribed to their home stream, when the author edits a status,
     /// then the follower receives the replacement status as a streaming update.
     async fn status_update_streams_to_local_followers(context: &mut StatusContext) {
@@ -5535,6 +5948,27 @@ mod tests {
         assert_eq!(update["media_attachments"][0]["description"], "Alt test");
         assert_eq!(update["media_attachments"][0]["meta"]["focus"]["x"], 0.1);
         assert_eq!(update["media_attachments"][0]["meta"]["focus"]["y"], -0.2);
+
+        let history = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{status_id}/history"))
+                .await,
+        )
+        .await;
+        assert_eq!(history.as_array().unwrap().len(), 2);
+        assert!(history[0]["media_attachments"][0]["description"].is_null());
+        assert_eq!(
+            history[1]["media_attachments"][0]["description"],
+            "Alt test"
+        );
+        assert_eq!(
+            history[1]["media_attachments"][0]["meta"]["focus"],
+            serde_json::json!({"x": 0.1, "y": -0.2})
+        );
+        assert_eq!(
+            history[0]["media_attachments"][0]["url"],
+            history[1]["media_attachments"][0]["url"]
+        );
     }
 
     #[test_context(StatusContext)]
@@ -5605,6 +6039,23 @@ mod tests {
                 .await
                 .status(),
             StatusCode::OK
+        );
+        let history = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{status_id}/history"))
+                .await,
+        )
+        .await;
+        assert_eq!(history.as_array().unwrap().len(), 3);
+        assert_eq!(history[0]["media_attachments"][0]["id"], media_id);
+        assert_eq!(history[1]["media_attachments"][0]["id"], media_id);
+        assert_eq!(history[2]["media_attachments"], serde_json::json!([]));
+        assert_eq!(
+            context
+                .authenticated_empty("DELETE", &format!("/api/v1/media/{media_id}"), &token)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
         );
     }
 

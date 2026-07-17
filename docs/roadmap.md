@@ -8,6 +8,7 @@
 - Local public/unlisted home-timeline fan-out, including streaming status creation and edit replacements, replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
+- Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.

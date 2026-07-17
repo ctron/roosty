@@ -44,6 +44,18 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "streaming_event").await);
     assert!(table_exists(database.connection(), "local_status_local_mention").await);
     assert!(table_exists(database.connection(), "remote_status_local_mention").await);
+    assert!(table_exists(database.connection(), "local_status_edit").await);
+    assert!(table_exists(database.connection(), "local_status_edit_media").await);
+    assert!(table_exists(database.connection(), "remote_status_edit").await);
+    assert!(table_exists(database.connection(), "remote_status_edit_media").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "remote_media_attachment",
+            "status_order"
+        )
+        .await
+    );
     assert!(column_exists(database.connection(), "streaming_event", "sequence").await);
     assert!(
         column_exists(
@@ -253,9 +265,9 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back streaming metadata, edit delivery, subscription extensions,
+    // Roll back status history, streaming metadata, edit delivery, subscription extensions,
     // streaming-kind extension, remote moderation, the streaming log, and the followers URL.
-    Migrator::down(database.connection(), Some(8))
+    Migrator::down(database.connection(), Some(9))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -363,6 +375,29 @@ async fn replay_ledger_upgrade_preserves_legacy_rows(database: &mut EmbeddedData
             .unwrap()
             .is_none()
     );
+}
+
+/// Given the pre-history schema, migration 55 can be applied and rolled back cleanly.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn status_edit_history_upgrade_and_rollback(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(54)).await.unwrap();
+
+    Migrator::up(database.connection(), None).await.unwrap();
+    assert!(table_exists(database.connection(), "local_status_edit").await);
+    assert!(table_exists(database.connection(), "local_status_edit_media").await);
+    assert!(table_exists(database.connection(), "remote_status_edit").await);
+    assert!(table_exists(database.connection(), "remote_status_edit_media").await);
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!table_exists(database.connection(), "local_status_edit").await);
+    assert!(!table_exists(database.connection(), "local_status_edit_media").await);
+    assert!(!table_exists(database.connection(), "remote_status_edit").await);
+    assert!(!table_exists(database.connection(), "remote_status_edit_media").await);
+    assert!(table_exists(database.connection(), "local_status").await);
+    assert!(table_exists(database.connection(), "remote_status").await);
 }
 
 struct EmbeddedDatabase {

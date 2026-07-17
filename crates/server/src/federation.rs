@@ -315,6 +315,10 @@ struct InboundNote {
     r#type: String,
     attributed_to: String,
     content: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    sensitive: bool,
     published: String,
     updated: Option<String>,
     #[serde(default)]
@@ -2067,8 +2071,7 @@ async fn process_remote_status_activity(
                 txn.commit().await?;
                 return Ok(RemoteStatusChange::Ignored);
             }
-            roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
-            let status = roosty_db::process_remote_status_upsert(
+            let upsert = roosty_db::process_remote_status_upsert(
                 &txn,
                 roosty_db::NewRemoteStatus {
                     activitypub_id: note.id,
@@ -2088,6 +2091,15 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
+            let (status, edited) = match upsert {
+                roosty_db::RemoteStatusUpsertResult::Created(status) => (status, false),
+                roosty_db::RemoteStatusUpsertResult::Updated(status) => (status, true),
+                roosty_db::RemoteStatusUpsertResult::Unchanged(_) => {
+                    txn.commit().await?;
+                    return Ok(RemoteStatusChange::Ignored);
+                }
+            };
+            roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
             let direct_conversation_refresh = if audience.visibility() == StatusVisibility::Direct {
                 Some(
                     roosty_db::attach_remote_direct_status_to_conversation(
@@ -2130,7 +2142,7 @@ async fn process_remote_status_activity(
                     notifications.push(notification);
                 }
             }
-            if !is_create {
+            if edited {
                 notifications.extend(
                     roosty_db::replace_remote_status_update_notifications(
                         &txn,
@@ -2140,7 +2152,7 @@ async fn process_remote_status_activity(
                     .await?,
                 );
             }
-            let notifiable_post = if !is_create || status.visibility == StatusVisibility::Direct {
+            let notifiable_post = if edited || status.visibility == StatusVisibility::Direct {
                 false
             } else if status.in_reply_to.is_none() {
                 true
@@ -2184,7 +2196,7 @@ async fn process_remote_status_activity(
                 status: Box::new(status),
                 notifications,
                 refresh: direct_conversation_refresh,
-                edited: !is_create,
+                edited,
             })
         }
         Some("Delete") => {
@@ -4361,6 +4373,9 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        let roosty_db::LocalStatusUpdateResult::Updated(edited) = edited else {
+            panic!("content-changing edit must be material");
+        };
         super::enqueue_status_activity_in_transaction(
             &context.alpha,
             &txn,

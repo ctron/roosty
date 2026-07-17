@@ -896,6 +896,59 @@ pub(crate) fn media_response(
     }
 }
 
+/// Project immutable revision media while retaining cached paths and remote fallback URLs.
+pub(crate) fn status_edit_media_response(
+    state: &AppState,
+    media: roosty_db::StatusEditMedia,
+) -> MediaAttachmentResponse {
+    let fallback = media.remote_url.clone().unwrap_or_default();
+    let url = media
+        .file_path
+        .as_deref()
+        .map(|path| media_url(state, path))
+        .unwrap_or_else(|| fallback.clone());
+    let preview_url = media
+        .preview_file_path
+        .as_deref()
+        .map(|path| media_url(state, path))
+        .unwrap_or_else(|| url.clone());
+    let original = media
+        .width
+        .zip(media.height)
+        .map(|(width, height)| ImageMeta {
+            width,
+            height,
+            size: format!("{width}x{height}"),
+            aspect: width as f64 / height as f64,
+        });
+    let small = media
+        .preview_width
+        .zip(media.preview_height)
+        .map(|(width, height)| ImageMeta {
+            width,
+            height,
+            size: format!("{width}x{height}"),
+            aspect: width as f64 / height as f64,
+        });
+    MediaAttachmentResponse {
+        id: media.id.to_string(),
+        media_type: media.content_type.as_deref().map_or("unknown", media_type),
+        url,
+        preview_url,
+        remote_url: media.remote_url,
+        meta: MediaMeta {
+            original,
+            small,
+            focus: media
+                .focus_x
+                .zip(media.focus_y)
+                .map(|(x, y)| FocusMeta { x, y }),
+        },
+        description: media.description,
+        blurhash: media.blurhash,
+    }
+}
+
 /// Store an original upload, generated preview, and database media metadata.
 async fn store_upload(
     state: &AppState,

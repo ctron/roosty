@@ -95,14 +95,15 @@ use entity::{
     local_conversation, local_conversation_account, local_conversation_remote_participant,
     local_follow, local_media_attachment, local_notification, local_remote_account_block,
     local_remote_account_mute, local_remote_status_favourite, local_remote_status_reblog,
-    local_status, local_status_bookmark, local_status_favourite, local_status_local_mention,
-    local_status_local_recipient, local_status_reblog, local_status_remote_mention,
-    local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
-    oauth_application, oauth_authorization_code, processed_inbox_activity, remote_actor,
-    remote_custom_emoji, remote_follow, remote_following, remote_local_account_block,
-    remote_media_attachment, remote_profile_media, remote_status, remote_status_favourite,
-    remote_status_local_mention, remote_status_local_recipient, remote_status_reblog,
-    remote_status_remote_recipient, streaming_event,
+    local_status, local_status_bookmark, local_status_edit, local_status_edit_media,
+    local_status_favourite, local_status_local_mention, local_status_local_recipient,
+    local_status_reblog, local_status_remote_mention, local_status_tag, local_tag,
+    local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
+    oauth_authorization_code, processed_inbox_activity, remote_actor, remote_custom_emoji,
+    remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
+    remote_profile_media, remote_status, remote_status_edit, remote_status_edit_media,
+    remote_status_favourite, remote_status_local_mention, remote_status_local_recipient,
+    remote_status_reblog, remote_status_remote_recipient, streaming_event,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -180,6 +181,7 @@ pub enum RemoteMediaState {
 pub struct RemoteMediaAttachment {
     pub id: Uuid,
     pub remote_status_id: StatusId,
+    pub status_order: i32,
     pub remote_url: String,
     pub content_type: Option<String>,
     pub description: Option<String>,
@@ -193,6 +195,63 @@ pub struct RemoteMediaAttachment {
     pub preview_height: Option<i32>,
     pub blurhash: Option<String>,
     pub expires_at: Option<OffsetDateTime>,
+}
+
+/// Immutable media projection stored with a status revision.
+#[derive(Clone, Debug)]
+pub struct StatusEditMedia {
+    pub id: Uuid,
+    pub content_type: Option<String>,
+    pub file_path: Option<String>,
+    pub preview_file_path: Option<String>,
+    pub remote_url: Option<String>,
+    pub description: Option<String>,
+    pub focus_x: Option<f64>,
+    pub focus_y: Option<f64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub preview_width: Option<i32>,
+    pub preview_height: Option<i32>,
+    pub blurhash: Option<String>,
+}
+
+/// One immutable revision of a locally authored status.
+#[derive(Clone, Debug)]
+pub struct LocalStatusEdit {
+    pub content: String,
+    pub spoiler_text: String,
+    pub sensitive: bool,
+    pub local_mention_ids: Vec<AccountId>,
+    pub remote_mention_ids: Vec<AccountId>,
+    pub tag_names: Vec<String>,
+    pub created_at: OffsetDateTime,
+    pub media: Vec<StatusEditMedia>,
+}
+
+/// One immutable revision of a cached remote status.
+#[derive(Clone, Debug)]
+pub struct RemoteStatusEdit {
+    pub content: String,
+    pub spoiler_text: String,
+    pub sensitive: bool,
+    pub object: JsonValue,
+    pub created_at: OffsetDateTime,
+    pub media: Vec<StatusEditMedia>,
+}
+
+/// Outcome of a status edit after row locking and material-change comparison.
+#[derive(Clone, Debug)]
+pub enum LocalStatusUpdateResult {
+    Updated(LocalStatus),
+    Unchanged(LocalStatus),
+}
+
+/// Outcome of caching a verified remote Create or Update.
+#[derive(Clone, Debug)]
+pub enum RemoteStatusUpsertResult {
+    Created(RemoteStatus),
+    Updated(RemoteStatus),
+    Unchanged(RemoteStatus),
 }
 
 /// A remote custom emoji discovered in a signed actor or Note document.
@@ -1160,10 +1219,11 @@ pub async fn replace_remote_media_attachments(
         .exec(txn)
         .await?;
     let now = OffsetDateTime::now_utc();
-    for attachment in attachments {
+    for (status_order, attachment) in attachments.iter().enumerate() {
         remote_media_attachment::ActiveModel {
             id: Set(Uuid::now_v7()),
             remote_status_id: Set(status_id.0),
+            status_order: Set(status_order as i32),
             remote_url: Set(attachment.remote_url.clone()),
             content_type: Set(attachment.content_type.clone()),
             description: Set(attachment.description.clone()),
@@ -1195,7 +1255,7 @@ pub async fn remote_media_attachments_for_status(
 ) -> Result<Vec<RemoteMediaAttachment>> {
     remote_media_attachment::Entity::find()
         .filter(remote_media_attachment::Column::RemoteStatusId.eq(status_id.0))
-        .order_by_asc(remote_media_attachment::Column::CreatedAt)
+        .order_by_asc(remote_media_attachment::Column::StatusOrder)
         .all(db)
         .await?
         .into_iter()
@@ -1224,6 +1284,7 @@ fn remote_media_attachment_from_model(
     Ok(RemoteMediaAttachment {
         id: model.id,
         remote_status_id: StatusId(model.remote_status_id),
+        status_order: model.status_order,
         remote_url: model.remote_url,
         content_type: model.content_type,
         description: model.description,
@@ -1627,10 +1688,127 @@ pub async fn process_remote_status_upsert(
     txn: &sea_orm::DatabaseTransaction,
     status: NewRemoteStatus,
     attachments: &[NewRemoteMediaAttachment],
-) -> Result<RemoteStatus> {
+) -> Result<RemoteStatusUpsertResult> {
+    let existing = remote_status::Entity::find()
+        .filter(remote_status::Column::ActivitypubId.eq(&status.activitypub_id))
+        .lock_exclusive()
+        .one(txn)
+        .await?;
+    let Some(existing) = existing else {
+        let status = upsert_remote_status_on(txn, status).await?;
+        replace_remote_media_attachments(txn, status.id, attachments).await?;
+        return Ok(RemoteStatusUpsertResult::Created(status));
+    };
+    if existing.remote_actor_id != status.remote_actor_id.0 {
+        return Err(RoostyError::InvalidInput(
+            "remote status author does not match cached author".to_owned(),
+        ));
+    }
+    let current_media = remote_media_attachment::Entity::find()
+        .filter(remote_media_attachment::Column::RemoteStatusId.eq(existing.id))
+        .order_by_asc(remote_media_attachment::Column::StatusOrder)
+        .all(txn)
+        .await?;
+    let media_changed = current_media.len() != attachments.len()
+        || current_media
+            .iter()
+            .zip(attachments)
+            .any(|(current, replacement)| {
+                current.remote_url != replacement.remote_url
+                    || current.content_type != replacement.content_type
+                    || current.description != replacement.description
+            });
+    let projection_changed = existing.content != status.content
+        || existing.object.get("summary") != status.object.get("summary")
+        || existing.object.get("sensitive") != status.object.get("sensitive")
+        || existing.object.get("tag") != status.object.get("tag");
+    if status.updated_at <= existing.updated_at || (!projection_changed && !media_changed) {
+        return Ok(RemoteStatusUpsertResult::Unchanged(
+            remote_status_from_model(existing)?,
+        ));
+    }
+    if remote_status_edit::Entity::find()
+        .filter(remote_status_edit::Column::RemoteStatusId.eq(existing.id))
+        .one(txn)
+        .await?
+        .is_none()
+    {
+        let timestamp = if existing.updated_at == existing.published_at {
+            existing.published_at
+        } else {
+            existing.updated_at
+        };
+        remote_status_snapshot(txn, &existing, timestamp).await?;
+    }
+    let revision_timestamp = status.updated_at;
     let status = upsert_remote_status_on(txn, status).await?;
     replace_remote_media_attachments(txn, status.id, attachments).await?;
-    Ok(status)
+    let current = remote_status::Entity::find_by_id(status.id.0)
+        .one(txn)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("remote status disappeared".to_owned()))?;
+    remote_status_snapshot(txn, &current, revision_timestamp).await?;
+    Ok(RemoteStatusUpsertResult::Updated(status))
+}
+
+fn remote_object_spoiler_text(object: &JsonValue) -> String {
+    object
+        .get("summary")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn remote_object_sensitive(object: &JsonValue) -> bool {
+    object
+        .get("sensitive")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+}
+
+async fn remote_status_snapshot(
+    txn: &DatabaseTransaction,
+    status: &remote_status::Model,
+    created_at: OffsetDateTime,
+) -> Result<()> {
+    let edit_id = Uuid::now_v7();
+    remote_status_edit::ActiveModel {
+        id: Set(edit_id),
+        remote_status_id: Set(status.id),
+        content: Set(status.content.clone()),
+        spoiler_text: Set(remote_object_spoiler_text(&status.object)),
+        sensitive: Set(remote_object_sensitive(&status.object)),
+        object: Set(status.object.clone()),
+        created_at: Set(created_at),
+    }
+    .insert(txn)
+    .await?;
+    let media = remote_media_attachment::Entity::find()
+        .filter(remote_media_attachment::Column::RemoteStatusId.eq(status.id))
+        .order_by_asc(remote_media_attachment::Column::StatusOrder)
+        .all(txn)
+        .await?;
+    for (order, item) in media.into_iter().enumerate() {
+        remote_status_edit_media::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            remote_status_edit_id: Set(edit_id),
+            source_attachment_id: Set(Some(item.id)),
+            status_order: Set(order as i32),
+            remote_url: Set(item.remote_url),
+            content_type: Set(item.content_type),
+            file_path: Set(item.file_path),
+            preview_file_path: Set(item.preview_file_path),
+            description: Set(item.description),
+            width: Set(item.width),
+            height: Set(item.height),
+            preview_width: Set(item.preview_width),
+            preview_height: Set(item.preview_height),
+            blurhash: Set(item.blurhash),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Soft-delete a remote Note only when its verified author owns it.
@@ -5641,6 +5819,82 @@ fn normalize_tag_name(name: &str) -> String {
     name.trim().trim_start_matches('#').to_lowercase()
 }
 
+async fn local_status_snapshot(
+    txn: &DatabaseTransaction,
+    status: &local_status::Model,
+    created_at: OffsetDateTime,
+) -> Result<()> {
+    let edit_id = Uuid::now_v7();
+    let mut local_mention_ids = local_status_local_mention::Entity::find()
+        .filter(local_status_local_mention::Column::StatusId.eq(status.id))
+        .filter(local_status_local_mention::Column::Active.eq(true))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|row| row.account_id)
+        .collect::<Vec<_>>();
+    let mut remote_mention_ids = local_status_remote_mention::Entity::find()
+        .filter(local_status_remote_mention::Column::StatusId.eq(status.id))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|row| row.remote_actor_id)
+        .collect::<Vec<_>>();
+    let tag_rows = local_status_tag::Entity::find()
+        .filter(local_status_tag::Column::StatusId.eq(status.id))
+        .all(txn)
+        .await?;
+    let mut tag_names = Vec::with_capacity(tag_rows.len());
+    for row in tag_rows {
+        if let Some(tag) = local_tag::Entity::find_by_id(row.tag_id).one(txn).await? {
+            tag_names.push(tag.name);
+        }
+    }
+    local_mention_ids.sort();
+    remote_mention_ids.sort();
+    tag_names.sort();
+    local_status_edit::ActiveModel {
+        id: Set(edit_id),
+        local_status_id: Set(status.id),
+        content: Set(status.content.clone()),
+        spoiler_text: Set(status.spoiler_text.clone()),
+        sensitive: Set(status.sensitive),
+        local_mention_ids: Set(serde_json::json!(local_mention_ids)),
+        remote_mention_ids: Set(serde_json::json!(remote_mention_ids)),
+        tag_names: Set(serde_json::json!(tag_names)),
+        created_at: Set(created_at),
+    }
+    .insert(txn)
+    .await?;
+    let media = local_media_attachment::Entity::find()
+        .filter(local_media_attachment::Column::StatusId.eq(status.id))
+        .order_by_asc(local_media_attachment::Column::StatusOrder)
+        .all(txn)
+        .await?;
+    for item in media {
+        local_status_edit_media::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_status_edit_id: Set(edit_id),
+            local_media_attachment_id: Set(item.id),
+            status_order: Set(item.status_order),
+            content_type: Set(item.content_type),
+            file_path: Set(item.file_path),
+            preview_file_path: Set(item.preview_file_path),
+            description: Set(item.description),
+            focus_x: Set(item.focus_x),
+            focus_y: Set(item.focus_y),
+            width: Set(item.width),
+            height: Set(item.height),
+            preview_width: Set(item.preview_width),
+            preview_height: Set(item.preview_height),
+            blurhash: Set(item.blurhash),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Update an owned local status and its attached media metadata.
 pub async fn update_owned_local_status(
     txn: &sea_orm::DatabaseTransaction,
@@ -5650,15 +5904,112 @@ pub async fn update_owned_local_status(
     media_ids: Option<&[Uuid]>,
     media_attributes: &[LocalStatusMediaAttributeUpdate],
     metadata: LocalStatusMetadata,
-) -> Result<Option<LocalStatus>> {
+) -> Result<Option<LocalStatusUpdateResult>> {
     let Some(status) = local_status::Entity::find_by_id(status_id.0)
         .filter(local_status::Column::AccountId.eq(account_id.0))
         .filter(local_status::Column::DeletedAt.is_null())
+        .lock_exclusive()
         .one(txn)
         .await?
     else {
         return Ok(None);
     };
+
+    let current_media = local_media_attachment::Entity::find()
+        .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
+        .order_by_asc(local_media_attachment::Column::StatusOrder)
+        .all(txn)
+        .await?;
+    let desired_media_ids = media_ids
+        .map(<[Uuid]>::to_vec)
+        .unwrap_or_else(|| current_media.iter().map(|media| media.id).collect());
+    let scalar_changed = update
+        .content
+        .as_ref()
+        .is_some_and(|value| value != &status.content)
+        || update
+            .sensitive
+            .is_some_and(|value| value != status.sensitive)
+        || update
+            .spoiler_text
+            .as_ref()
+            .is_some_and(|value| value != &status.spoiler_text)
+        || update
+            .language
+            .as_ref()
+            .is_some_and(|value| value != &status.language);
+    let media_set_changed = desired_media_ids
+        != current_media
+            .iter()
+            .map(|media| media.id)
+            .collect::<Vec<_>>();
+    let media_attributes_changed = media_attributes.iter().any(|attribute| {
+        current_media
+            .iter()
+            .find(|media| media.id == attribute.media_id)
+            .is_none_or(|media| {
+                attribute
+                    .description
+                    .as_ref()
+                    .is_some_and(|description| description != &media.description)
+                    || attribute
+                        .focus
+                        .is_some_and(|(x, y)| media.focus_x != Some(x) || media.focus_y != Some(y))
+            })
+    });
+    let mut desired_tags = metadata
+        .tag_names
+        .iter()
+        .map(|name| normalize_tag_name(name))
+        .collect::<Vec<_>>();
+    desired_tags.sort();
+    desired_tags.dedup();
+    let current_tag_rows = local_status_tag::Entity::find()
+        .filter(local_status_tag::Column::StatusId.eq(status_id.0))
+        .all(txn)
+        .await?;
+    let mut current_tags = Vec::with_capacity(current_tag_rows.len());
+    for row in current_tag_rows {
+        if let Some(tag) = local_tag::Entity::find_by_id(row.tag_id).one(txn).await? {
+            current_tags.push(tag.name);
+        }
+    }
+    current_tags.sort();
+    let mut desired_remote = metadata
+        .remote_actor_ids
+        .iter()
+        .map(|id| id.0)
+        .collect::<Vec<_>>();
+    desired_remote.sort();
+    desired_remote.dedup();
+    let mut current_remote = local_status_remote_mention::Entity::find()
+        .filter(local_status_remote_mention::Column::StatusId.eq(status_id.0))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|row| row.remote_actor_id)
+        .collect::<Vec<_>>();
+    current_remote.sort();
+    let metadata_changed = desired_tags != current_tags || desired_remote != current_remote;
+    if !scalar_changed && !media_set_changed && !media_attributes_changed && !metadata_changed {
+        return Ok(Some(LocalStatusUpdateResult::Unchanged(
+            local_status_from_model(status)?,
+        )));
+    }
+
+    if local_status_edit::Entity::find()
+        .filter(local_status_edit::Column::LocalStatusId.eq(status_id.0))
+        .one(txn)
+        .await?
+        .is_none()
+    {
+        let previous_timestamp = if status.updated_at == status.created_at {
+            status.created_at
+        } else {
+            status.updated_at
+        };
+        local_status_snapshot(txn, &status, previous_timestamp).await?;
+    }
 
     if let Some(media_ids) = media_ids {
         for media_id in media_ids {
@@ -5740,7 +6091,8 @@ pub async fn update_owned_local_status(
     set_if_some(&mut active.sensitive, update.sensitive);
     set_if_some(&mut active.spoiler_text, update.spoiler_text);
     set_if_some(&mut active.language, update.language);
-    active.updated_at = Set(OffsetDateTime::now_utc());
+    let revision_timestamp = OffsetDateTime::now_utc();
+    active.updated_at = Set(revision_timestamp);
     let status = active.update(txn).await?;
 
     local_status_tag::Entity::delete_many()
@@ -5808,7 +6160,10 @@ pub async fn update_owned_local_status(
     }
     replace_local_status_local_mentions(txn, status_id, &local_mention_ids).await?;
 
-    Ok(Some(local_status_from_model(status)?))
+    local_status_snapshot(txn, &status, revision_timestamp).await?;
+    Ok(Some(LocalStatusUpdateResult::Updated(
+        local_status_from_model(status)?,
+    )))
 }
 
 /// Replace the active local mentions of a local status while retaining inactive history.
@@ -6030,6 +6385,14 @@ pub async fn delete_owned_unattached_media_attachment(
     let Some(media) = local_media_attachment::Entity::find_by_id(media_id)
         .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
         .filter(local_media_attachment::Column::StatusId.is_null())
+        .filter(
+            local_media_attachment::Column::Id.not_in_subquery(
+                Query::select()
+                    .column(local_status_edit_media::Column::LocalMediaAttachmentId)
+                    .from(local_status_edit_media::Entity)
+                    .to_owned(),
+            ),
+        )
         .one(db)
         .await?
     else {
@@ -6056,6 +6419,107 @@ pub async fn local_media_attachments_for_status(
         .into_iter()
         .map(local_media_attachment_from_model)
         .collect())
+}
+
+/// Load every stored local revision oldest first.
+pub async fn local_status_edits(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<LocalStatusEdit>> {
+    let edits = local_status_edit::Entity::find()
+        .filter(local_status_edit::Column::LocalStatusId.eq(status_id.0))
+        .order_by_asc(local_status_edit::Column::CreatedAt)
+        .order_by_asc(local_status_edit::Column::Id)
+        .all(db)
+        .await?;
+    let mut result = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let media = local_status_edit_media::Entity::find()
+            .filter(local_status_edit_media::Column::LocalStatusEditId.eq(edit.id))
+            .order_by_asc(local_status_edit_media::Column::StatusOrder)
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|item| StatusEditMedia {
+                id: item.local_media_attachment_id,
+                content_type: Some(item.content_type),
+                file_path: Some(item.file_path),
+                preview_file_path: item.preview_file_path,
+                remote_url: None,
+                description: item.description,
+                focus_x: item.focus_x,
+                focus_y: item.focus_y,
+                width: item.width,
+                height: item.height,
+                preview_width: item.preview_width,
+                preview_height: item.preview_height,
+                blurhash: item.blurhash,
+            })
+            .collect();
+        let local_ids = serde_json::from_value::<Vec<Uuid>>(edit.local_mention_ids)
+            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        let remote_ids = serde_json::from_value::<Vec<Uuid>>(edit.remote_mention_ids)
+            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        result.push(LocalStatusEdit {
+            content: edit.content,
+            spoiler_text: edit.spoiler_text,
+            sensitive: edit.sensitive,
+            local_mention_ids: local_ids.into_iter().map(AccountId).collect(),
+            remote_mention_ids: remote_ids.into_iter().map(AccountId).collect(),
+            tag_names: serde_json::from_value(edit.tag_names)
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
+            created_at: edit.created_at,
+            media,
+        });
+    }
+    Ok(result)
+}
+
+/// Load every stored cached-remote revision oldest first.
+pub async fn remote_status_edits(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<RemoteStatusEdit>> {
+    let edits = remote_status_edit::Entity::find()
+        .filter(remote_status_edit::Column::RemoteStatusId.eq(status_id.0))
+        .order_by_asc(remote_status_edit::Column::CreatedAt)
+        .order_by_asc(remote_status_edit::Column::Id)
+        .all(db)
+        .await?;
+    let mut result = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let media = remote_status_edit_media::Entity::find()
+            .filter(remote_status_edit_media::Column::RemoteStatusEditId.eq(edit.id))
+            .order_by_asc(remote_status_edit_media::Column::StatusOrder)
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|item| StatusEditMedia {
+                id: item.source_attachment_id.unwrap_or(item.id),
+                content_type: item.content_type,
+                file_path: item.file_path,
+                preview_file_path: item.preview_file_path,
+                remote_url: Some(item.remote_url),
+                description: item.description,
+                focus_x: None,
+                focus_y: None,
+                width: item.width,
+                height: item.height,
+                preview_width: item.preview_width,
+                preview_height: item.preview_height,
+                blurhash: item.blurhash,
+            })
+            .collect();
+        result.push(RemoteStatusEdit {
+            content: edit.content,
+            spoiler_text: edit.spoiler_text,
+            sensitive: edit.sensitive,
+            object: edit.object,
+            created_at: edit.created_at,
+            media,
+        });
+    }
+    Ok(result)
 }
 
 /// Return whether a local status has at least one media attachment.
