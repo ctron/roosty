@@ -51,6 +51,7 @@ pub fn router() -> Router<AppState> {
             "/api/v1/statuses/{status_id}",
             get(show_status).put(update_status).delete(delete_status),
         )
+        .route("/api/v1/statuses/{status_id}/source", get(status_source))
         .route("/api/v1/statuses/{status_id}/context", get(status_context))
         .route(
             "/api/v1/statuses/{status_id}/favourite",
@@ -208,6 +209,14 @@ pub(crate) struct StatusResponse {
     pinned: bool,
     reblog: Option<Box<StatusResponse>>,
     application: Option<Value>,
+}
+
+/// Plain-text source fields used to populate Mastodon-compatible status editors.
+#[derive(Serialize)]
+struct StatusSourceResponse {
+    id: String,
+    text: String,
+    spoiler_text: String,
 }
 
 /// Mastodon account projection for either a local or cached remote status author.
@@ -578,6 +587,29 @@ async fn show_status(
                 Err(error) => server_error(error),
             }
         }
+    }
+}
+
+async fn status_source(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    let status = match roosty_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => return not_found(),
+        Err(error) => return server_error(error),
+    };
+    match status_visible_to_viewer(&state, &status, Some(account.id)).await {
+        Ok(true) => Json(StatusSourceResponse {
+            id: status.id.0.to_string(),
+            text: status.content,
+            spoiler_text: status.spoiler_text,
+        })
+        .into_response(),
+        Ok(false) => not_found(),
+        Err(error) => server_error(error),
     }
 }
 
@@ -4797,6 +4829,56 @@ mod tests {
         assert_eq!(update["spoiler_text"], "warning");
         assert_eq!(update["language"], "en");
         assert!(update["edited_at"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given an owned status, when an editor requests its source, then the original plain text and
+    /// content warning are returned instead of the rendered HTML.
+    async fn status_source_returns_editable_plain_text(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &token,
+                serde_json::json!({
+                    "status": "hello <roosty>",
+                    "spoiler_text": "warning"
+                }),
+            )
+            .await;
+        let status = json_body(status).await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let source = context
+            .authenticated_get(&format!("/api/v1/statuses/{status_id}/source"), &token)
+            .await;
+
+        assert_eq!(source.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(source).await,
+            serde_json::json!({
+                "id": status_id,
+                "text": "hello <roosty>",
+                "spoiler_text": "warning"
+            })
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a status source request without a token, then the editor endpoint rejects it.
+    async fn status_source_requires_authentication(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let status = context.create_status(&token, "hello", None, None).await;
+        let status_id = status["id"].as_str().unwrap();
+
+        let source = context
+            .get(&format!("/api/v1/statuses/{status_id}/source"))
+            .await;
+
+        assert_eq!(source.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test_context(StatusContext)]

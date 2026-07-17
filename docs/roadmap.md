@@ -6,6 +6,7 @@
 
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
 - Local public/unlisted home-timeline fan-out, replies, mentions, favourites, boosts, notifications, and direct conversations.
+- Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
