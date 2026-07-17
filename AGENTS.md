@@ -54,6 +54,7 @@ Keep this as the default verification command for changes in this repository.
 ## Database Transactions
 
 - Prefer database transactions for multi-step reads and writes that must observe or preserve a consistent state.
+- Perform even read-only database operations within a transaction; use a read-only transaction when appropriate.
 
 ## Documentation
 
