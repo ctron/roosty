@@ -1497,37 +1497,30 @@ async fn tag_timeline(
     };
     let query = match timeline_query(TimelineParams {
         limit: params.limit,
-        max_id: params.max_id,
-        since_id: params.since_id,
-        min_id: params.min_id,
+        max_id: params.max_id.clone(),
+        since_id: params.since_id.clone(),
+        min_id: params.min_id.clone(),
     }) {
         Ok(query) => query,
         Err(error) => return bad_request(&error.to_string()),
     };
-    if params.remote.unwrap_or(false) && !params.local.unwrap_or(false) {
-        return timeline_response(
-            &state,
-            roosty_db::TimelinePage {
-                items: Vec::new(),
-                first_cursor: None,
-                last_cursor: None,
-                has_more: false,
-            },
-            query.limit,
-            &format!("/api/v1/timelines/tag/{}", path.hashtag),
-            viewer.as_ref().map(|account| account.id),
-        )
-        .await;
-    }
-
-    match roosty_db::local_tag_timeline(
+    let origin = match (params.local == Some(true), params.remote == Some(true)) {
+        (true, false) => roosty_db::PublicTimelineOrigin::Local,
+        (false, true) => roosty_db::PublicTimelineOrigin::Remote,
+        _ => roosty_db::PublicTimelineOrigin::Federated,
+    };
+    match roosty_db::tag_timeline(
         &state.db,
         &path.hashtag,
-        roosty_db::LocalTagTimelineOptions {
-            any: params.any,
-            all: params.all,
-            none: params.none,
+        roosty_db::TagTimelineOptions {
+            any: params.any.clone(),
+            all: params.all.clone(),
+            none: params.none.clone(),
             only_media: params.only_media.unwrap_or(false),
+            origin,
+            viewer: viewer.as_ref().map(|account| account.id),
+            allowed_remote_domains: state.config.federation_allowed_domains.clone(),
+            blocked_remote_domains: state.config.federation_blocked_domains.clone(),
         },
         query.limit,
         query.cursor,
@@ -1535,12 +1528,13 @@ async fn tag_timeline(
     .await
     {
         Ok(statuses) => {
-            timeline_response(
+            tag_timeline_response(
                 &state,
                 statuses,
                 query.limit,
                 &format!("/api/v1/timelines/tag/{}", path.hashtag),
                 viewer.as_ref().map(|account| account.id),
+                &params,
             )
             .await
         }
@@ -1614,7 +1608,7 @@ pub(crate) async fn tag_response_model(
     tag: roosty_db::LocalTag,
     following: Option<bool>,
 ) -> Result<TagResponse, RoostyError> {
-    let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
+    let history = roosty_db::tag_history(&state.db, tag.id).await?;
     Ok(TagResponse::new(state, tag, history, following))
 }
 
@@ -2536,6 +2530,38 @@ async fn public_timeline_response(
     response
 }
 
+/// Build a mixed local/remote hashtag timeline response.
+async fn tag_timeline_response(
+    state: &AppState,
+    page: roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    limit: u64,
+    path: &str,
+    viewer: Option<AccountId>,
+    filters: &TagTimelineParams,
+) -> Response {
+    let link_header = tag_timeline_link_header(&page, limit, path, filters);
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let result = match item {
+            roosty_db::PublicTimelineItem::Local(status) => {
+                status_with_author(state, status, viewer).await
+            }
+            roosty_db::PublicTimelineItem::Remote(status) => {
+                remote_status_response_for_viewer(state, status, viewer).await
+            }
+        };
+        match result {
+            Ok(status) => items.push(status),
+            Err(error) => return server_error(error),
+        }
+    }
+    let mut response = Json(items).into_response();
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
+}
+
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
 pub(crate) async fn timeline_response(
     state: &AppState,
@@ -2792,6 +2818,7 @@ async fn remote_status_response_for_viewer(
         } else {
             (None, None)
         };
+    let tags = remote_status_tags(state, status.id).await?;
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.published_at),
@@ -2824,7 +2851,7 @@ async fn remote_status_response_for_viewer(
             .map(|media| remote_media_attachment_response(state, media))
             .collect(),
         mentions,
-        tags: remote_status_tags(&status.object),
+        tags,
         emojis: remote_custom_emojis(&status.object),
         reblogs_count: 0,
         favourites_count: 0,
@@ -2898,45 +2925,22 @@ async fn remote_status_mentions(
     Ok(mentions)
 }
 
-/// Project valid ActivityPub Hashtag tags without merging them into local tag state.
-fn remote_status_tags(object: &Value) -> Vec<TagResponse> {
-    let Some(tags) = object.get("tag").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut projected = Vec::new();
-    let mut seen = HashSet::new();
-    for tag in tags {
-        let kind = tag.get("type").and_then(Value::as_str);
-        if !matches!(
-            kind,
-            Some("Hashtag") | Some("https://www.w3.org/ns/activitystreams#Hashtag")
-        ) {
-            continue;
-        }
-        let Some(name) = tag.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(name) = name.strip_prefix('#').filter(|name| !name.is_empty()) else {
-            continue;
-        };
-        let Some(url) = tag
-            .get("href")
-            .and_then(Value::as_str)
-            .filter(|url| url.starts_with("https://"))
-        else {
-            continue;
-        };
-        if seen.insert((name.to_owned(), url.to_owned())) {
-            projected.push(TagResponse {
-                id: name.to_owned(),
-                name: name.to_owned(),
-                url: url.to_owned(),
-                history: Vec::new(),
-                following: None,
-            });
-        }
-    }
-    projected
+/// Project indexed remote hashtags through this instance's canonical tag URLs.
+async fn remote_status_tags(
+    state: &AppState,
+    status_id: StatusId,
+) -> Result<Vec<TagResponse>, RoostyError> {
+    Ok(roosty_db::remote_tags_for_status(&state.db, status_id)
+        .await?
+        .into_iter()
+        .map(|tag| TagResponse {
+            id: tag.id.to_string(),
+            name: tag.name.clone(),
+            url: public_url(state, &format!("tags/{}", tag.name)),
+            history: Vec::new(),
+            following: None,
+        })
+        .collect())
 }
 
 async fn reblog_response(
@@ -3179,7 +3183,7 @@ async fn status_tags(
     let tags = roosty_db::local_tags_for_status(&state.db, status_id).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
-        let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
+        let history = roosty_db::tag_history(&state.db, tag.id).await?;
         responses.push(TagResponse::new(state, tag, history, None));
     }
 
@@ -3541,6 +3545,49 @@ fn public_timeline_link_header(
         r#"</api/v1/timelines/public?limit={limit}&min_id={first}{filters_query}>; rel="prev", </api/v1/timelines/public?limit={limit}&max_id={last}{filters_query}>; rel="next""#,
     );
     HeaderValue::from_str(&value).ok()
+}
+
+fn tag_timeline_link_header(
+    page: &roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    limit: u64,
+    path: &str,
+    filters: &TagTimelineParams,
+) -> Option<HeaderValue> {
+    if !page.has_more {
+        return None;
+    }
+    let first = page.first_cursor?;
+    let last = page.last_cursor?;
+    let query = |cursor: &str, id: uuid::Uuid| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor, &id.to_string());
+        for tag in &filters.any {
+            serializer.append_pair("any[]", tag);
+        }
+        for tag in &filters.all {
+            serializer.append_pair("all[]", tag);
+        }
+        for tag in &filters.none {
+            serializer.append_pair("none[]", tag);
+        }
+        if filters.local == Some(true) {
+            serializer.append_pair("local", "true");
+        }
+        if filters.remote == Some(true) {
+            serializer.append_pair("remote", "true");
+        }
+        if filters.only_media == Some(true) {
+            serializer.append_pair("only_media", "true");
+        }
+        serializer.finish()
+    };
+    HeaderValue::from_str(&format!(
+        r#"<{path}?{}>; rel="prev", <{path}?{}>; rel="next""#,
+        query("min_id", first),
+        query("max_id", last)
+    ))
+    .ok()
 }
 
 fn home_timeline_link_header(
@@ -4181,8 +4228,7 @@ mod tests {
 
     use super::{
         StatusContextLimits, escape_html, hashtag_names, mention_usernames, push_url_html,
-        remote_mention_matches, remote_status_tags, status_content_html, timeline_limit,
-        url_matches,
+        remote_mention_matches, status_content_html, timeline_limit, url_matches,
     };
     use crate::{config::Config, http::AppState, password};
 
@@ -4198,29 +4244,6 @@ mod tests {
         assert_eq!(authenticated.ancestors, 4_096);
         assert_eq!(authenticated.descendants, 4_096);
         assert_eq!(authenticated.descendants_depth, None);
-    }
-
-    #[test]
-    /// Remote hashtag metadata remains contextual and keeps its source-instance URL.
-    fn projects_valid_remote_hashtag_tags() {
-        let tags = remote_status_tags(&serde_json::json!({
-            "tag": [
-                {"type": "Hashtag", "name": "#cats", "href": "https://remote.test/tags/cats"},
-                {"type": "https://www.w3.org/ns/activitystreams#Hashtag", "name": "#cats", "href": "https://remote.test/tags/cats"},
-                {"type": "Hashtag", "name": "cats", "href": "https://remote.test/tags/cats"},
-                {"type": "Hashtag", "name": "#local", "href": "http://remote.test/tags/local"}
-            ]
-        }));
-        let value = serde_json::to_value(tags).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!([{
-                "id": "cats",
-                "name": "cats",
-                "url": "https://remote.test/tags/cats",
-                "history": []
-            }])
-        );
     }
 
     #[test_context(StatusContext)]
@@ -4573,6 +4596,146 @@ mod tests {
         assert_eq!(
             context.get("/api/v1/tags/missing").await.status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given indexed cached hashtags, mixed APIs and followed-tag home delivery expose public remote Notes.
+    async fn cached_remote_hashtags_integrate_with_timelines_search_and_follows(
+        context: &mut StatusContext,
+    ) {
+        std::sync::Arc::make_mut(&mut context.state.config).federation_allowed_domains =
+            vec!["*".to_owned()];
+        let bob_token = context
+            .access_token_for("remote_tag_follower", "remote-tag@example.com")
+            .await;
+        let follow = context
+            .authenticated_empty("POST", "/api/v1/tags/fediverse/follow", &bob_token)
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+
+        let actor = context.cache_remote_actor("tagged").await;
+        let now = time::OffsetDateTime::now_utc();
+        let remote = roosty_db::upsert_remote_status(
+            &context.db,
+            NewRemoteStatus {
+                activitypub_id: "https://remote.test/statuses/tagged".to_owned(),
+                remote_actor_id: actor.id,
+                content: "<p>#Fediverse #Rust</p>".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: now,
+                updated_at: now,
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({
+                    "tag": [
+                        {"type": "Hashtag", "name": "#Fediverse", "href": "https://remote.test/tags/fediverse"},
+                        {"type": "https://www.w3.org/ns/activitystreams#Hashtag", "name": "#Rust"}
+                    ]
+                }),
+                tag_names: vec!["fediverse".to_owned(), "rust".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let mixed = json_body(context.get("/api/v1/timelines/tag/fediverse").await).await;
+        assert_eq!(status_ids(&mixed), [remote.id.0.to_string()]);
+        let remote_only = json_body(
+            context
+                .get("/api/v1/timelines/tag/fediverse?remote=true")
+                .await,
+        )
+        .await;
+        assert_eq!(status_ids(&remote_only), [remote.id.0.to_string()]);
+        assert!(
+            json_body(
+                context
+                    .get("/api/v1/timelines/tag/fediverse?local=true")
+                    .await
+            )
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            mixed[0]["tags"][0]["url"],
+            "https://localhost:4000/tags/fediverse"
+        );
+
+        let tag = json_body(context.get("/api/v1/tags/fediverse").await).await;
+        assert_eq!(tag["history"][0]["uses"], "1");
+        assert_eq!(tag["history"][0]["accounts"], "1");
+        let search = json_body(context.get("/api/v2/search?type=hashtags&q=%23fedi").await).await;
+        assert_eq!(search["hashtags"][0]["name"], "fediverse");
+
+        let home = json_body(
+            context
+                .authenticated_get("/api/v1/timelines/home", &bob_token)
+                .await,
+        )
+        .await;
+        assert_eq!(status_ids(&home), [remote.id.0.to_string()]);
+        assert_eq!(
+            roosty_db::remote_tag_follower_ids_for_status(&context.db, remote.id)
+                .await
+                .unwrap(),
+            vec![
+                roosty_db::find_local_account_by_username(&context.db, "remote_tag_follower")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id
+            ]
+        );
+
+        let txn = context.db.begin().await.unwrap();
+        let updated = roosty_db::process_remote_status_upsert(
+            &txn,
+            NewRemoteStatus {
+                activitypub_id: remote.activitypub_id.clone(),
+                remote_actor_id: actor.id,
+                content: "<p>#Rust</p>".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: remote.published_at,
+                updated_at: now + TimeDuration::seconds(1),
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({
+                    "tag": [{"type": "Hashtag", "name": "#Rust"}]
+                }),
+                tag_names: vec!["rust".to_owned()],
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            updated,
+            roosty_db::RemoteStatusUpsertResult::Updated(_)
+        ));
+        txn.commit().await.unwrap();
+        assert!(
+            json_body(context.get("/api/v1/timelines/tag/fediverse").await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            json_body(
+                context
+                    .authenticated_get("/api/v1/timelines/home", &bob_token)
+                    .await,
+            )
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -5659,6 +5822,7 @@ mod tests {
                         "icon": {"url": "https://remote.test/emoji/wave.png"}
                     }]
                 }),
+                tag_names: Vec::new(),
             },
             &[NewRemoteMediaAttachment {
                 remote_url: "https://remote.test/media/second.png".to_owned(),
@@ -7911,6 +8075,7 @@ mod tests {
                     in_reply_to_local_status_id,
                     in_reply_to_remote_status_id,
                     object: json!({}),
+                    tag_names: Vec::new(),
                 },
             )
             .await

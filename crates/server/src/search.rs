@@ -185,7 +185,7 @@ async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<
     let tags = roosty_db::search_local_tags(&state.db, &query, limit, offset).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
-        let history = roosty_db::local_tag_history(&state.db, tag.id).await?;
+        let history = roosty_db::tag_history(&state.db, tag.id).await?;
         responses.push(TagResponse::new(state, tag, history, None));
     }
 
@@ -338,6 +338,7 @@ mod tests {
                     object: serde_json::json!({
                         "tag": [{"type": "Hashtag", "name": "#remote"}]
                     }),
+                    tag_names: vec!["remote".to_owned()],
                 },
             )
             .await

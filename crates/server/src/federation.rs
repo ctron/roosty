@@ -372,6 +372,7 @@ struct InboundTag {
 #[derive(Deserialize, Serialize, PartialEq)]
 enum InboundTagType {
     Mention,
+    #[serde(alias = "https://www.w3.org/ns/activitystreams#Hashtag")]
     Hashtag,
     Emoji,
     #[serde(rename = "http://joinmastodon.org/ns#Emoji")]
@@ -2015,6 +2016,7 @@ async fn process_remote_status_activity(
                 })
                 .collect::<Vec<_>>();
             let emojis = remote_custom_emoji_definitions(&note.tag);
+            let tag_names = remote_hashtag_names(&note.tag);
             let mention_urls = note
                 .tag
                 .iter()
@@ -2087,6 +2089,7 @@ async fn process_remote_status_activity(
                     },
                     in_reply_to_remote_status_id,
                     object,
+                    tag_names,
                 },
                 &attachments,
             )
@@ -2277,6 +2280,13 @@ async fn publish_remote_status_change(
                 | StatusVisibility::Private => followers,
                 StatusVisibility::Direct => Vec::new(),
             };
+            if status.visibility == StatusVisibility::Public {
+                recipients.extend(
+                    roosty_db::remote_tag_follower_ids_for_status(&state.db, status.id).await?,
+                );
+                recipients.sort_by_key(|id| id.0);
+                recipients.dedup();
+            }
             if matches!(
                 status.visibility,
                 StatusVisibility::Private | StatusVisibility::Direct
@@ -2460,6 +2470,26 @@ fn remote_custom_emoji_definitions(tags: &[InboundTag]) -> Vec<NewRemoteCustomEm
             })
         })
         .collect()
+}
+
+/// Extract normalized hashtag names from typed ActivityPub tag objects.
+fn remote_hashtag_names(tags: &[InboundTag]) -> Vec<String> {
+    let mut names = tags
+        .iter()
+        .filter(|tag| tag.r#type == InboundTagType::Hashtag)
+        .filter_map(|tag| tag.name.as_deref())
+        .filter_map(|name| name.strip_prefix('#'))
+        .map(str::to_lowercase)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Classify a verified Note using exact actor and collection identifiers.
@@ -4126,10 +4156,11 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
+        InboundFollowActivity, InboundTag, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
         InboundUndoFollowActivity, MentionTag, MentionType, Note, NoteType, OrderedCollection,
         PublicKey, actor_context, actor_profile_fields, canonical_activity_digest,
-        is_remote_actor_lifecycle_activity, local_actor_type, parse_acct, same_url_origin,
+        is_remote_actor_lifecycle_activity, local_actor_type, parse_acct, remote_hashtag_names,
+        same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -4152,6 +4183,21 @@ mod tests {
             canonical_activity_digest(&left).unwrap(),
             canonical_activity_digest(&array_changed).unwrap()
         );
+    }
+
+    /// Typed remote hashtag extraction accepts compact and expanded ActivityStreams names.
+    #[test]
+    fn extracts_only_valid_remote_hashtag_names() {
+        let tags: Vec<InboundTag> = serde_json::from_value(json!([
+            {"type": "Hashtag", "name": "#Rust"},
+            {"type": "https://www.w3.org/ns/activitystreams#Hashtag", "name": "#FÉDI"},
+            {"type": "Hashtag", "name": "missing-prefix"},
+            {"type": "Hashtag", "name": "#invalid tag"},
+            {"type": "Mention", "name": "#ignored"}
+        ]))
+        .unwrap();
+
+        assert_eq!(remote_hashtag_names(&tags), ["fédi", "rust"]);
     }
 
     /// Only an `acct:` resource with one non-empty local handle and domain is valid.
@@ -5218,6 +5264,7 @@ mod tests {
                 in_reply_to_local_status_id: None,
                 in_reply_to_remote_status_id: None,
                 object: serde_json::json!({}),
+                tag_names: Vec::new(),
             },
         )
         .await

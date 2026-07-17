@@ -77,7 +77,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v2/search` | Public basic mixed account and local hashtag search. A user token is required for exact-handle `resolve=true`, nonzero `offset`, or `following=true`; status search remains missing. |
+| 🟡 | `GET /api/v2/search` | Public basic mixed account and observed hashtag search, including tags indexed from cached remote Notes. A user token is required for exact-handle `resolve=true`, nonzero `offset`, or `following=true`; status search remains missing. |
 | 🟢 | Remote account resolution | Exact remote handles can be resolved synchronously through policy-controlled WebFinger and validated actor fetching, with cross-process advisory-lock deduplication. URLs are not resolved. |
 
 ### Statuses
@@ -93,14 +93,15 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local and resolved remote mentions render as links and populate `mentions`. Local recipients are tracked independently from notifications; active addressed mentions receive idempotent notifications and subsequent edit/delete streaming. |
-| 🟡 | Hashtags | Local `#tag` text is stored, linked in rendered status HTML, and returned in status `tags`. Cached remote Notes expose valid ActivityPub Hashtag tags with their origin URLs; remote discovery, timelines, and follows are missing. |
+| 🟢 | Hashtags | Local `#tag` text and valid Hashtag tags from cached remote Notes share a normalized namespace. Status projections use local canonical tag URLs; mixed search, seven-day history, origin-filtered tag timelines, and followed-tag home/user-stream fan-out are available. Remote delivery remains cache-only and push-driven. |
 | 🟢 | Status links | Explicit local `http://` and `https://` URLs render as Mastodon-compatible safe anchors in status, history, streaming, and federation projections. Bare domains and non-web URI schemes remain plain text; rich preview cards are not implemented. |
 | 🟡 | Conversations | Direct-message conversations list/read/delete and direct stream events support recipient-scoped local/cached-remote direct Notes, mention-audience replacement on edits, unresolved remote participant IDs, replies to cached direct Notes, remote media fetching, and local/remote update/delete repair. Conversation deletion is account-local, and the direct stream emits only complete `conversation` payloads. |
 | 🟢 | Visibility semantics | Public/unlisted reads work; follower-only local and cached remote posts and replies are visible to owners, current followers, and explicitly mentioned accounts; direct reads remain recipient-scoped. Anonymous and unrelated access returns `404`, and inaccessible thread nodes stop cache-only traversal. |
 | 🟢 | `GET /api/v1/favourites` | Returns authenticated user's local and cached-remote favourites with cursor pagination. |
 | 🟡 | Favourites | Authorized public/unlisted/follower-only local and cached remote statuses support favourite/unfavourite. Signed ActivityPub `Like`/`Undo` updates local counts and notifications; remote favourite counts are not fetched. |
 | 🟢 | `GET /api/v1/bookmarks` | Returns authenticated user's local bookmarks with cursor pagination. |
-| 🟡 | Boosts | Public/unlisted local and cached-remote statuses support reblog/unreblog. Follower-only boosts are rejected except for author self-boosts representable by the existing model. Signed ActivityPub `Announce`/`Undo` supports public/unlisted statuses; quote posts are missing. |
+| 🟡 | Boosts | Public/unlisted local and cached-remote statuses support reblog/unreblog. Follower-only boosts are rejected except for author self-boosts representable by the existing model. Signed ActivityPub `Announce`/`Undo` supports public/unlisted statuses. |
+| 🔴 | Quote posts | Creating, accepting, federating, and projecting quote posts and quote-approval state are not implemented. |
 | 🟢 | Bookmarks | Bookmark/unbookmark APIs are implemented for local statuses. |
 
 ### Timelines
@@ -109,7 +110,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed and explicitly addressed local/cached-remote follower-only statuses, public/unlisted followed statuses, local boosts, and inbound remote boosts. |
 | 🟢 | `GET /api/v1/timelines/public` | Chronological local and already-cached remote public statuses with `local`, `remote`, `only_media`, cursor pagination, `Link` headers, federation-domain policy, and authenticated mute/block filtering. Replies and boosts are excluded to match Mastodon's live feeds. |
-| 🟡 | `GET /api/v1/timelines/tag/:tag` | Local public hashtag timeline with `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, and `Link` headers; remote hashtag timelines are missing. |
+| 🟢 | `GET /api/v1/timelines/tag/:tag` | Mixed local and cached-remote public hashtag timeline with `local`, `remote`, `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, `Link` headers, domain policy, and viewer moderation filtering. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
 
 ### Notifications and Markers
@@ -125,9 +126,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/tags/:name` | Public lookup for locally observed hashtags with local history and authenticated `following` state; featured tag state is missing. |
+| 🟡 | `GET /api/v1/tags/:name` | Public lookup for observed local/cached-remote hashtags with mixed history and authenticated `following` state; featured tag state is missing. |
 | 🟡 | `GET /api/v1/followed_tags` | Lists locally followed hashtags for the authenticated account. |
-| 🟡 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local posts enter the home timeline and user stream; remote tag delivery is missing. |
+| 🟢 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local or cached-remote posts enter the home timeline and user stream. Remote matching is limited to Notes received through normal federation delivery. |
 | 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
 | 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
 | 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
@@ -157,7 +158,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Inbound status lifecycle | Signed public/unlisted/follower-only `Create`, complete-object `Update`, and `Delete` activities are cached with canonical object IDs, exact addressed audiences, reply references, author ownership checks, and transactional material-change revision history. Mention tags do not grant delivery without matching `to`/`cc` addressing. Replay markers and state changes commit atomically; replayed, stale, and no-op updates do not create revisions or events. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
 | 🟢 | Remote timeline fan-out | Cached remote posts are pushed to authorized home streams; follower-only access follows current accepted relationships and explicit audiences, with no polling or backfill. |
-| 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed subject to bilateral block and notification-mute policy. |
+| 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed subject to bilateral block and notification-mute policy. Cached public Note hashtags are transactionally indexed for mixed timelines and followed-tag fan-out. |
 | 🟡 | Remote conversations and moderation | Signed remote direct Notes, mixed participant projection, direct replies, personal-inbox delivery, remote media fetching, per-account moderation, and domain suspension work. Account migration remains missing. |
 
 ## TODO
@@ -170,7 +171,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [x] Add remote mutes and blocks with notification and recipient filtering. Signed remote delete repair is implemented.
 - [ ] Add federated direct-message media fetching and account migration.
 - [ ] Expand conversation support beyond local direct messages.
-- [ ] Add remote hashtag support.
+- [x] Add cache-only remote hashtag indexing, timelines, discovery, history, and followed-tag fan-out.
 - [ ] Add grouped notifications, push integration, and remote notification events.
 - [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.

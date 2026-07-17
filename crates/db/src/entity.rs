@@ -47,4 +47,5 @@ pub mod remote_status_local_mention;
 pub mod remote_status_local_recipient;
 pub mod remote_status_reblog;
 pub mod remote_status_remote_recipient;
+pub mod remote_status_tag;
 pub mod streaming_event;

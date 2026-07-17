@@ -51,7 +51,8 @@
 - [x] Finish transactional remote notifications for Follow and Announce flows, matching the existing transactional mention/reply and Like handling.
 - [ ] Replace stringly persisted status visibility with the typed `StatusVisibility` model at persistence and wire boundaries.
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
-- [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
+- [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
+- [ ] Fetch and expose remote featured/profile tags.
 - [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, and account migration metadata.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
@@ -74,6 +75,7 @@
 
 ## Short Term
 
+- [ ] Add Mastodon-compatible quote posts, including quote approval, API projections, and ActivityPub federation.
 - [x] Harden inbound remote follow handling with signed HTTP `Date` freshness checks and activity-ID idempotency.
 - [x] Add canonical-payload replay protection for reused IDs and reject ID-less, non-HTTPS, or cross-origin durable activities.
 - [x] Add cursor pagination and `Link` headers to remote follow-request listing.
@@ -91,7 +93,8 @@
 - [ ] Improve local account administration now that multiple local users can be operator-created.
 - [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [x] Add cursor pagination for local and cached-remote account status collections.
-- [ ] Add remote hashtag discovery, timelines, and featured/profile tags.
+- [x] Add cached-remote hashtag discovery, timelines, history, and followed-tag fan-out.
+- [ ] Add remote featured/profile tags.
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.
 - [ ] Replace manually formatted Prometheus metrics and global atomic counters with standardized instrumentation and an exporter; evaluate OpenTelemetry for correlated metrics and traces.

@@ -48,6 +48,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_status_edit_media").await);
     assert!(table_exists(database.connection(), "remote_status_edit").await);
     assert!(table_exists(database.connection(), "remote_status_edit_media").await);
+    assert!(table_exists(database.connection(), "remote_status_tag").await);
     assert!(
         column_exists(
             database.connection(),
@@ -265,9 +266,9 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back status history, streaming metadata, edit delivery, subscription extensions,
-    // streaming-kind extension, remote moderation, the streaming log, and the followers URL.
-    Migrator::down(database.connection(), Some(9))
+    // Roll back remote tags, status history, streaming metadata, edit delivery, subscription
+    // extensions, streaming-kind extension, remote moderation, the streaming log, and the URL.
+    Migrator::down(database.connection(), Some(10))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -383,7 +384,7 @@ async fn replay_ledger_upgrade_preserves_legacy_rows(database: &mut EmbeddedData
 async fn status_edit_history_upgrade_and_rollback(database: &mut EmbeddedDatabase) {
     Migrator::up(database.connection(), Some(54)).await.unwrap();
 
-    Migrator::up(database.connection(), None).await.unwrap();
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
     assert!(table_exists(database.connection(), "local_status_edit").await);
     assert!(table_exists(database.connection(), "local_status_edit_media").await);
     assert!(table_exists(database.connection(), "remote_status_edit").await);
@@ -398,6 +399,61 @@ async fn status_edit_history_upgrade_and_rollback(database: &mut EmbeddedDatabas
     assert!(!table_exists(database.connection(), "remote_status_edit_media").await);
     assert!(table_exists(database.connection(), "local_status").await);
     assert!(table_exists(database.connection(), "remote_status").await);
+}
+
+/// Given cached legacy hashtags, migration 56 indexes valid tags and rolls back its join table.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(55)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r##"
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '10000000-0000-0000-0000-000000000001',
+                'https://remote.test/users/alice', 'alice', 'remote.test',
+                'https://remote.test/users/alice/inbox',
+                'https://remote.test/users/alice#main-key', 'key', now() + interval '1 day'
+            );
+            INSERT INTO remote_status (
+                id, activitypub_id, remote_actor_id, content, visibility,
+                published_at, updated_at, object
+            ) VALUES (
+                '20000000-0000-0000-0000-000000000001',
+                'https://remote.test/statuses/1',
+                '10000000-0000-0000-0000-000000000001', '', 'public', now(), now(),
+                '{"tag":[
+                    {"type":"Hashtag","name":"#Rust"},
+                    {"type":"https://www.w3.org/ns/activitystreams#Hashtag","name":"#Fediverse"},
+                    {"type":"Hashtag","name":"invalid tag"}
+                ]}'::jsonb
+            );
+            "##,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), None).await.unwrap();
+    let row = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS count FROM remote_status_tag".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "count").unwrap(), 2);
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!table_exists(database.connection(), "remote_status_tag").await);
+    assert!(table_exists(database.connection(), "local_tag").await);
 }
 
 struct EmbeddedDatabase {

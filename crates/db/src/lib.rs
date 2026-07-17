@@ -103,7 +103,7 @@ use entity::{
     remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
     remote_profile_media, remote_status, remote_status_edit, remote_status_edit_media,
     remote_status_favourite, remote_status_local_mention, remote_status_local_recipient,
-    remote_status_reblog, remote_status_remote_recipient, streaming_event,
+    remote_status_reblog, remote_status_remote_recipient, remote_status_tag, streaming_event,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -755,6 +755,8 @@ pub struct NewRemoteStatus {
     pub in_reply_to_remote_status_id: Option<StatusId>,
     /// Original Note object.
     pub object: JsonValue,
+    /// Validated, normalized hashtag names derived from the Note.
+    pub tag_names: Vec<String>,
 }
 
 /// A local actor's relationship to a remote actor.
@@ -1630,7 +1632,12 @@ pub async fn upsert_remote_status(
     db: &DbConnection,
     status: NewRemoteStatus,
 ) -> Result<RemoteStatus> {
-    upsert_remote_status_on(db, status).await
+    let tag_names = status.tag_names.clone();
+    let txn = db.begin().await?;
+    let status = upsert_remote_status_on(&txn, status).await?;
+    replace_remote_status_tags(&txn, status.id, &tag_names).await?;
+    txn.commit().await?;
+    Ok(status)
 }
 
 /// Persist a remote Note through either a pool connection or a transaction.
@@ -1689,6 +1696,7 @@ pub async fn process_remote_status_upsert(
     status: NewRemoteStatus,
     attachments: &[NewRemoteMediaAttachment],
 ) -> Result<RemoteStatusUpsertResult> {
+    let tag_names = status.tag_names.clone();
     let existing = remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(&status.activitypub_id))
         .lock_exclusive()
@@ -1697,6 +1705,7 @@ pub async fn process_remote_status_upsert(
     let Some(existing) = existing else {
         let status = upsert_remote_status_on(txn, status).await?;
         replace_remote_media_attachments(txn, status.id, attachments).await?;
+        replace_remote_status_tags(txn, status.id, &tag_names).await?;
         return Ok(RemoteStatusUpsertResult::Created(status));
     };
     if existing.remote_actor_id != status.remote_actor_id.0 {
@@ -1743,12 +1752,50 @@ pub async fn process_remote_status_upsert(
     let revision_timestamp = status.updated_at;
     let status = upsert_remote_status_on(txn, status).await?;
     replace_remote_media_attachments(txn, status.id, attachments).await?;
+    replace_remote_status_tags(txn, status.id, &tag_names).await?;
     let current = remote_status::Entity::find_by_id(status.id.0)
         .one(txn)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("remote status disappeared".to_owned()))?;
     remote_status_snapshot(txn, &current, revision_timestamp).await?;
     Ok(RemoteStatusUpsertResult::Updated(status))
+}
+
+/// Replace the indexed hashtags for a cached Note inside its caller-owned transaction.
+async fn replace_remote_status_tags(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    tag_names: &[String],
+) -> Result<()> {
+    remote_status_tag::Entity::delete_many()
+        .filter(remote_status_tag::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
+
+    let now = OffsetDateTime::now_utc();
+    let mut names = tag_names
+        .iter()
+        .map(|name| normalize_tag_name(name))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let tag = find_or_create_local_tag(txn, &name, now).await?;
+        remote_status_tag::ActiveModel {
+            remote_status_id: Set(status_id.0),
+            tag_id: Set(tag.id),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
 }
 
 fn remote_object_spoiler_text(object: &JsonValue) -> String {
@@ -1877,6 +1924,11 @@ async fn repair_one_remote_status_delete(
         }
         StatusVisibility::Direct => Vec::new(),
     };
+    if visibility == StatusVisibility::Public {
+        home_recipient_ids.extend(remote_tag_follower_ids_for_status(txn, status_id).await?);
+        home_recipient_ids.sort_by_key(|id| id.0);
+        home_recipient_ids.dedup();
+    }
     if visibility == StatusVisibility::Private {
         home_recipient_ids.extend(explicit_recipient_ids.iter().copied());
         home_recipient_ids.sort_by_key(|id| id.0);
@@ -2622,9 +2674,9 @@ pub struct AccountStatusTimelineOptions {
     pub tagged: Option<String>,
 }
 
-/// Filters supported by Mastodon's local hashtag timeline request.
+/// Filters supported by Mastodon's mixed hashtag timeline request.
 #[derive(Clone, Debug, Default)]
-pub struct LocalTagTimelineOptions {
+pub struct TagTimelineOptions {
     /// Return statuses that include at least one of these additional tags.
     pub any: Vec<String>,
     /// Return statuses that include every one of these additional tags.
@@ -2633,6 +2685,14 @@ pub struct LocalTagTimelineOptions {
     pub none: Vec<String>,
     /// Return only statuses with at least one media attachment.
     pub only_media: bool,
+    /// Restrict results to local, remote, or both origins.
+    pub origin: PublicTimelineOrigin,
+    /// Optional authenticated viewer used for moderation filtering.
+    pub viewer: Option<AccountId>,
+    /// Remote domains eligible for cached public projection.
+    pub allowed_remote_domains: Vec<String>,
+    /// Remote domains excluded from cached public projection.
+    pub blocked_remote_domains: Vec<String>,
 }
 
 /// Supported local Mastodon notification kinds.
@@ -5483,6 +5543,25 @@ pub async fn local_tags_for_status(
     Ok(tags)
 }
 
+/// List normalized hashtags indexed for a cached remote status.
+pub async fn remote_tags_for_status(
+    db: &DbConnection,
+    status_id: StatusId,
+) -> Result<Vec<LocalTag>> {
+    let rows = remote_status_tag::Entity::find()
+        .filter(remote_status_tag::Column::RemoteStatusId.eq(status_id.0))
+        .all(db)
+        .await?;
+    let mut tags = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(tag) = local_tag::Entity::find_by_id(row.tag_id).one(db).await? {
+            tags.push(local_tag_from_model(tag));
+        }
+    }
+    tags.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(tags)
+}
+
 /// List accounts following at least one hashtag currently attached to a local status.
 pub async fn local_tag_follower_ids_for_status(
     db: &impl ConnectionTrait,
@@ -5495,6 +5574,32 @@ pub async fn local_tag_follower_ids_for_status(
                     .column(local_status_tag::Column::TagId)
                     .from(local_status_tag::Entity)
                     .and_where(local_status_tag::Column::StatusId.eq(status_id.0))
+                    .to_owned(),
+            ),
+        )
+        .all(db)
+        .await?;
+    let mut account_ids = follows
+        .into_iter()
+        .map(|follow| AccountId(follow.account_id))
+        .collect::<Vec<_>>();
+    account_ids.sort_by_key(|id| id.0);
+    account_ids.dedup();
+    Ok(account_ids)
+}
+
+/// List local accounts following a hashtag currently attached to a cached remote status.
+pub async fn remote_tag_follower_ids_for_status(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    let follows = local_tag_follow::Entity::find()
+        .filter(
+            local_tag_follow::Column::TagId.in_subquery(
+                Query::select()
+                    .column(remote_status_tag::Column::TagId)
+                    .from(remote_status_tag::Entity)
+                    .and_where(remote_status_tag::Column::RemoteStatusId.eq(status_id.0))
                     .to_owned(),
             ),
         )
@@ -5635,16 +5740,18 @@ pub async fn is_local_tag_followed(
 }
 
 /// Return recent local usage history for a tag.
-pub async fn local_tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTagHistory>> {
+pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTagHistory>> {
     let rows = local_status_tag::Entity::find()
         .filter(local_status_tag::Column::TagId.eq(tag_id))
         .all(db)
         .await?;
-    let mut buckets = std::collections::BTreeMap::<u64, (u64, Vec<Uuid>)>::new();
+    let mut buckets =
+        std::collections::BTreeMap::<u64, (u64, std::collections::HashSet<(bool, Uuid)>)>::new();
 
     for row in rows {
         let Some(status) = local_status::Entity::find_by_id(row.status_id)
             .filter(local_status::Column::DeletedAt.is_null())
+            .filter(local_status::Column::Visibility.eq("public"))
             .one(db)
             .await?
         else {
@@ -5653,21 +5760,36 @@ pub async fn local_tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<Lo
         let day = (status.created_at.unix_timestamp() / 86_400 * 86_400).max(0) as u64;
         let (uses, accounts) = buckets.entry(day).or_default();
         *uses += 1;
-        accounts.push(status.account_id);
+        accounts.insert((false, status.account_id));
+    }
+
+    let rows = remote_status_tag::Entity::find()
+        .filter(remote_status_tag::Column::TagId.eq(tag_id))
+        .all(db)
+        .await?;
+    for row in rows {
+        let Some(status) = remote_status::Entity::find_by_id(row.remote_status_id)
+            .filter(remote_status::Column::DeletedAt.is_null())
+            .filter(remote_status::Column::Visibility.eq("public"))
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        let day = (status.published_at.unix_timestamp() / 86_400 * 86_400).max(0) as u64;
+        let (uses, accounts) = buckets.entry(day).or_default();
+        *uses += 1;
+        accounts.insert((true, status.remote_actor_id));
     }
 
     let mut history = buckets
         .into_iter()
         .rev()
         .take(7)
-        .map(|(day, (uses, mut accounts))| {
-            accounts.sort();
-            accounts.dedup();
-            LocalTagHistory {
-                day,
-                uses,
-                accounts: accounts.len() as u64,
-            }
+        .map(|(day, (uses, accounts))| LocalTagHistory {
+            day,
+            uses,
+            accounts: accounts.len() as u64,
         })
         .collect::<Vec<_>>();
     history.sort_by_key(|bucket| std::cmp::Reverse(bucket.day));
@@ -5675,14 +5797,14 @@ pub async fn local_tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<Lo
     Ok(history)
 }
 
-/// List public local statuses containing a tag and optional tag filters.
-pub async fn local_tag_timeline(
+/// List public local and cached remote statuses containing a hashtag.
+pub async fn tag_timeline(
     db: &DbConnection,
     tag: &str,
-    options: LocalTagTimelineOptions,
+    options: TagTimelineOptions,
     limit: u64,
     cursor: TimelineCursor,
-) -> Result<TimelinePage<LocalStatus>> {
+) -> Result<TimelinePage<PublicTimelineItem>> {
     let Some(primary) = find_local_tag_by_name(db, tag).await? else {
         return Ok(TimelinePage {
             items: Vec::new(),
@@ -5691,14 +5813,10 @@ pub async fn local_tag_timeline(
             has_more: false,
         });
     };
-    let mut query = local_status::Entity::find()
-        .filter(local_status::Column::Visibility.eq("public"))
-        .filter(local_status::Column::DeletedAt.is_null())
-        .filter(local_status::Column::Id.in_subquery(status_tag_subquery(primary.id)));
-
+    let mut all_tag_ids = Vec::new();
     for tag in &options.all {
         if let Some(tag) = find_local_tag_by_name(db, tag).await? {
-            query = query.filter(local_status::Column::Id.in_subquery(status_tag_subquery(tag.id)));
+            all_tag_ids.push(tag.id);
         } else {
             return Ok(TimelinePage {
                 items: Vec::new(),
@@ -5708,51 +5826,167 @@ pub async fn local_tag_timeline(
             });
         }
     }
-
     let any_tags = local_tags_by_names(db, &options.any).await?;
-    if !options.any.is_empty() {
-        if any_tags.is_empty() {
-            return Ok(TimelinePage {
-                items: Vec::new(),
-                first_cursor: None,
-                last_cursor: None,
-                has_more: false,
-            });
-        }
-        query = query.filter(local_status::Column::Id.in_subquery(status_tags_subquery(
-            any_tags.iter().map(|tag| tag.id).collect(),
-        )));
+    if !options.any.is_empty() && any_tags.is_empty() {
+        return Ok(TimelinePage {
+            items: Vec::new(),
+            first_cursor: None,
+            last_cursor: None,
+            has_more: false,
+        });
     }
-
     let none_tags = local_tags_by_names(db, &options.none).await?;
-    if !none_tags.is_empty() {
-        query = query.filter(
-            local_status::Column::Id.not_in_subquery(status_tags_subquery(
-                none_tags.iter().map(|tag| tag.id).collect(),
-            )),
+    let any_tag_ids = any_tags.iter().map(|tag| tag.id).collect::<Vec<_>>();
+    let none_tag_ids = none_tags.iter().map(|tag| tag.id).collect::<Vec<_>>();
+    let hidden_local_ids = if let Some(viewer) = options.viewer {
+        hidden_local_account_ids_for_account(db, viewer)
+            .await?
+            .into_iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let hidden_remote_ids = if let Some(viewer) = options.viewer {
+        hidden_remote_actor_ids_for_account(db, viewer)
+            .await?
+            .into_iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let mut items = Vec::new();
+    if options.origin != PublicTimelineOrigin::Remote {
+        let mut query = local_status::Entity::find()
+            .filter(local_status::Column::Visibility.eq("public"))
+            .filter(local_status::Column::DeletedAt.is_null())
+            .filter(local_status::Column::Id.in_subquery(status_tag_subquery(primary.id)));
+        for tag_id in &all_tag_ids {
+            query =
+                query.filter(local_status::Column::Id.in_subquery(status_tag_subquery(*tag_id)));
+        }
+        if !any_tag_ids.is_empty() {
+            query = query.filter(
+                local_status::Column::Id.in_subquery(status_tags_subquery(any_tag_ids.clone())),
+            );
+        }
+        if !none_tag_ids.is_empty() {
+            query = query.filter(
+                local_status::Column::Id
+                    .not_in_subquery(status_tags_subquery(none_tag_ids.clone())),
+            );
+        }
+        if options.only_media {
+            query = query.filter(local_status::Column::Id.in_subquery(media_status_subquery()));
+        }
+        if !hidden_local_ids.is_empty() {
+            query = query.filter(local_status::Column::AccountId.is_not_in(hidden_local_ids));
+        }
+        let statuses = apply_timeline_cursor(query, cursor)
+            .order_by_desc(local_status::Column::Id)
+            .limit(page_query_limit(limit))
+            .all(db)
+            .await?;
+        items.extend(
+            statuses
+                .into_iter()
+                .map(|status| local_status_from_model(status).map(PublicTimelineItem::Local))
+                .collect::<Result<Vec<_>>>()?,
         );
     }
 
-    if options.only_media {
-        query = query.filter(local_status::Column::Id.in_subquery(media_status_subquery()));
+    if options.origin != PublicTimelineOrigin::Local && !options.allowed_remote_domains.is_empty() {
+        let mut actor_condition = Condition::all().add(remote_actor::Column::DeletedAt.is_null());
+        if !options
+            .allowed_remote_domains
+            .iter()
+            .any(|domain| domain == "*")
+        {
+            actor_condition = actor_condition
+                .add(remote_actor::Column::Domain.is_in(options.allowed_remote_domains.clone()));
+        }
+        for domain in &options.blocked_remote_domains {
+            actor_condition = actor_condition
+                .add(remote_actor::Column::Domain.ne(domain.clone()))
+                .add(remote_actor::Column::Domain.not_like(format!("%.{domain}")));
+        }
+        let allowed_actors = Query::select()
+            .column(remote_actor::Column::Id)
+            .from(remote_actor::Entity)
+            .and_where(actor_condition.into())
+            .to_owned();
+        let mut query = remote_status::Entity::find()
+            .filter(remote_status::Column::Visibility.eq("public"))
+            .filter(remote_status::Column::DeletedAt.is_null())
+            .filter(remote_status::Column::RemoteActorId.in_subquery(allowed_actors))
+            .filter(remote_status::Column::Id.in_subquery(remote_status_tag_subquery(primary.id)));
+        for tag_id in &all_tag_ids {
+            query = query
+                .filter(remote_status::Column::Id.in_subquery(remote_status_tag_subquery(*tag_id)));
+        }
+        if !any_tag_ids.is_empty() {
+            query = query.filter(
+                remote_status::Column::Id.in_subquery(remote_status_tags_subquery(any_tag_ids)),
+            );
+        }
+        if !none_tag_ids.is_empty() {
+            query = query.filter(
+                remote_status::Column::Id
+                    .not_in_subquery(remote_status_tags_subquery(none_tag_ids)),
+            );
+        }
+        if options.only_media {
+            query = query.filter(
+                remote_status::Column::Id.in_subquery(
+                    Query::select()
+                        .column(remote_media_attachment::Column::RemoteStatusId)
+                        .from(remote_media_attachment::Entity)
+                        .to_owned(),
+                ),
+            );
+        }
+        if !hidden_remote_ids.is_empty() {
+            query = query.filter(remote_status::Column::RemoteActorId.is_not_in(hidden_remote_ids));
+        }
+        if let Some(max_id) = cursor.max_id {
+            query = query.filter(remote_status::Column::Id.lt(max_id.0));
+        }
+        if let Some(since_id) = cursor.since_id {
+            query = query.filter(remote_status::Column::Id.gt(since_id.0));
+        }
+        if let Some(min_id) = cursor.min_id {
+            query = query.filter(remote_status::Column::Id.gt(min_id.0));
+        }
+        let statuses = query
+            .order_by_desc(remote_status::Column::Id)
+            .limit(page_query_limit(limit))
+            .all(db)
+            .await?;
+        items.extend(
+            statuses
+                .into_iter()
+                .map(|status| remote_status_from_model(status).map(PublicTimelineItem::Remote))
+                .collect::<Result<Vec<_>>>()?,
+        );
     }
 
-    let statuses = apply_timeline_cursor(query, cursor)
-        .order_by_desc(local_status::Column::Id)
-        .limit(page_query_limit(limit))
-        .all(db)
-        .await?;
-    let (statuses, has_more) = trim_to_page(statuses, limit);
-    let first_cursor = statuses.first().map(|status| status.id);
-    let last_cursor = statuses.last().map(|status| status.id);
-
+    items.sort_by_key(|item| {
+        Reverse(match item {
+            PublicTimelineItem::Local(status) => status.id.0,
+            PublicTimelineItem::Remote(status) => status.id.0,
+        })
+    });
+    let (items, has_more) = trim_to_page(items, limit);
+    let item_id = |item: &PublicTimelineItem| match item {
+        PublicTimelineItem::Local(status) => status.id.0,
+        PublicTimelineItem::Remote(status) => status.id.0,
+    };
     Ok(TimelinePage {
-        items: statuses
-            .into_iter()
-            .map(local_status_from_model)
-            .collect::<Result<_>>()?,
-        first_cursor,
-        last_cursor,
+        first_cursor: items.first().map(item_id),
+        last_cursor: items.last().map(item_id),
+        items,
         has_more,
     })
 }
@@ -5774,14 +6008,24 @@ where
         return Ok(tag);
     }
 
-    Ok(local_tag::ActiveModel {
+    local_tag::Entity::insert(local_tag::ActiveModel {
         id: Set(Uuid::now_v7()),
-        name: Set(name),
+        name: Set(name.clone()),
         created_at: Set(now),
         updated_at: Set(now),
-    }
-    .insert(db)
-    .await?)
+    })
+    .on_conflict(
+        OnConflict::column(local_tag::Column::Name)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec(db)
+    .await?;
+    local_tag::Entity::find()
+        .filter(local_tag::Column::Name.eq(&name))
+        .one(db)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput(format!("hashtag {name} disappeared")))
 }
 
 async fn local_tags_by_names(db: &DbConnection, names: &[String]) -> Result<Vec<LocalTag>> {
@@ -5804,6 +6048,18 @@ fn status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::SelectStateme
         .column(local_status_tag::Column::StatusId)
         .from(local_status_tag::Entity)
         .and_where(local_status_tag::Column::TagId.is_in(tag_ids))
+        .to_owned()
+}
+
+fn remote_status_tag_subquery(tag_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+    remote_status_tags_subquery(vec![tag_id])
+}
+
+fn remote_status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::SelectStatement {
+    Query::select()
+        .column(remote_status_tag::Column::RemoteStatusId)
+        .from(remote_status_tag::Entity)
+        .and_where(remote_status_tag::Column::TagId.is_in(tag_ids))
         .to_owned()
 }
 
@@ -8831,25 +9087,26 @@ pub async fn remote_statuses_by_account(
             ),
         );
     }
-    query = query.order_by_desc(remote_status::Column::Id);
-    if options.tagged.is_none() {
-        query = query.limit(page_query_limit(limit));
+    if let Some(tag) = options.tagged {
+        let Some(tag) = find_local_tag_by_name(db, &tag).await? else {
+            return Ok(TimelinePage {
+                items: Vec::new(),
+                first_cursor: None,
+                last_cursor: None,
+                has_more: false,
+            });
+        };
+        query =
+            query.filter(remote_status::Column::Id.in_subquery(remote_status_tag_subquery(tag.id)));
     }
-    let statuses = query
+    let mut statuses = query
+        .order_by_desc(remote_status::Column::Id)
+        .limit(page_query_limit(limit))
         .all(db)
         .await?
         .into_iter()
         .map(remote_status_from_model)
         .collect::<Result<Vec<_>>>()?;
-    let mut statuses = if let Some(tag) = options.tagged {
-        let tag = tag.trim_start_matches('#');
-        statuses
-            .into_iter()
-            .filter(|status| remote_status_has_tag(&status.object, tag))
-            .collect()
-    } else {
-        statuses
-    };
     let has_more = statuses.len() > limit as usize;
     if has_more {
         statuses.truncate(limit as usize);
@@ -8862,21 +9119,6 @@ pub async fn remote_statuses_by_account(
         last_cursor,
         has_more,
     })
-}
-
-fn remote_status_has_tag(object: &JsonValue, expected: &str) -> bool {
-    object
-        .get("tag")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .any(|tag| {
-            tag.get("type").and_then(JsonValue::as_str) == Some("Hashtag")
-                && tag
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(|name| name.trim_start_matches('#').eq_ignore_ascii_case(expected))
-        })
 }
 
 /// List statuses authored by the account and followed local accounts.
@@ -8941,7 +9183,10 @@ pub async fn home_timeline_for_account(
         status_condition = status_condition.add(
             Condition::all()
                 .add(local_status::Column::Visibility.eq("public"))
-                .add(local_status::Column::Id.in_subquery(status_tags_subquery(followed_tag_ids))),
+                .add(
+                    local_status::Column::Id
+                        .in_subquery(status_tags_subquery(followed_tag_ids.clone())),
+                ),
         );
     }
     let mut status_query = apply_timeline_cursor(
@@ -9002,37 +9247,39 @@ pub async fn home_timeline_for_account(
         .and_where(remote_following::Column::State.eq("accepted"))
         .and_where(remote_following::Column::DeactivatedAt.is_null())
         .to_owned();
-    let mut remote_query = remote_status::Entity::find()
-        .filter(
-            Condition::any()
-                .add(
-                    Condition::all()
-                        .add(
-                            remote_status::Column::RemoteActorId
-                                .in_subquery(followed_remote_actors),
-                        )
-                        .add(
-                            remote_status::Column::Visibility
-                                .is_in(["public", "unlisted", "private"]),
-                        ),
-                )
-                .add(
-                    Condition::all()
-                        .add(remote_status::Column::Visibility.eq("private"))
-                        .add(
-                            remote_status::Column::Id.in_subquery(
-                                Query::select()
-                                    .column(remote_status_local_recipient::Column::RemoteStatusId)
-                                    .from(remote_status_local_recipient::Entity)
-                                    .and_where(
-                                        remote_status_local_recipient::Column::AccountId
-                                            .eq(account_id.0),
-                                    )
-                                    .to_owned(),
-                            ),
-                        ),
-                ),
+    let mut remote_status_condition = Condition::any()
+        .add(
+            Condition::all()
+                .add(remote_status::Column::RemoteActorId.in_subquery(followed_remote_actors))
+                .add(remote_status::Column::Visibility.is_in(["public", "unlisted", "private"])),
         )
+        .add(
+            Condition::all()
+                .add(remote_status::Column::Visibility.eq("private"))
+                .add(
+                    remote_status::Column::Id.in_subquery(
+                        Query::select()
+                            .column(remote_status_local_recipient::Column::RemoteStatusId)
+                            .from(remote_status_local_recipient::Entity)
+                            .and_where(
+                                remote_status_local_recipient::Column::AccountId.eq(account_id.0),
+                            )
+                            .to_owned(),
+                    ),
+                ),
+        );
+    if !followed_tag_ids.is_empty() {
+        remote_status_condition = remote_status_condition.add(
+            Condition::all()
+                .add(remote_status::Column::Visibility.eq("public"))
+                .add(
+                    remote_status::Column::Id
+                        .in_subquery(remote_status_tags_subquery(followed_tag_ids)),
+                ),
+        );
+    }
+    let mut remote_query = remote_status::Entity::find()
+        .filter(remote_status_condition)
         .filter(remote_status::Column::DeletedAt.is_null());
     if !hidden_remote_actor_ids.is_empty() {
         remote_query = remote_query.filter(
