@@ -98,6 +98,12 @@ struct RemotePublicKey {
     public_key_pem: String,
 }
 
+#[derive(Clone, Copy)]
+enum RemoteActorStoreMode {
+    DiscoveredHandle,
+    RefreshedDocument,
+}
+
 /// Resolve and cache a remote actor after applying the configured network policy.
 pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<RemoteActor> {
     let (username, domain) = parse_remote_handle(handle)?;
@@ -136,7 +142,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
     let actor_url =
         Url::parse(&actor_url).map_err(|_| invalid("WebFinger actor URL is invalid"))?;
     let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
-    validate_actor_document(&document, &actor_url, username, &domain)?;
+    validate_actor_document(&document, &actor_url, username)?;
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let actor = RemoteActor {
@@ -158,7 +164,14 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         deleted_at: None,
         moved_to_remote_actor_id: None,
     };
-    let actor = store_remote_actor_on(&lock, actor, document.icon, document.image).await?;
+    let actor = store_remote_actor_on(
+        &lock,
+        actor,
+        document.icon,
+        document.image,
+        RemoteActorStoreMode::DiscoveredHandle,
+    )
+    .await?;
     lock.commit().await?;
     enqueue_profile_media_if_followed(state, actor.id).await?;
     Ok(actor)
@@ -269,7 +282,14 @@ pub async fn refresh_remote_actor_by_id(
     activitypub_id: &str,
 ) -> Result<RemoteActor> {
     let (actor, icon, image) = fetch_remote_actor_by_id(state, activitypub_id).await?;
-    store_remote_actor(state, actor, icon, image).await
+    store_remote_actor(
+        state,
+        actor,
+        icon,
+        image,
+        RemoteActorStoreMode::RefreshedDocument,
+    )
+    .await
 }
 
 /// Fetch and store a signed actor refresh inside an inbox-owned transaction.
@@ -279,7 +299,14 @@ pub async fn refresh_remote_actor_by_id_in_transaction(
     txn: &sea_orm::DatabaseTransaction,
 ) -> Result<RemoteActor> {
     let (actor, icon, image) = fetch_remote_actor_by_id(state, activitypub_id).await?;
-    store_remote_actor_on(txn, actor, icon, image).await
+    store_remote_actor_on(
+        txn,
+        actor,
+        icon,
+        image,
+        RemoteActorStoreMode::RefreshedDocument,
+    )
+    .await
 }
 
 async fn fetch_remote_actor_by_id(
@@ -398,6 +425,7 @@ pub async fn resolve_remote_move_target(
         },
         document.icon,
         document.image,
+        RemoteActorStoreMode::RefreshedDocument,
     )
     .await
 }
@@ -408,9 +436,10 @@ async fn store_remote_actor(
     actor: RemoteActor,
     icon: Option<RemoteActorImage>,
     image: Option<RemoteActorImage>,
+    mode: RemoteActorStoreMode,
 ) -> Result<RemoteActor> {
     let txn = state.db.begin().await?;
-    let actor = store_remote_actor_on(&txn, actor, icon, image).await?;
+    let actor = store_remote_actor_on(&txn, actor, icon, image, mode).await?;
     txn.commit().await?;
     enqueue_profile_media_if_followed(state, actor.id).await?;
     Ok(actor)
@@ -437,8 +466,16 @@ async fn store_remote_actor_on(
     actor: RemoteActor,
     icon: Option<RemoteActorImage>,
     image: Option<RemoteActorImage>,
+    mode: RemoteActorStoreMode,
 ) -> Result<RemoteActor> {
-    let actor = roosty_db::upsert_remote_actor(txn, &actor).await?;
+    let actor = match mode {
+        RemoteActorStoreMode::DiscoveredHandle => {
+            roosty_db::upsert_remote_actor(txn, &actor).await?
+        }
+        RemoteActorStoreMode::RefreshedDocument => {
+            roosty_db::refresh_remote_actor(txn, &actor).await?
+        }
+    };
     let emojis = crate::accounts::remote_custom_emojis(&actor.emojis)
         .into_iter()
         .filter_map(|emoji| {
@@ -584,7 +621,6 @@ fn validate_actor_document(
     document: &RemoteActorDocument,
     requested_url: &Url,
     username: &str,
-    domain: &str,
 ) -> Result<()> {
     if document.r#type != ActorType::Person
         || document.preferred_username.is_empty()
@@ -609,14 +645,8 @@ fn validate_actor_document(
             .unwrap_or(&document.inbox),
     ] {
         let url = Url::parse(target).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
-        if url.scheme() != "https"
-            || url
-                .host_str()
-                .is_none_or(|host| !host.eq_ignore_ascii_case(domain))
-        {
-            return Err(invalid(
-                "remote actor inbox is outside its WebFinger domain",
-            ));
+        if url.scheme() != "https" || url.origin() != actor_id.origin() {
+            return Err(invalid("remote actor inbox is outside its actor origin"));
         }
     }
     if document.public_key.owner != document.id
@@ -699,7 +729,8 @@ mod tests {
 
     use super::{
         RemoteActorDocument, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
-        parse_remote_handle, remote_profile_created_at, validated_followers_url,
+        parse_remote_handle, remote_profile_created_at, validate_actor_document,
+        validated_followers_url,
     };
 
     #[test]
@@ -845,6 +876,52 @@ mod tests {
             "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\""
         ));
         assert!(!is_activitypub_media_type("application/jrd+json"));
+    }
+
+    /// Given a WebFinger handle delegated to an actor host, when the actor and inbox share an
+    /// origin, then discovery accepts the delegation while retaining the WebFinger domain.
+    #[test]
+    fn accepts_delegated_webfinger_actor_origin() {
+        let actor: RemoteActorDocument = serde_json::from_str(
+            r#"{
+                "id": "https://mastodon.dentrassi.de/users/ctron",
+                "type": "Person",
+                "preferredUsername": "ctron",
+                "inbox": "https://mastodon.dentrassi.de/users/ctron/inbox",
+                "endpoints": {"sharedInbox": "https://mastodon.dentrassi.de/inbox"},
+                "publicKey": {
+                    "id": "https://mastodon.dentrassi.de/users/ctron#main-key",
+                    "owner": "https://mastodon.dentrassi.de/users/ctron",
+                    "publicKeyPem": "public-key"
+                }
+            }"#,
+        )
+        .unwrap();
+        let actor_url = url::Url::parse("https://mastodon.dentrassi.de/users/ctron").unwrap();
+
+        assert!(validate_actor_document(&actor, &actor_url, "ctron").is_ok());
+    }
+
+    /// Given a delegated actor, when its inbox leaves the actor origin, then discovery rejects it.
+    #[test]
+    fn rejects_delegated_actor_with_cross_origin_inbox() {
+        let actor: RemoteActorDocument = serde_json::from_str(
+            r#"{
+                "id": "https://mastodon.dentrassi.de/users/ctron",
+                "type": "Person",
+                "preferredUsername": "ctron",
+                "inbox": "https://attacker.example/inbox",
+                "publicKey": {
+                    "id": "https://mastodon.dentrassi.de/users/ctron#main-key",
+                    "owner": "https://mastodon.dentrassi.de/users/ctron",
+                    "publicKeyPem": "public-key"
+                }
+            }"#,
+        )
+        .unwrap();
+        let actor_url = url::Url::parse("https://mastodon.dentrassi.de/users/ctron").unwrap();
+
+        assert!(validate_actor_document(&actor, &actor_url, "ctron").is_err());
     }
 
     /// Only an explicitly declared same-origin HTTPS followers collection is cached.

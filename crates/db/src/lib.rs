@@ -2184,6 +2184,22 @@ pub async fn upsert_remote_actor(
     db: &impl ConnectionTrait,
     actor: &RemoteActor,
 ) -> Result<RemoteActor> {
+    upsert_remote_actor_with_identity(db, actor, true).await
+}
+
+/// Refresh an actor document without replacing its separately discovered WebFinger handle.
+pub async fn refresh_remote_actor(
+    db: &impl ConnectionTrait,
+    actor: &RemoteActor,
+) -> Result<RemoteActor> {
+    upsert_remote_actor_with_identity(db, actor, false).await
+}
+
+async fn upsert_remote_actor_with_identity(
+    db: &impl ConnectionTrait,
+    actor: &RemoteActor,
+    replace_identity: bool,
+) -> Result<RemoteActor> {
     let now = OffsetDateTime::now_utc();
     let existing = remote_actor::Entity::find()
         .filter(remote_actor::Column::ActivitypubId.eq(&actor.activitypub_id))
@@ -2191,8 +2207,10 @@ pub async fn upsert_remote_actor(
         .await?;
     let model = if let Some(existing) = existing {
         let mut active = existing.into_active_model();
-        active.username = Set(actor.username.clone());
-        active.domain = Set(actor.domain.clone());
+        if replace_identity {
+            active.username = Set(actor.username.clone());
+            active.domain = Set(actor.domain.clone());
+        }
         active.display_name = Set(actor.display_name.clone());
         active.summary = Set(actor.summary.clone());
         active.emojis = Set(actor.emojis.clone());

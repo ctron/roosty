@@ -78,7 +78,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | `GET /api/v2/search` | Public basic mixed account and observed hashtag search, including tags indexed from cached remote Notes. A user token is required for exact-handle `resolve=true`, nonzero `offset`, or `following=true`; status search remains missing. |
-| 🟢 | Remote account resolution | Exact remote handles can be resolved synchronously through policy-controlled WebFinger and validated actor fetching, with cross-process advisory-lock deduplication. URLs are not resolved. |
+| 🟢 | Remote account resolution | Exact remote handles can be resolved synchronously through policy-controlled WebFinger and validated actor fetching, including WebFinger domains delegated to a different actor origin, with cross-process advisory-lock deduplication. URLs are not resolved. |
 
 ### Statuses
 
