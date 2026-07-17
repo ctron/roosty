@@ -132,6 +132,24 @@ struct TimelineParams {
     min_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct PublicTimelineFilters {
+    local: Option<bool>,
+    remote: Option<bool>,
+    only_media: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct PublicTimelineParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
+    local: Option<bool>,
+    remote: Option<bool>,
+    only_media: Option<bool>,
+}
+
 #[derive(Default, Deserialize)]
 struct TagTimelineParams {
     limit: Option<u64>,
@@ -572,10 +590,17 @@ async fn create_status(
                         }
                     }
                     let recipients = status_stream_recipients(&state, &status).await;
+                    let stream_visibility = if status.in_reply_to_id.is_some()
+                        || status.in_reply_to_remote_status_id.is_some()
+                    {
+                        "unlisted"
+                    } else {
+                        &response.visibility
+                    };
                     state.streaming_events.publish_status_update(
                         &response,
                         author_id,
-                        &response.visibility,
+                        stream_visibility,
                         &recipients,
                     );
                     (StatusCode::OK, Json(response)).into_response()
@@ -862,10 +887,17 @@ async fn update_status(
                         }
                     }
                     let recipients = status_stream_recipients(&state, &status).await;
+                    let stream_visibility = if status.in_reply_to_id.is_some()
+                        || status.in_reply_to_remote_status_id.is_some()
+                    {
+                        "unlisted"
+                    } else {
+                        &response.visibility
+                    };
                     state.streaming_events.publish_status_edit(
                         &response,
                         status.account_id,
-                        &response.visibility,
+                        stream_visibility,
                         &recipients,
                         &local_mentions,
                     );
@@ -921,7 +953,13 @@ async fn delete_status(
                     Ok(reblogs) => reblogs,
                     Err(error) => return server_error(error),
                 };
-                publish_status_delete(&state, &status, &reblogs).await;
+                publish_status_delete(
+                    &state,
+                    &status,
+                    &reblogs,
+                    !response.media_attachments.is_empty(),
+                )
+                .await;
                 if let Some(refresh) = &refresh {
                     state.streaming_events.publish_delete(
                         &status.id.0.to_string(),
@@ -955,6 +993,7 @@ async fn publish_status_delete(
     state: &AppState,
     status: &roosty_db::LocalStatus,
     reblogs: &[roosty_db::LocalStatusReblog],
+    has_media: bool,
 ) {
     let mut recipients = status_stream_recipients(state, status).await;
     match roosty_db::active_local_mentions_for_local_status(&state.db, status.id).await {
@@ -963,11 +1002,18 @@ async fn publish_status_delete(
     }
     recipients.sort_by_key(|id| id.0);
     recipients.dedup();
-    state.streaming_events.publish_delete(
+    let stream_visibility =
+        if status.in_reply_to_id.is_some() || status.in_reply_to_remote_status_id.is_some() {
+            "unlisted"
+        } else {
+            (&status.visibility).into()
+        };
+    state.streaming_events.publish_local_status_delete(
         &status.id.0.to_string(),
         status.account_id,
-        (&status.visibility).into(),
+        stream_visibility,
         &recipients,
+        has_media,
     );
     for reblog in reblogs {
         let recipients = reblog_stream_recipients(state, reblog.account_id).await;
@@ -1170,20 +1216,44 @@ async fn home_timeline(
 async fn public_timeline(
     State(state): State<AppState>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
-    Query(params): Query<TimelineParams>,
+    Query(params): Query<PublicTimelineParams>,
 ) -> Response {
-    let query = match timeline_query(params) {
+    let filters = PublicTimelineFilters {
+        local: params.local,
+        remote: params.remote,
+        only_media: params.only_media,
+    };
+    let query = match timeline_query(TimelineParams {
+        limit: params.limit,
+        max_id: params.max_id,
+        since_id: params.since_id,
+        min_id: params.min_id,
+    }) {
         Ok(query) => query,
         Err(error) => return bad_request(&error.to_string()),
     };
-    match roosty_db::public_local_timeline(&state.db, query.limit, query.cursor).await {
+    let origin = match (filters.local == Some(true), filters.remote == Some(true)) {
+        (true, false) => roosty_db::PublicTimelineOrigin::Local,
+        (false, true) => roosty_db::PublicTimelineOrigin::Remote,
+        _ => roosty_db::PublicTimelineOrigin::Federated,
+    };
+    let options = roosty_db::PublicTimelineOptions {
+        origin,
+        only_media: filters.only_media == Some(true),
+        viewer: viewer.as_ref().map(|account| account.id),
+        allowed_remote_domains: state.config.federation_allowed_domains.clone(),
+        blocked_remote_domains: state.config.federation_blocked_domains.clone(),
+    };
+    match roosty_db::public_timeline_with_options(&state.db, query.limit, query.cursor, options)
+        .await
+    {
         Ok(statuses) => {
-            timeline_response(
+            public_timeline_response(
                 &state,
                 statuses,
                 query.limit,
-                "/api/v1/timelines/public",
                 viewer.as_ref().map(|account| account.id),
+                filters,
             )
             .await
         }
@@ -1731,10 +1801,9 @@ async fn status_collection_action(
                     match local_remote_reblog_response(state, reblog, Some(account_id)).await {
                         Ok(Some(response)) => {
                             let recipients = reblog_stream_recipients(state, account_id).await;
-                            state.streaming_events.publish_status_update(
+                            state.streaming_events.publish_home_update(
                                 &response,
                                 account_id,
-                                &response.visibility,
                                 &recipients,
                             );
                             Json(response).into_response()
@@ -1868,10 +1937,9 @@ async fn status_collection_action(
                         match reblog_response(state, reblog, Some(account_id)).await {
                             Ok(Some(response)) => {
                                 let recipients = reblog_stream_recipients(state, account_id).await;
-                                state.streaming_events.publish_status_update(
+                                state.streaming_events.publish_home_update(
                                     &response,
                                     account_id,
-                                    &response.visibility,
                                     &recipients,
                                 );
                                 Json(response).into_response()
@@ -2207,6 +2275,37 @@ async fn home_timeline_response(
         Ok(items) => Json(items).into_response(),
         Err(error) => return server_error(error),
     };
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    response
+}
+
+/// Build a mixed local/remote public timeline response.
+async fn public_timeline_response(
+    state: &AppState,
+    page: roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    limit: u64,
+    viewer: Option<AccountId>,
+    filters: PublicTimelineFilters,
+) -> Response {
+    let link_header = public_timeline_link_header(&page, limit, filters);
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let result = match item {
+            roosty_db::PublicTimelineItem::Local(status) => {
+                status_with_author(state, status, viewer).await
+            }
+            roosty_db::PublicTimelineItem::Remote(status) => {
+                remote_status_response_for_viewer(state, status, viewer).await
+            }
+        };
+        match result {
+            Ok(status) => items.push(status),
+            Err(error) => return server_error(error),
+        }
+    }
+    let mut response = Json(items).into_response();
     if let Some(link_header) = link_header {
         response.headers_mut().insert(header::LINK, link_header);
     }
@@ -3172,6 +3271,32 @@ fn timeline_link_header<T>(
     HeaderValue::from_str(&value).ok()
 }
 
+fn public_timeline_link_header(
+    page: &roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    limit: u64,
+    filters: PublicTimelineFilters,
+) -> Option<HeaderValue> {
+    if !page.has_more {
+        return None;
+    }
+    let first = page.first_cursor?;
+    let last = page.last_cursor?;
+    let mut filters_query = String::new();
+    if filters.local == Some(true) {
+        filters_query.push_str("&local=true");
+    }
+    if filters.remote == Some(true) {
+        filters_query.push_str("&remote=true");
+    }
+    if filters.only_media == Some(true) {
+        filters_query.push_str("&only_media=true");
+    }
+    let value = format!(
+        r#"</api/v1/timelines/public?limit={limit}&min_id={first}{filters_query}>; rel="prev", </api/v1/timelines/public?limit={limit}&max_id={last}{filters_query}>; rel="next""#,
+    );
+    HeaderValue::from_str(&value).ok()
+}
+
 fn home_timeline_link_header(
     page: &roosty_db::TimelinePage<roosty_db::HomeTimelineItem>,
     limit: u64,
@@ -3698,9 +3823,11 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::{AccountId, StatusId};
     use roosty_db::{
-        NewRemoteStatus, RemoteActor, RemoteStatus, StatusContextParent, StatusVisibility,
+        NewRemoteMediaAttachment, NewRemoteStatus, RemoteActor, RemoteStatus, StatusContextParent,
+        StatusVisibility,
     };
     use roosty_migration::Migrator;
+    use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -3786,6 +3913,98 @@ mod tests {
         let public = context.get("/api/v1/timelines/public?limit=30").await;
         assert_eq!(public.status(), StatusCode::OK);
         assert_eq!(json_body(public).await.as_array().unwrap().len(), 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Cached public Notes join the federated timeline while origin filters and reply exclusion remain compatible.
+    async fn public_timeline_merges_cached_remote_statuses(context: &mut StatusContext) {
+        std::sync::Arc::make_mut(&mut context.state.config).federation_allowed_domains =
+            vec!["*".to_owned()];
+        let token = context.access_token().await;
+        let local = context
+            .create_status(&token, "local public", Some("public"), None)
+            .await;
+        let actor = context.cache_remote_actor("federated").await;
+        let remote = context
+            .cache_remote_status(&actor, "remote public", None)
+            .await;
+        context
+            .cache_remote_status(
+                &actor,
+                "remote reply",
+                Some(StatusContextParent::Remote(remote.id)),
+            )
+            .await;
+        let remote_media = context
+            .cache_remote_status(&actor, "remote media", None)
+            .await;
+        let txn = context.db.begin().await.unwrap();
+        roosty_db::replace_remote_media_attachments(
+            &txn,
+            remote_media.id,
+            &[NewRemoteMediaAttachment {
+                remote_url: "https://remote.test/media/image.png".to_owned(),
+                content_type: Some("image/png".to_owned()),
+                description: Some("remote image".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let federated_response = context.get("/api/v1/timelines/public").await;
+        assert_eq!(federated_response.status(), StatusCode::OK);
+        let federated = json_body(federated_response).await;
+        assert_eq!(
+            status_ids(&federated),
+            [
+                remote_media.id.0.to_string(),
+                remote.id.0.to_string(),
+                local["id"].as_str().unwrap().to_owned()
+            ]
+        );
+        assert_eq!(federated[0]["account"]["acct"], "federated@remote.test");
+
+        let local_only = json_body(context.get("/api/v1/timelines/public?local=true").await).await;
+        assert_eq!(status_ids(&local_only), [local["id"].as_str().unwrap()]);
+
+        let remote_only =
+            json_body(context.get("/api/v1/timelines/public?remote=true").await).await;
+        assert_eq!(
+            status_ids(&remote_only),
+            [remote_media.id.0.to_string(), remote.id.0.to_string()]
+        );
+
+        let media_only = json_body(
+            context
+                .get("/api/v1/timelines/public?remote=true&only_media=true")
+                .await,
+        )
+        .await;
+        assert_eq!(status_ids(&media_only), [remote_media.id.0.to_string()]);
+
+        let paged = context
+            .get("/api/v1/timelines/public?remote=true&limit=1")
+            .await;
+        assert_eq!(paged.status(), StatusCode::OK);
+        assert!(
+            paged
+                .headers()
+                .get(header::LINK)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("remote=true")
+        );
+
+        let both = json_body(
+            context
+                .get("/api/v1/timelines/public?local=true&remote=true")
+                .await,
+        )
+        .await;
+        assert_eq!(status_ids(&both), status_ids(&federated));
     }
 
     #[test_context(StatusContext)]

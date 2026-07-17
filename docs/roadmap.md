@@ -68,7 +68,7 @@
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
 - Notifications: grouped notifications, push integration, and remote notification events.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
-- Streaming channels: `public`, `public:local`, `user`, `user:notification`, and bounded slow-client handling.
+- Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 
 ## Short Term
 

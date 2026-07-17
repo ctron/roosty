@@ -44,6 +44,14 @@ pub enum StreamingEventKind {
     Delete,
 }
 
+/// Origin of a status-like event used for public stream routing.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum StreamingStatusOrigin {
+    Local,
+    Remote,
+}
+
 /// A streaming event ready to be persisted and announced to other processes.
 #[derive(Clone, Debug)]
 pub struct NewStreamingEvent {
@@ -54,6 +62,8 @@ pub struct NewStreamingEvent {
     pub recipient_ids: Vec<AccountId>,
     pub notification_recipient_ids: Vec<AccountId>,
     pub visibility: StatusVisibility,
+    pub status_origin: StreamingStatusOrigin,
+    pub has_media: bool,
 }
 
 /// One ordered event recovered from the retained cross-process log.
@@ -67,6 +77,8 @@ pub struct RetainedStreamingEvent {
     pub recipient_ids: Vec<AccountId>,
     pub notification_recipient_ids: Vec<AccountId>,
     pub visibility: StatusVisibility,
+    pub status_origin: StreamingStatusOrigin,
+    pub has_media: bool,
 }
 
 impl StatusVisibility {
@@ -286,6 +298,8 @@ pub async fn publish_streaming_event(db: &DbConnection, event: NewStreamingEvent
         recipient_ids: Set(serde_json::json!(recipient_ids)),
         notification_recipient_ids: Set(serde_json::json!(notification_recipient_ids)),
         visibility: Set(event.visibility.to_string()),
+        status_origin: Set(event.status_origin.to_string()),
+        has_media: Set(event.has_media),
         created_at: ActiveValue::NotSet,
     }
     .insert(&transaction)
@@ -362,6 +376,12 @@ fn retained_streaming_event(model: streaming_event::Model) -> Result<RetainedStr
             model.event_kind
         ))
     })?;
+    let status_origin = StreamingStatusOrigin::from_str(&model.status_origin).map_err(|_| {
+        RoostyError::InvalidInput(format!(
+            "invalid streaming status origin: {}",
+            model.status_origin
+        ))
+    })?;
 
     Ok(RetainedStreamingEvent {
         sequence: model.sequence,
@@ -372,6 +392,8 @@ fn retained_streaming_event(model: streaming_event::Model) -> Result<RetainedStr
         recipient_ids,
         notification_recipient_ids,
         visibility: StatusVisibility::parse(&model.visibility)?,
+        status_origin,
+        has_media: model.has_media,
     })
 }
 
@@ -1027,6 +1049,9 @@ pub async fn process_remote_actor_delete(
             actor_id: remote_actor_id,
             home_recipient_ids: subscribers.clone(),
             direct_recipient_ids: Vec::new(),
+            visibility: StatusVisibility::Direct,
+            status_origin: StreamingStatusOrigin::Remote,
+            has_media: false,
         }));
     remote_status_reblog::Entity::delete_many()
         .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
@@ -1663,6 +1688,11 @@ async fn repair_one_remote_status_delete(
         .collect::<Vec<_>>();
     let active_mention_ids = active_local_mentions_for_remote_status(txn, status_id).await?;
     let visibility = StatusVisibility::parse(&status.visibility)?;
+    let stream_visibility = if status.in_reply_to.is_some() {
+        StatusVisibility::Unlisted
+    } else {
+        visibility
+    };
     let mut home_recipient_ids = match visibility {
         StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Private => {
             accepted_local_followers_of_remote_actor(txn, author_id).await?
@@ -1684,6 +1714,11 @@ async fn repair_one_remote_status_delete(
     } else {
         Vec::new()
     };
+    let has_media = remote_media_attachment::Entity::find()
+        .filter(remote_media_attachment::Column::RemoteStatusId.eq(status.id))
+        .count(txn)
+        .await?
+        > 0;
 
     let local_reblogs = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status.id))
@@ -1698,12 +1733,18 @@ async fn repair_one_remote_status_delete(
         actor_id: author_id,
         home_recipient_ids,
         direct_recipient_ids,
+        visibility: stream_visibility,
+        status_origin: StreamingStatusOrigin::Remote,
+        has_media,
     }];
     projections.extend(local_reblogs.iter().map(|reblog| DeleteStreamProjection {
         status_id: reblog.id.to_string(),
         actor_id: AccountId(reblog.local_account_id),
         home_recipient_ids: vec![AccountId(reblog.local_account_id)],
         direct_recipient_ids: Vec::new(),
+        visibility: StatusVisibility::Direct,
+        status_origin: StreamingStatusOrigin::Local,
+        has_media: false,
     }));
     for reblog in &inbound_reblogs {
         let actor_id = AccountId(reblog.remote_actor_id);
@@ -1712,6 +1753,9 @@ async fn repair_one_remote_status_delete(
             actor_id,
             home_recipient_ids: accepted_local_followers_of_remote_actor(txn, actor_id).await?,
             direct_recipient_ids: Vec::new(),
+            visibility: StatusVisibility::Direct,
+            status_origin: StreamingStatusOrigin::Remote,
+            has_media: false,
         });
     }
 
@@ -2190,6 +2234,9 @@ pub struct DeleteStreamProjection {
     pub actor_id: AccountId,
     pub home_recipient_ids: Vec<AccountId>,
     pub direct_recipient_ids: Vec<AccountId>,
+    pub visibility: StatusVisibility,
+    pub status_origin: StreamingStatusOrigin,
+    pub has_media: bool,
 }
 
 /// Durable state repaired by one signed remote status or actor deletion.
@@ -2495,6 +2542,37 @@ pub enum HomeTimelineItem {
     LocalRemoteReblog(LocalRemoteStatusReblog),
     /// Cached remote actor's boost of a local or cached remote status.
     RemoteReblog(RemoteStatusReblog),
+}
+
+/// A status displayed in the federated public timeline.
+#[derive(Clone, Debug)]
+pub enum PublicTimelineItem {
+    /// A status authored on this instance.
+    Local(LocalStatus),
+    /// A public status cached from another instance.
+    Remote(RemoteStatus),
+}
+
+/// Origin filter for the Mastodon-compatible public timeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PublicTimelineOrigin {
+    /// Include both local and cached remote statuses.
+    #[default]
+    Federated,
+    /// Include only statuses authored on this instance.
+    Local,
+    /// Include only cached remote statuses.
+    Remote,
+}
+
+/// Filters applied while reading the public timeline.
+#[derive(Clone, Debug, Default)]
+pub struct PublicTimelineOptions {
+    pub origin: PublicTimelineOrigin,
+    pub only_media: bool,
+    pub viewer: Option<AccountId>,
+    pub allowed_remote_domains: Vec<String>,
+    pub blocked_remote_domains: Vec<String>,
 }
 
 /// Local or remote actor that boosted a local status.
@@ -7977,31 +8055,153 @@ pub async fn delete_owned_local_status(
     Ok(Some(local_status_from_model(active.update(db).await?)?))
 }
 
-/// List public local statuses for the public timeline.
-pub async fn public_local_timeline(
+/// List local and cached remote statuses for the public timeline.
+pub async fn public_timeline(
     db: &DbConnection,
     limit: u64,
     cursor: TimelineCursor,
-) -> Result<TimelinePage<LocalStatus>> {
-    let statuses = apply_timeline_cursor(
-        local_status::Entity::find()
-            .filter(local_status::Column::Visibility.eq("public"))
-            .filter(local_status::Column::DeletedAt.is_null()),
-        cursor,
-    )
-    .order_by_desc(local_status::Column::Id)
-    .limit(page_query_limit(limit))
-    .all(db)
-    .await?;
-    let (statuses, has_more) = trim_to_page(statuses, limit);
-    let first_cursor = statuses.first().map(|status| status.id);
-    let last_cursor = statuses.last().map(|status| status.id);
+) -> Result<TimelinePage<PublicTimelineItem>> {
+    public_timeline_with_options(db, limit, cursor, PublicTimelineOptions::default()).await
+}
+
+/// List public statuses with Mastodon-compatible origin and media filters.
+pub async fn public_timeline_with_options(
+    db: &DbConnection,
+    limit: u64,
+    cursor: TimelineCursor,
+    options: PublicTimelineOptions,
+) -> Result<TimelinePage<PublicTimelineItem>> {
+    let hidden_local_ids = if let Some(viewer) = options.viewer {
+        hidden_local_account_ids_for_account(db, viewer)
+            .await?
+            .into_iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let hidden_remote_ids = if let Some(viewer) = options.viewer {
+        hidden_remote_actor_ids_for_account(db, viewer)
+            .await?
+            .into_iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let mut items = Vec::new();
+    if options.origin != PublicTimelineOrigin::Remote {
+        let mut query = apply_timeline_cursor(
+            local_status::Entity::find()
+                .filter(local_status::Column::Visibility.eq("public"))
+                .filter(local_status::Column::DeletedAt.is_null())
+                .filter(local_status::Column::InReplyToId.is_null())
+                .filter(local_status::Column::InReplyToRemoteStatusId.is_null()),
+            cursor,
+        );
+        if !hidden_local_ids.is_empty() {
+            query = query.filter(local_status::Column::AccountId.is_not_in(hidden_local_ids));
+        }
+        if options.only_media {
+            query = query.filter(
+                local_status::Column::Id.in_subquery(
+                    Query::select()
+                        .column(local_media_attachment::Column::StatusId)
+                        .from(local_media_attachment::Entity)
+                        .to_owned(),
+                ),
+            );
+        }
+        let local = query
+            .order_by_desc(local_status::Column::Id)
+            .limit(page_query_limit(limit))
+            .all(db)
+            .await?;
+        items.extend(
+            local
+                .into_iter()
+                .map(|model| local_status_from_model(model).map(PublicTimelineItem::Local))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+
+    if options.origin != PublicTimelineOrigin::Local && !options.allowed_remote_domains.is_empty() {
+        let mut actor_condition = Condition::all().add(remote_actor::Column::DeletedAt.is_null());
+        if !options
+            .allowed_remote_domains
+            .iter()
+            .any(|domain| domain == "*")
+        {
+            actor_condition = actor_condition
+                .add(remote_actor::Column::Domain.is_in(options.allowed_remote_domains.clone()));
+        }
+        for domain in &options.blocked_remote_domains {
+            actor_condition = actor_condition
+                .add(remote_actor::Column::Domain.ne(domain.clone()))
+                .add(remote_actor::Column::Domain.not_like(format!("%.{domain}")));
+        }
+        let allowed_actors = Query::select()
+            .column(remote_actor::Column::Id)
+            .from(remote_actor::Entity)
+            .and_where(actor_condition.into())
+            .to_owned();
+        let mut query = remote_status::Entity::find()
+            .filter(remote_status::Column::Visibility.eq("public"))
+            .filter(remote_status::Column::DeletedAt.is_null())
+            .filter(remote_status::Column::InReplyTo.is_null())
+            .filter(remote_status::Column::RemoteActorId.in_subquery(allowed_actors));
+        if !hidden_remote_ids.is_empty() {
+            query = query.filter(remote_status::Column::RemoteActorId.is_not_in(hidden_remote_ids));
+        }
+        if let Some(max_id) = cursor.max_id {
+            query = query.filter(remote_status::Column::Id.lt(max_id.0));
+        }
+        if let Some(since_id) = cursor.since_id {
+            query = query.filter(remote_status::Column::Id.gt(since_id.0));
+        }
+        if let Some(min_id) = cursor.min_id {
+            query = query.filter(remote_status::Column::Id.gt(min_id.0));
+        }
+        if options.only_media {
+            query = query.filter(
+                remote_status::Column::Id.in_subquery(
+                    Query::select()
+                        .column(remote_media_attachment::Column::RemoteStatusId)
+                        .from(remote_media_attachment::Entity)
+                        .to_owned(),
+                ),
+            );
+        }
+        let remote = query
+            .order_by_desc(remote_status::Column::Id)
+            .limit(page_query_limit(limit))
+            .all(db)
+            .await?;
+        items.extend(
+            remote
+                .into_iter()
+                .map(|model| remote_status_from_model(model).map(PublicTimelineItem::Remote))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+
+    items.sort_by_key(|item| {
+        Reverse(match item {
+            PublicTimelineItem::Local(status) => status.id.0,
+            PublicTimelineItem::Remote(status) => status.id.0,
+        })
+    });
+    let (items, has_more) = trim_to_page(items, limit);
+    let item_id = |item: &PublicTimelineItem| match item {
+        PublicTimelineItem::Local(status) => status.id.0,
+        PublicTimelineItem::Remote(status) => status.id.0,
+    };
+    let first_cursor = items.first().map(item_id);
+    let last_cursor = items.last().map(item_id);
 
     Ok(TimelinePage {
-        items: statuses
-            .into_iter()
-            .map(local_status_from_model)
-            .collect::<Result<_>>()?,
+        items,
         first_cursor,
         last_cursor,
         has_more,

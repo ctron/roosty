@@ -13,6 +13,8 @@ pub struct Model {
     pub recipient_ids: Json,
     pub notification_recipient_ids: Json,
     pub visibility: String,
+    pub status_origin: String,
+    pub has_media: bool,
     pub created_at: TimeDateTimeWithTimeZone,
 }
 

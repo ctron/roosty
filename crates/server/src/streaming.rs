@@ -7,7 +7,7 @@ use std::{
 };
 
 use roosty_core::{Result as RoostyResult, RoostyError};
-use roosty_db::{NewStreamingEvent, StatusVisibility, StreamingEventKind};
+use roosty_db::{NewStreamingEvent, StatusVisibility, StreamingEventKind, StreamingStatusOrigin};
 use serde::Serialize;
 use sqlx::postgres::PgListener;
 use strum::IntoStaticStr;
@@ -209,9 +209,37 @@ impl StreamingEvents {
     ) where
         T: Serialize,
     {
-        match streaming_update_message(status, author_id, visibility, user_recipient_ids) {
+        match streaming_update_message(
+            status,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            StreamingStatusOrigin::Local,
+        ) {
             Ok(event) => self.publish(event),
             Err(error) => warn!(%error, "failed to serialize streaming update"),
+        }
+    }
+
+    /// Publish a Mastodon `update` event for a cached remote status.
+    pub fn publish_remote_status_update<T>(
+        &self,
+        status: &T,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+    ) where
+        T: Serialize,
+    {
+        match streaming_update_message(
+            status,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            StreamingStatusOrigin::Remote,
+        ) {
+            Ok(event) => self.publish(event),
+            Err(error) => warn!(%error, "failed to serialize remote streaming update"),
         }
     }
 
@@ -232,9 +260,34 @@ impl StreamingEvents {
             visibility,
             user_recipient_ids,
             notification_recipient_ids,
+            StreamingStatusOrigin::Local,
         ) {
             Ok(event) => self.publish(event),
             Err(error) => warn!(%error, "failed to serialize edited status"),
+        }
+    }
+
+    /// Publish a Mastodon `status.update` event for a cached remote status.
+    pub fn publish_remote_status_edit<T>(
+        &self,
+        status: &T,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+        notification_recipient_ids: &[AccountId],
+    ) where
+        T: Serialize,
+    {
+        match streaming_status_update_message(
+            status,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            notification_recipient_ids,
+            StreamingStatusOrigin::Remote,
+        ) {
+            Ok(event) => self.publish(event),
+            Err(error) => warn!(%error, "failed to serialize edited remote status"),
         }
     }
 
@@ -268,8 +321,53 @@ impl StreamingEvents {
         visibility: &str,
         user_recipient_ids: &[AccountId],
     ) {
-        let event = streaming_delete_message(status_id, author_id, visibility, user_recipient_ids);
+        let event = streaming_delete_message(
+            status_id,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            StreamingStatusOrigin::Local,
+            false,
+        );
         self.publish(event);
+    }
+
+    /// Publish deletion of a public-capable local status with its media metadata.
+    pub fn publish_local_status_delete(
+        &self,
+        status_id: &str,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+        has_media: bool,
+    ) {
+        self.publish(streaming_delete_message(
+            status_id,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            StreamingStatusOrigin::Local,
+            has_media,
+        ));
+    }
+
+    /// Publish deletion of a cached remote status to home and public streams.
+    pub fn publish_remote_status_delete(
+        &self,
+        status_id: &str,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+        has_media: bool,
+    ) {
+        self.publish(streaming_delete_message(
+            status_id,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            StreamingStatusOrigin::Remote,
+            has_media,
+        ));
     }
 
     /// Publish a status update exclusively to selected users' home-capable streams.
@@ -278,25 +376,6 @@ impl StreamingEvents {
         T: Serialize,
     {
         self.publish_status_update(status, author_id, "unlisted", recipients);
-    }
-
-    /// Publish an edit to home recipients and mention-only notification streams.
-    pub fn publish_home_status_edit_with_notifications<T>(
-        &self,
-        status: &T,
-        author_id: AccountId,
-        recipients: &[AccountId],
-        notification_recipients: &[AccountId],
-    ) where
-        T: Serialize,
-    {
-        self.publish_status_edit(
-            status,
-            author_id,
-            "unlisted",
-            recipients,
-            notification_recipients,
-        );
     }
 
     /// Publish a status deletion exclusively to selected users' home-capable streams.
@@ -469,6 +548,8 @@ pub struct StreamingEvent {
     user_recipient_ids: Vec<AccountId>,
     notification_recipient_ids: Vec<AccountId>,
     visibility: String,
+    status_origin: StreamingStatusOrigin,
+    has_media: bool,
 }
 
 impl StreamingEvent {
@@ -481,6 +562,8 @@ impl StreamingEvent {
             recipient_ids: self.user_recipient_ids.clone(),
             notification_recipient_ids: self.notification_recipient_ids.clone(),
             visibility: StatusVisibility::parse(&self.visibility).ok()?,
+            status_origin: self.status_origin,
+            has_media: self.has_media,
         })
     }
 
@@ -492,6 +575,8 @@ impl StreamingEvent {
             user_recipient_ids: event.recipient_ids,
             notification_recipient_ids: event.notification_recipient_ids,
             visibility: event.visibility.to_string(),
+            status_origin: event.status_origin,
+            has_media: event.has_media,
         }
     }
 
@@ -540,7 +625,24 @@ impl StreamingEvent {
             "direct" => {
                 self.event == StreamingEventType::Conversation && self.account_id == account_id
             }
-            "public" | "public:local" => self.visibility == "public",
+            "public" => self.visibility == "public",
+            "public:media" => self.visibility == "public" && self.has_media,
+            "public:local" => {
+                self.visibility == "public" && self.status_origin == StreamingStatusOrigin::Local
+            }
+            "public:local:media" => {
+                self.visibility == "public"
+                    && self.status_origin == StreamingStatusOrigin::Local
+                    && self.has_media
+            }
+            "public:remote" => {
+                self.visibility == "public" && self.status_origin == StreamingStatusOrigin::Remote
+            }
+            "public:remote:media" => {
+                self.visibility == "public"
+                    && self.status_origin == StreamingStatusOrigin::Remote
+                    && self.has_media
+            }
             _ => false,
         }
     }
@@ -604,11 +706,14 @@ fn streaming_update_message<T>(
     author_id: AccountId,
     visibility: &str,
     user_recipient_ids: &[AccountId],
+    status_origin: StreamingStatusOrigin,
 ) -> Result<StreamingEvent, serde_json::Error>
 where
     T: Serialize,
 {
-    let payload = serde_json::to_string(status)?;
+    let value = serde_json::to_value(status)?;
+    let has_media = serialized_status_has_media(&value);
+    let payload = serde_json::to_string(&value)?;
     Ok(StreamingEvent {
         event: StreamingEventType::Update,
         payload,
@@ -616,6 +721,8 @@ where
         user_recipient_ids: user_recipient_ids.to_owned(),
         notification_recipient_ids: Vec::new(),
         visibility: visibility.to_owned(),
+        status_origin,
+        has_media,
     })
 }
 
@@ -626,11 +733,14 @@ fn streaming_status_update_message<T>(
     visibility: &str,
     user_recipient_ids: &[AccountId],
     notification_recipient_ids: &[AccountId],
+    status_origin: StreamingStatusOrigin,
 ) -> Result<StreamingEvent, serde_json::Error>
 where
     T: Serialize,
 {
-    let payload = serde_json::to_string(status)?;
+    let value = serde_json::to_value(status)?;
+    let has_media = serialized_status_has_media(&value);
+    let payload = serde_json::to_string(&value)?;
     Ok(StreamingEvent {
         event: StreamingEventType::StatusUpdate,
         payload,
@@ -638,6 +748,8 @@ where
         user_recipient_ids: user_recipient_ids.to_owned(),
         notification_recipient_ids: notification_recipient_ids.to_owned(),
         visibility: visibility.to_owned(),
+        status_origin,
+        has_media,
     })
 }
 
@@ -657,6 +769,8 @@ where
         user_recipient_ids: Vec::new(),
         notification_recipient_ids: Vec::new(),
         visibility: "direct".to_owned(),
+        status_origin: StreamingStatusOrigin::Local,
+        has_media: false,
     })
 }
 
@@ -676,6 +790,8 @@ where
         user_recipient_ids: Vec::new(),
         notification_recipient_ids: Vec::new(),
         visibility: "direct".to_owned(),
+        status_origin: StreamingStatusOrigin::Local,
+        has_media: false,
     })
 }
 
@@ -685,6 +801,8 @@ fn streaming_delete_message(
     author_id: AccountId,
     visibility: &str,
     user_recipient_ids: &[AccountId],
+    status_origin: StreamingStatusOrigin,
+    has_media: bool,
 ) -> StreamingEvent {
     StreamingEvent {
         event: StreamingEventType::Delete,
@@ -693,7 +811,16 @@ fn streaming_delete_message(
         user_recipient_ids: user_recipient_ids.to_owned(),
         notification_recipient_ids: Vec::new(),
         visibility: visibility.to_owned(),
+        status_origin,
+        has_media,
     }
+}
+
+fn serialized_status_has_media(value: &serde_json::Value) -> bool {
+    value
+        .get("media_attachments")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|attachments| !attachments.is_empty())
 }
 
 #[cfg(test)]
@@ -701,6 +828,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use roosty_core::AccountId;
+    use roosty_db::StreamingStatusOrigin;
     use serde_json::Value;
     use uuid::Uuid;
 
@@ -740,9 +868,14 @@ mod tests {
         // Mastodon clients expect the outer event as JSON and the status itself
         // as a JSON-encoded string in the payload field.
         let account_id = AccountId(Uuid::now_v7());
-        let event =
-            streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public", &[])
-                .unwrap();
+        let event = streaming_update_message(
+            &serde_json::json!({"id": "1"}),
+            account_id,
+            "public",
+            &[],
+            StreamingStatusOrigin::Local,
+        )
+        .unwrap();
         let message = event
             .to_socket_message(account_id, &["user".to_owned()])
             .unwrap()
@@ -769,6 +902,7 @@ mod tests {
             "public",
             &[],
             &[],
+            StreamingStatusOrigin::Local,
         )
         .unwrap();
         let message = event
@@ -792,9 +926,14 @@ mod tests {
     fn update_messages_are_scoped_to_matching_streams() {
         let author_id = AccountId(Uuid::now_v7());
         let viewer_id = AccountId(Uuid::now_v7());
-        let event =
-            streaming_update_message(&serde_json::json!({"id": "1"}), author_id, "public", &[])
-                .unwrap();
+        let event = streaming_update_message(
+            &serde_json::json!({"id": "1"}),
+            author_id,
+            "public",
+            &[],
+            StreamingStatusOrigin::Local,
+        )
+        .unwrap();
 
         let user_message = event
             .to_socket_message(viewer_id, &["user".to_owned()])
@@ -817,6 +956,43 @@ mod tests {
                 "event": "update",
                 "payload": "{\"id\":\"1\"}"
             })
+        );
+    }
+
+    #[test]
+    /// Remote media statuses reach federated and remote-media streams, but never local streams.
+    fn remote_media_updates_are_scoped_to_public_origin_streams() {
+        let author_id = AccountId(Uuid::now_v7());
+        let event = streaming_update_message(
+            &serde_json::json!({"id": "1", "media_attachments": [{"id": "media"}]}),
+            author_id,
+            "public",
+            &[],
+            StreamingStatusOrigin::Remote,
+        )
+        .unwrap();
+        let streams = [
+            "public".to_owned(),
+            "public:media".to_owned(),
+            "public:local".to_owned(),
+            "public:local:media".to_owned(),
+            "public:remote".to_owned(),
+            "public:remote:media".to_owned(),
+        ];
+        let message = event
+            .to_socket_message(author_id, &streams)
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(
+            value["stream"],
+            serde_json::json!([
+                "public",
+                "public:media",
+                "public:remote",
+                "public:remote:media"
+            ])
         );
     }
 
@@ -870,9 +1046,14 @@ mod tests {
     /// Given a status update, when serialized for notification-only streams, then it is not delivered there.
     fn update_messages_do_not_go_to_notification_only_streams() {
         let account_id = AccountId(Uuid::now_v7());
-        let event =
-            streaming_update_message(&serde_json::json!({"id": "1"}), account_id, "public", &[])
-                .unwrap();
+        let event = streaming_update_message(
+            &serde_json::json!({"id": "1"}),
+            account_id,
+            "public",
+            &[],
+            StreamingStatusOrigin::Local,
+        )
+        .unwrap();
 
         let message = event
             .to_socket_message(account_id, &["user:notification".to_owned()])
@@ -892,6 +1073,7 @@ mod tests {
             "public",
             &[],
             &[mentioned_id],
+            StreamingStatusOrigin::Local,
         )
         .unwrap();
 
@@ -953,6 +1135,7 @@ mod tests {
             author_id,
             "public",
             &[follower_id],
+            StreamingStatusOrigin::Local,
         )
         .unwrap();
 
@@ -977,7 +1160,14 @@ mod tests {
     fn delete_messages_use_plain_identifier_payloads() {
         let author_id = AccountId(Uuid::now_v7());
         let follower_id = AccountId(Uuid::now_v7());
-        let event = streaming_delete_message("boost-id", author_id, "direct", &[follower_id]);
+        let event = streaming_delete_message(
+            "boost-id",
+            author_id,
+            "direct",
+            &[follower_id],
+            StreamingStatusOrigin::Local,
+            false,
+        );
 
         let message = event
             .to_socket_message(follower_id, &["user".to_owned()])

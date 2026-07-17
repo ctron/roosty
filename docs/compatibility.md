@@ -106,7 +106,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed and explicitly addressed local/cached-remote follower-only statuses, public/unlisted followed statuses, local boosts, and inbound remote boosts. |
-| 🟡 | `GET /api/v1/timelines/public` | Local public statuses only. |
+| 🟢 | `GET /api/v1/timelines/public` | Chronological local and already-cached remote public statuses with `local`, `remote`, `only_media`, cursor pagination, `Link` headers, federation-domain policy, and authenticated mute/block filtering. Replies and boosts are excluded to match Mastodon's live feeds. |
 | 🟡 | `GET /api/v1/timelines/tag/:tag` | Local public hashtag timeline with `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, and `Link` headers; remote hashtag timelines are missing. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
 
@@ -138,8 +138,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/streaming` | Authenticated WebSockets use bounded, PostgreSQL-backed multi-process fan-out with connection, send, ping, and idle limits. |
 | 🟡 | `GET /api/v1/streaming/direct` | Local and accepted remote direct conversation updates emit recipient-scoped `conversation` events. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
-| 🟡 | `update` events | Local status creation reaches matching follower and followed-tag `user`, `public`, and `public:local` streams; accepted remote creation reaches follower `user` streams. Remote-public fan-out is missing. |
-| 🟡 | `status.update` events | Local and accepted remote edits reach matching followers and active mention-only recipients. Mention recipients receive the edit on both combined `user` and `user:notification` streams; local followed-tag and public streams also receive matching edits. Remote-public fan-out is missing. |
+| 🟢 | Public status events | Local and accepted cached-remote create, edit, and delete events reach origin-appropriate `public`, `public:local`, `public:remote`, and media-filtered streams through the multi-process event log. |
+| 🟡 | `status.update` events | Local and accepted remote edits reach matching followers and active mention-only recipients. Mention recipients receive the edit on both combined `user` and `user:notification` streams; followed-tag and origin-appropriate public streams receive matching public edits. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
 | 🟡 | `notification` events | Local and remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, boosted-status `update`, and follow-request notifications are emitted to recipient `user` and `user:notification` streams. |
 | 🟡 | `delete` events | Emitted for local status deletes, including current followed-tag recipients, and removed local or followed remote boost timeline entries. |

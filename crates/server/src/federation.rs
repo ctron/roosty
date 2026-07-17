@@ -2310,20 +2310,28 @@ async fn publish_remote_status_change(
                 )
                 .await?;
             }
-            if !recipients.is_empty() || (edited && !mention_recipients.is_empty()) {
-                if edited {
-                    state
-                        .streaming_events
-                        .publish_home_status_edit_with_notifications(
-                            &response,
-                            remote_actor_id,
-                            &recipients,
-                            &mention_recipients,
-                        );
+            if status.visibility == StatusVisibility::Public
+                || !recipients.is_empty()
+                || (edited && !mention_recipients.is_empty())
+            {
+                let stream_visibility = if status.in_reply_to.is_some() {
+                    "unlisted"
                 } else {
-                    state.streaming_events.publish_home_update(
+                    (&status.visibility).into()
+                };
+                if edited {
+                    state.streaming_events.publish_remote_status_edit(
                         &response,
                         remote_actor_id,
+                        stream_visibility,
+                        &recipients,
+                        &mention_recipients,
+                    );
+                } else {
+                    state.streaming_events.publish_remote_status_update(
+                        &response,
+                        remote_actor_id,
+                        stream_visibility,
                         &recipients,
                     );
                 }
@@ -2348,12 +2356,29 @@ async fn publish_delete_repair(
     repair: roosty_db::RemoteDeleteRepair,
 ) -> Result<(), RoostyError> {
     for projection in repair.projections {
-        if !projection.home_recipient_ids.is_empty() {
-            state.streaming_events.publish_home_delete(
-                &projection.status_id,
-                projection.actor_id,
-                &projection.home_recipient_ids,
-            );
+        if projection.visibility == StatusVisibility::Public
+            || !projection.home_recipient_ids.is_empty()
+        {
+            match projection.status_origin {
+                roosty_db::StreamingStatusOrigin::Local => {
+                    state.streaming_events.publish_local_status_delete(
+                        &projection.status_id,
+                        projection.actor_id,
+                        (&projection.visibility).into(),
+                        &projection.home_recipient_ids,
+                        projection.has_media,
+                    );
+                }
+                roosty_db::StreamingStatusOrigin::Remote => {
+                    state.streaming_events.publish_remote_status_delete(
+                        &projection.status_id,
+                        projection.actor_id,
+                        (&projection.visibility).into(),
+                        &projection.home_recipient_ids,
+                        projection.has_media,
+                    );
+                }
+            }
         }
         if !projection.direct_recipient_ids.is_empty() {
             state.streaming_events.publish_delete(
