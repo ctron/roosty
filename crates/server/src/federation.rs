@@ -1922,11 +1922,12 @@ enum RemoteStatusChange {
     /// An idempotent replay with no state or stream effect.
     Ignored,
     /// A newly created or edited Note.
-    Upsert(
-        Box<roosty_db::RemoteStatus>,
-        Vec<roosty_db::LocalNotification>,
-        Option<roosty_db::DirectConversationRefresh>,
-    ),
+    Upsert {
+        status: Box<roosty_db::RemoteStatus>,
+        notifications: Vec<roosty_db::LocalNotification>,
+        refresh: Option<roosty_db::DirectConversationRefresh>,
+        edited: bool,
+    },
     /// Removed status-like projections and repaired conversations.
     Delete(roosty_db::RemoteDeleteRepair),
 }
@@ -2134,11 +2135,12 @@ async fn process_remote_status_activity(
                     .await?;
             }
             txn.commit().await?;
-            Ok(RemoteStatusChange::Upsert(
-                Box::new(status),
+            Ok(RemoteStatusChange::Upsert {
+                status: Box::new(status),
                 notifications,
-                direct_conversation_refresh,
-            ))
+                refresh: direct_conversation_refresh,
+                edited: !is_create,
+            })
         }
         Some("Delete") => {
             let inbound: InboundDeleteActivity =
@@ -2206,7 +2208,12 @@ async fn publish_remote_status_change(
         roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
     match change {
         RemoteStatusChange::Ignored => {}
-        RemoteStatusChange::Upsert(status, notifications, refresh) => {
+        RemoteStatusChange::Upsert {
+            status,
+            notifications,
+            refresh,
+            edited,
+        } => {
             let mut recipients = match status.visibility {
                 StatusVisibility::Public
                 | StatusVisibility::Unlisted
@@ -2257,9 +2264,19 @@ async fn publish_remote_status_change(
                 .await?;
             }
             if !recipients.is_empty() {
-                state
-                    .streaming_events
-                    .publish_home_update(&response, remote_actor_id, &recipients);
+                if edited {
+                    state.streaming_events.publish_home_status_edit(
+                        &response,
+                        remote_actor_id,
+                        &recipients,
+                    );
+                } else {
+                    state.streaming_events.publish_home_update(
+                        &response,
+                        remote_actor_id,
+                        &recipients,
+                    );
+                }
             }
             for notification in notifications {
                 crate::notifications::publish_committed_notification(
@@ -4162,8 +4179,8 @@ mod tests {
         );
     }
 
-    /// Given isolated instances, when a remote account follows then unfollows, signed status
-    /// delivery reaches it only while the accepted relationship exists.
+    /// Given isolated instances, when a remote account follows, edits replace its cached status
+    /// and stream to the follower until the accepted relationship is removed.
     #[tokio::test]
     async fn remote_follow_handshake_delivers_then_stops_statuses() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
@@ -4219,15 +4236,69 @@ mod tests {
             .await
             .unwrap();
         deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
-        assert!(
-            roosty_db::find_remote_status_by_activitypub_id(
-                &context.beta.db,
-                &super::status_url(&context.alpha, "author", first.id),
-            )
+        let first_url = super::status_url(&context.alpha, "author", first.id);
+        let cached_first =
+            roosty_db::find_remote_status_by_activitypub_id(&context.beta.db, &first_url)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let txn = context.alpha.db.begin().await.unwrap();
+        let edited = roosty_db::update_owned_local_status(
+            &txn,
+            first.id,
+            author.id,
+            roosty_db::LocalStatusUpdate {
+                content: Some("edited delivery".to_owned()),
+                sensitive: None,
+                spoiler_text: None,
+                language: None,
+            },
+            None,
+            &[],
+            roosty_db::LocalStatusMetadata {
+                tag_names: Vec::new(),
+                remote_actor_ids: Vec::new(),
+                local_recipient_ids: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        super::enqueue_status_activity_in_transaction(
+            &context.alpha,
+            &txn,
+            &edited,
+            super::StatusActivityKind::Update,
+            &[],
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        let mut receiver = context.beta.streaming_events.subscribe();
+
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
+
+        let cached_edit =
+            roosty_db::find_remote_status_by_activitypub_id(&context.beta.db, &first_url)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(cached_edit.id, cached_first.id);
+        assert_eq!(cached_edit.content, "edited delivery");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
             .await
             .unwrap()
-            .is_some()
-        );
+            .unwrap();
+        let message = event
+            .to_socket_message(follower.id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let message: serde_json::Value = serde_json::from_str(&message).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(message["event"], "status.update");
+        assert_eq!(payload["content"], "edited delivery");
 
         let private = create_test_status(
             &context.alpha,

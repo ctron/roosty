@@ -215,6 +215,22 @@ impl StreamingEvents {
         }
     }
 
+    /// Publish a Mastodon `status.update` event for an edited status.
+    pub fn publish_status_edit<T>(
+        &self,
+        status: &T,
+        author_id: AccountId,
+        visibility: &str,
+        user_recipient_ids: &[AccountId],
+    ) where
+        T: Serialize,
+    {
+        match streaming_status_update_message(status, author_id, visibility, user_recipient_ids) {
+            Ok(event) => self.publish(event),
+            Err(error) => warn!(%error, "failed to serialize edited status"),
+        }
+    }
+
     /// Publish a Mastodon `notification` event to the recipient's user stream.
     pub fn publish_notification<T>(&self, notification: &T, recipient_id: AccountId)
     where
@@ -255,6 +271,18 @@ impl StreamingEvents {
         T: Serialize,
     {
         self.publish_status_update(status, author_id, "unlisted", recipients);
+    }
+
+    /// Publish an edited status exclusively to selected users' home-capable streams.
+    pub fn publish_home_status_edit<T>(
+        &self,
+        status: &T,
+        author_id: AccountId,
+        recipients: &[AccountId],
+    ) where
+        T: Serialize,
+    {
+        self.publish_status_edit(status, author_id, "unlisted", recipients);
     }
 
     /// Publish a status deletion exclusively to selected users' home-capable streams.
@@ -509,6 +537,8 @@ struct SocketMessage<'a> {
 enum StreamingEventType {
     #[strum(serialize = "update")]
     Update,
+    #[strum(serialize = "status.update")]
+    StatusUpdate,
     #[strum(serialize = "notification")]
     Notification,
     #[strum(serialize = "conversation")]
@@ -528,6 +558,7 @@ impl From<StreamingEventType> for StreamingEventKind {
     fn from(value: StreamingEventType) -> Self {
         match value {
             StreamingEventType::Update => Self::Update,
+            StreamingEventType::StatusUpdate => Self::StatusUpdate,
             StreamingEventType::Notification => Self::Notification,
             StreamingEventType::Conversation => Self::Conversation,
             StreamingEventType::Delete => Self::Delete,
@@ -539,6 +570,7 @@ impl From<StreamingEventKind> for StreamingEventType {
     fn from(value: StreamingEventKind) -> Self {
         match value {
             StreamingEventKind::Update => Self::Update,
+            StreamingEventKind::StatusUpdate => Self::StatusUpdate,
             StreamingEventKind::Notification => Self::Notification,
             StreamingEventKind::Conversation => Self::Conversation,
             StreamingEventKind::Delete => Self::Delete,
@@ -559,6 +591,26 @@ where
     let payload = serde_json::to_string(status)?;
     Ok(StreamingEvent {
         event: StreamingEventType::Update,
+        payload,
+        account_id: author_id,
+        user_recipient_ids: user_recipient_ids.to_owned(),
+        visibility: visibility.to_owned(),
+    })
+}
+
+/// Build the status-edit event stored in the in-process broadcast channel.
+fn streaming_status_update_message<T>(
+    status: &T,
+    author_id: AccountId,
+    visibility: &str,
+    user_recipient_ids: &[AccountId],
+) -> Result<StreamingEvent, serde_json::Error>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_string(status)?;
+    Ok(StreamingEvent {
+        event: StreamingEventType::StatusUpdate,
         payload,
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
@@ -628,7 +680,7 @@ mod tests {
 
     use super::{
         StreamingMetrics, streaming_conversation_message, streaming_delete_message,
-        streaming_notification_message, streaming_update_message,
+        streaming_notification_message, streaming_status_update_message, streaming_update_message,
     };
 
     #[test]
@@ -676,6 +728,33 @@ mod tests {
             serde_json::json!({
                 "stream": ["user"],
                 "event": "update",
+                "payload": "{\"id\":\"1\"}"
+            })
+        );
+    }
+
+    #[test]
+    /// An edit uses Mastodon's distinct `status.update` event while retaining a string payload.
+    fn status_update_message_uses_the_edit_event_name() {
+        let account_id = AccountId(Uuid::now_v7());
+        let event = streaming_status_update_message(
+            &serde_json::json!({"id": "1"}),
+            account_id,
+            "public",
+            &[],
+        )
+        .unwrap();
+        let message = event
+            .to_socket_message(account_id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stream": ["user"],
+                "event": "status.update",
                 "payload": "{\"id\":\"1\"}"
             })
         );

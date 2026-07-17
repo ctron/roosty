@@ -782,7 +782,16 @@ async fn update_status(
                 }
             }
             match status_response(&state, status.clone(), account).await {
-                Ok(status) => Json(status).into_response(),
+                Ok(response) => {
+                    let recipients = status_stream_recipients(&state, &status).await;
+                    state.streaming_events.publish_status_edit(
+                        &response,
+                        status.account_id,
+                        &response.visibility,
+                        &recipients,
+                    );
+                    Json(response).into_response()
+                }
                 Err(error) => server_error(error),
             }
         }
@@ -4829,6 +4838,56 @@ mod tests {
         assert_eq!(update["spoiler_text"], "warning");
         assert_eq!(update["language"], "en");
         assert!(update["edited_at"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a local follower subscribed to their home stream, when the author edits a status,
+    /// then the follower receives the replacement status as a streaming update.
+    async fn status_update_streams_to_local_followers(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        context
+            .access_token_for("follower", "follower-update@example.com")
+            .await;
+        let follower = roosty_db::find_local_account_by_username(&context.db, "follower")
+            .await
+            .unwrap()
+            .unwrap();
+        roosty_db::follow_local_account(&context.db, follower.id, context.account_id, true, false)
+            .await
+            .unwrap();
+        let status = context
+            .create_status(&author_token, "original text", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let mut receiver = context.state.streaming_events.subscribe();
+
+        let update = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &author_token,
+                serde_json::json!({"status": "edited text"}),
+            )
+            .await;
+
+        assert_eq!(update.status(), StatusCode::OK);
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = event
+            .to_socket_message(follower.id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let message: Value = serde_json::from_str(&message).unwrap();
+        let payload: Value = serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
+
+        assert_eq!(message["event"], "status.update");
+        assert_eq!(message["stream"], serde_json::json!(["user"]));
+        assert_eq!(payload["id"], status_id);
+        assert_eq!(payload["content"], "<p>edited text</p>");
+        assert!(payload["edited_at"].as_str().is_some());
     }
 
     #[test_context(StatusContext)]

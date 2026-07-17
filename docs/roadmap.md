@@ -5,7 +5,7 @@
 ### Available now
 
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
-- Local public/unlisted home-timeline fan-out, replies, mentions, favourites, boosts, notifications, and direct conversations.
+- Local public/unlisted home-timeline fan-out, including streaming status creation and edit replacements, replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.

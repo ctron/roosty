@@ -51,6 +51,7 @@ mod m20260701_000046_harden_inbox_replay;
 mod m20260701_000047_add_remote_actor_followers_url;
 mod m20260701_000048_create_streaming_event;
 mod m20260701_000049_create_remote_account_moderation;
+mod m20260701_000050_allow_status_update_streaming_event;
 
 pub struct Migrator;
 
@@ -107,6 +108,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000047_add_remote_actor_followers_url::Migration),
             Box::new(m20260701_000048_create_streaming_event::Migration),
             Box::new(m20260701_000049_create_remote_account_moderation::Migration),
+            Box::new(m20260701_000050_allow_status_update_streaming_event::Migration),
         ]
     }
 }

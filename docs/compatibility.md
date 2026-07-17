@@ -138,9 +138,10 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/streaming` | Authenticated WebSockets use bounded, PostgreSQL-backed multi-process fan-out with connection, send, ping, and idle limits. |
 | 🟡 | `GET /api/v1/streaming/direct` | Local and accepted remote direct conversation updates emit recipient-scoped `conversation` events. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
-| 🟢 | `update` events | Sent after local status creation to matching `user`, `public`, and `public:local` streams. |
+| 🟡 | `update` events | Local status creation reaches matching `user`, `public`, and `public:local` streams; accepted remote creation reaches follower `user` streams. Followed-tag and remote-public fan-out are missing. |
+| 🟡 | `status.update` events | Local edits reach matching `user`, `public`, and `public:local` streams; accepted remote edits reach follower `user` streams. Followed-tag and remote-public fan-out are missing. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
-| 🟡 | `notification` events | Local `mention`, `favourite`, and `follow` notifications are emitted to recipient `user` and `user:notification` streams. |
+| 🟡 | `notification` events | Local `mention`, `favourite`, `reblog`, `follow`, and remote follow-request notifications are emitted to recipient `user` and `user:notification` streams. Follow relationships with `notify=true` do not yet create `status` notifications. |
 | 🟡 | `delete` events | Emitted for local status deletes and removed local boost timeline entries. |
 | 🟢 | Multi-process fan-out | PostgreSQL notifications and a retained ordered event log provide reconnect recovery without startup replay. |
 

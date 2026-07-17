@@ -38,6 +38,7 @@ pub enum StatusVisibility {
 #[strum(serialize_all = "snake_case")]
 pub enum StreamingEventKind {
     Update,
+    StatusUpdate,
     Notification,
     Conversation,
     Delete,
@@ -9079,6 +9080,16 @@ mod tests {
         assert_eq!(
             JobKind::FederationFollowDelivery.as_str(),
             "federation_follow_delivery"
+        );
+    }
+
+    /// Streaming edit events retain their database spelling independently of the wire name.
+    #[test]
+    fn streaming_event_kinds_use_stable_persisted_values() {
+        assert_eq!(StreamingEventKind::Update.to_string(), "update");
+        assert_eq!(
+            StreamingEventKind::StatusUpdate.to_string(),
+            "status_update"
         );
     }
 }

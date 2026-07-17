@@ -239,8 +239,9 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back remote moderation, the streaming log, and the followers URL migration.
-    Migrator::down(database.connection(), Some(3))
+    // Roll back the streaming-kind extension, remote moderation, the streaming log, and the
+    // followers URL migration.
+    Migrator::down(database.connection(), Some(4))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
