@@ -461,6 +461,11 @@ async fn create_status(
             } else {
                 Vec::new()
             },
+            local_mention_ids: notification_recipients
+                .iter()
+                .filter(|account| account.id != author_id)
+                .map(|account| account.id)
+                .collect(),
         },
     )
     .await
@@ -718,17 +723,20 @@ async fn update_status(
         .iter()
         .map(|actor| actor.id)
         .collect::<Vec<_>>();
-    let local_recipient_ids = if matches!(
+    let local_mentions = match local_text_mentions(&state, &final_content).await {
+        Ok(accounts) => accounts
+            .into_iter()
+            .filter(|mentioned| mentioned.id != account.id)
+            .map(|mentioned| mentioned.id)
+            .collect::<Vec<_>>(),
+        Err(error) => return server_error(error),
+    };
+    let local_recipient_ids = matches!(
         existing.visibility,
         StatusVisibility::Private | StatusVisibility::Direct
-    ) {
-        match local_text_mentions(&state, &final_content).await {
-            Ok(accounts) => accounts.into_iter().map(|account| account.id).collect(),
-            Err(error) => return server_error(error),
-        }
-    } else {
-        Vec::new()
-    };
+    )
+    .then(|| local_mentions.clone())
+    .unwrap_or_default();
     let previous_remote_recipients =
         match roosty_db::remote_mentions_for_local_status(&state.db, existing.id).await {
             Ok(recipients) => recipients,
@@ -749,11 +757,33 @@ async fn update_status(
             tag_names: hashtag_names(&final_content),
             remote_actor_ids: remote_mention_ids,
             local_recipient_ids,
+            local_mention_ids: local_mentions.clone(),
         },
     )
     .await
     {
         Ok(Some(status)) => {
+            let mut notifications = Vec::new();
+            for account_id in &local_mentions {
+                match roosty_db::notify_local_status_mention(
+                    &txn,
+                    *account_id,
+                    account.id,
+                    status.id,
+                )
+                .await
+                {
+                    Ok(Some(notification)) => notifications.push(notification),
+                    Ok(None) => {}
+                    Err(error) => return server_error(error),
+                }
+            }
+            match roosty_db::replace_local_status_update_notifications(&txn, status.id, account.id)
+                .await
+            {
+                Ok(update_notifications) => notifications.extend(update_notifications),
+                Err(error) => return server_error(error),
+            }
             if status.visibility == StatusVisibility::Direct
                 && let Err(error) = sync_edited_direct_conversation(&state, &txn, &status).await
             {
@@ -820,12 +850,24 @@ async fn update_status(
             }
             match status_response(&state, status.clone(), account).await {
                 Ok(response) => {
+                    for notification in notifications {
+                        if let Err(error) = publish_committed_notification(
+                            &state,
+                            notification.account_id,
+                            notification,
+                        )
+                        .await
+                        {
+                            warn!(%error, "failed to publish status edit notification");
+                        }
+                    }
                     let recipients = status_stream_recipients(&state, &status).await;
                     state.streaming_events.publish_status_edit(
                         &response,
                         status.account_id,
                         &response.visibility,
                         &recipients,
+                        &local_mentions,
                     );
                     Json(response).into_response()
                 }
@@ -914,7 +956,13 @@ async fn publish_status_delete(
     status: &roosty_db::LocalStatus,
     reblogs: &[roosty_db::LocalStatusReblog],
 ) {
-    let recipients = status_stream_recipients(state, status).await;
+    let mut recipients = status_stream_recipients(state, status).await;
+    match roosty_db::active_local_mentions_for_local_status(&state.db, status.id).await {
+        Ok(mentions) => recipients.extend(mentions),
+        Err(error) => warn!(%error, "failed to resolve mentioned delete recipients"),
+    }
+    recipients.sort_by_key(|id| id.0);
+    recipients.dedup();
     state.streaming_events.publish_delete(
         &status.id.0.to_string(),
         status.account_id,
@@ -4933,6 +4981,131 @@ mod tests {
         assert_eq!(payload["id"], status_id);
         assert_eq!(payload["content"], "<p>edited text</p>");
         assert!(payload["edited_at"].as_str().is_some());
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a mention-only recipient, edits reach both Mastodon user stream variants until the
+    /// mention is removed.
+    async fn status_updates_follow_the_active_mention_lifecycle(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let mentioned_token = context
+            .access_token_for("mentionededit", "mentioned-edit@example.com")
+            .await;
+        let mentioned = roosty_db::find_local_account_by_username(&context.db, "mentionededit")
+            .await
+            .unwrap()
+            .unwrap();
+        let status = context
+            .create_status(&author_token, "hello @mentionededit", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let mut receiver = context.state.streaming_events.subscribe();
+
+        let edit = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &author_token,
+                serde_json::json!({"status": "still hello @mentionededit"}),
+            )
+            .await;
+        assert_eq!(edit.status(), StatusCode::OK);
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = event
+            .to_socket_message(
+                mentioned.id,
+                &["user".to_owned(), "user:notification".to_owned()],
+            )
+            .unwrap()
+            .unwrap();
+        let message: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(message["event"], "status.update");
+        assert_eq!(
+            message["stream"],
+            serde_json::json!(["user", "user:notification"])
+        );
+
+        context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &author_token,
+                serde_json::json!({"status": "mention removed"}),
+            )
+            .await;
+        let removal = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            removal
+                .to_socket_message(mentioned.id, &["user".to_owned()])
+                .unwrap()
+                .is_none()
+        );
+
+        let notifications = json_body(
+            context
+                .authenticated_get("/api/v1/notifications", &mentioned_token)
+                .await,
+        )
+        .await;
+        assert_eq!(notifications.as_array().unwrap().len(), 1);
+        assert_eq!(notifications[0]["type"], "mention");
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a local boost, every edit replaces the booster's Mastodon `update` notification.
+    async fn status_edits_replace_booster_update_notifications(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let booster_token = context
+            .access_token_for("editbooster", "edit-booster@example.com")
+            .await;
+        let status = context
+            .create_status(&author_token, "boost then edit", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let boost = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/reblog"),
+                &booster_token,
+            )
+            .await;
+        assert_eq!(boost.status(), StatusCode::OK);
+
+        for content in ["first edit", "second edit"] {
+            let edit = context
+                .authenticated_json(
+                    "PUT",
+                    &format!("/api/v1/statuses/{status_id}"),
+                    &author_token,
+                    serde_json::json!({"status": content}),
+                )
+                .await;
+            assert_eq!(edit.status(), StatusCode::OK);
+        }
+
+        let notifications = json_body(
+            context
+                .authenticated_get("/api/v1/notifications", &booster_token)
+                .await,
+        )
+        .await;
+        let updates = notifications
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|notification| notification["type"] == "update")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["status"]["id"], status_id);
+        assert_eq!(updates[0]["status"]["content"], "<p>second edit</p>");
     }
 
     #[test_context(StatusContext)]

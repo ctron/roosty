@@ -91,7 +91,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `PUT /api/v1/statuses/:id` | Owner-only local text, sensitivity, spoiler, language, media IDs, and media alt/focus edits; polls and edit history are missing. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
-| 🟡 | Mentions | Local `@username` mentions render as links, populate `mentions`, and create local notifications; remote mentions are missing. |
+| 🟡 | Mentions | Local and resolved remote mentions render as links and populate `mentions`. Local recipients are tracked independently from notifications; active addressed mentions receive idempotent notifications and subsequent edit/delete streaming. |
 | 🟡 | Hashtags | Local `#tag` text is stored, linked in rendered status HTML, and returned in status `tags`. Cached remote Notes expose valid ActivityPub Hashtag tags with their origin URLs; remote discovery, timelines, and follows are missing. |
 | 🟡 | Conversations | Direct-message conversations list/read/delete and direct stream events support recipient-scoped local/cached-remote direct Notes, mention-audience replacement on edits, unresolved remote participant IDs, replies to cached direct Notes, remote media fetching, and local/remote update/delete repair. Conversation deletion is account-local, and the direct stream emits only complete `conversation` payloads. |
 | 🟢 | Visibility semantics | Public/unlisted reads work; follower-only local and cached remote posts and replies are visible to owners, current followers, and explicitly mentioned accounts; direct reads remain recipient-scoped. Anonymous and unrelated access returns `404`, and inaccessible thread nodes stop cache-only traversal. |
@@ -114,9 +114,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, `follow`, and followed-account `status` notifications with cursor pagination and basic filters. |
+| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and boosted-status `update` notifications with cursor pagination and basic filters. |
 | 🟢 | `GET/POST /api/v1/markers` | Persists local home and notification read positions. |
-| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared; grouping and policy flows remain missing. |
+| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, boosted-status `update`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared; grouping and policy flows remain missing. |
 | 🟡 | Notification read state | Local home and notification markers work; grouped and remote notification state is missing. |
 
 ### Tags, Push, and Media
@@ -139,9 +139,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/streaming/direct` | Local and accepted remote direct conversation updates emit recipient-scoped `conversation` events. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
 | 🟡 | `update` events | Local status creation reaches matching follower and followed-tag `user`, `public`, and `public:local` streams; accepted remote creation reaches follower `user` streams. Remote-public fan-out is missing. |
-| 🟡 | `status.update` events | Local edits reach matching follower and current followed-tag `user`, `public`, and `public:local` streams; accepted remote edits reach follower `user` streams. Remote-public fan-out is missing. |
+| 🟡 | `status.update` events | Local and accepted remote edits reach matching followers and active mention-only recipients. Mention recipients receive the edit on both combined `user` and `user:notification` streams; local followed-tag and public streams also receive matching edits. Remote-public fan-out is missing. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
-| 🟡 | `notification` events | Local and remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and follow-request notifications are emitted to recipient `user` and `user:notification` streams. |
+| 🟡 | `notification` events | Local and remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, boosted-status `update`, and follow-request notifications are emitted to recipient `user` and `user:notification` streams. |
 | 🟡 | `delete` events | Emitted for local status deletes, including current followed-tag recipients, and removed local or followed remote boost timeline entries. |
 | 🟢 | Multi-process fan-out | PostgreSQL notifications and a retained ordered event log provide reconnect recovery without startup replay. |
 
@@ -152,7 +152,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
 | 🟢 | Remote discovery and profile projections | Lookup and account search perform policy-controlled WebFinger discovery, validate/cache HTTPS actor documents, refresh expired actors, and return navigable UUID-backed remote account projections with proxied actor avatar/header images. |
 | 🟡 | Outbound status lifecycle | Public, unlisted, and follower-only local status creates, edits, replies, and deletes are queued as signed ActivityPub deliveries to accepted remote followers and explicit remote mentions. |
-| 🟡 | Inbound status lifecycle | Signed public/unlisted/follower-only `Create`, `Update`, and `Delete` activities are cached with canonical object IDs, exact audiences, reply references, and author ownership checks. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
+| 🟡 | Inbound status lifecycle | Signed public/unlisted/follower-only `Create`, complete-object `Update`, and `Delete` activities are cached with canonical object IDs, exact addressed audiences, reply references, and author ownership checks. Mention tags do not grant delivery without matching `to`/`cc` addressing. Replay markers and state changes commit atomically. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
 | 🟢 | Remote timeline fan-out | Cached remote posts are pushed to authorized home streams; follower-only access follows current accepted relationships and explicit audiences, with no polling or backfill. |
 | 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed subject to bilateral block and notification-mute policy. |

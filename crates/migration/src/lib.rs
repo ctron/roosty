@@ -54,6 +54,7 @@ mod m20260701_000049_create_remote_account_moderation;
 mod m20260701_000050_allow_status_update_streaming_event;
 mod m20260701_000051_add_remote_follow_options;
 mod m20260701_000052_allow_status_notifications;
+mod m20260701_000053_add_status_edit_delivery;
 
 pub struct Migrator;
 
@@ -113,6 +114,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000050_allow_status_update_streaming_event::Migration),
             Box::new(m20260701_000051_add_remote_follow_options::Migration),
             Box::new(m20260701_000052_allow_status_notifications::Migration),
+            Box::new(m20260701_000053_add_status_edit_delivery::Migration),
         ]
     }
 }

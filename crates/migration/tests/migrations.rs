@@ -42,6 +42,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "remote_local_account_block").await);
     assert!(table_exists(database.connection(), "local_remote_account_mute").await);
     assert!(table_exists(database.connection(), "streaming_event").await);
+    assert!(table_exists(database.connection(), "local_status_local_mention").await);
+    assert!(table_exists(database.connection(), "remote_status_local_mention").await);
     assert!(column_exists(database.connection(), "streaming_event", "sequence").await);
     assert!(
         column_exists(
@@ -52,6 +54,14 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
         .await
     );
     assert!(column_exists(database.connection(), "streaming_event", "recipient_ids").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "streaming_event",
+            "notification_recipient_ids"
+        )
+        .await
+    );
     // Account settings are part of the local account schema until profile
     // boundaries justify a separate table.
     assert!(column_exists(database.connection(), "local_account", "display_name").await);
@@ -241,9 +251,9 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back the subscription extensions, streaming-kind extension, remote moderation, the
-    // streaming log, and the followers URL migration.
-    Migrator::down(database.connection(), Some(6))
+    // Roll back edit delivery, subscription extensions, streaming-kind extension, remote
+    // moderation, the streaming log, and the followers URL migration.
+    Migrator::down(database.connection(), Some(7))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);

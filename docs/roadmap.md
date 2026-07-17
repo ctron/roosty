@@ -27,6 +27,7 @@
 - [x] Project cached remote Notes into local home timelines.
 - [x] Stream cached remote Note create/update/delete events to local home timelines.
 - [x] Honor local-to-remote `reblogs` and `notify` follow preferences in timelines, streams, relationships, and notifications.
+- [x] Track active local mentions independently from notifications and deliver Mastodon edit/delete events plus boosted-status `update` notifications.
 - [x] Match Mastodon's push-based federation behavior: missed inbox deliveries are not backfilled by polling remote outboxes; deletion and follow-state cache repairs remain local operations.
 - [x] Implement remote follower-only Notes and replies using validated actor collection URLs, current follow relationships, explicit mentions, and cache-only traversal.
 - [ ] Fetch and expose paginated remote followers/following collection contents.

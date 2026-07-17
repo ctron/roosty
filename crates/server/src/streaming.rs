@@ -222,10 +222,17 @@ impl StreamingEvents {
         author_id: AccountId,
         visibility: &str,
         user_recipient_ids: &[AccountId],
+        notification_recipient_ids: &[AccountId],
     ) where
         T: Serialize,
     {
-        match streaming_status_update_message(status, author_id, visibility, user_recipient_ids) {
+        match streaming_status_update_message(
+            status,
+            author_id,
+            visibility,
+            user_recipient_ids,
+            notification_recipient_ids,
+        ) {
             Ok(event) => self.publish(event),
             Err(error) => warn!(%error, "failed to serialize edited status"),
         }
@@ -273,16 +280,23 @@ impl StreamingEvents {
         self.publish_status_update(status, author_id, "unlisted", recipients);
     }
 
-    /// Publish an edited status exclusively to selected users' home-capable streams.
-    pub fn publish_home_status_edit<T>(
+    /// Publish an edit to home recipients and mention-only notification streams.
+    pub fn publish_home_status_edit_with_notifications<T>(
         &self,
         status: &T,
         author_id: AccountId,
         recipients: &[AccountId],
+        notification_recipients: &[AccountId],
     ) where
         T: Serialize,
     {
-        self.publish_status_edit(status, author_id, "unlisted", recipients);
+        self.publish_status_edit(
+            status,
+            author_id,
+            "unlisted",
+            recipients,
+            notification_recipients,
+        );
     }
 
     /// Publish a status deletion exclusively to selected users' home-capable streams.
@@ -453,6 +467,7 @@ pub struct StreamingEvent {
     payload: String,
     account_id: AccountId,
     user_recipient_ids: Vec<AccountId>,
+    notification_recipient_ids: Vec<AccountId>,
     visibility: String,
 }
 
@@ -464,6 +479,7 @@ impl StreamingEvent {
             payload: self.payload.clone(),
             account_id: self.account_id,
             recipient_ids: self.user_recipient_ids.clone(),
+            notification_recipient_ids: self.notification_recipient_ids.clone(),
             visibility: StatusVisibility::parse(&self.visibility).ok()?,
         })
     }
@@ -474,6 +490,7 @@ impl StreamingEvent {
             payload: event.payload,
             account_id: event.account_id,
             user_recipient_ids: event.recipient_ids,
+            notification_recipient_ids: event.notification_recipient_ids,
             visibility: event.visibility.to_string(),
         }
     }
@@ -512,10 +529,13 @@ impl StreamingEvent {
             "user" => {
                 self.event != StreamingEventType::Conversation
                     && (self.account_id == account_id
-                        || self.user_recipient_ids.contains(&account_id))
+                        || self.user_recipient_ids.contains(&account_id)
+                        || self.notification_recipient_ids.contains(&account_id))
             }
             "user:notification" => {
-                self.event == StreamingEventType::Notification && self.account_id == account_id
+                (self.event == StreamingEventType::Notification && self.account_id == account_id)
+                    || (self.event == StreamingEventType::StatusUpdate
+                        && self.notification_recipient_ids.contains(&account_id))
             }
             "direct" => {
                 self.event == StreamingEventType::Conversation && self.account_id == account_id
@@ -594,6 +614,7 @@ where
         payload,
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
+        notification_recipient_ids: Vec::new(),
         visibility: visibility.to_owned(),
     })
 }
@@ -604,6 +625,7 @@ fn streaming_status_update_message<T>(
     author_id: AccountId,
     visibility: &str,
     user_recipient_ids: &[AccountId],
+    notification_recipient_ids: &[AccountId],
 ) -> Result<StreamingEvent, serde_json::Error>
 where
     T: Serialize,
@@ -614,6 +636,7 @@ where
         payload,
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
+        notification_recipient_ids: notification_recipient_ids.to_owned(),
         visibility: visibility.to_owned(),
     })
 }
@@ -632,6 +655,7 @@ where
         payload,
         account_id: recipient_id,
         user_recipient_ids: Vec::new(),
+        notification_recipient_ids: Vec::new(),
         visibility: "direct".to_owned(),
     })
 }
@@ -650,6 +674,7 @@ where
         payload,
         account_id: recipient_id,
         user_recipient_ids: Vec::new(),
+        notification_recipient_ids: Vec::new(),
         visibility: "direct".to_owned(),
     })
 }
@@ -666,6 +691,7 @@ fn streaming_delete_message(
         payload: status_id.to_owned(),
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
+        notification_recipient_ids: Vec::new(),
         visibility: visibility.to_owned(),
     }
 }
@@ -741,6 +767,7 @@ mod tests {
             &serde_json::json!({"id": "1"}),
             account_id,
             "public",
+            &[],
             &[],
         )
         .unwrap();
@@ -852,6 +879,36 @@ mod tests {
             .unwrap();
 
         assert!(message.is_none());
+    }
+
+    #[test]
+    /// Given an edited mention-only status, both combined user and notification streams receive it.
+    fn mentioned_status_edits_reach_notification_streams() {
+        let author_id = AccountId(Uuid::now_v7());
+        let mentioned_id = AccountId(Uuid::now_v7());
+        let event = streaming_status_update_message(
+            &serde_json::json!({"id": "1"}),
+            author_id,
+            "public",
+            &[],
+            &[mentioned_id],
+        )
+        .unwrap();
+
+        let message = event
+            .to_socket_message(
+                mentioned_id,
+                &["user".to_owned(), "user:notification".to_owned()],
+            )
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(value["event"], "status.update");
+        assert_eq!(
+            value["stream"],
+            serde_json::json!(["user", "user:notification"])
+        );
     }
 
     #[test]

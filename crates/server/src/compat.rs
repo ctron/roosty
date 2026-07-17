@@ -554,6 +554,13 @@ mod tests {
             "public",
             &[],
         );
+        alpha.streaming_events.publish_status_edit(
+            &serde_json::json!({"id": "status-update"}),
+            context.account_id,
+            "public",
+            &[],
+            &[context.account_id],
+        );
         alpha.streaming_events.publish_notification(
             &serde_json::json!({"id": "notification"}),
             context.account_id,
@@ -573,7 +580,7 @@ mod tests {
             "public".to_owned(),
         ];
         let mut event_names = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
                 .await
                 .unwrap()
@@ -582,11 +589,24 @@ mod tests {
                 .to_socket_message(context.account_id, &streams)
                 .unwrap()
                 .unwrap();
-            event_names.push(serde_json::from_str::<Value>(&message).unwrap()["event"].clone());
+            let message = serde_json::from_str::<Value>(&message).unwrap();
+            if message["event"] == "status.update" {
+                assert_eq!(
+                    message["stream"],
+                    serde_json::json!(["user", "user:notification", "public"])
+                );
+            }
+            event_names.push(message["event"].clone());
         }
         assert_eq!(
             event_names,
-            ["update", "notification", "conversation", "delete"]
+            [
+                "update",
+                "status.update",
+                "notification",
+                "conversation",
+                "delete"
+            ]
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), receiver.recv())

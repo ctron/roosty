@@ -52,6 +52,7 @@ pub struct NewStreamingEvent {
     pub payload: String,
     pub account_id: AccountId,
     pub recipient_ids: Vec<AccountId>,
+    pub notification_recipient_ids: Vec<AccountId>,
     pub visibility: StatusVisibility,
 }
 
@@ -64,6 +65,7 @@ pub struct RetainedStreamingEvent {
     pub payload: String,
     pub account_id: AccountId,
     pub recipient_ids: Vec<AccountId>,
+    pub notification_recipient_ids: Vec<AccountId>,
     pub visibility: StatusVisibility,
 }
 
@@ -81,13 +83,14 @@ use entity::{
     local_conversation, local_conversation_account, local_conversation_remote_participant,
     local_follow, local_media_attachment, local_notification, local_remote_account_block,
     local_remote_account_mute, local_remote_status_favourite, local_remote_status_reblog,
-    local_status, local_status_bookmark, local_status_favourite, local_status_local_recipient,
-    local_status_reblog, local_status_remote_mention, local_status_tag, local_tag,
-    local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
-    oauth_authorization_code, processed_inbox_activity, remote_actor, remote_custom_emoji,
-    remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
-    remote_profile_media, remote_status, remote_status_favourite, remote_status_local_recipient,
-    remote_status_reblog, remote_status_remote_recipient, streaming_event,
+    local_status, local_status_bookmark, local_status_favourite, local_status_local_mention,
+    local_status_local_recipient, local_status_reblog, local_status_remote_mention,
+    local_status_tag, local_tag, local_tag_follow, local_timeline_marker, oauth_access_token,
+    oauth_application, oauth_authorization_code, processed_inbox_activity, remote_actor,
+    remote_custom_emoji, remote_follow, remote_following, remote_local_account_block,
+    remote_media_attachment, remote_profile_media, remote_status, remote_status_favourite,
+    remote_status_local_mention, remote_status_local_recipient, remote_status_reblog,
+    remote_status_remote_recipient, streaming_event,
 };
 
 /// Shared database connection type used across Roosty crates.
@@ -139,6 +142,8 @@ pub struct LocalStatusMetadata {
     pub remote_actor_ids: Vec<AccountId>,
     /// Local accounts explicitly addressed by a direct status.
     pub local_recipient_ids: Vec<AccountId>,
+    /// Local accounts currently mentioned by the status, independent of visibility.
+    pub local_mention_ids: Vec<AccountId>,
 }
 
 /// An attachment declared by a verified remote Note.
@@ -267,6 +272,11 @@ pub async fn publish_streaming_event(db: &DbConnection, event: NewStreamingEvent
         .iter()
         .map(|account_id| account_id.0)
         .collect::<Vec<_>>();
+    let notification_recipient_ids = event
+        .notification_recipient_ids
+        .iter()
+        .map(|account_id| account_id.0)
+        .collect::<Vec<_>>();
     let model = streaming_event::ActiveModel {
         sequence: ActiveValue::NotSet,
         origin_process_id: Set(event.origin_process_id),
@@ -274,6 +284,7 @@ pub async fn publish_streaming_event(db: &DbConnection, event: NewStreamingEvent
         payload: Set(event.payload),
         account_id: Set(event.account_id.0),
         recipient_ids: Set(serde_json::json!(recipient_ids)),
+        notification_recipient_ids: Set(serde_json::json!(notification_recipient_ids)),
         visibility: Set(event.visibility.to_string()),
         created_at: ActiveValue::NotSet,
     }
@@ -335,6 +346,16 @@ fn retained_streaming_event(model: streaming_event::Model) -> Result<RetainedStr
         .into_iter()
         .map(AccountId)
         .collect();
+    let notification_recipient_ids =
+        serde_json::from_value::<Vec<Uuid>>(model.notification_recipient_ids)
+            .map_err(|error| {
+                RoostyError::InvalidInput(format!(
+                    "invalid streaming notification recipients: {error}"
+                ))
+            })?
+            .into_iter()
+            .map(AccountId)
+            .collect();
     let kind = StreamingEventKind::from_str(&model.event_kind).map_err(|_| {
         RoostyError::InvalidInput(format!(
             "invalid streaming event kind: {}",
@@ -349,6 +370,7 @@ fn retained_streaming_event(model: streaming_event::Model) -> Result<RetainedStr
         payload: model.payload,
         account_id: AccountId(model.account_id),
         recipient_ids,
+        notification_recipient_ids,
         visibility: StatusVisibility::parse(&model.visibility)?,
     })
 }
@@ -1639,6 +1661,7 @@ async fn repair_one_remote_status_delete(
         .into_iter()
         .map(|recipient| AccountId(recipient.account_id))
         .collect::<Vec<_>>();
+    let active_mention_ids = active_local_mentions_for_remote_status(txn, status_id).await?;
     let visibility = StatusVisibility::parse(&status.visibility)?;
     let mut home_recipient_ids = match visibility {
         StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Private => {
@@ -1648,6 +1671,11 @@ async fn repair_one_remote_status_delete(
     };
     if visibility == StatusVisibility::Private {
         home_recipient_ids.extend(explicit_recipient_ids.iter().copied());
+        home_recipient_ids.sort_by_key(|id| id.0);
+        home_recipient_ids.dedup();
+    }
+    if visibility != StatusVisibility::Direct {
+        home_recipient_ids.extend(active_mention_ids);
         home_recipient_ids.sort_by_key(|id| id.0);
         home_recipient_ids.dedup();
     }
@@ -2398,6 +2426,8 @@ pub enum LocalNotificationType {
     Reblog,
     /// An account followed with notifications enabled published a new status.
     Status,
+    /// A status boosted by the recipient was edited.
+    Update,
 }
 
 /// Stored local boost relationship between an account and a status.
@@ -3106,6 +3136,88 @@ where
     .insert(db)
     .await?;
     Ok(Some(local_notification_from_model(model)))
+}
+
+/// Replace Mastodon `update` notifications for local accounts that boosted a local status.
+pub async fn replace_local_status_update_notifications(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+    author_id: AccountId,
+) -> Result<Vec<LocalNotification>> {
+    let reblogs = local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
+        .all(db)
+        .await?;
+    let mut notifications = Vec::new();
+    for reblog in reblogs {
+        let account_id = AccountId(reblog.account_id);
+        if account_id == author_id
+            || !local_account_allows_notification(db, account_id, author_id).await?
+        {
+            continue;
+        }
+        local_notification::Entity::delete_many()
+            .filter(local_notification::Column::AccountId.eq(account_id.0))
+            .filter(local_notification::Column::NotificationType.eq("update"))
+            .filter(local_notification::Column::StatusId.eq(status_id.0))
+            .exec(db)
+            .await?;
+        let model = local_notification::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            account_id: Set(account_id.0),
+            notification_type: Set("update".to_owned()),
+            actor_account_id: Set(Some(author_id.0)),
+            remote_actor_id: Set(None),
+            status_id: Set(Some(status_id.0)),
+            remote_status_id: Set(None),
+            created_at: Set(OffsetDateTime::now_utc()),
+            dismissed_at: Set(None),
+        }
+        .insert(db)
+        .await?;
+        notifications.push(local_notification_from_model(model));
+    }
+    Ok(notifications)
+}
+
+/// Replace Mastodon `update` notifications for local accounts that boosted a remote status.
+pub async fn replace_remote_status_update_notifications(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+    remote_actor_id: AccountId,
+) -> Result<Vec<LocalNotification>> {
+    let reblogs = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status_id.0))
+        .all(db)
+        .await?;
+    let mut notifications = Vec::new();
+    for reblog in reblogs {
+        let account_id = AccountId(reblog.local_account_id);
+        if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+            continue;
+        }
+        local_notification::Entity::delete_many()
+            .filter(local_notification::Column::AccountId.eq(account_id.0))
+            .filter(local_notification::Column::NotificationType.eq("update"))
+            .filter(local_notification::Column::RemoteStatusId.eq(status_id.0))
+            .exec(db)
+            .await?;
+        let model = local_notification::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            account_id: Set(account_id.0),
+            notification_type: Set("update".to_owned()),
+            actor_account_id: Set(None),
+            remote_actor_id: Set(Some(remote_actor_id.0)),
+            status_id: Set(None),
+            remote_status_id: Set(Some(status_id.0)),
+            created_at: Set(OffsetDateTime::now_utc()),
+            dismissed_at: Set(None),
+        }
+        .insert(db)
+        .await?;
+        notifications.push(local_notification_from_model(model));
+    }
+    Ok(notifications)
 }
 
 /// Create an idempotent new-post notification caused by a cached remote Note.
@@ -4519,6 +4631,45 @@ pub async fn notify_local_account(
     Ok(local_notification_from_model(model))
 }
 
+/// Create a local mention notification only when the logical event is new.
+pub async fn notify_local_status_mention(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    actor_account_id: AccountId,
+    status_id: StatusId,
+) -> Result<Option<LocalNotification>> {
+    if account_id == actor_account_id
+        || !local_account_allows_notification(db, account_id, actor_account_id).await?
+    {
+        return Ok(None);
+    }
+    if local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq("mention"))
+        .filter(local_notification::Column::ActorAccountId.eq(Some(actor_account_id.0)))
+        .filter(local_notification::Column::StatusId.eq(status_id.0))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("mention".to_owned()),
+        actor_account_id: Set(Some(actor_account_id.0)),
+        remote_actor_id: Set(None),
+        status_id: Set(Some(status_id.0)),
+        remote_status_id: Set(None),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(Some(local_notification_from_model(model)))
+}
+
 /// List visible local notifications for one recipient with Mastodon cursor filters.
 pub async fn local_notifications_for_account(
     db: &DbConnection,
@@ -4870,6 +5021,7 @@ pub async fn create_local_status_with_media(
         mut tag_names,
         remote_actor_ids,
         local_recipient_ids,
+        local_mention_ids,
     } = metadata;
     let status_id = Uuid::now_v7();
     let created_at = OffsetDateTime::now_utc();
@@ -4968,6 +5120,7 @@ pub async fn create_local_status_with_media(
         .insert(txn)
         .await?;
     }
+    replace_local_status_local_mentions(txn, StatusId(status_id), &local_mention_ids).await?;
 
     local_status_from_model(status)
 }
@@ -5520,6 +5673,7 @@ pub async fn update_owned_local_status(
         mut tag_names,
         remote_actor_ids,
         local_recipient_ids,
+        local_mention_ids,
     } = metadata;
     tag_names.sort();
     tag_names.dedup();
@@ -5574,8 +5728,121 @@ pub async fn update_owned_local_status(
             .await?;
         }
     }
+    replace_local_status_local_mentions(txn, status_id, &local_mention_ids).await?;
 
     Ok(Some(local_status_from_model(status)?))
+}
+
+/// Replace the active local mentions of a local status while retaining inactive history.
+pub async fn replace_local_status_local_mentions(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+    account_ids: &[AccountId],
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc();
+    local_status_local_mention::Entity::update_many()
+        .col_expr(local_status_local_mention::Column::Active, false.into())
+        .col_expr(local_status_local_mention::Column::UpdatedAt, now.into())
+        .filter(local_status_local_mention::Column::StatusId.eq(status_id.0))
+        .exec(db)
+        .await?;
+    let mut account_ids = account_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    account_ids.sort();
+    account_ids.dedup();
+    for account_id in account_ids {
+        local_status_local_mention::Entity::insert(local_status_local_mention::ActiveModel {
+            status_id: Set(status_id.0),
+            account_id: Set(account_id),
+            active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                local_status_local_mention::Column::StatusId,
+                local_status_local_mention::Column::AccountId,
+            ])
+            .update_columns([
+                local_status_local_mention::Column::Active,
+                local_status_local_mention::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec(db)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Return the accounts currently mentioned by a local status.
+pub async fn active_local_mentions_for_local_status(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    Ok(local_status_local_mention::Entity::find()
+        .filter(local_status_local_mention::Column::StatusId.eq(status_id.0))
+        .filter(local_status_local_mention::Column::Active.eq(true))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|mention| AccountId(mention.account_id))
+        .collect())
+}
+
+/// Replace the active local mentions of a cached remote status.
+pub async fn replace_remote_status_local_mentions(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+    account_ids: &[AccountId],
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc();
+    remote_status_local_mention::Entity::update_many()
+        .col_expr(remote_status_local_mention::Column::Active, false.into())
+        .col_expr(remote_status_local_mention::Column::UpdatedAt, now.into())
+        .filter(remote_status_local_mention::Column::RemoteStatusId.eq(status_id.0))
+        .exec(db)
+        .await?;
+    let mut account_ids = account_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    account_ids.sort();
+    account_ids.dedup();
+    for account_id in account_ids {
+        remote_status_local_mention::Entity::insert(remote_status_local_mention::ActiveModel {
+            remote_status_id: Set(status_id.0),
+            account_id: Set(account_id),
+            active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                remote_status_local_mention::Column::RemoteStatusId,
+                remote_status_local_mention::Column::AccountId,
+            ])
+            .update_columns([
+                remote_status_local_mention::Column::Active,
+                remote_status_local_mention::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec(db)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Return the accounts currently mentioned by a cached remote status.
+pub async fn active_local_mentions_for_remote_status(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    Ok(remote_status_local_mention::Entity::find()
+        .filter(remote_status_local_mention::Column::RemoteStatusId.eq(status_id.0))
+        .filter(remote_status_local_mention::Column::Active.eq(true))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|mention| AccountId(mention.account_id))
+        .collect())
 }
 
 /// Create local media metadata after the uploaded file has been stored.

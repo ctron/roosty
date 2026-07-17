@@ -2051,15 +2051,14 @@ async fn process_remote_status_activity(
                     .map(|status| status.id),
                 None => None,
             };
+            let addressed = note.to.iter().chain(&note.cc).collect::<HashSet<_>>();
+            let addressed_mention_urls = mention_urls
+                .iter()
+                .filter(|mention| addressed.contains(mention))
+                .cloned()
+                .collect::<Vec<_>>();
             let mut notification_recipients =
-                local_mention_recipients(state, &mention_urls).await?;
-            if let Some(parent_id) = note.in_reply_to.as_deref()
-                && let Some(status_id) = local_status_id_from_url(state, parent_id).await?
-                && let Some(parent) =
-                    roosty_db::find_local_status_by_id(&state.db, status_id).await?
-            {
-                notification_recipients.push(parent.account_id);
-            }
+                local_mention_recipients(state, &addressed_mention_urls).await?;
             notification_recipients.extend(audience.explicit_recipients().iter().copied());
             notification_recipients.sort_by_key(|id| id.0);
             notification_recipients.dedup();
@@ -2113,10 +2112,16 @@ async fn process_remote_status_activity(
                     .await?
             };
             let mut notifications = Vec::new();
-            for account_id in notification_recipients {
+            roosty_db::replace_remote_status_local_mentions(
+                &txn,
+                status.id,
+                &notification_recipients,
+            )
+            .await?;
+            for account_id in &notification_recipients {
                 if let Some(notification) = roosty_db::notify_remote_status_mention(
                     &txn,
-                    account_id,
+                    *account_id,
                     remote_actor.id,
                     status.id,
                 )
@@ -2124,6 +2129,16 @@ async fn process_remote_status_activity(
                 {
                     notifications.push(notification);
                 }
+            }
+            if !is_create {
+                notifications.extend(
+                    roosty_db::replace_remote_status_update_notifications(
+                        &txn,
+                        status.id,
+                        remote_actor.id,
+                    )
+                    .await?,
+                );
             }
             let notifiable_post = if !is_create || status.visibility == StatusVisibility::Direct {
                 false
@@ -2274,6 +2289,8 @@ async fn publish_remote_status_change(
             let recipients = filtered;
             let response =
                 crate::statuses::remote_status_response(state, (*status).clone()).await?;
+            let mention_recipients =
+                roosty_db::active_local_mentions_for_remote_status(&state.db, status.id).await?;
             if let Some(refresh) = refresh {
                 let mut account_ids = refresh.updated_account_ids;
                 account_ids.extend(
@@ -2293,13 +2310,16 @@ async fn publish_remote_status_change(
                 )
                 .await?;
             }
-            if !recipients.is_empty() {
+            if !recipients.is_empty() || (edited && !mention_recipients.is_empty()) {
                 if edited {
-                    state.streaming_events.publish_home_status_edit(
-                        &response,
-                        remote_actor_id,
-                        &recipients,
-                    );
+                    state
+                        .streaming_events
+                        .publish_home_status_edit_with_notifications(
+                            &response,
+                            remote_actor_id,
+                            &recipients,
+                            &mention_recipients,
+                        );
                 } else {
                     state.streaming_events.publish_home_update(
                         &response,
@@ -4310,6 +4330,7 @@ mod tests {
                 tag_names: Vec::new(),
                 remote_actor_ids: Vec::new(),
                 local_recipient_ids: Vec::new(),
+                local_mention_ids: Vec::new(),
             },
         )
         .await

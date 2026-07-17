@@ -11,6 +11,7 @@ pub struct Model {
     pub payload: String,
     pub account_id: Uuid,
     pub recipient_ids: Json,
+    pub notification_recipient_ids: Json,
     pub visibility: String,
     pub created_at: TimeDateTimeWithTimeZone,
 }
