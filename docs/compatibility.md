@@ -69,7 +69,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local and active cached-remote account lookup. |
 | 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns statuses authorized for the viewer, including cached follower-only posts for current followers and explicit mentions, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state; pinned statuses are missing. |
-| 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented; remote graph fetching remains missing. |
+| 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented. Local and remote follows honor `reblogs` and `notify`; remote graph fetching and language filters remain missing. |
 | 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
 | 🟢 | Mutes and blocks | Local and remote mute/unmute and block/unblock, relationship state, mute duration/expiry, and mixed cursor-paginated collections work. Remote mutes remain local-only; blocks federate. |
 
@@ -114,9 +114,9 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, and `follow` notifications with cursor pagination and basic filters. |
+| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, `follow`, and followed-account `status` notifications with cursor pagination and basic filters. |
 | 🟢 | `GET/POST /api/v1/markers` | Persists local home and notification read positions. |
-| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared; grouping and policy flows remain missing. |
+| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared; grouping and policy flows remain missing. |
 | 🟡 | Notification read state | Local home and notification markers work; grouped and remote notification state is missing. |
 
 ### Tags, Push, and Media
@@ -125,7 +125,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/tags/:name` | Public lookup for locally observed hashtags with local history and authenticated `following` state; featured tag state is missing. |
 | 🟡 | `GET /api/v1/followed_tags` | Lists locally followed hashtags for the authenticated account. |
-| 🟡 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local posts enter the home timeline; remote tag delivery is missing. |
+| 🟡 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local posts enter the home timeline and user stream; remote tag delivery is missing. |
 | 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
 | 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
 | 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
@@ -138,11 +138,11 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/streaming` | Authenticated WebSockets use bounded, PostgreSQL-backed multi-process fan-out with connection, send, ping, and idle limits. |
 | 🟡 | `GET /api/v1/streaming/direct` | Local and accepted remote direct conversation updates emit recipient-scoped `conversation` events. |
 | 🟢 | `GET /api/v1/streaming/health` | Returns `OK`. |
-| 🟡 | `update` events | Local status creation reaches matching `user`, `public`, and `public:local` streams; accepted remote creation reaches follower `user` streams. Followed-tag and remote-public fan-out are missing. |
-| 🟡 | `status.update` events | Local edits reach matching `user`, `public`, and `public:local` streams; accepted remote edits reach follower `user` streams. Followed-tag and remote-public fan-out are missing. |
+| 🟡 | `update` events | Local status creation reaches matching follower and followed-tag `user`, `public`, and `public:local` streams; accepted remote creation reaches follower `user` streams. Remote-public fan-out is missing. |
+| 🟡 | `status.update` events | Local edits reach matching follower and current followed-tag `user`, `public`, and `public:local` streams; accepted remote edits reach follower `user` streams. Remote-public fan-out is missing. |
 | 🟡 | Subscribe controls | Basic subscribe/unsubscribe messages are accepted. |
-| 🟡 | `notification` events | Local `mention`, `favourite`, `reblog`, `follow`, and remote follow-request notifications are emitted to recipient `user` and `user:notification` streams. Follow relationships with `notify=true` do not yet create `status` notifications. |
-| 🟡 | `delete` events | Emitted for local status deletes and removed local boost timeline entries. |
+| 🟡 | `notification` events | Local and remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and follow-request notifications are emitted to recipient `user` and `user:notification` streams. |
+| 🟡 | `delete` events | Emitted for local status deletes, including current followed-tag recipients, and removed local or followed remote boost timeline entries. |
 | 🟢 | Multi-process fan-out | PostgreSQL notifications and a retained ordered event log provide reconnect recovery without startup replay. |
 
 ## Federation

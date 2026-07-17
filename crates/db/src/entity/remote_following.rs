@@ -11,6 +11,8 @@ pub struct Model {
     pub remote_actor_id: Uuid,
     pub activity_id: String,
     pub state: String,
+    pub show_reblogs: bool,
+    pub notify: bool,
     pub deactivated_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,

@@ -533,6 +533,8 @@ async fn follow(
             account.id,
             target_id,
             &activity_id,
+            input.reblogs.unwrap_or(true),
+            input.notify.unwrap_or(false),
             job,
         )
         .await
@@ -1140,8 +1142,14 @@ async fn relationship_model(
             || remote_following
                 .as_ref()
                 .is_some_and(|follow| follow.state == "accepted"),
-        showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs),
-        notifying: following.as_ref().is_some_and(|follow| follow.notify),
+        showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs)
+            || remote_following
+                .as_ref()
+                .is_some_and(|follow| follow.show_reblogs),
+        notifying: following.as_ref().is_some_and(|follow| follow.notify)
+            || remote_following
+                .as_ref()
+                .is_some_and(|follow| follow.notify),
         followed_by: followed_by.is_some() || remote_followed_by,
         blocking,
         blocked_by,
@@ -1540,6 +1548,96 @@ mod tests {
         )
         .await;
         assert_eq!(home, serde_json::json!([]));
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Given an active remote follow, posting follow settings again updates the relationship
+    /// without enqueueing a second ActivityPub Follow delivery.
+    async fn remote_follow_updates_delivery_preferences_idempotently(context: &mut AccountContext) {
+        context.config.federation_allowed_domains = vec!["*".to_owned()];
+        context.state = AppState::new(context.config.clone(), context.db.clone());
+        let (alice_id, alice_token) = context
+            .create_account("alice_remote_follow", "alice-remote-follow@example.com")
+            .await;
+        let remote_id = context
+            .create_remote_follow_request(alice_id, "remote_follow_target", "accepted")
+            .await;
+
+        let first = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", remote_id.0),
+                &alice_token,
+                serde_json::json!({"reblogs": false, "notify": true}),
+            )
+            .await;
+        let first = json_body(first).await;
+        assert_eq!(first["requested"], true);
+        assert_eq!(first["showing_reblogs"], false);
+        assert_eq!(first["notifying"], true);
+        let first_relationship = roosty_db::find_remote_following(&context.db, alice_id, remote_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let second = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", remote_id.0),
+                &alice_token,
+                serde_json::json!({"reblogs": true, "notify": false}),
+            )
+            .await;
+        let second = json_body(second).await;
+        assert_eq!(second["showing_reblogs"], true);
+        assert_eq!(second["notifying"], false);
+        let second_relationship =
+            roosty_db::find_remote_following(&context.db, alice_id, remote_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            second_relationship.activity_id,
+            first_relationship.activity_id
+        );
+        assert!(second_relationship.show_reblogs);
+        assert!(!second_relationship.notify);
+
+        let row = context
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*)::bigint AS count FROM job WHERE kind = 'federation_follow_delivery'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "count").unwrap(), 1);
+
+        context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", remote_id.0),
+                &alice_token,
+                serde_json::json!({"reblogs": false, "notify": true}),
+            )
+            .await;
+        roosty_db::accept_remote_following(&context.db, remote_id, &first_relationship.activity_id)
+            .await
+            .unwrap();
+        assert!(
+            roosty_db::accepted_local_reblog_followers_of_remote_actor(&context.db, remote_id,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            roosty_db::accepted_local_notified_followers_of_remote_actor(&context.db, remote_id,)
+                .await
+                .unwrap(),
+            [alice_id]
+        );
     }
 
     #[test_context(AccountContext)]

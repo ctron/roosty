@@ -6,6 +6,7 @@
 
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
 - Local public/unlisted home-timeline fan-out, including streaming status creation and edit replacements, replies, mentions, favourites, boosts, notifications, and direct conversations.
+- Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
@@ -25,6 +26,7 @@
 - [x] Verify signed inbound public/unlisted `Create`, `Update`, and `Delete` activities and cache remote Notes by canonical object ID.
 - [x] Project cached remote Notes into local home timelines.
 - [x] Stream cached remote Note create/update/delete events to local home timelines.
+- [x] Honor local-to-remote `reblogs` and `notify` follow preferences in timelines, streams, relationships, and notifications.
 - [x] Match Mastodon's push-based federation behavior: missed inbox deliveries are not backfilled by polling remote outboxes; deletion and follow-state cache repairs remain local operations.
 - [x] Implement remote follower-only Notes and replies using validated actor collection URLs, current follow relationships, explicit mentions, and cache-only traversal.
 - [ ] Fetch and expose paginated remote followers/following collection contents.

@@ -365,9 +365,11 @@ async fn create_status(
         Err(error) => return bad_request(&error.to_string()),
     };
     let mut in_reply_to_remote_status_id = None;
+    let mut notifiable_reply = true;
     if let Some(parent_id) = in_reply_to_id {
         match roosty_db::find_local_status_by_id(&state.db, parent_id).await {
             Ok(Some(parent)) => {
+                notifiable_reply = parent.account_id == account.id;
                 match status_visible_to_viewer(&state, &parent, Some(account.id)).await {
                     Ok(true) => {}
                     Ok(false) => return bad_request("reply target status does not exist"),
@@ -376,6 +378,7 @@ async fn create_status(
             }
             Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, parent_id).await {
                 Ok(Some(parent)) => {
+                    notifiable_reply = false;
                     let visible = if matches!(
                         parent.visibility,
                         StatusVisibility::Public | StatusVisibility::Unlisted
@@ -413,6 +416,7 @@ async fn create_status(
     };
 
     let author_id = account.id;
+    let creates_follow_notification = visibility != StatusVisibility::Direct && notifiable_reply;
     let has_explicit_audience = matches!(
         new_status.visibility,
         StatusVisibility::Private | StatusVisibility::Direct
@@ -491,6 +495,39 @@ async fn create_status(
                     Err(error) => return server_error(error),
                 }
             }
+            if creates_follow_notification {
+                let notified_followers =
+                    match roosty_db::local_notified_follower_ids_for_account(&txn, author_id).await
+                    {
+                        Ok(followers) => followers,
+                        Err(error) => return server_error(error),
+                    };
+                for account_id in notified_followers {
+                    let allowed = match roosty_db::local_account_allows_notification(
+                        &txn, account_id, author_id,
+                    )
+                    .await
+                    {
+                        Ok(allowed) => allowed,
+                        Err(error) => return server_error(error),
+                    };
+                    if !allowed {
+                        continue;
+                    }
+                    match roosty_db::notify_local_account(
+                        &txn,
+                        account_id,
+                        LocalNotificationType::Status,
+                        author_id,
+                        Some(status.id),
+                    )
+                    .await
+                    {
+                        Ok(notification) => notifications.push(notification),
+                        Err(error) => return server_error(error),
+                    }
+                }
+            }
             if let Err(error) =
                 attach_direct_conversation(&state, &txn, &mut status, author_id).await
             {
@@ -526,7 +563,7 @@ async fn create_status(
                         )
                         .await
                         {
-                            warn!(%error, "failed to publish mention notification");
+                            warn!(%error, "failed to publish status notification");
                         }
                     }
                     let recipients = status_stream_recipients(&state, &status).await;
@@ -1825,14 +1862,20 @@ async fn status_stream_recipients(
     }
     match roosty_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
         Ok(mut recipients) => {
+            if status.visibility == StatusVisibility::Public {
+                match roosty_db::local_tag_follower_ids_for_status(&state.db, status.id).await {
+                    Ok(tag_followers) => recipients.extend(tag_followers),
+                    Err(error) => warn!(%error, "failed to resolve followed-tag stream recipients"),
+                }
+            }
             if status.visibility == StatusVisibility::Private {
                 match roosty_db::local_status_local_recipients(&state.db, status.id).await {
                     Ok(explicit) => recipients.extend(explicit),
                     Err(error) => warn!(%error, "failed to resolve explicit status recipients"),
                 }
-                recipients.sort_by_key(|id| id.0);
-                recipients.dedup();
             }
+            recipients.sort_by_key(|id| id.0);
+            recipients.dedup();
             filter_stream_recipients(state, status.account_id, recipients).await
         }
         Err(error) => {
@@ -2312,7 +2355,8 @@ pub(crate) async fn publish_remote_reblog_update(
         return Ok(());
     };
     let recipients =
-        roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+        roosty_db::accepted_local_reblog_followers_of_remote_actor(&state.db, remote_actor_id)
+            .await?;
     let recipients = filter_remote_stream_recipients(state, remote_actor_id, recipients).await;
     if let Some(response) =
         remote_reblog_response(state, reblog, recipients.first().copied()).await?
@@ -2331,7 +2375,8 @@ pub(crate) async fn publish_remote_reblog_delete(
     reblog_id: uuid::Uuid,
 ) -> Result<(), RoostyError> {
     let recipients =
-        roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+        roosty_db::accepted_local_reblog_followers_of_remote_actor(&state.db, remote_actor_id)
+            .await?;
     let recipients = filter_remote_stream_recipients(state, remote_actor_id, recipients).await;
     state.streaming_events.publish_home_delete(
         &reblog_id.to_string(),
@@ -4892,6 +4937,110 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given a followed hashtag, matching public creates, edits, and deletes reach the user stream
+    /// while an edit that removes the hashtag no longer targets that subscriber.
+    async fn followed_tags_stream_current_matching_statuses(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let follower_token = context
+            .access_token_for("tag_follower", "tag-follower@example.com")
+            .await;
+        let follower = roosty_db::find_local_account_by_username(&context.db, "tag_follower")
+            .await
+            .unwrap()
+            .unwrap();
+        let follow = context
+            .authenticated_empty("POST", "/api/v1/tags/testing/follow", &follower_token)
+            .await;
+        assert_eq!(follow.status(), StatusCode::OK);
+        let mut receiver = context.state.streaming_events.subscribe();
+
+        let status = context
+            .create_status(&author_token, "first #testing", Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = event
+            .to_socket_message(follower.id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&message).unwrap()["event"],
+            "update"
+        );
+
+        context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &author_token,
+                serde_json::json!({"status": "edited #testing"}),
+            )
+            .await;
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = event
+            .to_socket_message(follower.id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&message).unwrap()["event"],
+            "status.update"
+        );
+
+        context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &author_token,
+                serde_json::json!({"status": "tag removed"}),
+            )
+            .await;
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            event
+                .to_socket_message(follower.id, &["user".to_owned()])
+                .unwrap()
+                .is_none()
+        );
+
+        let deleted = context
+            .create_status(&author_token, "delete #testing", Some("public"), None)
+            .await;
+        let deleted_id = deleted["id"].as_str().unwrap();
+        let _ = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        context
+            .authenticated_empty(
+                "DELETE",
+                &format!("/api/v1/statuses/{deleted_id}"),
+                &author_token,
+            )
+            .await;
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = event
+            .to_socket_message(follower.id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let message: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(message["event"], "delete");
+        assert_eq!(message["payload"], deleted_id);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Given an owned status, when an editor requests its source, then the original plain text and
     /// content warning are returned instead of the rendered HTML.
     async fn status_source_returns_editable_plain_text(context: &mut StatusContext) {
@@ -5456,6 +5605,93 @@ mod tests {
                 "account": "bob",
                 "status": status["id"],
             })
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a follow with notifications enabled, only new original posts and self-thread replies
+    /// create Mastodon `status` notifications, and the first notification is streamed live.
+    async fn notified_follows_create_status_notifications(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let follower_token = context
+            .access_token_for("notified", "notified@example.com")
+            .await;
+        let follower = roosty_db::find_local_account_by_username(&context.db, "notified")
+            .await
+            .unwrap()
+            .unwrap();
+        let follow = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", context.account_id.0),
+                &follower_token,
+                serde_json::json!({"notify": true}),
+            )
+            .await;
+        assert_eq!(json_body(follow).await["notifying"], true);
+        let mut receiver = context.state.streaming_events.subscribe();
+
+        let original = context
+            .create_status(&author_token, "notify original", Some("public"), None)
+            .await;
+        let original_id = original["id"].as_str().unwrap();
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = event
+            .to_socket_message(follower.id, &["user".to_owned()])
+            .unwrap()
+            .unwrap();
+        let message: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(message["event"], "notification");
+        let payload: Value = serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["type"], "status");
+        assert_eq!(payload["status"]["id"], original_id);
+
+        context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{original_id}"),
+                &author_token,
+                serde_json::json!({"status": "edited without notification"}),
+            )
+            .await;
+        context
+            .create_status(
+                &author_token,
+                "self reply",
+                Some("public"),
+                Some(original_id),
+            )
+            .await;
+        let foreign = context
+            .create_status(&follower_token, "foreign parent", Some("public"), None)
+            .await;
+        context
+            .create_status(
+                &author_token,
+                "reply to another account",
+                Some("public"),
+                foreign["id"].as_str(),
+            )
+            .await;
+        context
+            .create_status(&author_token, "direct", Some("direct"), None)
+            .await;
+
+        let response = context
+            .authenticated_get("/api/v1/notifications?types[]=status", &follower_token)
+            .await;
+        let notifications = json_body(response).await;
+        assert_eq!(notifications.as_array().unwrap().len(), 2);
+        assert!(
+            notifications
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|notification| notification["type"] == "status")
         );
     }
 

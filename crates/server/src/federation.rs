@@ -2125,6 +2125,36 @@ async fn process_remote_status_activity(
                     notifications.push(notification);
                 }
             }
+            let notifiable_post = if !is_create || status.visibility == StatusVisibility::Direct {
+                false
+            } else if status.in_reply_to.is_none() {
+                true
+            } else if let Some(parent_id) = status.in_reply_to_remote_status_id {
+                roosty_db::find_remote_status_by_id(&txn, parent_id)
+                    .await?
+                    .is_some_and(|parent| parent.remote_actor_id == remote_actor.id)
+            } else {
+                false
+            };
+            if notifiable_post {
+                for account_id in roosty_db::accepted_local_notified_followers_of_remote_actor(
+                    &txn,
+                    remote_actor.id,
+                )
+                .await?
+                {
+                    if let Some(notification) = roosty_db::notify_remote_status(
+                        &txn,
+                        account_id,
+                        remote_actor.id,
+                        status.id,
+                    )
+                    .await?
+                    {
+                        notifications.push(notification);
+                    }
+                }
+            }
             let has_local_recipients = !audience.explicit_recipients().is_empty();
             let has_local_followers =
                 !roosty_db::accepted_local_followers_of_remote_actor(&txn, remote_actor.id)
@@ -4207,6 +4237,8 @@ mod tests {
             follower.id,
             alpha_remote.id,
             &follow_id,
+            true,
+            true,
         )
         .await
         .unwrap();
@@ -4242,6 +4274,24 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        let notifications = roosty_db::local_notifications_for_account(
+            &context.beta.db,
+            follower.id,
+            30,
+            roosty_db::CollectionCursor::default(),
+            roosty_db::NotificationFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notifications.items.len(), 1);
+        assert_eq!(
+            notifications.items[0].notification_type,
+            roosty_db::LocalNotificationType::Status
+        );
+        assert_eq!(
+            notifications.items[0].remote_status_id,
+            Some(cached_first.id)
+        );
 
         let txn = context.alpha.db.begin().await.unwrap();
         let edited = roosty_db::update_owned_local_status(
@@ -4299,6 +4349,16 @@ mod tests {
             serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
         assert_eq!(message["event"], "status.update");
         assert_eq!(payload["content"], "edited delivery");
+        let notifications = roosty_db::local_notifications_for_account(
+            &context.beta.db,
+            follower.id,
+            30,
+            roosty_db::CollectionCursor::default(),
+            roosty_db::NotificationFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notifications.items.len(), 1);
 
         let private = create_test_status(
             &context.alpha,
@@ -4989,6 +5049,8 @@ mod tests {
             local_account_id,
             remote_actor_id,
             &activity_id,
+            true,
+            false,
         )
         .await
         .unwrap();

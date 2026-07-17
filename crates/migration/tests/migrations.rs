@@ -196,6 +196,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_status_tag", "tag_id").await);
     assert!(column_exists(database.connection(), "local_tag_follow", "account_id").await);
     assert!(column_exists(database.connection(), "local_tag_follow", "tag_id").await);
+    assert!(column_exists(database.connection(), "remote_following", "show_reblogs").await);
+    assert!(column_exists(database.connection(), "remote_following", "notify").await);
 }
 
 /// Existing cached actors retain an unknown followers collection across the nullable upgrade.
@@ -239,9 +241,9 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back the streaming-kind extension, remote moderation, the streaming log, and the
-    // followers URL migration.
-    Migrator::down(database.connection(), Some(4))
+    // Roll back the subscription extensions, streaming-kind extension, remote moderation, the
+    // streaming log, and the followers URL migration.
+    Migrator::down(database.connection(), Some(6))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);

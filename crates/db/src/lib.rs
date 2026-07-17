@@ -665,6 +665,10 @@ pub struct RemoteFollowing {
     pub activity_id: String,
     /// `pending` or `accepted`.
     pub state: String,
+    /// Whether boosts by the followed actor should appear in the home timeline.
+    pub show_reblogs: bool,
+    /// Whether new posts by the followed actor should create notifications.
+    pub notify: bool,
 }
 
 /// A local or cached remote account returned from a follow collection.
@@ -691,6 +695,8 @@ pub async fn create_remote_following(
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity_id: &str,
+    show_reblogs: bool,
+    notify: bool,
 ) -> Result<RemoteFollowing> {
     let row = remote_following::ActiveModel {
         id: Set(Uuid::now_v7()),
@@ -698,6 +704,8 @@ pub async fn create_remote_following(
         remote_actor_id: Set(remote_actor_id.0),
         activity_id: Set(activity_id.to_owned()),
         state: Set("pending".to_owned()),
+        show_reblogs: Set(show_reblogs),
+        notify: Set(notify),
         ..Default::default()
     }
     .insert(db)
@@ -714,23 +722,56 @@ pub async fn create_remote_following_with_job(
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity_id: &str,
+    show_reblogs: bool,
+    notify: bool,
     job: NewJob,
 ) -> Result<RemoteFollowing> {
     lock_local_remote_relation(txn, local_account_id, remote_actor_id).await?;
     if local_remote_accounts_are_blocked(txn, local_account_id, remote_actor_id).await? {
         return Err(AccountRelationshipError::FollowBlocked.into());
     }
-    let row = remote_following::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        local_account_id: Set(local_account_id.0),
-        remote_actor_id: Set(remote_actor_id.0),
-        activity_id: Set(activity_id.to_owned()),
-        state: Set("pending".to_owned()),
-        ..Default::default()
-    }
-    .insert(txn)
-    .await?;
-    enqueue_job_in_transaction(txn, job).await?;
+    let existing = remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .one(txn)
+        .await?;
+    let row = match existing {
+        Some(model) if model.deactivated_at.is_none() => {
+            let mut active = model.into_active_model();
+            active.show_reblogs = Set(show_reblogs);
+            active.notify = Set(notify);
+            active.updated_at = Set(OffsetDateTime::now_utc());
+            active.update(txn).await?
+        }
+        Some(model) => {
+            let mut active = model.into_active_model();
+            active.activity_id = Set(activity_id.to_owned());
+            active.state = Set("pending".to_owned());
+            active.show_reblogs = Set(show_reblogs);
+            active.notify = Set(notify);
+            active.deactivated_at = Set(None);
+            active.updated_at = Set(OffsetDateTime::now_utc());
+            let row = active.update(txn).await?;
+            enqueue_job_in_transaction(txn, job).await?;
+            row
+        }
+        None => {
+            let row = remote_following::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                local_account_id: Set(local_account_id.0),
+                remote_actor_id: Set(remote_actor_id.0),
+                activity_id: Set(activity_id.to_owned()),
+                state: Set("pending".to_owned()),
+                show_reblogs: Set(show_reblogs),
+                notify: Set(notify),
+                ..Default::default()
+            }
+            .insert(txn)
+            .await?;
+            enqueue_job_in_transaction(txn, job).await?;
+            row
+        }
+    };
     Ok(remote_following_from_model(row))
 }
 
@@ -762,6 +803,44 @@ pub async fn accepted_local_followers_of_remote_actor(
         .await?;
     let mut accounts = Vec::with_capacity(follows.len());
     for follow in follows {
+        let local = AccountId(follow.local_account_id);
+        if !local_remote_accounts_are_blocked(db, local, remote_actor_id).await? {
+            accounts.push(local);
+        }
+    }
+    Ok(accounts)
+}
+
+/// List accepted local followers that opted into boosts by the remote actor.
+pub async fn accepted_local_reblog_followers_of_remote_actor(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    accepted_local_followers_of_remote_actor_with(db, remote_actor_id, |follow| follow.show_reblogs)
+        .await
+}
+
+/// List accepted local followers that opted into new-post notifications.
+pub async fn accepted_local_notified_followers_of_remote_actor(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    accepted_local_followers_of_remote_actor_with(db, remote_actor_id, |follow| follow.notify).await
+}
+
+async fn accepted_local_followers_of_remote_actor_with(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+    include: impl Fn(&remote_following::Model) -> bool,
+) -> Result<Vec<AccountId>> {
+    let follows = remote_following::Entity::find()
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::State.eq("accepted"))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .all(db)
+        .await?;
+    let mut accounts = Vec::with_capacity(follows.len());
+    for follow in follows.iter().filter(|follow| include(follow)) {
         let local = AccountId(follow.local_account_id);
         if !local_remote_accounts_are_blocked(db, local, remote_actor_id).await? {
             accounts.push(local);
@@ -2317,6 +2396,8 @@ pub enum LocalNotificationType {
     FollowRequest,
     /// A local account boosted one of the recipient's statuses.
     Reblog,
+    /// An account followed with notifications enabled published a new status.
+    Status,
 }
 
 /// Stored local boost relationship between an account and a status.
@@ -3027,6 +3108,46 @@ where
     Ok(Some(local_notification_from_model(model)))
 }
 
+/// Create an idempotent new-post notification caused by a cached remote Note.
+pub async fn notify_remote_status<C>(
+    db: &C,
+    account_id: AccountId,
+    remote_actor_id: AccountId,
+    remote_status_id: StatusId,
+) -> Result<Option<LocalNotification>>
+where
+    C: ConnectionTrait,
+{
+    if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
+    if local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq("status"))
+        .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
+        .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set("status".to_owned()),
+        actor_account_id: Set(None),
+        remote_actor_id: Set(Some(remote_actor_id.0)),
+        status_id: Set(None),
+        remote_status_id: Set(Some(remote_status_id.0)),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(Some(local_notification_from_model(model)))
+}
+
 /// Timelines that support persisted Mastodon read markers.
 #[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
 #[strum(serialize_all = "snake_case")]
@@ -3406,6 +3527,22 @@ pub async fn local_follower_ids_for_account(
     }
     let follows = query.all(db).await?;
 
+    Ok(follows
+        .into_iter()
+        .map(|follow| AccountId(follow.follower_account_id))
+        .collect())
+}
+
+/// List local followers that opted into new-post notifications.
+pub async fn local_notified_follower_ids_for_account(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    let follows = local_follow::Entity::find()
+        .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
+        .filter(local_follow::Column::Notify.eq(true))
+        .all(db)
+        .await?;
     Ok(follows
         .into_iter()
         .map(|follow| AccountId(follow.follower_account_id))
@@ -4935,6 +5072,32 @@ pub async fn local_tags_for_status(
     tags.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(tags)
+}
+
+/// List accounts following at least one hashtag currently attached to a local status.
+pub async fn local_tag_follower_ids_for_status(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<Vec<AccountId>> {
+    let follows = local_tag_follow::Entity::find()
+        .filter(
+            local_tag_follow::Column::TagId.in_subquery(
+                Query::select()
+                    .column(local_status_tag::Column::TagId)
+                    .from(local_status_tag::Entity)
+                    .and_where(local_status_tag::Column::StatusId.eq(status_id.0))
+                    .to_owned(),
+            ),
+        )
+        .all(db)
+        .await?;
+    let mut account_ids = follows
+        .into_iter()
+        .map(|follow| AccountId(follow.account_id))
+        .collect::<Vec<_>>();
+    account_ids.sort_by_key(|id| id.0);
+    account_ids.dedup();
+    Ok(account_ids)
 }
 
 /// Search local tags by normalized prefix with offset pagination.
@@ -7966,6 +8129,7 @@ pub async fn home_timeline_for_account(
                 .from(remote_following::Entity)
                 .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
                 .and_where(remote_following::Column::State.eq("accepted"))
+                .and_where(remote_following::Column::ShowReblogs.eq(true))
                 .and_where(remote_following::Column::DeactivatedAt.is_null())
                 .to_owned(),
         ),
@@ -8626,6 +8790,8 @@ fn remote_following_from_model(follow: remote_following::Model) -> RemoteFollowi
         remote_actor_id: AccountId(follow.remote_actor_id),
         activity_id: follow.activity_id,
         state: follow.state,
+        show_reblogs: follow.show_reblogs,
+        notify: follow.notify,
     }
 }
 
