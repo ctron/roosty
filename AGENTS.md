@@ -38,11 +38,18 @@ Keep this as the default verification command for changes in this repository.
 - Prefer importing types over repeatedly using fully qualified type paths, except where importing would make the code
   ambiguous or less clear.
 - Avoid unnecessary cloning; prefer borrowing, moving, or restructuring ownership when it keeps the code clear.
-- Prefer `?` with `From`/`Into` error conversions over manual error mapping; map errors explicitly only when adding
-  useful context or translating an error at a boundary.
 - Prefer file-backed Rust modules over nested inline modules. Use nested inline modules only when they are very small
   and local to their parent.
 - Before adding a new dependency, check for its most recent version.
+
+## Error Handling
+
+- Prefer typed error enums derived with `thiserror` over stringly typed or ad hoc errors.
+- Prefer `From` conversions and `?` over `map_err` or dedicated error-mapping functions. Map errors explicitly only
+  when adding useful context or translating an error at a boundary.
+- When an error variant carries a human-readable reason as a string, prefer `Cow<'static, str>` so static reasons do
+  not require allocation while dynamic reasons remain supported.
+- Test error conditions by matching error types and variants, not by comparing or searching their display messages.
 
 ## Database Transactions
 
