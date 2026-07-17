@@ -3923,6 +3923,7 @@ async fn note_object(
         },
     };
     let mut tag = Vec::new();
+    let mut local_mentions = Vec::new();
     for username in crate::statuses::mention_usernames(&status.content) {
         if let Some(account) =
             roosty_db::find_local_account_by_username(&state.db, &username).await?
@@ -3932,12 +3933,14 @@ async fn note_object(
                 href: actor_url(state, &account.username),
                 name: format!("@{}", account.username),
             });
+            local_mentions.push(account);
         }
     }
-    for actor in roosty_db::remote_mentions_for_local_status(&state.db, status.id).await? {
+    let remote_mentions = roosty_db::remote_mentions_for_local_status(&state.db, status.id).await?;
+    for actor in &remote_mentions {
         tag.push(MentionTag {
             r#type: MentionType::Mention,
-            href: actor.activitypub_id,
+            href: actor.activitypub_id.clone(),
             name: format!("@{}@{}", actor.username, actor.domain),
         });
     }
@@ -3964,12 +3967,20 @@ async fn note_object(
             name: media.description,
         })
         .collect();
+    let tags = crate::statuses::local_status_content_tag_links(state, &status.content);
+    let content = crate::statuses::status_content_html_with_mentions_and_tags(
+        state,
+        &status.content,
+        &local_mentions,
+        &remote_mentions,
+        &tags,
+    );
     Ok(Note {
         context: ACTIVITYSTREAMS_CONTEXT,
         id,
         r#type: NoteType::Note,
         attributed_to: actor_url(state, username),
-        content: status.content,
+        content,
         published: crate::statuses::format_timestamp(status.created_at),
         updated: crate::statuses::format_timestamp(status.updated_at),
         in_reply_to,
@@ -4320,7 +4331,12 @@ mod tests {
             "accepted"
         );
 
-        let first = create_public_test_status(&context.alpha, author.id, "first delivery").await;
+        let first = create_public_test_status(
+            &context.alpha,
+            author.id,
+            "first delivery https://example.test/first",
+        )
+        .await;
         super::enqueue_status_activity(&context.alpha, &first, super::StatusActivityKind::Create)
             .await
             .unwrap();
@@ -4331,6 +4347,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        assert!(cached_first.content.contains(
+            "href=\"https://example.test/first\" target=\"_blank\" rel=\"nofollow noopener\""
+        ));
         let notifications = roosty_db::local_notifications_for_account(
             &context.beta.db,
             follower.id,
@@ -4356,7 +4375,7 @@ mod tests {
             first.id,
             author.id,
             roosty_db::LocalStatusUpdate {
-                content: Some("edited delivery".to_owned()),
+                content: Some("edited delivery https://example.test/edited".to_owned()),
                 sensitive: None,
                 spoiler_text: None,
                 language: None,
@@ -4396,7 +4415,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(cached_edit.id, cached_first.id);
-        assert_eq!(cached_edit.content, "edited delivery");
+        assert!(cached_edit.content.starts_with("<p>edited delivery "));
+        assert!(cached_edit.content.contains(
+            "href=\"https://example.test/edited\" target=\"_blank\" rel=\"nofollow noopener\""
+        ));
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
             .await
             .unwrap()
@@ -4409,7 +4431,7 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
         assert_eq!(message["event"], "status.update");
-        assert_eq!(payload["content"], "edited delivery");
+        assert_eq!(payload["content"], cached_edit.content);
         let notifications = roosty_db::local_notifications_for_account(
             &context.beta.db,
             follower.id,

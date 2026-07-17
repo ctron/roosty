@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use linkify::{LinkFinder, LinkKind};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
     LocalNotificationType, RemoteConversationParticipant, RemoteStatus, StatusContextItem,
@@ -3170,7 +3171,6 @@ async fn status_response_for_viewer(
     })
 }
 
-/// Replace stored hashtag links for a local status based on its plain text content.
 /// Load Mastodon tag responses attached to a local status.
 async fn status_tags(
     state: &AppState,
@@ -3184,6 +3184,20 @@ async fn status_tags(
     }
 
     Ok(responses)
+}
+
+/// Build lightweight hashtag links for rendering outbound local ActivityPub content.
+pub(crate) fn local_status_content_tag_links(state: &AppState, content: &str) -> Vec<TagResponse> {
+    hashtag_names(content)
+        .into_iter()
+        .map(|name| TagResponse {
+            id: name.clone(),
+            url: public_url(state, &format!("tags/{name}")),
+            name,
+            history: Vec::new(),
+            following: None,
+        })
+        .collect()
 }
 
 /// Resolve local `@username` references present in status text.
@@ -3641,7 +3655,7 @@ fn status_content_html(content: &str) -> String {
     format!("<p>{escaped}</p>")
 }
 
-fn status_content_html_with_mentions_and_tags(
+pub(crate) fn status_content_html_with_mentions_and_tags(
     state: &AppState,
     content: &str,
     mentions: &[roosty_db::LocalAccount],
@@ -3683,8 +3697,9 @@ fn status_content_html_with_mentions_and_tags(
                 .into_iter()
                 .map(TextLinkMatch::Hashtag),
         )
+        .chain(url_matches(content).into_iter().map(TextLinkMatch::Url))
         .collect::<Vec<_>>();
-    matches.sort_by_key(TextLinkMatch::start);
+    matches.sort_by_key(|link| (link.start(), std::cmp::Reverse(link.end())));
     let mut html = String::new();
     let mut last = 0;
 
@@ -3731,6 +3746,10 @@ fn status_content_html_with_mentions_and_tags(
                 }
                 last = hashtag.end;
             }
+            TextLinkMatch::Url(url) => {
+                push_url_html(&mut html, &url.url);
+                last = url.end;
+            }
         }
     }
 
@@ -3743,6 +3762,7 @@ enum TextLinkMatch {
     Mention(MentionMatch),
     RemoteMention(RemoteMentionMatch),
     Hashtag(HashtagMatch),
+    Url(UrlMatch),
 }
 
 impl TextLinkMatch {
@@ -3751,6 +3771,16 @@ impl TextLinkMatch {
             TextLinkMatch::Mention(mention) => mention.start,
             TextLinkMatch::RemoteMention(mention) => mention.start,
             TextLinkMatch::Hashtag(hashtag) => hashtag.start,
+            TextLinkMatch::Url(url) => url.start,
+        }
+    }
+
+    fn end(&self) -> usize {
+        match self {
+            TextLinkMatch::Mention(mention) => mention.end,
+            TextLinkMatch::RemoteMention(mention) => mention.end,
+            TextLinkMatch::Hashtag(hashtag) => hashtag.end,
+            TextLinkMatch::Url(url) => url.end,
         }
     }
 }
@@ -3777,19 +3807,91 @@ struct HashtagMatch {
     name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UrlMatch {
+    start: usize,
+    end: usize,
+    url: String,
+}
+
+/// Locate explicit HTTP(S) URLs while retaining byte offsets into the source text.
+fn url_matches(content: &str) -> Vec<UrlMatch> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder.url_must_have_scheme(true);
+    finder
+        .links(content)
+        .filter_map(|link| {
+            let parsed = url::Url::parse(link.as_str()).ok()?;
+            matches!(parsed.scheme(), "http" | "https").then(|| UrlMatch {
+                start: link.start(),
+                end: link.end(),
+                url: link.as_str().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Render a URL using Mastodon's safe destination and visually shortened text shape.
+fn push_url_html(output: &mut String, url: &str) {
+    output.push_str(r#"<a href=""#);
+    output.push_str(&escape_html(url));
+    output.push_str(r#"" target="_blank" rel="nofollow noopener" translate="no">"#);
+
+    let prefix_len = ["https://www.", "http://www.", "https://", "http://"]
+        .into_iter()
+        .find_map(|prefix| url.starts_with(prefix).then_some(prefix.len()))
+        .unwrap_or(0);
+    let (prefix, remainder) = url.split_at(prefix_len);
+    let visible_end = remainder
+        .char_indices()
+        .nth(30)
+        .map_or(remainder.len(), |(index, _)| index);
+    let (mut visible, mut suffix) = remainder.split_at(visible_end);
+    let cutoff = if suffix.chars().count() == 1 {
+        visible = remainder;
+        suffix = "";
+        false
+    } else {
+        !suffix.is_empty()
+    };
+
+    output.push_str(r#"<span class="invisible">"#);
+    output.push_str(&escape_html(prefix));
+    output.push_str("</span><span");
+    if cutoff {
+        output.push_str(r#" class="ellipsis""#);
+    }
+    output.push('>');
+    output.push_str(&escape_html(visible));
+    output.push_str("</span>");
+    if !suffix.is_empty() {
+        output.push_str(r#"<span class="invisible">"#);
+        output.push_str(&escape_html(suffix));
+        output.push_str("</span>");
+    }
+    output.push_str("</a>");
+}
+
 /// Return local mention usernames in first-seen order.
 pub(crate) fn mention_usernames(content: &str) -> Vec<String> {
+    let urls = url_matches(content);
     local_mention_matches(content)
         .into_iter()
+        .filter(|mention| !overlaps_url(mention.start, mention.end, &urls))
         .map(|mention| mention.username)
         .collect()
 }
 
 /// Return normalized hashtag names in first-seen order.
 fn hashtag_names(content: &str) -> Vec<String> {
+    let urls = url_matches(content);
     let mut seen = HashSet::new();
     let mut names = Vec::new();
     for hashtag in local_hashtag_matches(content) {
+        if overlaps_url(hashtag.start, hashtag.end, &urls) {
+            continue;
+        }
         if seen.insert(hashtag.name.clone()) {
             names.push(hashtag.name);
         }
@@ -3890,14 +3992,22 @@ fn remote_mention_matches(content: &str) -> Vec<RemoteMentionMatch> {
 
 /// Return syntactically valid remote handles in first-seen order.
 pub(crate) fn remote_mention_handles(content: &str) -> Vec<String> {
+    let urls = url_matches(content);
     let mut handles = Vec::new();
     for mention in remote_mention_matches(content) {
+        if overlaps_url(mention.start, mention.end, &urls) {
+            continue;
+        }
         let handle = format!("{}@{}", mention.username, mention.domain);
         if !handles.contains(&handle) {
             handles.push(handle);
         }
     }
     handles
+}
+
+fn overlaps_url(start: usize, end: usize, urls: &[UrlMatch]) -> bool {
+    urls.iter().any(|url| url.start < end && start < url.end)
 }
 
 fn valid_mention_prefix(previous: Option<char>) -> bool {
@@ -4070,8 +4180,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        StatusContextLimits, escape_html, hashtag_names, mention_usernames, remote_mention_matches,
-        remote_status_tags, status_content_html, timeline_limit,
+        StatusContextLimits, escape_html, hashtag_names, mention_usernames, push_url_html,
+        remote_mention_matches, remote_status_tags, status_content_html, timeline_limit,
+        url_matches,
     };
     use crate::{config::Config, http::AppState, password};
 
@@ -4314,6 +4425,67 @@ mod tests {
         assert_eq!(
             status_tag_names(&json_body(edit).await),
             ["roosty".to_owned()]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given explicit web URLs, local projections link them without treating URL fragments or
+    /// path components as mentions and hashtags, while source text remains unchanged.
+    async fn local_urls_are_linked_in_statuses_and_history(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        context
+            .access_token_for("alice", "url-alice@example.com")
+            .await;
+        let source_text = "see https://example.test/@alice?x=1&tag=#inside and #outside";
+        let status = context
+            .create_status(&token, source_text, Some("public"), None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+        let content = status["content"].as_str().unwrap();
+
+        assert!(content.contains(
+            r#"<a href="https://example.test/@alice?x=1&amp;tag=#inside" target="_blank" rel="nofollow noopener" translate="no">"#
+        ));
+        assert!(content.contains(r#"<span class="invisible">https://</span>"#));
+        assert!(status["mentions"].as_array().unwrap().is_empty());
+        assert_eq!(status_tag_names(&status), ["outside"]);
+
+        let source = json_body(
+            context
+                .authenticated_get(&format!("/api/v1/statuses/{status_id}/source"), &token)
+                .await,
+        )
+        .await;
+        assert_eq!(source["text"], source_text);
+
+        let edit = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &token,
+                serde_json::json!({"status": "new https://example.test/second"}),
+            )
+            .await;
+        assert_eq!(edit.status(), StatusCode::OK);
+        let history = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{status_id}/history"))
+                .await,
+        )
+        .await;
+        assert_eq!(history.as_array().unwrap().len(), 2);
+        assert!(
+            history[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("href=\"https://example.test/@alice?x=1&amp;tag=#inside\"")
+        );
+        assert!(
+            history[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("href=\"https://example.test/second\"")
         );
     }
 
@@ -7195,6 +7367,39 @@ mod tests {
             hashtag_names("#Rust text##ignored word#skip #web_dev"),
             ["rust", "ignored", "web_dev"]
         );
+        let url_text = "bare.example ftp://files.example javascript://alert \
+            (https://example.org/a_(b)) https://üñîçøðé.example/ä.";
+        let urls = url_matches(url_text);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            &url_text[urls[0].start..urls[0].end],
+            "https://example.org/a_(b)"
+        );
+        assert_eq!(
+            &url_text[urls[1].start..urls[1].end],
+            "https://üñîçøðé.example/ä"
+        );
+        assert_eq!(
+            mention_usernames("https://example.test/@alice @bob"),
+            ["bob"]
+        );
+        assert_eq!(
+            hashtag_names("https://example.test/#inside #outside"),
+            ["outside"]
+        );
+
+        let mut linked = String::new();
+        push_url_html(
+            &mut linked,
+            "https://www.example.test/abcdefghijklmnopqrstuvwxyz0123456789",
+        );
+        assert!(
+            linked
+                .contains("href=\"https://www.example.test/abcdefghijklmnopqrstuvwxyz0123456789\"")
+        );
+        assert!(linked.contains("<span class=\"invisible\">https://www.</span>"));
+        assert!(linked.contains("<span class=\"ellipsis\">"));
+        assert!(linked.contains("rel=\"nofollow noopener\""));
     }
 
     /// Build a small valid image fixture for media upload compatibility tests.
