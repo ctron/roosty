@@ -51,6 +51,7 @@ impl AppState {
 pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
     let public_router = Router::<AppState>::new()
         .merge(crate::accounts::router())
+        .merge(crate::featured_tags::router())
         .merge(crate::auth::router())
         .merge(crate::compat::router())
         .merge(crate::conversations::router())

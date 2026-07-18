@@ -22,7 +22,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rand_core::{OsRng, RngCore};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
-use roosty_db::{NewRemoteCustomEmoji, RemoteConversationParticipant, StatusVisibility};
+use roosty_db::{
+    FeaturedTag, NewRemoteCustomEmoji, RemoteConversationParticipant, RemoteFeaturedTagInput,
+    StatusVisibility,
+};
 use rsa::{
     RsaPrivateKey,
     pkcs1v15::SigningKey,
@@ -670,6 +673,7 @@ pub fn router() -> Router<AppState> {
         .route("/users/{username}/followers", get(followers))
         .route("/users/{username}/following", get(following))
         .route("/users/{username}/collections/featured", get(featured))
+        .route("/users/{username}/collections/tags", get(featured_tags))
         .route("/users/{username}/inbox", post(inbox))
         .route("/inbox", post(inbox))
         .route("/users/{username}/statuses/{status_id}", get(note))
@@ -773,6 +777,7 @@ struct Actor {
     followers: String,
     following: String,
     featured: String,
+    featured_tags: String,
     url: String,
     manually_approves_followers: bool,
     discoverable: bool,
@@ -807,6 +812,16 @@ struct ActorExtensionsContext {
     #[serde(rename = "PropertyValue")]
     property_value: &'static str,
     value: &'static str,
+    #[serde(rename = "featuredTags")]
+    featured_tags: JsonLdIdTerm,
+}
+
+#[derive(Serialize)]
+struct JsonLdIdTerm {
+    #[serde(rename = "@id")]
+    id: &'static str,
+    #[serde(rename = "@type")]
+    r#type: &'static str,
 }
 
 /// ActivityStreams image reference used for actor avatars and headers.
@@ -991,6 +1006,24 @@ struct FeaturedCollection {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct FeaturedTagsCollection {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: CollectionType,
+    total_items: u64,
+    ordered_items: Vec<ActivityPubHashtag>,
+}
+
+#[derive(Clone, Serialize)]
+struct ActivityPubHashtag {
+    r#type: &'static str,
+    href: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Collection {
     #[serde(rename = "@context")]
     context: &'static str,
@@ -1090,6 +1123,7 @@ fn actor_document(
         followers: format!("{id}/followers"),
         following: format!("{id}/following"),
         featured: format!("{id}/collections/featured"),
+        featured_tags: format!("{id}/collections/tags"),
         url: public_url(state, &format!("@{}", account.username)),
         manually_approves_followers: account.locked,
         discoverable: account.discoverable,
@@ -1150,6 +1184,37 @@ async fn featured(State(state): State<AppState>, Path(username): Path<String>) -
     })
 }
 
+/// Serve the local account's featured hashtags as embedded ActivityStreams objects.
+async fn featured_tags(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+    if !state.config.federation_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    };
+    let tags = match roosty_db::local_featured_tags(&state.db, account.id).await {
+        Ok(tags) => tags,
+        Err(error) => return internal_error(error),
+    };
+    let ordered_items = tags
+        .into_iter()
+        .map(|tag| ActivityPubHashtag {
+            r#type: "Hashtag",
+            href: public_url(&state, &format!("@{username}/tagged/{}", tag.name)),
+            name: format!("#{}", tag.name),
+        })
+        .collect::<Vec<_>>();
+    activity_response(FeaturedTagsCollection {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: format!("{}/collections/tags", actor_url(&state, &username)),
+        r#type: CollectionType::OrderedCollection,
+        total_items: ordered_items.len() as u64,
+        ordered_items,
+    })
+}
+
 /// Map Roosty's local bot setting to the ActivityPub actor type Mastodon uses for services.
 fn local_actor_type(bot: bool) -> ActorType {
     if bot {
@@ -1171,6 +1236,10 @@ fn actor_context() -> ActorContext {
             schema: "http://schema.org#",
             property_value: "schema:PropertyValue",
             value: "schema:value",
+            featured_tags: JsonLdIdTerm {
+                id: "toot:featuredTags",
+                r#type: "@id",
+            },
         }),
     ])
 }
@@ -1502,6 +1571,23 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         };
     }
     if matches!(activity_type, Some("Add" | "Remove")) {
+        let target = activity.get("target").and_then(activitypub_reference);
+        if remote_actor.featured_tags_url.as_deref() == target {
+            return match process_inbound_featured_tag_activity(
+                state,
+                &activity,
+                &remote_actor,
+                activity_type == Some("Add"),
+            )
+            .await
+            {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => {
+                    tracing::warn!(%error, "rejected featured hashtag activity");
+                    StatusCode::BAD_REQUEST.into_response()
+                }
+            };
+        }
         let featured: InboundFeaturedActivity = match serde_json::from_value(activity.clone()) {
             Ok(featured) => featured,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -3628,6 +3714,8 @@ pub(crate) async fn refresh_remote_featured(
 
     let mut status_ids = Vec::new();
     let mut seen = HashSet::new();
+    let mut legacy_tags = Vec::new();
+    let mut seen_tags = HashSet::new();
     for item in item_values.into_iter().take(20) {
         let note_value = match item {
             JsonValue::String(reference) => {
@@ -3641,6 +3729,17 @@ pub(crate) async fn refresh_remote_featured(
                 ));
             }
         };
+        if actor.featured_tags_url.is_none()
+            && note_value.get("type").and_then(JsonValue::as_str) == Some("Hashtag")
+        {
+            let tag = validated_remote_hashtag(&featured, &note_value)?;
+            if seen_tags.insert(tag.name.clone())
+                && legacy_tags.len() < crate::featured_tags::MAX_FEATURED_TAGS as usize
+            {
+                legacy_tags.push(tag);
+            }
+            continue;
+        }
         let note: InboundNote = serde_json::from_value(note_value.clone())
             .map_err(|_| RoostyError::InvalidInput("remote featured Note is invalid".to_owned()))?;
         if !seen.insert(note.id.clone()) {
@@ -3674,6 +3773,170 @@ pub(crate) async fn refresh_remote_featured(
     }
     let txn = state.db.begin().await?;
     roosty_db::replace_remote_status_pins(&txn, actor.id, &status_ids).await?;
+    if actor.featured_tags_url.is_none() {
+        roosty_db::replace_remote_featured_tags(&txn, actor.id, &legacy_tags).await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Refresh and atomically reconcile one validated remote featured-tags collection.
+pub(crate) async fn refresh_remote_featured_tags(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: FeaturedRefreshPayload = serde_json::from_value(payload).map_err(|_| {
+        RoostyError::InvalidInput("invalid featured-tags refresh payload".to_owned())
+    })?;
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, payload.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote featured-tags actor does not exist".to_owned())
+        })?;
+    let Some(collection_url) = actor.featured_tags_url.as_deref() else {
+        let txn = state.db.begin().await?;
+        roosty_db::replace_remote_featured_tags(&txn, actor.id, &[]).await?;
+        txn.commit().await?;
+        return Ok(());
+    };
+    let collection = url::Url::parse(collection_url)
+        .map_err(|_| RoostyError::InvalidInput("remote featured-tags URL is invalid".to_owned()))?;
+    let mut page_url = Some(collection.clone());
+    let mut followed_pages = 0_usize;
+    let mut item_values = Vec::new();
+    while let Some(url) = page_url.take() {
+        let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+        let kind = document.get("type").and_then(JsonValue::as_str);
+        if !matches!(
+            kind,
+            Some("Collection" | "OrderedCollection" | "CollectionPage" | "OrderedCollectionPage")
+        ) {
+            return Err(RoostyError::InvalidInput(
+                "remote featured-tags document is not a collection".to_owned(),
+            ));
+        }
+        if let Some(items) = document
+            .get("orderedItems")
+            .or_else(|| document.get("items"))
+        {
+            let items = items.as_array().ok_or_else(|| {
+                RoostyError::InvalidInput("remote featured-tags items are invalid".to_owned())
+            })?;
+            item_values.extend(items.iter().cloned());
+        }
+        if item_values.len() >= crate::featured_tags::MAX_FEATURED_TAGS as usize {
+            item_values.truncate(crate::featured_tags::MAX_FEATURED_TAGS as usize);
+            break;
+        }
+        let next = document
+            .get("next")
+            .or_else(|| {
+                (item_values.is_empty())
+                    .then(|| document.get("first"))
+                    .flatten()
+            })
+            .and_then(activitypub_reference);
+        let Some(next) = next else { break };
+        if followed_pages >= 4 {
+            break;
+        }
+        page_url = Some(validated_featured_member_url(&collection, next)?);
+        followed_pages += 1;
+    }
+
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+    for item in item_values {
+        let value = match item {
+            JsonValue::String(reference) => {
+                let url = validated_featured_member_url(&collection, &reference)?;
+                discovery::fetch_json(state, url, None).await?
+            }
+            JsonValue::Object(_) => item,
+            _ => {
+                return Err(RoostyError::InvalidInput(
+                    "remote featured hashtag is invalid".to_owned(),
+                ));
+            }
+        };
+        let input = validated_remote_hashtag(&collection, &value)?;
+        if seen.insert(input.name.clone()) {
+            tags.push(input);
+        }
+    }
+    let txn = state.db.begin().await?;
+    roosty_db::replace_remote_featured_tags(&txn, actor.id, &tags).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+fn validated_remote_hashtag(
+    collection: &url::Url,
+    value: &JsonValue,
+) -> Result<RemoteFeaturedTagInput, RoostyError> {
+    if value.get("type").and_then(JsonValue::as_str) != Some("Hashtag") {
+        return Err(RoostyError::InvalidInput(
+            "remote featured item is not a Hashtag".to_owned(),
+        ));
+    }
+    let display_name = value
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote featured hashtag has no name".to_owned())
+        })?;
+    let name = roosty_db::normalize_featured_tag_name(display_name).ok_or_else(|| {
+        RoostyError::InvalidInput("remote featured hashtag name is invalid".to_owned())
+    })?;
+    let href = value
+        .get("href")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote featured hashtag has no href".to_owned())
+        })?;
+    let href = validated_featured_member_url(collection, href)?.to_string();
+    Ok(RemoteFeaturedTagInput {
+        name,
+        display_name: display_name.trim_start_matches('#').to_owned(),
+        href,
+    })
+}
+
+/// Validate and apply one replay-safe featured hashtag activity in a compact inbox branch.
+async fn process_inbound_featured_tag_activity(
+    state: &AppState,
+    activity: &JsonValue,
+    actor: &roosty_db::RemoteActor,
+    feature: bool,
+) -> Result<(), RoostyError> {
+    if activity.get("actor").and_then(JsonValue::as_str) != Some(actor.activitypub_id.as_str()) {
+        return Err(RoostyError::InvalidInput(
+            "featured hashtag signer does not own the collection".to_owned(),
+        ));
+    }
+    let target = activity
+        .get("target")
+        .and_then(activitypub_reference)
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("featured hashtag target is invalid".to_owned())
+        })?;
+    let collection = url::Url::parse(target)
+        .map_err(|_| RoostyError::InvalidInput("featured hashtag target is invalid".to_owned()))?;
+    let object = activity.get("object").ok_or_else(|| {
+        RoostyError::InvalidInput("featured hashtag object is missing".to_owned())
+    })?;
+    let input = validated_remote_hashtag(&collection, object)?;
+    let txn = state.db.begin().await?;
+    if is_new_inbox_activity(&txn, activity, actor).await? {
+        roosty_db::apply_remote_featured_tag_activity(
+            &txn,
+            actor.id,
+            &input,
+            feature,
+            crate::featured_tags::MAX_FEATURED_TAGS,
+        )
+        .await?;
+    }
     txn.commit().await?;
     Ok(())
 }
@@ -3736,6 +3999,58 @@ pub(crate) async fn enqueue_pin_activity_in_transaction(
     for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, status.account_id).await? {
         let payload = serde_json::to_value(StatusDelivery {
             local_account_id: status.account_id,
+            remote_actor_id,
+            activity: activity.clone(),
+            personal_inbox: false,
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationStatusDelivery,
+                payload,
+                deduplication_key: Some(format!("{activity_id}:{}", remote_actor_id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Atomically queue a featured hashtag Add or Remove for every accepted remote follower.
+pub(crate) async fn enqueue_featured_tag_activity(
+    state: &AppState,
+    txn: &sea_orm::DatabaseTransaction,
+    account: &roosty_db::LocalAccount,
+    tag: &FeaturedTag,
+    featured: bool,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+    let actor = actor_url(state, &account.username);
+    let activity_id = format!(
+        "{actor}#{}-featured-tag-{}",
+        if featured { "add" } else { "remove" },
+        Uuid::now_v7()
+    );
+    let activity = serde_json::json!({
+        "@context": ACTIVITYSTREAMS_CONTEXT,
+        "id": activity_id,
+        "type": if featured { "Add" } else { "Remove" },
+        "actor": actor,
+        "object": ActivityPubHashtag {
+            r#type: "Hashtag",
+            href: public_url(state, &format!("@{}/tagged/{}", account.username, tag.name)),
+            name: format!("#{}", tag.name),
+        },
+        "target": format!("{actor}/collections/tags"),
+        "to": format!("{actor}/followers"),
+    });
+    for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, account.id).await? {
+        let payload = serde_json::to_value(StatusDelivery {
+            local_account_id: account.id,
             remote_actor_id,
             activity: activity.clone(),
             personal_inbox: false,
@@ -6086,6 +6401,7 @@ mod tests {
             followers: "https://example.test/users/alice/followers".to_owned(),
             following: "https://example.test/users/alice/following".to_owned(),
             featured: "https://example.test/users/alice/collections/featured".to_owned(),
+            featured_tags: "https://example.test/users/alice/collections/tags".to_owned(),
             url: "https://example.test/@alice".to_owned(),
             manually_approves_followers: false,
             discoverable: true,
@@ -6180,10 +6496,18 @@ mod tests {
             "schema:PropertyValue"
         );
         assert_eq!(actor["@context"][2]["value"], "schema:value");
+        assert_eq!(
+            actor["@context"][2]["featuredTags"]["@id"],
+            "toot:featuredTags"
+        );
         assert_eq!(actor["url"], "https://example.test/@alice");
         assert_eq!(
             actor["featured"],
             "https://example.test/users/alice/collections/featured"
+        );
+        assert_eq!(
+            actor["featuredTags"],
+            "https://example.test/users/alice/collections/tags"
         );
         assert!(actor["discoverable"].as_bool().unwrap());
         assert_eq!(actor["published"], "2026-07-13T00:00:00.000Z");
@@ -6367,6 +6691,7 @@ mod tests {
             shared_inbox_url: None,
             followers_url: Some(format!("https://{domain}/users/{username}/followers")),
             featured_url: None,
+            featured_tags_url: None,
             public_key_id: format!("https://{domain}/users/{username}#main-key"),
             public_key_pem,
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -6497,6 +6822,9 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Featured-tag refresh tests invoke the worker directly; keeping its large future out
+            // of this shared two-instance delivery helper avoids inflating every scenario future.
+            roosty_db::JobKind::FederationFeaturedTagsRefresh => {}
         }
         assert!(
             roosty_db::mark_job_completed(&state.db, &job)

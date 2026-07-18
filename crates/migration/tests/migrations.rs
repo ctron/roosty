@@ -45,6 +45,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "status_quote").await);
     assert!(table_exists(database.connection(), "local_status_pin").await);
     assert!(table_exists(database.connection(), "remote_status_pin").await);
+    assert!(table_exists(database.connection(), "local_featured_tag").await);
+    assert!(table_exists(database.connection(), "remote_featured_tag").await);
     assert!(table_exists(database.connection(), "local_status_local_mention").await);
     assert!(table_exists(database.connection(), "remote_status_local_mention").await);
     assert!(table_exists(database.connection(), "local_status_edit").await);
@@ -184,6 +186,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "remote_actor", "profile_created_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "followers_url").await);
     assert!(column_exists(database.connection(), "remote_actor", "featured_url").await);
+    assert!(column_exists(database.connection(), "remote_actor", "featured_tags_url").await);
     assert!(
         column_exists(
             database.connection(),
@@ -286,9 +289,10 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back remote tags, status history, streaming metadata, edit delivery, subscription
-    // extensions, streaming-kind extension, remote moderation, the streaming log, and the URL.
-    Migrator::down(database.connection(), Some(12))
+    // Roll back featured tags, pins, remote tags, status history, streaming metadata, edit
+    // delivery, subscription extensions, streaming-kind extension, remote moderation, the
+    // streaming log, and the URL.
+    Migrator::down(database.connection(), Some(13))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -422,6 +426,26 @@ async fn status_edit_history_upgrade_and_rollback(database: &mut EmbeddedDatabas
     assert!(table_exists(database.connection(), "remote_status").await);
 }
 
+/// Given the pinned-post schema, migration 59 adds and cleanly removes featured hashtags.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn featured_tags_upgrade_and_rollback(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(58)).await.unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    assert!(table_exists(database.connection(), "local_featured_tag").await);
+    assert!(table_exists(database.connection(), "remote_featured_tag").await);
+    assert!(column_exists(database.connection(), "remote_actor", "featured_tags_url").await);
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!table_exists(database.connection(), "local_featured_tag").await);
+    assert!(!table_exists(database.connection(), "remote_featured_tag").await);
+    assert!(!column_exists(database.connection(), "remote_actor", "featured_tags_url").await);
+    assert!(table_exists(database.connection(), "local_status_pin").await);
+}
+
 /// Given cached legacy hashtags, migration 56 indexes valid tags and rolls back its join table.
 #[test_context(EmbeddedDatabase)]
 #[tokio::test]
@@ -470,7 +494,7 @@ async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut Embedded
         .unwrap();
     assert_eq!(row.try_get::<i64>("", "count").unwrap(), 2);
 
-    Migrator::down(database.connection(), Some(3))
+    Migrator::down(database.connection(), Some(4))
         .await
         .unwrap();
     assert!(!table_exists(database.connection(), "remote_status_tag").await);

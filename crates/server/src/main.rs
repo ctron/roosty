@@ -16,6 +16,7 @@ mod auth;
 mod compat;
 mod config;
 mod conversations;
+mod featured_tags;
 mod federation;
 mod http;
 mod instance;
@@ -431,6 +432,9 @@ async fn worker_iteration(
         }
         "federation_featured_refresh" => {
             federation::refresh_remote_featured(&state, job.payload.clone()).await
+        }
+        "federation_featured_tags_refresh" => {
+            federation::refresh_remote_featured_tags(&state, job.payload.clone()).await
         }
         _ => Ok(()),
     };

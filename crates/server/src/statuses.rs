@@ -9234,6 +9234,7 @@ mod tests {
                 shared_inbox_url: None,
                 followers_url: Some(format!("{actor_url}/followers")),
                 featured_url: None,
+                featured_tags_url: None,
                 public_key_id: format!("{actor_url}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: now + TimeDuration::hours(1),

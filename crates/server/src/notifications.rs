@@ -11,14 +11,14 @@ use roosty_db::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::str::FromStr;
+use std::{future::Future, pin::Pin, str::FromStr};
 use uuid::Uuid;
 
 use crate::{
     accounts::RemoteAccountResponse,
     auth::{AccountResponse, AuthenticatedAccount, account_response},
     http::AppState,
-    statuses::{CollectionLink, StatusResponse},
+    statuses::{CollectionLink, StatusResponse, remote_status_response},
 };
 
 const DEFAULT_NOTIFICATION_LIMIT: u64 = 40;
@@ -197,17 +197,19 @@ pub(crate) async fn create_and_stream_notification(
 }
 
 /// Publish a notification that was persisted by a caller-owned transaction.
-pub(crate) async fn publish_committed_notification(
+pub(crate) fn publish_committed_notification(
     state: &AppState,
     account_id: AccountId,
     notification: LocalNotification,
-) -> Result<(), RoostyError> {
-    if let Some(response) = notification_response(state, account_id, notification).await? {
-        state
-            .streaming_events
-            .publish_notification(&response, account_id);
-    }
-    Ok(())
+) -> Pin<Box<dyn Future<Output = Result<(), RoostyError>> + Send + '_>> {
+    Box::pin(async move {
+        if let Some(response) = notification_response(state, account_id, notification).await? {
+            state
+                .streaming_events
+                .publish_notification(&response, account_id);
+        }
+        Ok(())
+    })
 }
 
 async fn notification_page_response(
@@ -282,7 +284,7 @@ async fn notification_response(
             if !roosty_db::remote_status_visible_to_account(&state.db, &status, viewer_id).await? {
                 return Ok(None);
             }
-            Some(crate::statuses::remote_status_response(state, status).await?)
+            Some(remote_status_response(state, status).await?)
         }
         (None, None) => None,
         (Some(_), Some(_)) => return Ok(None),

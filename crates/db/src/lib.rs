@@ -16,7 +16,10 @@ use sea_orm::{
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
-use std::{cmp::Reverse, collections::HashSet};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+};
 use strum::{Display, EnumString, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -93,13 +96,14 @@ mod entity;
 use entity::{
     job, local_account, local_account_block, local_account_mute, local_actor_key,
     local_conversation, local_conversation_account, local_conversation_remote_participant,
-    local_follow, local_media_attachment, local_notification, local_remote_account_block,
-    local_remote_account_mute, local_remote_status_favourite, local_remote_status_reblog,
-    local_status, local_status_bookmark, local_status_edit, local_status_edit_media,
-    local_status_favourite, local_status_local_mention, local_status_local_recipient,
-    local_status_pin, local_status_reblog, local_status_remote_mention, local_status_tag,
-    local_tag, local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
-    oauth_authorization_code, processed_inbox_activity, remote_actor, remote_custom_emoji,
+    local_featured_tag, local_follow, local_media_attachment, local_notification,
+    local_remote_account_block, local_remote_account_mute, local_remote_status_favourite,
+    local_remote_status_reblog, local_status, local_status_bookmark, local_status_edit,
+    local_status_edit_media, local_status_favourite, local_status_local_mention,
+    local_status_local_recipient, local_status_pin, local_status_reblog,
+    local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
+    local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
+    processed_inbox_activity, remote_actor, remote_custom_emoji, remote_featured_tag,
     remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
     remote_profile_media, remote_status, remote_status_edit, remote_status_edit_media,
     remote_status_favourite, remote_status_local_mention, remote_status_local_recipient,
@@ -676,6 +680,8 @@ pub struct RemoteActor {
     pub followers_url: Option<String>,
     /// Exact same-origin featured collection URL declared by the actor.
     pub featured_url: Option<String>,
+    /// Exact same-origin featured-tags collection URL declared by the actor.
+    pub featured_tags_url: Option<String>,
     /// Public key identity URL.
     pub public_key_id: String,
     /// Public signing key PEM.
@@ -2224,6 +2230,7 @@ async fn upsert_remote_actor_with_identity(
         active.shared_inbox_url = Set(actor.shared_inbox_url.clone());
         active.followers_url = Set(actor.followers_url.clone());
         active.featured_url = Set(actor.featured_url.clone());
+        active.featured_tags_url = Set(actor.featured_tags_url.clone());
         active.public_key_id = Set(actor.public_key_id.clone());
         active.public_key_pem = Set(actor.public_key_pem.clone());
         active.fetched_at = Set(now);
@@ -2246,6 +2253,7 @@ async fn upsert_remote_actor_with_identity(
             shared_inbox_url: Set(actor.shared_inbox_url.clone()),
             followers_url: Set(actor.followers_url.clone()),
             featured_url: Set(actor.featured_url.clone()),
+            featured_tags_url: Set(actor.featured_tags_url.clone()),
             public_key_id: Set(actor.public_key_id.clone()),
             public_key_pem: Set(actor.public_key_pem.clone()),
             fetched_at: Set(now),
@@ -2456,7 +2464,7 @@ pub struct LocalStatus {
 }
 
 /// Stored local hashtag metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromQueryResult)]
 pub struct LocalTag {
     /// Internal hashtag identifier.
     pub id: Uuid,
@@ -2477,6 +2485,48 @@ pub struct LocalTagHistory {
     pub uses: u64,
     /// Number of distinct local accounts using the tag on this day.
     pub accounts: u64,
+}
+
+/// A featured hashtag projected with account-scoped visible-status statistics.
+#[derive(Clone, Debug, FromQueryResult)]
+pub struct FeaturedTag {
+    /// Identifier of the featured relationship, not the shared tag.
+    pub id: Uuid,
+    /// Normalized tag name without `#`.
+    pub name: String,
+    /// Remote profile link, when supplied by a remote actor.
+    pub href: Option<String>,
+    /// Number of locally known public or unlisted statuses by this account.
+    pub statuses_count: i64,
+    /// Most recent locally known use of the tag.
+    pub last_status_at: Option<OffsetDateTime>,
+    /// Relationship creation timestamp.
+    pub created_at: OffsetDateTime,
+}
+
+/// Result of an idempotent local featured-tag creation attempt.
+#[derive(Clone, Debug)]
+pub enum FeatureTagResult {
+    /// The relationship was created or already existed.
+    Featured {
+        /// Current relationship projection.
+        tag: FeaturedTag,
+        /// Whether this call created the relationship.
+        created: bool,
+    },
+    /// The local account has reached its configured maximum.
+    LimitReached,
+}
+
+/// Validated remote featured-tag data ready for atomic reconciliation.
+#[derive(Clone, Debug)]
+pub struct RemoteFeaturedTagInput {
+    /// Normalized name without the leading `#`.
+    pub name: String,
+    /// Original display spelling received from the remote actor.
+    pub display_name: String,
+    /// Validated public profile hashtag link.
+    pub href: String,
 }
 
 /// Data accepted when creating a local status.
@@ -3048,6 +3098,8 @@ pub enum JobKind {
     FederationRemoteMediaFetch,
     /// Refresh one remote actor's declared featured collection.
     FederationFeaturedRefresh,
+    /// Refresh one remote actor's declared featured-tags collection.
+    FederationFeaturedTagsRefresh,
 }
 
 impl JobKind {
@@ -6226,6 +6278,278 @@ fn normalize_tag_name(name: &str) -> String {
     name.trim().trim_start_matches('#').to_lowercase()
 }
 
+/// Normalize and validate a Mastodon-compatible featured hashtag name.
+pub fn normalize_featured_tag_name(name: &str) -> Option<String> {
+    let name = normalize_tag_name(name);
+    if name.is_empty()
+        || name.chars().count() > 100
+        || !name
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_')
+        || !name.chars().any(char::is_alphabetic)
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// List local featured tags and their visible-status statistics in one aggregate query.
+pub async fn local_featured_tags(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<Vec<FeaturedTag>> {
+    FeaturedTag::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT ft.id, t.name, NULL::text AS href,
+                  count(s.id)::bigint AS statuses_count,
+                  max(s.created_at) AS last_status_at, ft.created_at
+           FROM local_featured_tag ft
+           JOIN local_tag t ON t.id = ft.tag_id
+           LEFT JOIN local_status_tag st ON st.tag_id = ft.tag_id
+           LEFT JOIN local_status s ON s.id = st.status_id
+                AND s.account_id = ft.account_id
+                AND s.deleted_at IS NULL
+                AND s.visibility IN ('public', 'unlisted')
+           WHERE ft.account_id = $1
+           GROUP BY ft.id, t.name, ft.created_at
+           ORDER BY count(s.id) DESC, ft.created_at DESC, ft.id DESC"#,
+        vec![account_id.0.into()],
+    ))
+    .all(db)
+    .await
+    .map_err(Into::into)
+}
+
+/// List cached remote featured tags with locally known status statistics in one query.
+pub async fn remote_featured_tags(
+    db: &impl ConnectionTrait,
+    actor_id: AccountId,
+) -> Result<Vec<FeaturedTag>> {
+    FeaturedTag::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT ft.id, t.name, ft.href,
+                  count(s.id)::bigint AS statuses_count,
+                  max(s.published_at) AS last_status_at, ft.created_at
+           FROM remote_featured_tag ft
+           JOIN local_tag t ON t.id = ft.tag_id
+           LEFT JOIN remote_status_tag st ON st.tag_id = ft.tag_id
+           LEFT JOIN remote_status s ON s.id = st.remote_status_id
+                AND s.remote_actor_id = ft.remote_actor_id
+                AND s.deleted_at IS NULL
+                AND s.visibility IN ('public', 'unlisted')
+           WHERE ft.remote_actor_id = $1
+           GROUP BY ft.id, t.name, ft.href, ft.position, ft.created_at
+           ORDER BY ft.position ASC, ft.id ASC"#,
+        vec![actor_id.0.into()],
+    ))
+    .all(db)
+    .await
+    .map_err(Into::into)
+}
+
+/// Create a local featured tag idempotently while enforcing the limit across processes.
+pub async fn feature_local_tag(
+    txn: &DatabaseTransaction,
+    account_id: AccountId,
+    name: &str,
+    limit: u64,
+) -> Result<FeatureTagResult> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("local-featured-tags:{}", account_id.0).into()],
+    ))
+    .await?;
+    let now = OffsetDateTime::now_utc();
+    let tag = find_or_create_local_tag(txn, name, now).await?;
+    let mut created = false;
+    if local_featured_tag::Entity::find()
+        .filter(local_featured_tag::Column::AccountId.eq(account_id.0))
+        .filter(local_featured_tag::Column::TagId.eq(tag.id))
+        .one(txn)
+        .await?
+        .is_none()
+    {
+        if local_featured_tag::Entity::find()
+            .filter(local_featured_tag::Column::AccountId.eq(account_id.0))
+            .count(txn)
+            .await?
+            >= limit
+        {
+            return Ok(FeatureTagResult::LimitReached);
+        }
+        local_featured_tag::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            account_id: Set(account_id.0),
+            tag_id: Set(tag.id),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+        created = true;
+    }
+    let featured = local_featured_tags(txn, account_id)
+        .await?
+        .into_iter()
+        .find(|featured| featured.name == tag.name)
+        .ok_or_else(|| DbErr::RecordNotFound("featured tag disappeared".to_owned()))?;
+    Ok(FeatureTagResult::Featured {
+        tag: featured,
+        created,
+    })
+}
+
+/// Remove a local featured tag owned by the account and return its prior projection.
+pub async fn unfeature_local_tag(
+    txn: &DatabaseTransaction,
+    account_id: AccountId,
+    featured_tag_id: Uuid,
+) -> Result<Option<FeaturedTag>> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("local-featured-tags:{}", account_id.0).into()],
+    ))
+    .await?;
+    let featured = local_featured_tags(txn, account_id)
+        .await?
+        .into_iter()
+        .find(|featured| featured.id == featured_tag_id);
+    if featured.is_some() {
+        local_featured_tag::Entity::delete_many()
+            .filter(local_featured_tag::Column::Id.eq(featured_tag_id))
+            .filter(local_featured_tag::Column::AccountId.eq(account_id.0))
+            .exec(txn)
+            .await?;
+    }
+    Ok(featured)
+}
+
+/// Suggest recently used, not-yet-featured local tags without per-tag reads.
+pub async fn suggested_featured_tags(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<Vec<LocalTag>> {
+    LocalTag::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT t.id, t.name, t.created_at, t.updated_at
+           FROM local_tag t
+           JOIN local_status_tag st ON st.tag_id = t.id
+           JOIN local_status s ON s.id = st.status_id
+           LEFT JOIN local_featured_tag ft
+             ON ft.tag_id = t.id AND ft.account_id = s.account_id
+           WHERE s.account_id = $1 AND s.deleted_at IS NULL
+             AND s.visibility IN ('public', 'unlisted') AND ft.id IS NULL
+           GROUP BY t.id, t.name, t.created_at, t.updated_at
+           ORDER BY max(s.created_at) DESC, t.name ASC
+           LIMIT $2"#,
+        vec![account_id.0.into(), limit.into()],
+    ))
+    .all(db)
+    .await
+    .map_err(Into::into)
+}
+
+/// Atomically replace a remote actor's bounded featured-tag cache.
+pub async fn replace_remote_featured_tags(
+    txn: &DatabaseTransaction,
+    actor_id: AccountId,
+    tags: &[RemoteFeaturedTagInput],
+) -> Result<()> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("remote-featured:{}", actor_id.0).into()],
+    ))
+    .await?;
+    remote_featured_tag::Entity::delete_many()
+        .filter(remote_featured_tag::Column::RemoteActorId.eq(actor_id.0))
+        .exec(txn)
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    for (position, input) in tags.iter().enumerate() {
+        let tag = find_or_create_local_tag(txn, &input.name, now).await?;
+        remote_featured_tag::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            remote_actor_id: Set(actor_id.0),
+            tag_id: Set(tag.id),
+            display_name: Set(input.display_name.clone()),
+            href: Set(input.href.clone()),
+            position: Set(position as i32),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Apply one signed featured hashtag Add or Remove under the refresh reconciliation lock.
+pub async fn apply_remote_featured_tag_activity(
+    txn: &DatabaseTransaction,
+    actor_id: AccountId,
+    input: &RemoteFeaturedTagInput,
+    feature: bool,
+    limit: u64,
+) -> Result<()> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("remote-featured:{}", actor_id.0).into()],
+    ))
+    .await?;
+    let now = OffsetDateTime::now_utc();
+    let tag = find_or_create_local_tag(txn, &input.name, now).await?;
+    if feature {
+        if let Some(existing) = remote_featured_tag::Entity::find()
+            .filter(remote_featured_tag::Column::RemoteActorId.eq(actor_id.0))
+            .filter(remote_featured_tag::Column::TagId.eq(tag.id))
+            .one(txn)
+            .await?
+        {
+            let mut active = existing.into_active_model();
+            active.display_name = Set(input.display_name.clone());
+            active.href = Set(input.href.clone());
+            active.updated_at = Set(now);
+            active.update(txn).await?;
+        } else {
+            remote_featured_tag::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                remote_actor_id: Set(actor_id.0),
+                tag_id: Set(tag.id),
+                display_name: Set(input.display_name.clone()),
+                href: Set(input.href.clone()),
+                position: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(txn)
+            .await?;
+        }
+        let rows = remote_featured_tag::Entity::find()
+            .filter(remote_featured_tag::Column::RemoteActorId.eq(actor_id.0))
+            .order_by_desc(remote_featured_tag::Column::UpdatedAt)
+            .order_by_desc(remote_featured_tag::Column::Id)
+            .all(txn)
+            .await?;
+        for row in rows.into_iter().skip(limit as usize) {
+            remote_featured_tag::Entity::delete_by_id(row.id)
+                .exec(txn)
+                .await?;
+        }
+    } else {
+        remote_featured_tag::Entity::delete_many()
+            .filter(remote_featured_tag::Column::RemoteActorId.eq(actor_id.0))
+            .filter(remote_featured_tag::Column::TagId.eq(tag.id))
+            .exec(txn)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn local_status_snapshot(
     txn: &DatabaseTransaction,
     status: &local_status::Model,
@@ -7130,12 +7454,19 @@ pub async fn pinned_local_statuses_by_account(
     let (pins, has_more) = trim_to_page(pins, limit);
     let first_cursor = pins.first().map(|pin| pin.id);
     let last_cursor = pins.last().map(|pin| pin.id);
-    let mut items = Vec::with_capacity(pins.len());
-    for pin in pins {
-        if let Some(status) = find_local_status_by_id(db, StatusId(pin.status_id)).await? {
-            items.push(status);
-        }
-    }
+    let status_ids = pins.iter().map(|pin| pin.status_id).collect::<Vec<_>>();
+    let statuses = local_status::Entity::find()
+        .filter(local_status::Column::Id.is_in(status_ids))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|status| local_status_from_model(status).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let items = pins
+        .into_iter()
+        .filter_map(|pin| statuses.get(&pin.status_id).cloned())
+        .collect();
     Ok(TimelinePage {
         items,
         first_cursor,
@@ -7171,12 +7502,22 @@ pub async fn pinned_remote_statuses_by_account(
     let (pins, has_more) = trim_to_page(pins, limit);
     let first_cursor = pins.first().map(|pin| pin.id);
     let last_cursor = pins.last().map(|pin| pin.id);
-    let mut items = Vec::with_capacity(pins.len());
-    for pin in pins {
-        if let Some(status) = find_remote_status_by_id(db, StatusId(pin.remote_status_id)).await? {
-            items.push(status);
-        }
-    }
+    let status_ids = pins
+        .iter()
+        .map(|pin| pin.remote_status_id)
+        .collect::<Vec<_>>();
+    let statuses = remote_status::Entity::find()
+        .filter(remote_status::Column::Id.is_in(status_ids))
+        .filter(remote_status::Column::DeletedAt.is_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|status| remote_status_from_model(status).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let items = pins
+        .into_iter()
+        .filter_map(|pin| statuses.get(&pin.remote_status_id).cloned())
+        .collect();
     Ok(TimelinePage {
         items,
         first_cursor,
@@ -10762,6 +11103,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         shared_inbox_url: actor.shared_inbox_url,
         followers_url: actor.followers_url,
         featured_url: actor.featured_url,
+        featured_tags_url: actor.featured_tags_url,
         public_key_id: actor.public_key_id,
         public_key_pem: actor.public_key_pem,
         expires_at: actor.expires_at,
@@ -11341,6 +11683,26 @@ mod tests {
             JobKind::FederationFollowDelivery.as_str(),
             "federation_follow_delivery"
         );
+        assert_eq!(
+            JobKind::FederationFeaturedTagsRefresh.as_str(),
+            "federation_featured_tags_refresh"
+        );
+    }
+
+    /// Featured hashtag input is normalized while malformed and numeric-only names are rejected.
+    #[test]
+    fn validates_featured_hashtag_names() {
+        assert_eq!(
+            normalize_featured_tag_name(" #Rust_2026 ").as_deref(),
+            Some("rust_2026")
+        );
+        assert_eq!(
+            normalize_featured_tag_name("日本語").as_deref(),
+            Some("日本語")
+        );
+        assert!(normalize_featured_tag_name("1234").is_none());
+        assert!(normalize_featured_tag_name("two words").is_none());
+        assert!(normalize_featured_tag_name("#").is_none());
     }
 
     /// Streaming edit events retain their database spelling independently of the wire name.

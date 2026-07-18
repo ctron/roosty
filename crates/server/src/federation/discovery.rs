@@ -66,6 +66,8 @@ struct RemoteActorDocument {
     #[serde(default)]
     featured: Option<String>,
     #[serde(default)]
+    featured_tags: Option<String>,
+    #[serde(default)]
     endpoints: RemoteEndpoints,
     public_key: RemotePublicKey,
 }
@@ -148,6 +150,8 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
+    let featured_tags_url =
+        validated_featured_url(&document.id, document.featured_tags.as_deref())?;
     let actor = RemoteActor {
         id: AccountId(Uuid::now_v7()),
         activitypub_id: document.id,
@@ -160,6 +164,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         shared_inbox_url: document.endpoints.shared_inbox,
         followers_url,
         featured_url,
+        featured_tags_url,
         public_key_id: document.public_key.id,
         public_key_pem: document.public_key.public_key_pem,
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -340,6 +345,8 @@ async fn fetch_remote_actor_by_id(
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
+    let featured_tags_url =
+        validated_featured_url(&document.id, document.featured_tags.as_deref())?;
     let inbox =
         Url::parse(&document.inbox).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
     if inbox.scheme() != "https"
@@ -362,6 +369,7 @@ async fn fetch_remote_actor_by_id(
             shared_inbox_url: document.endpoints.shared_inbox,
             followers_url,
             featured_url,
+            featured_tags_url,
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -409,6 +417,8 @@ pub async fn resolve_remote_move_target(
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
+    let featured_tags_url =
+        validated_featured_url(&document.id, document.featured_tags.as_deref())?;
     store_remote_actor(
         state,
         RemoteActor {
@@ -423,6 +433,7 @@ pub async fn resolve_remote_move_target(
             shared_inbox_url: document.endpoints.shared_inbox,
             followers_url,
             featured_url,
+            featured_tags_url,
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -516,6 +527,20 @@ async fn store_remote_actor_on(
         .await?;
     } else {
         roosty_db::replace_remote_status_pins(txn, actor.id, &[]).await?;
+    }
+    if actor.featured_tags_url.is_some() {
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationFeaturedTagsRefresh,
+                payload: serde_json::json!({ "remote_actor_id": actor.id.0 }),
+                deduplication_key: Some(actor.id.0.to_string()),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    } else {
+        roosty_db::replace_remote_featured_tags(txn, actor.id, &[]).await?;
     }
     Ok(actor)
 }

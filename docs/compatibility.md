@@ -131,6 +131,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/tags/:name` | Public lookup for observed local/cached-remote hashtags with mixed history and authenticated `following` state; featured tag state is missing. |
 | 🟡 | `GET /api/v1/followed_tags` | Lists locally followed hashtags for the authenticated account. |
+| 🟢 | Featured hashtags | Authenticated list/create/delete and suggestion APIs, public per-account lookup, a fixed ten-tag limit, and batched visible-status statistics are implemented for local and cached-remote accounts. |
 | 🟢 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local or cached-remote posts enter the home timeline and user stream. Remote matching is limited to Notes received through normal federation delivery. |
 | 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
 | 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
@@ -155,13 +156,14 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, and follower/following collection metadata are available. |
+| 🟡 | Local ActivityPub identity | Opt-in WebFinger, actor documents with encrypted-at-rest RSA keys, public Note objects, outboxes, follower/following collection metadata, pinned Notes, and featured hashtag collections are available. |
 | 🟢 | Remote discovery and profile projections | Lookup and account search perform policy-controlled WebFinger discovery, validate/cache HTTPS actor documents, refresh expired actors, and return navigable UUID-backed remote account projections with proxied actor avatar/header images. |
 | 🟡 | Outbound status lifecycle | Public, unlisted, and follower-only local status creates, edits, replies, and deletes are queued as signed ActivityPub deliveries to accepted remote followers and explicit remote mentions. Note content uses the same linked HTML projection exposed through Mastodon APIs. |
 | 🟡 | Inbound status lifecycle | Signed public/unlisted/follower-only `Create`, complete-object `Update`, and `Delete` activities are cached with canonical object IDs, exact addressed audiences, reply references, author ownership checks, and transactional material-change revision history. Mention tags do not grant delivery without matching `to`/`cc` addressing. Replay markers and state changes commit atomically; replayed, stale, and no-op updates do not create revisions or events. Signed status and actor Deletes retain tombstones/audit objects while atomically removing stale notifications, favourites, boosts, typed reply links, follow state, delivery jobs, timelines, and conversation projections; captured stream repairs publish after commit. |
 | 🟡 | Follow graph federation | Signed inbound/outbound follows, undo, accept, and reject are persisted and delivered through retrying jobs. Automatic and manually approved/rejected inbound follows create their response jobs atomically; Follow and Undo support both common link and embedded-object forms. Mastodon and paged public ActivityPub follower/following collections include accepted local and remote relationships. Remote collection fetching remains unavailable. |
 | 🟢 | Remote timeline fan-out | Cached remote posts are pushed to authorized home streams; follower-only access follows current accepted relationships and explicit audiences, with no polling or backfill. |
 | 🟡 | Remote replies, mentions, favourites, and boosts | Public/unlisted replies and resolved mentions are delivered with `inReplyTo` and typed Mention tags, cached inbound, and generate idempotent local mention/reply notifications. Signed `Like`/`Undo` and `Announce`/`Undo` are delivered and processed subject to bilateral block and notification-mute policy. Cached public Note hashtags are transactionally indexed for mixed timelines and followed-tag fan-out. |
+| 🟢 | Featured content federation | Actor `featured` Notes and `featuredTags` hashtags are discovered through validated same-origin collections, refreshed by bounded durable jobs, cached atomically, and synchronized through signed replay-safe `Add`/`Remove` activities. |
 | 🟡 | Remote conversations and moderation | Signed remote direct Notes, mixed participant projection, direct replies, personal-inbox delivery, remote media fetching, per-account moderation, and domain suspension work. Account migration remains missing. |
 
 ## TODO

@@ -17,6 +17,7 @@ pub struct Model {
     pub shared_inbox_url: Option<String>,
     pub followers_url: Option<String>,
     pub featured_url: Option<String>,
+    pub featured_tags_url: Option<String>,
     pub public_key_id: String,
     pub public_key_pem: String,
     pub fetched_at: OffsetDateTime,
