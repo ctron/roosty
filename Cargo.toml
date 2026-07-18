@@ -25,6 +25,8 @@ axum = { version = "0.8.4", features = ["macros", "ws"] }
 axum-params = "0.4.1"
 base64 = "0.22.1"
 blurhash = "0.2.3"
+build-info = "0.0.45"
+build-info-build = "0.0.45"
 bytesize = "2.4.2"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 hmac = "0.12.1"

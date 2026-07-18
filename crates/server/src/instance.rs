@@ -208,13 +208,9 @@ fn registrations_approval_required(config: &Config) -> bool {
     config.registration_mode == "approval"
 }
 
-/// Build a Mastodon-compatible version string that still identifies Roosty.
-fn roosty_version() -> String {
-    format!(
-        "{} (compatible; Roosty {})",
-        "4.3.0",
-        env!("CARGO_PKG_VERSION")
-    )
+/// Return the Roosty release version without build-specific metadata.
+fn roosty_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 /// Extract the instance domain from the configured public base URL.
@@ -281,6 +277,7 @@ mod tests {
 
         assert_eq!(body["domain"], "roosty.localhost");
         assert_eq!(body["title"], "Roosty Test");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["description"], "Endpoint test instance");
         assert_eq!(body["registrations"]["enabled"], false);
         assert_eq!(body["registrations"]["approval_required"], false);
@@ -302,6 +299,7 @@ mod tests {
 
         assert_eq!(body["uri"], "roosty.localhost");
         assert_eq!(body["short_description"], "Endpoint test instance");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["registrations"], true);
         assert_eq!(body["approval_required"], true);
         assert_eq!(body["stats"]["user_count"], 0);

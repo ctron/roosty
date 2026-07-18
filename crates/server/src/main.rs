@@ -28,6 +28,7 @@ mod statuses;
 mod streaming;
 #[cfg(test)]
 mod test_postgres;
+mod version;
 
 use crate::{
     config::{Config, database_url_from_env},

@@ -61,6 +61,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::notifications::router())
         .merge(crate::search::router())
         .merge(crate::statuses::router())
+        .merge(crate::version::router())
         .fallback(public_fallback)
         .layer(request_trace_layer())
         .layer(public_cors_layer());

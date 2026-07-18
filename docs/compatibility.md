@@ -44,7 +44,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `/api/v1/instance`, `/api/v2/instance` | Enough metadata for Elk startup; counts and capabilities are minimal. |
+| 🟡 | `/api/v1/instance`, `/api/v2/instance` | Enough metadata for Elk startup; `version` reports the Roosty release version, while counts and capabilities are minimal. |
+| ✅ | `/api/v1/version` | Roosty extension exposing package and build-time Git identity. |
 
 ### OAuth
 
