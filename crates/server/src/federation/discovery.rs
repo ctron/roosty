@@ -64,6 +64,8 @@ struct RemoteActorDocument {
     #[serde(default)]
     followers: Option<String>,
     #[serde(default)]
+    featured: Option<String>,
+    #[serde(default)]
     endpoints: RemoteEndpoints,
     public_key: RemotePublicKey,
 }
@@ -145,6 +147,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
     validate_actor_document(&document, &actor_url, username)?;
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
+    let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
     let actor = RemoteActor {
         id: AccountId(Uuid::now_v7()),
         activitypub_id: document.id,
@@ -156,6 +159,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         inbox_url: document.inbox,
         shared_inbox_url: document.endpoints.shared_inbox,
         followers_url,
+        featured_url,
         public_key_id: document.public_key.id,
         public_key_pem: document.public_key.public_key_pem,
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -335,6 +339,7 @@ async fn fetch_remote_actor_by_id(
     }
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
+    let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
     let inbox =
         Url::parse(&document.inbox).map_err(|_| invalid("remote actor inbox URL is invalid"))?;
     if inbox.scheme() != "https"
@@ -356,6 +361,7 @@ async fn fetch_remote_actor_by_id(
             inbox_url: document.inbox,
             shared_inbox_url: document.endpoints.shared_inbox,
             followers_url,
+            featured_url,
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -402,6 +408,7 @@ pub async fn resolve_remote_move_target(
     }
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
+    let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
     store_remote_actor(
         state,
         RemoteActor {
@@ -415,6 +422,7 @@ pub async fn resolve_remote_move_target(
             inbox_url: document.inbox,
             shared_inbox_url: document.endpoints.shared_inbox,
             followers_url,
+            featured_url,
             public_key_id: document.public_key.id,
             public_key_pem: document.public_key.public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
@@ -495,6 +503,20 @@ async fn store_remote_actor_on(
         },
     )
     .await?;
+    if actor.featured_url.is_some() {
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationFeaturedRefresh,
+                payload: serde_json::json!({ "remote_actor_id": actor.id.0 }),
+                deduplication_key: Some(actor.id.0.to_string()),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    } else {
+        roosty_db::replace_remote_status_pins(txn, actor.id, &[]).await?;
+    }
     Ok(actor)
 }
 
@@ -524,6 +546,26 @@ fn validated_followers_url(actor_id: &str, followers: Option<&str>) -> Result<Op
         ));
     }
     Ok(Some(followers.into()))
+}
+
+/// Validate a featured collection as an unauthenticated same-origin HTTPS URL.
+fn validated_featured_url(actor_id: &str, featured: Option<&str>) -> Result<Option<String>> {
+    let Some(featured) = featured else {
+        return Ok(None);
+    };
+    let actor = Url::parse(actor_id).map_err(|_| invalid("remote actor ID is invalid"))?;
+    let featured =
+        Url::parse(featured).map_err(|_| invalid("remote actor featured URL is invalid"))?;
+    if featured.scheme() != "https"
+        || !featured.username().is_empty()
+        || featured.password().is_some()
+        || featured.origin() != actor.origin()
+    {
+        return Err(invalid(
+            "remote actor featured URL is outside its actor origin",
+        ));
+    }
+    Ok(Some(featured.into()))
 }
 
 /// Fetch a JSON document with policy revalidation before every request.
@@ -730,7 +772,7 @@ mod tests {
     use super::{
         RemoteActorDocument, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
         parse_remote_handle, remote_profile_created_at, validate_actor_document,
-        validated_followers_url,
+        validated_featured_url, validated_followers_url,
     };
 
     #[test]
@@ -939,5 +981,26 @@ mod tests {
             validated_followers_url(actor, Some("https://attacker.example/followers")).is_err()
         );
         assert!(validated_followers_url(actor, Some("http://social.example/followers")).is_err());
+    }
+
+    /// Featured collection URLs must be credential-free HTTPS URLs at the actor origin.
+    #[test]
+    fn validates_declared_featured_collection() {
+        let actor = "https://social.example/users/alice";
+        assert_eq!(validated_featured_url(actor, None).unwrap(), None);
+        assert_eq!(
+            validated_featured_url(
+                actor,
+                Some("https://social.example/users/alice/collections/featured")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://social.example/users/alice/collections/featured")
+        );
+        assert!(validated_featured_url(actor, Some("https://attacker.example/featured")).is_err());
+        assert!(
+            validated_featured_url(actor, Some("https://alice:secret@social.example/featured"))
+                .is_err()
+        );
     }
 }

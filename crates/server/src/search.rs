@@ -633,6 +633,7 @@ mod tests {
                 inbox_url: format!("https://{domain}/users/{username}/inbox"),
                 shared_inbox_url: None,
                 followers_url: None,
+                featured_url: None,
                 public_key_id: format!("https://{domain}/users/{username}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),

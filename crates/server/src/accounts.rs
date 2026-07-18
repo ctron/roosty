@@ -412,10 +412,6 @@ async fn account_statuses(
     Query(params): Query<AccountStatusesParams>,
 ) -> Response {
     let account_id = AccountId(path.account_id);
-    if params.pinned.unwrap_or(false) {
-        return Json(Vec::<serde_json::Value>::new()).into_response();
-    }
-
     let cursor = match timeline_cursor(&params) {
         Ok(cursor) => cursor,
         Err(()) => return bad_request("status id is invalid"),
@@ -433,6 +429,25 @@ async fn account_statuses(
                     && !state.config.federation_domain_is_blocked(&actor.domain) => {}
             Ok(_) => return not_found(),
             Err(error) => return server_error(error),
+        }
+        if params.pinned.unwrap_or(false) {
+            return match roosty_db::pinned_remote_statuses_by_account(
+                &state.db, account_id, limit, cursor,
+            )
+            .await
+            {
+                Ok(page) => {
+                    crate::statuses::remote_timeline_response(
+                        &state,
+                        page,
+                        limit,
+                        &format!("/api/v1/accounts/{}/statuses?pinned=true", account_id.0),
+                        viewer.as_ref().map(|account| account.id),
+                    )
+                    .await
+                }
+                Err(error) => server_error(error),
+            };
         }
         return match roosty_db::remote_statuses_by_account(
             &state.db,
@@ -454,6 +469,26 @@ async fn account_statuses(
                     page,
                     limit,
                     &format!("/api/v1/accounts/{}/statuses", account_id.0),
+                    viewer.as_ref().map(|account| account.id),
+                )
+                .await
+            }
+            Err(error) => server_error(error),
+        };
+    }
+
+    if params.pinned.unwrap_or(false) {
+        return match roosty_db::pinned_local_statuses_by_account(
+            &state.db, account_id, limit, cursor,
+        )
+        .await
+        {
+            Ok(page) => {
+                crate::statuses::timeline_response(
+                    &state,
+                    page,
+                    limit,
+                    &format!("/api/v1/accounts/{}/statuses?pinned=true", account_id.0),
                     viewer.as_ref().map(|account| account.id),
                 )
                 .await
@@ -1363,6 +1398,7 @@ mod tests {
             inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
             shared_inbox_url: None,
             followers_url: None,
+            featured_url: None,
             public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
             public_key_pem: "test-public-key".to_owned(),
             expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
@@ -1414,6 +1450,7 @@ mod tests {
             inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
             shared_inbox_url: None,
             followers_url: None,
+            featured_url: None,
             public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
             public_key_pem: "test-public-key".to_owned(),
             expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
@@ -2363,6 +2400,7 @@ mod tests {
                 inbox_url: format!("https://remote.test/users/{username}/inbox"),
                 shared_inbox_url: None,
                 followers_url: None,
+                featured_url: None,
                 public_key_id: format!("https://remote.test/users/{username}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),

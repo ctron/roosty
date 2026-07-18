@@ -29,6 +29,7 @@ Keep this as the default verification command for changes in this repository.
 - Use SeaORM migrations as the canonical migration system from the start.
 - Prefer SeaORM entities and query builders for database reads and writes. Use raw SQL only when it is materially clearer
   or required for a database-specific operation such as row locking, partial-index conflict inference, or a complex CTE.
+- Avoid SELECT N+1 query patterns; batch related reads or use joins/preloading where appropriate.
 - Prefer idiomatic, strongly typed Rust: model domain concepts with dedicated types, structs, and enums instead of
   stringly typed values or dynamically shaped data.
 - Model closed `kind`, `type`, `state`, and similar discriminator fields as Rust enums. Convert them to strings only at

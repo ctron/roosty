@@ -11,6 +11,7 @@
 - Mastodon-compatible safe linkification of explicit web URLs across local API, history, streaming, and outbound ActivityPub projections.
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
 - Mastodon-compatible consent-aware quote posts with transactional policy, authorization, listing, revocation, notifications, and FEP-044f delivery.
+- Mastodon-compatible public/unlisted status pins with a five-pin transactional limit, pinned account collections, ActivityPub featured collections, durable Add/Remove delivery, and bounded remote featured caching.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
@@ -53,8 +54,8 @@
 - [ ] Replace stringly persisted status visibility with the typed `StatusVisibility` model at persistence and wire boundaries.
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
 - [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
-- [ ] Fetch and expose remote featured/profile tags.
-- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured collections/tags, and account migration metadata.
+- [ ] Fetch and expose remote featured profile tags.
+- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured tags, and account migration metadata.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
 
@@ -95,7 +96,7 @@
 - [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [x] Add cursor pagination for local and cached-remote account status collections.
 - [x] Add cached-remote hashtag discovery, timelines, history, and followed-tag fan-out.
-- [ ] Add remote featured/profile tags.
+- [ ] Add remote featured profile tags.
 - [ ] Extend media support with video/audio validation, async processing, and object storage.
 - [ ] Keep compatibility documentation updated with every implemented or intentionally deferred API.
 - [ ] Replace manually formatted Prometheus metrics and global atomic counters with standardized instrumentation and an exporter; evaluate OpenTelemetry for correlated metrics and traces.

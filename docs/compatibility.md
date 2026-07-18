@@ -16,9 +16,10 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors, public profile URLs, service types, discovery preferences, profile creation timestamps/fields, public keys, and configured avatar/header image URLs. |
+| 🟢 | Actor document | Opt-in `GET /users/:username` exposes local actors, public profile URLs, service types, discovery preferences, profile creation timestamps/fields, public keys, configured avatar/header image URLs, and the actor's `featured` collection. |
 | 🟡 | Outbox | `GET /users/:username/outbox` exposes local public activities. |
-| 🟢 | Status object pages | Public local Notes are available at `/users/:username/statuses/:id`. |
+| 🟢 | Status object pages | Public local Notes and explicitly pinned unlisted Notes are available at `/users/:username/statuses/:id`. |
+| 🟢 | Featured posts | `/users/:username/collections/featured` embeds up to five pinned public/unlisted Notes newest-pin-first. Remote same-origin featured collections are refreshed durably through at most four pages and cached to 20 Notes; signed replay-safe `Add`/`Remove` updates use the same per-actor reconciliation lock. |
 | 🟢 | Actor keys | RSA signing keys are encrypted at rest and the public key is published in actor documents. |
 
 ### Inbox and Delivery
@@ -27,7 +28,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟢 | Inbox integrity | Every supported durable signed activity requires an absolute HTTPS ID at the verified actor origin. Canonical-JSON SHA-256 replay records make exact deliveries idempotent and ignore reused IDs with a different signer or payload. Transient ID-less activities are intentionally unsupported. |
 | 🟡 | Signed HTTP requests | Legacy Mastodon-compatible HTTP signatures with `Digest` are verified and emitted; RFC 9421 is not implemented. |
-| 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted/follower-only local status lifecycle activities, and local actor profile `Update` activities, with retry until the configured maximum age. Follower-only activities also reach explicitly mentioned remote actors. |
+| 🟡 | Outbound delivery | Durable jobs deliver follow responses, public/unlisted/follower-only local status lifecycle activities, pin `Add`/`Remove` activities, and local actor profile `Update` activities, with retry until the configured maximum age. Follower-only activities also reach explicitly mentioned remote actors. |
 | 🟡 | Remote fetch/cache | Policy-controlled remote actor discovery and signed public/unlisted/follower-only Note caching are available; follower-only acceptance uses the actor's validated exact `followers` URL and requires a current local follower or explicit local mention. Profile creation dates use actor `published` when supplied and fall back to first-seen time. Discovered remote avatar/header URLs are cached through a same-origin proxy, eagerly for followed accounts and lazily on request for other actors. Profile images must be supported, decodable raster images and refresh stale-while-serving. Remote status images are validated, cached with PNG previews and Mastodon metadata, and refreshed stale-while-serving; video/audio remain proxy-only. Signed Actor `Update`, `Delete`, and reciprocal `Move` activities refresh, tombstone, or redirect cached profiles; moves do not migrate follows. Missing private deliveries are never fetched or backfilled. |
 
 ### Moderation and Safety
@@ -69,7 +70,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, remote status metadata reflects active locally cached posts, and remote avatar/header fields use locally cached proxy URLs when advertised. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local and active cached-remote account lookup. |
-| 🟡 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns statuses authorized for the viewer, including cached follower-only posts for current followers and explicit mentions, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state; pinned statuses are missing. |
+| 🟢 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns statuses authorized for the viewer, including local or cached-remote `pinned=true` results, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state. |
 | 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented. Local and remote follows honor `reblogs` and `notify`; remote graph fetching and language filters remain missing. |
 | 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
 | 🟢 | Mutes and blocks | Local and remote mute/unmute and block/unblock, relationship state, mute duration/expiry, and mixed cursor-paginated collections work. Remote mutes remain local-only; blocks federate. |
@@ -92,6 +93,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/statuses/:id/context` | Visible local and cached-remote ancestors and descendants, with Mastodon-compatible anonymous and authenticated traversal limits. Remote context is cache-only and does not fetch or backfill missing posts. |
 | 🟡 | `PUT /api/v1/statuses/:id` | Owner-only local text, sensitivity, spoiler, language, media IDs, and media alt/focus edits with transactional history; polls are missing. No-op edits produce no revision, delivery, or streaming event. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
+| 🟢 | Status pins | Authenticated idempotent `POST /api/v1/statuses/:id/pin` and `/unpin` support owned public/unlisted posts, enforce five pins transactionally across processes, expose `Status.pinned`, and advertise the limit in instance configuration. |
 | 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
 | 🟡 | Mentions | Local and resolved remote mentions render as links and populate `mentions`. Local recipients are tracked independently from notifications; active addressed mentions receive idempotent notifications and subsequent edit/delete streaming. |
 | 🟢 | Hashtags | Local `#tag` text and valid Hashtag tags from cached remote Notes share a normalized namespace. Status projections use local canonical tag URLs; mixed search, seven-day history, origin-filtered tag timelines, and followed-tag home/user-stream fan-out are available. Remote delivery remains cache-only and push-driven. |

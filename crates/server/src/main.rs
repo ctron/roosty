@@ -429,6 +429,9 @@ async fn worker_iteration(
         "federation_remote_media_fetch" => {
             media::fetch_remote_media(&state, job.payload.clone()).await
         }
+        "federation_featured_refresh" => {
+            federation::refresh_remote_featured(&state, job.payload.clone()).await
+        }
         _ => Ok(()),
     };
     match result {

@@ -43,6 +43,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_remote_account_mute").await);
     assert!(table_exists(database.connection(), "streaming_event").await);
     assert!(table_exists(database.connection(), "status_quote").await);
+    assert!(table_exists(database.connection(), "local_status_pin").await);
+    assert!(table_exists(database.connection(), "remote_status_pin").await);
     assert!(table_exists(database.connection(), "local_status_local_mention").await);
     assert!(table_exists(database.connection(), "remote_status_local_mention").await);
     assert!(table_exists(database.connection(), "local_status_edit").await);
@@ -181,6 +183,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_account_mute", "expires_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "profile_created_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "followers_url").await);
+    assert!(column_exists(database.connection(), "remote_actor", "featured_url").await);
     assert!(
         column_exists(
             database.connection(),
@@ -285,7 +288,7 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
 
     // Roll back remote tags, status history, streaming metadata, edit delivery, subscription
     // extensions, streaming-kind extension, remote moderation, the streaming log, and the URL.
-    Migrator::down(database.connection(), Some(11))
+    Migrator::down(database.connection(), Some(12))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -467,7 +470,7 @@ async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut Embedded
         .unwrap();
     assert_eq!(row.try_get::<i64>("", "count").unwrap(), 2);
 
-    Migrator::down(database.connection(), Some(2))
+    Migrator::down(database.connection(), Some(3))
         .await
         .unwrap();
     assert!(!table_exists(database.connection(), "remote_status_tag").await);

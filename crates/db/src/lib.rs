@@ -15,8 +15,8 @@ use sea_orm::{
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use std::cmp::Reverse;
 use std::str::FromStr;
+use std::{cmp::Reverse, collections::HashSet};
 use strum::{Display, EnumString, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -97,14 +97,14 @@ use entity::{
     local_remote_account_mute, local_remote_status_favourite, local_remote_status_reblog,
     local_status, local_status_bookmark, local_status_edit, local_status_edit_media,
     local_status_favourite, local_status_local_mention, local_status_local_recipient,
-    local_status_reblog, local_status_remote_mention, local_status_tag, local_tag,
-    local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
+    local_status_pin, local_status_reblog, local_status_remote_mention, local_status_tag,
+    local_tag, local_tag_follow, local_timeline_marker, oauth_access_token, oauth_application,
     oauth_authorization_code, processed_inbox_activity, remote_actor, remote_custom_emoji,
     remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
     remote_profile_media, remote_status, remote_status_edit, remote_status_edit_media,
     remote_status_favourite, remote_status_local_mention, remote_status_local_recipient,
-    remote_status_reblog, remote_status_remote_recipient, remote_status_tag, status_quote,
-    streaming_event,
+    remote_status_pin, remote_status_reblog, remote_status_remote_recipient, remote_status_tag,
+    status_quote, streaming_event,
 };
 
 /// Quote policy values authored by Mastodon-compatible clients.
@@ -674,6 +674,8 @@ pub struct RemoteActor {
     pub shared_inbox_url: Option<String>,
     /// Exact followers collection URL validated from the actor document.
     pub followers_url: Option<String>,
+    /// Exact same-origin featured collection URL declared by the actor.
+    pub featured_url: Option<String>,
     /// Public key identity URL.
     pub public_key_id: String,
     /// Public signing key PEM.
@@ -2067,6 +2069,10 @@ async fn repair_one_remote_status_delete(
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(txn).await?;
+    remote_status_pin::Entity::delete_many()
+        .filter(remote_status_pin::Column::RemoteStatusId.eq(status_id.0))
+        .exec(txn)
+        .await?;
     local_notification::Entity::delete_many()
         .filter(local_notification::Column::RemoteStatusId.eq(status_id.0))
         .exec(txn)
@@ -2217,6 +2223,7 @@ async fn upsert_remote_actor_with_identity(
         active.inbox_url = Set(actor.inbox_url.clone());
         active.shared_inbox_url = Set(actor.shared_inbox_url.clone());
         active.followers_url = Set(actor.followers_url.clone());
+        active.featured_url = Set(actor.featured_url.clone());
         active.public_key_id = Set(actor.public_key_id.clone());
         active.public_key_pem = Set(actor.public_key_pem.clone());
         active.fetched_at = Set(now);
@@ -2238,6 +2245,7 @@ async fn upsert_remote_actor_with_identity(
             inbox_url: Set(actor.inbox_url.clone()),
             shared_inbox_url: Set(actor.shared_inbox_url.clone()),
             followers_url: Set(actor.followers_url.clone()),
+            featured_url: Set(actor.featured_url.clone()),
             public_key_id: Set(actor.public_key_id.clone()),
             public_key_pem: Set(actor.public_key_pem.clone()),
             fetched_at: Set(now),
@@ -2760,6 +2768,27 @@ pub struct TimelinePage<T> {
     pub has_more: bool,
 }
 
+/// Result of an idempotent local status pin attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinStatusResult {
+    /// A new pin was stored.
+    Pinned,
+    /// The status was already pinned by its author.
+    AlreadyPinned,
+    /// An existing pin was removed.
+    Unpinned,
+    /// The owned status was not pinned.
+    AlreadyUnpinned,
+    /// No active local status has this identifier.
+    NotFound,
+    /// The authenticated account does not own the status.
+    NotOwned,
+    /// Only public and unlisted statuses can currently be pinned.
+    UnsupportedVisibility,
+    /// The account already has the configured maximum number of pins.
+    LimitReached,
+}
+
 /// Filters supported by Mastodon account status timeline requests.
 #[derive(Clone, Debug, Default)]
 pub struct AccountStatusTimelineOptions {
@@ -3017,6 +3046,8 @@ pub enum JobKind {
     FederationModerationDelivery,
     /// Safely fetch one remote media attachment into the local cache.
     FederationRemoteMediaFetch,
+    /// Refresh one remote actor's declared featured collection.
+    FederationFeaturedRefresh,
 }
 
 impl JobKind {
@@ -4022,6 +4053,21 @@ pub async fn accepted_remote_followers(
         }
     }
     Ok(actors)
+}
+
+/// List accepted remote follower identifiers through a caller-owned transaction.
+pub async fn accepted_remote_follower_ids(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<Vec<AccountId>> {
+    Ok(remote_follow::Entity::find()
+        .filter(remote_follow::Column::LocalAccountId.eq(account_id.0))
+        .filter(remote_follow::Column::State.eq("accepted"))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|follow| AccountId(follow.remote_actor_id))
+        .collect())
 }
 
 /// Count local accounts this account follows.
@@ -6905,6 +6951,325 @@ pub async fn find_local_status_by_id(
     status.map(local_status_from_model).transpose()
 }
 
+/// Pin an owned public or unlisted status while enforcing a cross-process account limit.
+pub async fn pin_local_status(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    account_id: AccountId,
+    limit: u64,
+) -> Result<PinStatusResult> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("local-status-pins:{}", account_id.0).into()],
+    ))
+    .await?;
+    let Some(status) = local_status::Entity::find_by_id(status_id.0)
+        .filter(local_status::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    else {
+        return Ok(PinStatusResult::NotFound);
+    };
+    if status.account_id != account_id.0 {
+        return Ok(PinStatusResult::NotOwned);
+    }
+    if !matches!(status.visibility.as_str(), "public" | "unlisted") {
+        return Ok(PinStatusResult::UnsupportedVisibility);
+    }
+    if local_status_pin::Entity::find()
+        .filter(local_status_pin::Column::StatusId.eq(status_id.0))
+        .one(txn)
+        .await?
+        .is_some()
+    {
+        return Ok(PinStatusResult::AlreadyPinned);
+    }
+    if local_status_pin::Entity::find()
+        .filter(local_status_pin::Column::AccountId.eq(account_id.0))
+        .count(txn)
+        .await?
+        >= limit
+    {
+        return Ok(PinStatusResult::LimitReached);
+    }
+    local_status_pin::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        status_id: Set(status_id.0),
+        ..Default::default()
+    }
+    .insert(txn)
+    .await?;
+    Ok(PinStatusResult::Pinned)
+}
+
+/// Remove an owned local status pin, returning whether one existed.
+pub async fn unpin_local_status(
+    txn: &DatabaseTransaction,
+    status_id: StatusId,
+    account_id: AccountId,
+) -> Result<PinStatusResult> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("local-status-pins:{}", account_id.0).into()],
+    ))
+    .await?;
+    let Some(status) = local_status::Entity::find_by_id(status_id.0)
+        .filter(local_status::Column::DeletedAt.is_null())
+        .one(txn)
+        .await?
+    else {
+        return Ok(PinStatusResult::NotFound);
+    };
+    if status.account_id != account_id.0 {
+        return Ok(PinStatusResult::NotOwned);
+    }
+    let result = local_status_pin::Entity::delete_many()
+        .filter(local_status_pin::Column::StatusId.eq(status_id.0))
+        .filter(local_status_pin::Column::AccountId.eq(account_id.0))
+        .exec(txn)
+        .await?;
+    Ok(if result.rows_affected == 0 {
+        PinStatusResult::AlreadyUnpinned
+    } else {
+        PinStatusResult::Unpinned
+    })
+}
+
+/// Return whether one local status is currently pinned by its author.
+pub async fn is_local_status_pinned(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<bool> {
+    Ok(local_status_pin::Entity::find()
+        .filter(local_status_pin::Column::StatusId.eq(status_id.0))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Return whether one cached remote status is in its author's featured collection.
+pub async fn is_remote_status_pinned(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<bool> {
+    Ok(remote_status_pin::Entity::find()
+        .filter(remote_status_pin::Column::RemoteStatusId.eq(status_id.0))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Fetch the pinned subset of a local status batch in one query.
+pub async fn pinned_local_status_ids(
+    db: &impl ConnectionTrait,
+    status_ids: &[StatusId],
+) -> Result<HashSet<StatusId>> {
+    if status_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(local_status_pin::Entity::find()
+        .filter(
+            local_status_pin::Column::StatusId
+                .is_in(status_ids.iter().map(|id| id.0).collect::<Vec<_>>()),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|pin| StatusId(pin.status_id))
+        .collect())
+}
+
+/// Fetch the pinned subset of a cached remote status batch in one query.
+pub async fn pinned_remote_status_ids(
+    db: &impl ConnectionTrait,
+    status_ids: &[StatusId],
+) -> Result<HashSet<StatusId>> {
+    if status_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(remote_status_pin::Entity::find()
+        .filter(
+            remote_status_pin::Column::RemoteStatusId
+                .is_in(status_ids.iter().map(|id| id.0).collect::<Vec<_>>()),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|pin| StatusId(pin.remote_status_id))
+        .collect())
+}
+
+/// List local pins newest-first using pin identities as Mastodon cursors.
+pub async fn pinned_local_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<TimelinePage<LocalStatus>> {
+    let mut query = local_status_pin::Entity::find()
+        .filter(local_status_pin::Column::AccountId.eq(account_id.0));
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(local_status_pin::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(local_status_pin::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(local_status_pin::Column::Id.gt(min_id.0));
+    }
+    let pins = query
+        .order_by_desc(local_status_pin::Column::PinnedAt)
+        .order_by_desc(local_status_pin::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (pins, has_more) = trim_to_page(pins, limit);
+    let first_cursor = pins.first().map(|pin| pin.id);
+    let last_cursor = pins.last().map(|pin| pin.id);
+    let mut items = Vec::with_capacity(pins.len());
+    for pin in pins {
+        if let Some(status) = find_local_status_by_id(db, StatusId(pin.status_id)).await? {
+            items.push(status);
+        }
+    }
+    Ok(TimelinePage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// List cached remote pins newest-first using cache-row identities as cursors.
+pub async fn pinned_remote_statuses_by_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<TimelinePage<RemoteStatus>> {
+    let mut query = remote_status_pin::Entity::find()
+        .filter(remote_status_pin::Column::RemoteActorId.eq(account_id.0));
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(remote_status_pin::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(remote_status_pin::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(remote_status_pin::Column::Id.gt(min_id.0));
+    }
+    let pins = query
+        .order_by_desc(remote_status_pin::Column::PinnedAt)
+        .order_by_desc(remote_status_pin::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (pins, has_more) = trim_to_page(pins, limit);
+    let first_cursor = pins.first().map(|pin| pin.id);
+    let last_cursor = pins.last().map(|pin| pin.id);
+    let mut items = Vec::with_capacity(pins.len());
+    for pin in pins {
+        if let Some(status) = find_remote_status_by_id(db, StatusId(pin.remote_status_id)).await? {
+            items.push(status);
+        }
+    }
+    Ok(TimelinePage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// Atomically replace one actor's featured cache under its cross-process advisory lock.
+pub async fn replace_remote_status_pins(
+    txn: &DatabaseTransaction,
+    actor_id: AccountId,
+    status_ids: &[StatusId],
+) -> Result<()> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("remote-featured:{}", actor_id.0).into()],
+    ))
+    .await?;
+    remote_status_pin::Entity::delete_many()
+        .filter(remote_status_pin::Column::RemoteActorId.eq(actor_id.0))
+        .exec(txn)
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    for (position, status_id) in status_ids.iter().enumerate() {
+        remote_status_pin::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            remote_actor_id: Set(actor_id.0),
+            remote_status_id: Set(status_id.0),
+            pinned_at: Set(now - Duration::microseconds(position as i64)),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Apply one signed featured Add or Remove under the refresh reconciliation lock.
+pub async fn apply_remote_status_pin_activity(
+    txn: &DatabaseTransaction,
+    actor_id: AccountId,
+    status_id: StatusId,
+    pin: bool,
+) -> Result<()> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("remote-featured:{}", actor_id.0).into()],
+    ))
+    .await?;
+    if pin {
+        remote_status_pin::Entity::insert(remote_status_pin::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            remote_actor_id: Set(actor_id.0),
+            remote_status_id: Set(status_id.0),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(remote_status_pin::Column::RemoteStatusId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .do_nothing()
+        .exec(txn)
+        .await?;
+        let pins = remote_status_pin::Entity::find()
+            .filter(remote_status_pin::Column::RemoteActorId.eq(actor_id.0))
+            .order_by_desc(remote_status_pin::Column::PinnedAt)
+            .order_by_desc(remote_status_pin::Column::Id)
+            .all(txn)
+            .await?;
+        let stale = pins
+            .into_iter()
+            .skip(20)
+            .map(|pin| pin.id)
+            .collect::<Vec<_>>();
+        if !stale.is_empty() {
+            remote_status_pin::Entity::delete_many()
+                .filter(remote_status_pin::Column::Id.is_in(stale))
+                .exec(txn)
+                .await?;
+        }
+    } else {
+        remote_status_pin::Entity::delete_many()
+            .filter(remote_status_pin::Column::RemoteActorId.eq(actor_id.0))
+            .filter(remote_status_pin::Column::RemoteStatusId.eq(status_id.0))
+            .exec(txn)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Attach one immutable quote target to a newly-created local status.
 pub async fn create_local_status_quote(
     txn: &DatabaseTransaction,
@@ -9275,8 +9640,12 @@ pub async fn delete_owned_local_status(
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.updated_at = Set(OffsetDateTime::now_utc());
-
-    Ok(Some(local_status_from_model(active.update(db).await?)?))
+    let status = local_status_from_model(active.update(db).await?)?;
+    local_status_pin::Entity::delete_many()
+        .filter(local_status_pin::Column::StatusId.eq(status_id.0))
+        .exec(db)
+        .await?;
+    Ok(Some(status))
 }
 
 /// List local and cached remote statuses for the public timeline.
@@ -10392,6 +10761,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         inbox_url: actor.inbox_url,
         shared_inbox_url: actor.shared_inbox_url,
         followers_url: actor.followers_url,
+        featured_url: actor.featured_url,
         public_key_id: actor.public_key_id,
         public_key_pem: actor.public_key_pem,
         expires_at: actor.expires_at,

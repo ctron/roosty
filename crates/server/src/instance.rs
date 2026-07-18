@@ -170,7 +170,7 @@ fn configuration(config: &Config) -> Value {
         },
         "accounts": {
             "max_featured_tags": 10,
-            "max_pinned_statuses": 0,
+            "max_pinned_statuses": crate::statuses::MAX_PINNED_STATUSES,
         },
         "statuses": {
             "max_characters": 500,
@@ -289,6 +289,7 @@ mod tests {
             body["configuration"]["media_attachments"]["image_matrix_limit"],
             IMAGE_MATRIX_LIMIT
         );
+        assert_eq!(body["configuration"]["accounts"]["max_pinned_statuses"], 5);
     }
 
     #[test]

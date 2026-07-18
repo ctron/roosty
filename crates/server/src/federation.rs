@@ -647,6 +647,13 @@ struct InboundMoveActivity {
     target: InboundActorReference,
 }
 
+#[derive(Deserialize)]
+struct InboundFeaturedActivity {
+    actor: String,
+    object: InboundActivityReference,
+    target: InboundActivityReference,
+}
+
 /// ActivityStreams collection types exposed by local actor endpoints.
 #[derive(Serialize)]
 enum CollectionType {
@@ -662,6 +669,7 @@ pub fn router() -> Router<AppState> {
         .route("/users/{username}/outbox", get(outbox))
         .route("/users/{username}/followers", get(followers))
         .route("/users/{username}/following", get(following))
+        .route("/users/{username}/collections/featured", get(featured))
         .route("/users/{username}/inbox", post(inbox))
         .route("/inbox", post(inbox))
         .route("/users/{username}/statuses/{status_id}", get(note))
@@ -764,6 +772,7 @@ struct Actor {
     outbox: String,
     followers: String,
     following: String,
+    featured: String,
     url: String,
     manually_approves_followers: bool,
     discoverable: bool,
@@ -971,6 +980,17 @@ struct OrderedCollection {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct FeaturedCollection {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: CollectionType,
+    total_items: u64,
+    ordered_items: Vec<Note>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Collection {
     #[serde(rename = "@context")]
     context: &'static str,
@@ -1069,6 +1089,7 @@ fn actor_document(
         outbox: format!("{id}/outbox"),
         followers: format!("{id}/followers"),
         following: format!("{id}/following"),
+        featured: format!("{id}/collections/featured"),
         url: public_url(state, &format!("@{}", account.username)),
         manually_approves_followers: account.locked,
         discoverable: account.discoverable,
@@ -1090,6 +1111,43 @@ fn actor_document(
             public_key_pem,
         },
     }
+}
+
+/// Serve complete pinned Notes in most-recently-pinned order.
+async fn featured(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+    if !state.config.federation_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    };
+    let page = match roosty_db::pinned_local_statuses_by_account(
+        &state.db,
+        account.id,
+        crate::statuses::MAX_PINNED_STATUSES,
+        roosty_db::TimelineCursor::default(),
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => return internal_error(error),
+    };
+    let mut ordered_items = Vec::with_capacity(page.items.len());
+    for status in page.items {
+        match note_object(&state, &username, status).await {
+            Ok(note) => ordered_items.push(note),
+            Err(error) => return internal_error(error),
+        }
+    }
+    activity_response(FeaturedCollection {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: format!("{}/collections/featured", actor_url(&state, &username)),
+        r#type: CollectionType::OrderedCollection,
+        total_items: ordered_items.len() as u64,
+        ordered_items,
+    })
 }
 
 /// Map Roosty's local bot setting to the ActivityPub actor type Mastodon uses for services.
@@ -1178,7 +1236,16 @@ async fn note(
         return StatusCode::NOT_FOUND.into_response();
     };
     match roosty_db::find_local_status_by_id(&state.db, StatusId(id)).await {
-        Ok(Some(status)) if status.visibility == StatusVisibility::Public => {
+        Ok(Some(status)) => {
+            let dereferenceable = status.visibility == StatusVisibility::Public
+                || (status.visibility == StatusVisibility::Unlisted
+                    && match roosty_db::is_local_status_pinned(&state.db, status.id).await {
+                        Ok(pinned) => pinned,
+                        Err(error) => return internal_error(error),
+                    });
+            if !dereferenceable {
+                return StatusCode::NOT_FOUND.into_response();
+            }
             match roosty_db::find_local_account_by_id(&state.db, status.account_id).await {
                 Ok(Some(account)) if account.username == username => {
                     match note_object(&state, &username, status).await {
@@ -1370,6 +1437,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 | "Undo"
                 | "Move"
                 | "Block"
+                | "Add"
+                | "Remove"
                 | "https://w3id.org/fep/044f#QuoteRequest"
         )
     );
@@ -1430,6 +1499,48 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 tracing::warn!(%error, activity_id, "rejected remote actor lifecycle activity");
                 StatusCode::ACCEPTED.into_response()
             }
+        };
+    }
+    if matches!(activity_type, Some("Add" | "Remove")) {
+        let featured: InboundFeaturedActivity = match serde_json::from_value(activity.clone()) {
+            Ok(featured) => featured,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        if featured.actor != remote_actor.activitypub_id
+            || remote_actor.featured_url.as_deref() != Some(featured.target.id())
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let status =
+            match roosty_db::find_remote_status_by_activitypub_id(&state.db, featured.object.id())
+                .await
+            {
+                Ok(Some(status)) if status.remote_actor_id == remote_actor.id => status,
+                Ok(_) => return StatusCode::BAD_REQUEST.into_response(),
+                Err(error) => return internal_error(error),
+            };
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(error) => return internal_error(error),
+        };
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        if is_new
+            && let Err(error) = roosty_db::apply_remote_status_pin_activity(
+                &txn,
+                remote_actor.id,
+                status.id,
+                activity_type == Some("Add"),
+            )
+            .await
+        {
+            return internal_error(error);
+        }
+        return match txn.commit().await {
+            Ok(()) => StatusCode::ACCEPTED.into_response(),
+            Err(error) => internal_error(error),
         };
     }
     if activity_type == Some("Block") {
@@ -3446,6 +3557,202 @@ struct StatusDelivery {
     activity: JsonValue,
     #[serde(default)]
     personal_inbox: bool,
+}
+
+#[derive(Deserialize)]
+struct FeaturedRefreshPayload {
+    remote_actor_id: AccountId,
+}
+
+/// Refresh and atomically reconcile one validated remote featured collection.
+pub(crate) async fn refresh_remote_featured(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: FeaturedRefreshPayload = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid featured refresh payload".to_owned()))?;
+    let actor = roosty_db::find_remote_actor_by_id(&state.db, payload.remote_actor_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote featured actor does not exist".to_owned())
+        })?;
+    let Some(featured_url) = actor.featured_url.as_deref() else {
+        let txn = state.db.begin().await?;
+        roosty_db::replace_remote_status_pins(&txn, actor.id, &[]).await?;
+        txn.commit().await?;
+        return Ok(());
+    };
+    let featured = url::Url::parse(featured_url)
+        .map_err(|_| RoostyError::InvalidInput("remote featured URL is invalid".to_owned()))?;
+    let mut collection_url = Some(featured.clone());
+    let mut followed_pages = 0_usize;
+    let mut item_values = Vec::new();
+    while let Some(url) = collection_url.take() {
+        let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+        let kind = document.get("type").and_then(JsonValue::as_str);
+        if !matches!(kind, Some("OrderedCollection" | "OrderedCollectionPage")) {
+            return Err(RoostyError::InvalidInput(
+                "remote featured document is not an ordered collection".to_owned(),
+            ));
+        }
+        if let Some(items) = document
+            .get("orderedItems")
+            .or_else(|| document.get("items"))
+        {
+            let items = items.as_array().ok_or_else(|| {
+                RoostyError::InvalidInput("remote featured items are invalid".to_owned())
+            })?;
+            item_values.extend(items.iter().cloned());
+        }
+        if item_values.len() >= 20 {
+            item_values.truncate(20);
+            break;
+        }
+        let next = document
+            .get("next")
+            .or_else(|| {
+                (item_values.is_empty())
+                    .then(|| document.get("first"))
+                    .flatten()
+            })
+            .and_then(activitypub_reference);
+        let Some(next) = next else {
+            break;
+        };
+        if followed_pages >= 4 {
+            break;
+        }
+        collection_url = Some(validated_featured_member_url(&featured, next)?);
+        followed_pages += 1;
+    }
+
+    let mut status_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for item in item_values.into_iter().take(20) {
+        let note_value = match item {
+            JsonValue::String(reference) => {
+                let url = validated_featured_member_url(&featured, &reference)?;
+                discovery::fetch_json(state, url, None).await?
+            }
+            JsonValue::Object(_) => item,
+            _ => {
+                return Err(RoostyError::InvalidInput(
+                    "remote featured item is invalid".to_owned(),
+                ));
+            }
+        };
+        let note: InboundNote = serde_json::from_value(note_value.clone())
+            .map_err(|_| RoostyError::InvalidInput("remote featured Note is invalid".to_owned()))?;
+        if !seen.insert(note.id.clone()) {
+            continue;
+        }
+        let revision = note.updated.as_deref().unwrap_or(&note.published);
+        let activity_id = format!("{}#featured-{}", note.id, revision.replace(':', "-"));
+        let activity = serde_json::json!({
+            "id": activity_id,
+            "type": "Create",
+            "actor": actor.activitypub_id.clone(),
+            "object": note_value,
+        });
+        process_remote_status_activity(state, &activity_id, &activity, &actor).await?;
+        let status = roosty_db::find_remote_status_by_activitypub_id(&state.db, &note.id)
+            .await?
+            .ok_or_else(|| {
+                RoostyError::InvalidInput("remote featured Note was not cached".to_owned())
+            })?;
+        if status.remote_actor_id != actor.id
+            || !matches!(
+                status.visibility,
+                StatusVisibility::Public | StatusVisibility::Unlisted
+            )
+        {
+            return Err(RoostyError::InvalidInput(
+                "remote featured Note is not owned and visible".to_owned(),
+            ));
+        }
+        status_ids.push(status.id);
+    }
+    let txn = state.db.begin().await?;
+    roosty_db::replace_remote_status_pins(&txn, actor.id, &status_ids).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+fn activitypub_reference(value: &JsonValue) -> Option<&str> {
+    match value {
+        JsonValue::String(value) => Some(value),
+        JsonValue::Object(value) => value.get("id").and_then(JsonValue::as_str),
+        _ => None,
+    }
+}
+
+fn validated_featured_member_url(
+    featured: &url::Url,
+    member: &str,
+) -> Result<url::Url, RoostyError> {
+    let member = url::Url::parse(member).map_err(|_| {
+        RoostyError::InvalidInput("remote featured member URL is invalid".to_owned())
+    })?;
+    if member.scheme() != "https"
+        || !member.username().is_empty()
+        || member.password().is_some()
+        || member.origin() != featured.origin()
+    {
+        return Err(RoostyError::InvalidInput(
+            "remote featured member URL is outside the actor origin".to_owned(),
+        ));
+    }
+    Ok(member)
+}
+
+/// Atomically queue an Add or Remove for every accepted remote follower.
+pub(crate) async fn enqueue_pin_activity_in_transaction(
+    state: &AppState,
+    txn: &sea_orm::DatabaseTransaction,
+    status: &roosty_db::LocalStatus,
+    pinned: bool,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+    let local = roosty_db::find_local_account_by_id(txn, status.account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local status actor does not exist".to_owned()))?;
+    let actor = actor_url(state, &local.username);
+    let activity_id = format!(
+        "{actor}#{}-pin-{}",
+        if pinned { "add" } else { "remove" },
+        Uuid::now_v7()
+    );
+    let activity = serde_json::json!({
+        "@context": ACTIVITYSTREAMS_CONTEXT,
+        "id": activity_id,
+        "type": if pinned { "Add" } else { "Remove" },
+        "actor": actor,
+        "object": status_url(state, &local.username, status.id),
+        "target": format!("{actor}/collections/featured"),
+        "to": format!("{actor}/followers"),
+    });
+    for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, status.account_id).await? {
+        let payload = serde_json::to_value(StatusDelivery {
+            local_account_id: status.account_id,
+            remote_actor_id,
+            activity: activity.clone(),
+            personal_inbox: false,
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationStatusDelivery,
+                payload,
+                deduplication_key: Some(format!("{activity_id}:{}", remote_actor_id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -5778,6 +6085,7 @@ mod tests {
             outbox: "https://example.test/users/alice/outbox".to_owned(),
             followers: "https://example.test/users/alice/followers".to_owned(),
             following: "https://example.test/users/alice/following".to_owned(),
+            featured: "https://example.test/users/alice/collections/featured".to_owned(),
             url: "https://example.test/@alice".to_owned(),
             manually_approves_followers: false,
             discoverable: true,
@@ -5873,6 +6181,10 @@ mod tests {
         );
         assert_eq!(actor["@context"][2]["value"], "schema:value");
         assert_eq!(actor["url"], "https://example.test/@alice");
+        assert_eq!(
+            actor["featured"],
+            "https://example.test/users/alice/collections/featured"
+        );
         assert!(actor["discoverable"].as_bool().unwrap());
         assert_eq!(actor["published"], "2026-07-13T00:00:00.000Z");
         assert_eq!(actor["attachment"][0]["type"], "PropertyValue");
@@ -6054,6 +6366,7 @@ mod tests {
             inbox_url: format!("https://{domain}/inbox"),
             shared_inbox_url: None,
             followers_url: Some(format!("https://{domain}/users/{username}/followers")),
+            featured_url: None,
             public_key_id: format!("https://{domain}/users/{username}#main-key"),
             public_key_pem,
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -6176,6 +6489,11 @@ mod tests {
             }
             roosty_db::JobKind::FederationRemoteMediaFetch => {
                 crate::media::fetch_remote_media(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationFeaturedRefresh => {
+                super::refresh_remote_featured(state, job.payload.clone())
                     .await
                     .unwrap();
             }

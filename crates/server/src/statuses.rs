@@ -47,6 +47,7 @@ const PUBLIC_CONTEXT_DESCENDANTS_DEPTH: usize = 20;
 const AUTHENTICATED_CONTEXT_LIMIT: usize = 4_096;
 const MAX_STATUS_CHARS: usize = 500;
 const MAX_MEDIA_ATTACHMENTS: u64 = 4;
+pub(crate) const MAX_PINNED_STATUSES: u64 = 5;
 
 /// Build routes for local status creation, lookup, deletion, and timelines.
 pub fn router() -> Router<AppState> {
@@ -68,6 +69,8 @@ pub fn router() -> Router<AppState> {
             post(revoke_quote),
         )
         .route("/api/v1/statuses/{status_id}/context", get(status_context))
+        .route("/api/v1/statuses/{status_id}/pin", post(pin_status))
+        .route("/api/v1/statuses/{status_id}/unpin", post(unpin_status))
         .route(
             "/api/v1/statuses/{status_id}/favourite",
             post(favourite_status),
@@ -960,6 +963,80 @@ async fn show_status(
                 Err(error) => server_error(error),
             }
         }
+    }
+}
+
+/// Pin an owned public or unlisted status, idempotently.
+async fn pin_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    mutate_status_pin(&state, account, StatusId(path.status_id), true).await
+}
+
+/// Remove an owned status pin, idempotently.
+async fn unpin_status(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    mutate_status_pin(&state, account, StatusId(path.status_id), false).await
+}
+
+async fn mutate_status_pin(
+    state: &AppState,
+    account: roosty_db::LocalAccount,
+    status_id: StatusId,
+    pin: bool,
+) -> Response {
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result = if pin {
+        roosty_db::pin_local_status(&txn, status_id, account.id, MAX_PINNED_STATUSES).await
+    } else {
+        roosty_db::unpin_local_status(&txn, status_id, account.id).await
+    };
+    let changed = match result {
+        Ok(roosty_db::PinStatusResult::Pinned) | Ok(roosty_db::PinStatusResult::Unpinned) => true,
+        Ok(roosty_db::PinStatusResult::AlreadyPinned)
+        | Ok(roosty_db::PinStatusResult::AlreadyUnpinned) => false,
+        Ok(roosty_db::PinStatusResult::NotFound) => return not_found(),
+        Ok(roosty_db::PinStatusResult::NotOwned) => {
+            return unprocessable("You can only pin your own statuses");
+        }
+        Ok(roosty_db::PinStatusResult::UnsupportedVisibility) => {
+            return unprocessable("Only public and unlisted statuses can be pinned");
+        }
+        Ok(roosty_db::PinStatusResult::LimitReached) => {
+            return unprocessable("You have already pinned the maximum number of statuses");
+        }
+        Err(error) => return server_error(error),
+    };
+    if changed {
+        let status = match roosty_db::find_local_status_by_id(&txn, status_id).await {
+            Ok(Some(status)) => status,
+            Ok(None) => return not_found(),
+            Err(error) => return server_error(error),
+        };
+        if let Err(error) =
+            crate::federation::enqueue_pin_activity_in_transaction(state, &txn, &status, pin).await
+        {
+            return server_error(error);
+        }
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+        Ok(Some(status)) => match status_response(state, status, account).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => server_error(error),
+        },
+        Ok(None) => not_found(),
+        Err(error) => server_error(error),
     }
 }
 
@@ -2998,10 +3075,16 @@ async fn status_models(
     statuses: Vec<roosty_db::LocalStatus>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
+    let pinned = roosty_db::pinned_local_status_ids(
+        &state.db,
+        &statuses.iter().map(|status| status.id).collect::<Vec<_>>(),
+    )
+    .await?;
     let mut response = Vec::with_capacity(statuses.len());
     for status in statuses {
         if status_visible_to_viewer(state, &status, viewer).await? {
-            response.push(status_with_author(state, status, viewer).await?);
+            let is_pinned = pinned.contains(&status.id);
+            response.push(status_with_author_and_pin(state, status, viewer, is_pinned).await?);
         }
     }
 
@@ -3013,11 +3096,29 @@ async fn home_timeline_models(
     items: Vec<roosty_db::HomeTimelineItem>,
     viewer: AccountId,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
+    let local_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            roosty_db::HomeTimelineItem::Status(status) => Some(status.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            roosty_db::HomeTimelineItem::RemoteStatus(status) => Some(status.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let local_pins = roosty_db::pinned_local_status_ids(&state.db, &local_ids).await?;
+    let remote_pins = roosty_db::pinned_remote_status_ids(&state.db, &remote_ids).await?;
     let mut response = Vec::with_capacity(items.len());
     for item in items {
         match item {
             roosty_db::HomeTimelineItem::Status(status) => {
-                response.push(status_with_author(state, status, Some(viewer)).await?);
+                let pinned = local_pins.contains(&status.id);
+                response
+                    .push(status_with_author_and_pin(state, status, Some(viewer), pinned).await?);
             }
             roosty_db::HomeTimelineItem::Reblog(reblog) => {
                 if let Some(reblog) = reblog_response(state, reblog, Some(viewer)).await? {
@@ -3028,8 +3129,11 @@ async fn home_timeline_models(
                 if !remote_status_available(state, &status).await? {
                     continue;
                 }
-                response
-                    .push(remote_status_response_for_viewer(state, status, Some(viewer)).await?);
+                let pinned = remote_pins.contains(&status.id);
+                response.push(
+                    remote_status_response_for_viewer_with_pin(state, status, Some(viewer), pinned)
+                        .await?,
+                );
             }
             roosty_db::HomeTimelineItem::LocalRemoteReblog(reblog) => {
                 let Some(original) =
@@ -3094,21 +3198,10 @@ async fn public_timeline_response(
     filters: PublicTimelineFilters,
 ) -> Response {
     let link_header = public_timeline_link_header(&page, limit, filters);
-    let mut items = Vec::with_capacity(page.items.len());
-    for item in page.items {
-        let result = match item {
-            roosty_db::PublicTimelineItem::Local(status) => {
-                status_with_author(state, status, viewer).await
-            }
-            roosty_db::PublicTimelineItem::Remote(status) => {
-                remote_status_response_for_viewer(state, status, viewer).await
-            }
-        };
-        match result {
-            Ok(status) => items.push(status),
-            Err(error) => return server_error(error),
-        }
-    }
+    let items = match public_timeline_models(state, page.items, viewer).await {
+        Ok(items) => items,
+        Err(error) => return server_error(error),
+    };
     let mut response = Json(items).into_response();
     if let Some(link_header) = link_header {
         response.headers_mut().insert(header::LINK, link_header);
@@ -3126,26 +3219,53 @@ async fn tag_timeline_response(
     filters: &TagTimelineParams,
 ) -> Response {
     let link_header = tag_timeline_link_header(&page, limit, path, filters);
-    let mut items = Vec::with_capacity(page.items.len());
-    for item in page.items {
-        let result = match item {
-            roosty_db::PublicTimelineItem::Local(status) => {
-                status_with_author(state, status, viewer).await
-            }
-            roosty_db::PublicTimelineItem::Remote(status) => {
-                remote_status_response_for_viewer(state, status, viewer).await
-            }
-        };
-        match result {
-            Ok(status) => items.push(status),
-            Err(error) => return server_error(error),
-        }
-    }
+    let items = match public_timeline_models(state, page.items, viewer).await {
+        Ok(items) => items,
+        Err(error) => return server_error(error),
+    };
     let mut response = Json(items).into_response();
     if let Some(link_header) = link_header {
         response.headers_mut().insert(header::LINK, link_header);
     }
     response
+}
+
+async fn public_timeline_models(
+    state: &AppState,
+    timeline: Vec<roosty_db::PublicTimelineItem>,
+    viewer: Option<AccountId>,
+) -> Result<Vec<StatusResponse>, RoostyError> {
+    let local_ids = timeline
+        .iter()
+        .filter_map(|item| match item {
+            roosty_db::PublicTimelineItem::Local(status) => Some(status.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_ids = timeline
+        .iter()
+        .filter_map(|item| match item {
+            roosty_db::PublicTimelineItem::Remote(status) => Some(status.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let local_pins = roosty_db::pinned_local_status_ids(&state.db, &local_ids).await?;
+    let remote_pins = roosty_db::pinned_remote_status_ids(&state.db, &remote_ids).await?;
+    let mut items = Vec::with_capacity(timeline.len());
+    for item in timeline {
+        let result = match item {
+            roosty_db::PublicTimelineItem::Local(status) => {
+                let pinned = local_pins.contains(&status.id);
+                status_with_author_and_pin(state, status, viewer, pinned).await
+            }
+            roosty_db::PublicTimelineItem::Remote(status) => {
+                let pinned = remote_pins.contains(&status.id);
+                remote_status_response_for_viewer_with_pin(state, status, viewer, pinned).await
+            }
+        };
+        items.push(result?);
+    }
+    Ok(items)
 }
 
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
@@ -3173,6 +3293,19 @@ pub(crate) async fn remote_timeline_response(
     viewer: Option<AccountId>,
 ) -> Response {
     let link_header = timeline_link_header(&page, limit, path);
+    let pinned = match roosty_db::pinned_remote_status_ids(
+        &state.db,
+        &page
+            .items
+            .iter()
+            .map(|status| status.id)
+            .collect::<Vec<_>>(),
+    )
+    .await
+    {
+        Ok(pinned) => pinned,
+        Err(error) => return server_error(error),
+    };
     let mut items = Vec::with_capacity(page.items.len());
     for status in page.items {
         let visible = match viewer {
@@ -3189,7 +3322,8 @@ pub(crate) async fn remote_timeline_response(
             Ok(false) => continue,
             Err(error) => return server_error(error),
         }
-        match remote_status_response_for_viewer(state, status, viewer).await {
+        let is_pinned = pinned.contains(&status.id);
+        match remote_status_response_for_viewer_with_pin(state, status, viewer, is_pinned).await {
             Ok(status) => items.push(status),
             Err(error) => return server_error(error),
         }
@@ -3217,11 +3351,21 @@ pub(crate) async fn status_with_author(
     status: roosty_db::LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
+    let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
+    status_with_author_and_pin(state, status, viewer, pinned).await
+}
+
+async fn status_with_author_and_pin(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    viewer: Option<AccountId>,
+    pinned: bool,
+) -> Result<StatusResponse, RoostyError> {
     let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("status author does not exist".to_owned()))?;
 
-    status_response_for_viewer(state, status, account, viewer).await
+    status_response_for_viewer_with_pin(state, status, account, viewer, pinned).await
 }
 
 async fn status_response(
@@ -3382,8 +3526,18 @@ async fn remote_status_response_for_viewer(
     status: roosty_db::RemoteStatus,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
+    let pinned = roosty_db::is_remote_status_pinned(&state.db, status.id).await?;
+    remote_status_response_for_viewer_with_pin(state, status, viewer, pinned).await
+}
+
+async fn remote_status_response_for_viewer_with_pin(
+    state: &AppState,
+    status: roosty_db::RemoteStatus,
+    viewer: Option<AccountId>,
+    pinned: bool,
+) -> Result<StatusResponse, RoostyError> {
     let status_ref = roosty_db::StatusReference::Remote(status.id);
-    let mut response = remote_status_response_base(state, status, viewer).await?;
+    let mut response = remote_status_response_base(state, status, viewer, pinned).await?;
     response.quote = status_quote_response(state, status_ref, viewer).await?;
     Ok(response)
 }
@@ -3392,6 +3546,7 @@ async fn remote_status_response_base(
     state: &AppState,
     status: roosty_db::RemoteStatus,
     viewer: Option<AccountId>,
+    pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
     let replies_count =
         roosty_db::count_status_context_replies(&state.db, StatusContextParent::Remote(status.id))
@@ -3479,7 +3634,7 @@ async fn remote_status_response_base(
         },
         muted: false,
         bookmarked: false,
-        pinned: false,
+        pinned,
         reblog: None,
         quote: None,
         quote_approval,
@@ -3687,8 +3842,19 @@ async fn status_response_for_viewer(
     account: roosty_db::LocalAccount,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
+    let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
+    status_response_for_viewer_with_pin(state, status, account, viewer, pinned).await
+}
+
+async fn status_response_for_viewer_with_pin(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    account: roosty_db::LocalAccount,
+    viewer: Option<AccountId>,
+    pinned: bool,
+) -> Result<StatusResponse, RoostyError> {
     let status_ref = roosty_db::StatusReference::Local(status.id);
-    let mut response = status_response_base(state, status, account, viewer).await?;
+    let mut response = status_response_base(state, status, account, viewer, pinned).await?;
     response.quote = status_quote_response(state, status_ref, viewer).await?;
     if let Some(quote) = roosty_db::quote_for_status(&state.db, status_ref).await?
         && !response.content.contains(&quote.quoted_activitypub_id)
@@ -3708,6 +3874,7 @@ async fn status_response_base(
     status: roosty_db::LocalStatus,
     account: roosty_db::LocalAccount,
     viewer: Option<AccountId>,
+    pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
     let status_path = format!("@{}/{}", account.username, status.id.0);
     let url = public_url(state, &status_path);
@@ -3821,7 +3988,7 @@ async fn status_response_base(
         reblogged,
         muted,
         bookmarked,
-        pinned: false,
+        pinned,
         reblog: None,
         quote: None,
         quote_approval,
@@ -3879,8 +4046,9 @@ async fn status_quote_response(
                             state_name = "muted_account".to_owned();
                         }
                     }
+                    let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
                     Some(Box::new(
-                        status_response_base(state, status, account, viewer).await?,
+                        status_response_base(state, status, account, viewer, pinned).await?,
                     ))
                 }
             }
@@ -3933,8 +4101,9 @@ async fn status_quote_response(
                     state_name = "unauthorized".to_owned();
                     None
                 } else {
+                    let pinned = roosty_db::is_remote_status_pinned(&state.db, status.id).await?;
                     Some(Box::new(
-                        remote_status_response_base(state, status, viewer).await?,
+                        remote_status_response_base(state, status, viewer, pinned).await?,
                     ))
                 }
             }
@@ -4378,8 +4547,9 @@ fn timeline_link_header<T>(
     }
     let first = page.first_cursor?;
     let last = page.last_cursor?;
+    let separator = if path.contains('?') { '&' } else { '?' };
     let value = format!(
-        r#"<{path}?limit={limit}&min_id={first}>; rel="prev", <{path}?limit={limit}&max_id={last}>; rel="next""#,
+        r#"<{path}{separator}limit={limit}&min_id={first}>; rel="prev", <{path}{separator}limit={limit}&max_id={last}>; rel="next""#,
     );
     HeaderValue::from_str(&value).ok()
 }
@@ -5029,6 +5199,14 @@ fn bad_request(description: &str) -> Response {
 
 fn forbidden(description: &str) -> Response {
     error_response(StatusCode::FORBIDDEN, "forbidden", description)
+}
+
+fn unprocessable(description: &str) -> Response {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unprocessable_entity",
+        description,
+    )
 }
 
 fn not_found() -> Response {
@@ -8282,6 +8460,85 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given owned statuses, pin mutations are idempotent, bounded, listed, and cascade on delete.
+    async fn status_pins_enforce_limit_and_drive_account_collection(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let mut ids = Vec::new();
+        for position in 0..6 {
+            let status = context
+                .create_status(&token, &format!("pin {position}"), None, None)
+                .await;
+            ids.push(status["id"].as_str().unwrap().to_owned());
+        }
+        for id in ids.iter().take(5) {
+            let response = context
+                .authenticated_empty("POST", &format!("/api/v1/statuses/{id}/pin"), &token)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["pinned"], true);
+        }
+        let repeated = context
+            .authenticated_empty("POST", &format!("/api/v1/statuses/{}/pin", ids[0]), &token)
+            .await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let over_limit = context
+            .authenticated_empty("POST", &format!("/api/v1/statuses/{}/pin", ids[5]), &token)
+            .await;
+        assert_eq!(over_limit.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let page = context
+            .authenticated_get(
+                &format!(
+                    "/api/v1/accounts/{}/statuses?pinned=true&limit=2",
+                    context.account_id.0
+                ),
+                &token,
+            )
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(page.headers().get(header::LINK).is_some());
+        let page = json_body(page).await;
+        assert_eq!(page.as_array().unwrap().len(), 2);
+        assert!(
+            page.as_array()
+                .unwrap()
+                .iter()
+                .all(|status| status["pinned"] == true)
+        );
+
+        let deleted = context
+            .authenticated_empty("DELETE", &format!("/api/v1/statuses/{}", ids[0]), &token)
+            .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let pins = json_body(
+            context
+                .authenticated_get(
+                    &format!(
+                        "/api/v1/accounts/{}/statuses?pinned=true",
+                        context.account_id.0
+                    ),
+                    &token,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(pins.as_array().unwrap().len(), 4);
+
+        let private = context
+            .create_status(&token, "private pin", Some("private"), None)
+            .await;
+        let rejected = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{}/pin", private["id"].as_str().unwrap()),
+                &token,
+            )
+            .await;
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Verifies bookmarks expose Mastodon cursor pagination through Link headers.
     async fn bookmarks_collection_uses_cursor_pagination(context: &mut StatusContext) {
         let token = context.access_token().await;
@@ -8976,6 +9233,7 @@ mod tests {
                 inbox_url: format!("{actor_url}/inbox"),
                 shared_inbox_url: None,
                 followers_url: Some(format!("{actor_url}/followers")),
+                featured_url: None,
                 public_key_id: format!("{actor_url}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: now + TimeDuration::hours(1),
