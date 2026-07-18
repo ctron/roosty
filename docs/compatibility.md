@@ -94,7 +94,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `PUT /api/v1/statuses/:id` | Owner-only local text, sensitivity, spoiler, language, media IDs, and media alt/focus edits with transactional history; polls are missing. No-op edits produce no revision, delivery, or streaming event. |
 | 🟢 | `DELETE /api/v1/statuses/:id` | Owner-only soft delete. |
 | 🟢 | Status pins | Authenticated idempotent `POST /api/v1/statuses/:id/pin` and `/unpin` support owned public/unlisted posts, enforce five pins transactionally across processes, expose `Status.pinned`, and advertise the limit in instance configuration. |
-| 🟡 | Replies | Reply targets are validated and reply metadata includes the target account mention. |
+| 🟢 | Replies | Reply targets are validated and reply metadata includes the target account mention. ActivityPub replies to cached remote Notes address and deliver to the parent author even without an explicit text mention. |
 | 🟡 | Mentions | Local and resolved remote mentions render as links and populate `mentions`. Local recipients are tracked independently from notifications; active addressed mentions receive idempotent notifications and subsequent edit/delete streaming. |
 | 🟢 | Hashtags | Local `#tag` text and valid Hashtag tags from cached remote Notes share a normalized namespace. Status projections use local canonical tag URLs; mixed search, seven-day history, origin-filtered tag timelines, and followed-tag home/user-stream fan-out are available. Remote delivery remains cache-only and push-driven. |
 | 🟢 | Status links | Explicit local `http://` and `https://` URLs render as Mastodon-compatible safe anchors in status, history, streaming, and federation projections. Bare domains and non-web URI schemes remain plain text; rich preview cards are not implemented. |
@@ -177,7 +177,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add federated direct-message media fetching and account migration.
 - [ ] Expand conversation support beyond local direct messages.
 - [x] Add cache-only remote hashtag indexing, timelines, discovery, history, and followed-tag fan-out.
-- [ ] Add grouped notifications, push integration, and remote notification events.
+- [ ] Add grouped notifications and push integration.
 - [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [x] Add per-account moderation APIs and configured suspend-level domain policy.

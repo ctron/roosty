@@ -3913,7 +3913,7 @@ where
 
 /// Find a local account by its exact local username.
 pub async fn find_local_account_by_username(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     username: &str,
 ) -> Result<Option<LocalAccount>> {
     let account = local_account::Entity::find()
@@ -4087,24 +4087,24 @@ pub async fn count_remote_followers(db: &DbConnection, account_id: AccountId) ->
 
 /// List accepted remote followers that must receive activities from a local actor.
 pub async fn accepted_remote_followers(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Vec<RemoteActor>> {
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT remote_actor_id FROM remote_follow WHERE local_account_id = $1 AND state = 'accepted'",
-            vec![account_id.0.into()],
-        ))
-        .await?;
-    let mut actors = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: Uuid = row.try_get("", "remote_actor_id")?;
-        if let Some(actor) = find_remote_actor_by_id(db, AccountId(id)).await? {
-            actors.push(actor);
-        }
+    let actor_ids = accepted_remote_follower_ids(db, account_id)
+        .await?
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<Vec<_>>();
+    if actor_ids.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(actors)
+    Ok(remote_actor::Entity::find()
+        .filter(remote_actor::Column::Id.is_in(actor_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_actor_from_model)
+        .collect())
 }
 
 /// List accepted remote follower identifiers through a caller-owned transaction.
@@ -5714,16 +5714,34 @@ pub async fn remote_mentions_for_local_status(
         .filter(local_status_remote_mention::Column::StatusId.eq(status_id.0))
         .all(db)
         .await?;
-    let mut actors = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(actor) = remote_actor::Entity::find_by_id(row.remote_actor_id)
-            .one(db)
-            .await?
-        {
-            actors.push(remote_actor_from_model(actor));
-        }
+    let actor_ids = rows
+        .into_iter()
+        .map(|row| row.remote_actor_id)
+        .collect::<Vec<_>>();
+    if actor_ids.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(actors)
+    Ok(remote_actor::Entity::find()
+        .filter(remote_actor::Column::Id.is_in(actor_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_actor_from_model)
+        .collect())
+}
+
+/// Return the author of the cached remote Note that one local status replies to.
+pub async fn remote_reply_actor_for_local_status(
+    db: &impl ConnectionTrait,
+    status: &LocalStatus,
+) -> Result<Option<RemoteActor>> {
+    let Some(parent_id) = status.in_reply_to_remote_status_id else {
+        return Ok(None);
+    };
+    let Some(parent) = find_remote_status_by_id(db, parent_id).await? else {
+        return Ok(None);
+    };
+    find_remote_actor_by_id(db, parent.remote_actor_id).await
 }
 
 /// List tags attached to a local status in normalized name order.
@@ -7137,7 +7155,7 @@ pub async fn delete_owned_unattached_media_attachment(
 
 /// List media attachments for a local status in client-supplied order.
 pub async fn local_media_attachments_for_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Vec<LocalMediaAttachment>> {
     let media = local_media_attachment::Entity::find()

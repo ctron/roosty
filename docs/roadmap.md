@@ -44,7 +44,7 @@
 - [x] Repair cached-status timelines, interactions, notifications, reply links, and direct-conversation projections atomically after signed remote status and actor Deletes.
 - [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
 - [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
-- [ ] Federate follow, mention, reply, favourite, and boost notifications to remote recipients.
+- [x] Federate the underlying Follow, addressed Create/Update/Delete, Like/Undo, and Announce/Undo activities that produce remote follow, mention, reply, favourite, and boost notifications. Replies always address and reach a cached remote parent author even when the text omits an explicit mention.
 - [ ] Add grouped notifications and Web Push integration.
 - [x] Apply local mute/block and suspend-level domain-policy decisions to discovery, inbox processing, delivery, timelines, conversations, streams, and notifications.
 - [x] Deliver remote Block/Undo activities, accept validated inbound Block/Undo, and project remote mute/block relationship state.
@@ -71,7 +71,7 @@
 
 - Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: grouped notifications, push integration, and remote notification events.
+- Notifications: grouped notifications and push integration.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 
