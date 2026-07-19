@@ -37,7 +37,7 @@ struct WebFingerResponse {
 struct WebFingerLink {
     rel: String,
     r#type: Option<String>,
-    href: String,
+    href: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,13 +135,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
             "WebFinger subject does not match requested account",
         ));
     }
-    let actor_url = webfinger
-        .links
-        .into_iter()
-        .find(|link| {
-            link.rel == "self" && link.r#type.as_deref().is_none_or(is_activitypub_media_type)
-        })
-        .map(|link| link.href)
+    let actor_url = activitypub_actor_href(webfinger)
         .ok_or_else(|| invalid("WebFinger response does not include an ActivityPub actor link"))?;
     let actor_url =
         Url::parse(&actor_url).map_err(|_| invalid("WebFinger actor URL is invalid"))?;
@@ -765,6 +759,15 @@ fn is_activitypub_media_type(media_type: &str) -> bool {
     })
 }
 
+/// Select an ActivityPub actor URL while ignoring template-only WebFinger links.
+fn activitypub_actor_href(webfinger: WebFingerResponse) -> Option<String> {
+    webfinger.links.into_iter().find_map(|link| {
+        (link.rel == "self" && link.r#type.as_deref().is_none_or(is_activitypub_media_type))
+            .then_some(link.href)
+            .flatten()
+    })
+}
+
 fn is_unsafe_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
@@ -798,9 +801,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::{
-        RemoteActorDocument, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
-        parse_remote_handle, remote_profile_created_at, validate_actor_document,
-        validated_featured_url, validated_followers_url,
+        RemoteActorDocument, WebFingerResponse, activitypub_actor_href, is_activitypub_media_type,
+        is_json_content_type, is_unsafe_address, parse_remote_handle, remote_profile_created_at,
+        validate_actor_document, validated_featured_url, validated_followers_url,
     };
 
     #[test]
@@ -946,6 +949,34 @@ mod tests {
             "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\""
         ));
         assert!(!is_activitypub_media_type("application/jrd+json"));
+    }
+
+    /// Given a JRD document containing template-only relations, when selecting its actor link,
+    /// then those relations do not make the otherwise valid WebFinger response fail to parse.
+    #[test]
+    fn ignores_webfinger_links_without_href() {
+        let webfinger: WebFingerResponse = serde_json::from_str(
+            r#"{
+                "subject": "acct:ctron@dentrassi.de",
+                "links": [
+                    {
+                        "rel": "http://ostatus.org/schema/1.0/subscribe",
+                        "template": "https://mastodon.dentrassi.de/authorize_interaction?uri={uri}"
+                    },
+                    {
+                        "rel": "self",
+                        "type": "application/activity+json",
+                        "href": "https://mastodon.dentrassi.de/users/ctron"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            activitypub_actor_href(webfinger).as_deref(),
+            Some("https://mastodon.dentrassi.de/users/ctron")
+        );
     }
 
     /// Given a WebFinger handle delegated to an actor host, when the actor and inbox share an
