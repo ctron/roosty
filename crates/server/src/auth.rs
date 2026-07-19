@@ -1188,7 +1188,8 @@ pub(crate) async fn account_response(
     let statuses_count = roosty_db::count_local_statuses_by_account(&state.db, account.id).await?;
     let followers_count = roosty_db::count_local_followers(&state.db, account.id).await?
         + roosty_db::count_remote_followers(&state.db, account.id).await?;
-    let following_count = roosty_db::count_local_following(&state.db, account.id).await?;
+    let following_count = roosty_db::count_local_following(&state.db, account.id).await?
+        + roosty_db::count_remote_following(&state.db, account.id).await?;
     let last_status_at = roosty_db::last_local_status_at(&state.db, account.id)
         .await?
         .map(|timestamp| DateOnly(timestamp).to_string());

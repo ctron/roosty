@@ -1190,7 +1190,7 @@ async fn accepted_local_followers_of_remote_actor_with(
 
 /// Return a page of local and remote accounts following one local account.
 pub async fn followers_for_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -1212,7 +1212,7 @@ pub async fn followers_for_local_account(
 
 /// Return a page of local and accepted remote accounts followed by one local account.
 pub async fn following_for_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -1234,7 +1234,7 @@ pub async fn following_for_local_account(
 
 /// Merge UUIDv7-ordered local and remote relationship rows into one cursor page.
 async fn follow_collection_page<L, R, FL, FR>(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local: Select<L>,
     remote: Select<R>,
     limit: u64,
@@ -1285,6 +1285,90 @@ where
     })
 }
 
+/// Return locally known accounts following one cached remote actor.
+pub async fn followers_for_remote_account(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    let rows = remote_following::Entity::find()
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .apply_collection_cursor(cursor)
+        .order_by_desc(remote_following::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let relationships = rows
+        .into_iter()
+        .map(|follow| (follow.id, AccountId(follow.local_account_id)))
+        .collect();
+    local_relationship_collection_page(db, relationships, has_more).await
+}
+
+/// Return locally known accounts followed by one cached remote actor.
+pub async fn following_for_remote_account(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    let rows = remote_follow::Entity::find()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Accepted))
+        .apply_collection_cursor(cursor)
+        .order_by_desc(remote_follow::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let relationships = rows
+        .into_iter()
+        .map(|follow| (follow.id, AccountId(follow.local_account_id)))
+        .collect();
+    local_relationship_collection_page(db, relationships, has_more).await
+}
+
+/// Project ordered relationship rows into local account collection entries.
+async fn local_relationship_collection_page(
+    db: &impl ConnectionTrait,
+    relationships: Vec<(Uuid, AccountId)>,
+    has_more: bool,
+) -> Result<CollectionPage<FollowCollectionEntry>> {
+    let first_cursor = relationships.first().map(|(id, _)| *id);
+    let last_cursor = relationships.last().map(|(id, _)| *id);
+    let account_ids = relationships
+        .iter()
+        .map(|(_, account_id)| *account_id)
+        .collect();
+    let mut accounts = local_accounts_by_id(db, account_ids)
+        .await?
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect::<HashMap<_, _>>();
+    let items = relationships
+        .into_iter()
+        .filter_map(|(id, account_id)| {
+            accounts
+                .remove(&account_id)
+                .map(|account| FollowCollectionEntry {
+                    id,
+                    account: FollowCollectionAccount::Local(account),
+                })
+        })
+        .collect();
+
+    Ok(CollectionPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
 fn collection_cursor_matches(id: Uuid, cursor: CollectionCursor) -> bool {
     cursor.max_id.is_none_or(|max_id| id < max_id)
         && cursor.since_id.is_none_or(|since_id| id > since_id)
@@ -1292,11 +1376,39 @@ fn collection_cursor_matches(id: Uuid, cursor: CollectionCursor) -> bool {
 }
 
 /// Count accepted remote actors followed by this local account.
-pub async fn count_remote_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+pub async fn count_remote_following(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<u64> {
     Ok(remote_following::Entity::find()
         .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
         .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
         .filter(remote_following::Column::DeactivatedAt.is_null())
+        .count(db)
+        .await?)
+}
+
+/// Count accepted local accounts following one cached remote actor.
+pub async fn count_remote_actor_followers_known_locally(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+) -> Result<u64> {
+    Ok(remote_following::Entity::find()
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .count(db)
+        .await?)
+}
+
+/// Count accepted local accounts followed by one cached remote actor.
+pub async fn count_remote_actor_following_known_locally(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+) -> Result<u64> {
+    Ok(remote_follow::Entity::find()
+        .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Accepted))
         .count(db)
         .await?)
 }
@@ -2330,7 +2442,7 @@ pub async fn find_remote_actor_by_handle(
 
 /// Count active cached statuses for a remote actor profile.
 pub async fn count_remote_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     actor_id: AccountId,
 ) -> Result<u64> {
     Ok(remote_status::Entity::find()
@@ -2343,7 +2455,7 @@ pub async fn count_remote_statuses_by_account(
 
 /// Return the newest active cached status date for a remote actor profile.
 pub async fn last_remote_status_at(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     actor_id: AccountId,
 ) -> Result<Option<OffsetDateTime>> {
     Ok(remote_status::Entity::find()
@@ -11786,13 +11898,25 @@ async fn active_statuses_by_id(
 
 /// Return local accounts in the same order as the provided ids.
 async fn local_accounts_by_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_ids: Vec<AccountId>,
 ) -> Result<Vec<LocalAccount>> {
+    if account_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let models = local_account::Entity::find()
+        .filter(local_account::Column::Id.is_in(account_ids.iter().map(|id| id.0)))
+        .all(db)
+        .await?;
+    let mut accounts_by_id = models
+        .into_iter()
+        .map(|model| (model.id, model))
+        .collect::<HashMap<_, _>>();
     let mut accounts = Vec::with_capacity(account_ids.len());
     for account_id in account_ids {
-        if let Some(account) = find_local_account_by_id(db, account_id).await? {
-            accounts.push(account);
+        if let Some(model) = accounts_by_id.remove(&account_id.0) {
+            accounts.push(local_account_from_model(model)?);
         }
     }
 
@@ -13349,6 +13473,21 @@ impl ApplyCollectionCursor for Select<remote_follow::Entity> {
         }
         if let Some(min_id) = cursor.min_id {
             self = self.filter(remote_follow::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<remote_following::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(remote_following::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(remote_following::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(remote_following::Column::Id.gt(min_id));
         }
         self
     }

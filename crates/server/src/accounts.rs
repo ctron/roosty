@@ -237,14 +237,18 @@ pub(crate) async fn remote_account_response(
     state: &AppState,
     actor: RemoteActor,
 ) -> roosty_core::Result<RemoteAccountResponse> {
-    let statuses_count = roosty_db::count_remote_statuses_by_account(&state.db, actor.id).await?;
-    let last_status_at = roosty_db::last_remote_status_at(&state.db, actor.id)
-        .await?
-        .map(crate::statuses::format_timestamp);
     let txn = state
         .db
         .begin_with_config(None, Some(AccessMode::ReadOnly))
         .await?;
+    let statuses_count = roosty_db::count_remote_statuses_by_account(&txn, actor.id).await?;
+    let last_status_at = roosty_db::last_remote_status_at(&txn, actor.id)
+        .await?
+        .map(crate::statuses::format_timestamp);
+    let followers_count =
+        roosty_db::count_remote_actor_followers_known_locally(&txn, actor.id).await?;
+    let following_count =
+        roosty_db::count_remote_actor_following_known_locally(&txn, actor.id).await?;
     let profile_media = roosty_db::remote_profile_media_for_actor(&txn, actor.id).await?;
     txn.commit().await?;
     let media_url = |kind| {
@@ -258,6 +262,8 @@ pub(crate) async fn remote_account_response(
     let header = media_url(RemoteProfileMediaKind::Header);
     let moved_to_remote_actor_id = actor.moved_to_remote_actor_id;
     let mut response = remote_account_response_from_media(actor, avatar, header);
+    response.followers_count = followers_count;
+    response.following_count = following_count;
     response.statuses_count = statuses_count;
     response.last_status_at = last_status_at;
     if let Some(moved_to_remote_actor_id) = moved_to_remote_actor_id
@@ -965,7 +971,7 @@ async fn reject_follow_request(
     }
 }
 
-/// Return local followers for a local account.
+/// Return locally known followers for a local or cached remote account.
 async fn followers(
     State(state): State<AppState>,
     Path(path): Path<AccountPath>,
@@ -980,7 +986,7 @@ async fn followers(
     .await
 }
 
-/// Return local accounts followed by a local account.
+/// Return locally known accounts followed by a local or cached remote account.
 async fn following(
     State(state): State<AppState>,
     Path(path): Path<AccountPath>,
@@ -1013,24 +1019,13 @@ async fn muted_accounts(
     account_collection(&state, account.id, params, AccountCollection::Mutes).await
 }
 
-/// Return a local follower/following account collection.
+/// Return a Mastodon account collection.
 async fn account_collection(
     state: &AppState,
     account_id: AccountId,
     params: AccountCollectionParams,
     collection: AccountCollection,
 ) -> Response {
-    if !matches!(
-        collection,
-        AccountCollection::Blocks | AccountCollection::Mutes
-    ) {
-        match roosty_db::find_local_account_by_id(&state.db, account_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return not_found(),
-            Err(error) => return server_error(error),
-        }
-    }
-
     let limit = params
         .limit
         .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
@@ -1040,25 +1035,12 @@ async fn account_collection(
         Err(()) => return bad_request("collection cursor is invalid"),
     };
     let accounts = match collection {
-        AccountCollection::Followers => {
-            roosty_db::followers_for_local_account(&state.db, account_id, limit, cursor)
-                .await
-                .map(|page| roosty_db::CollectionPage {
-                    items: page.items.into_iter().map(|entry| entry.account).collect(),
-                    first_cursor: page.first_cursor,
-                    last_cursor: page.last_cursor,
-                    has_more: page.has_more,
-                })
-        }
-        AccountCollection::Following => {
-            roosty_db::following_for_local_account(&state.db, account_id, limit, cursor)
-                .await
-                .map(|page| roosty_db::CollectionPage {
-                    items: page.items.into_iter().map(|entry| entry.account).collect(),
-                    first_cursor: page.first_cursor,
-                    last_cursor: page.last_cursor,
-                    has_more: page.has_more,
-                })
+        AccountCollection::Followers | AccountCollection::Following => {
+            match follow_account_collection(state, account_id, limit, cursor, collection).await {
+                Ok(Some(page)) => Ok(page),
+                Ok(None) => return not_found(),
+                Err(error) => Err(error),
+            }
         }
         AccountCollection::Blocks => {
             roosty_db::blocked_accounts_for_account(&state.db, account_id, limit, cursor)
@@ -1112,6 +1094,58 @@ async fn account_collection(
         },
         Err(error) => server_error(error),
     }
+}
+
+/// Read one local or cached-remote follow collection from a consistent snapshot.
+async fn follow_account_collection(
+    state: &AppState,
+    account_id: AccountId,
+    limit: u64,
+    cursor: roosty_db::CollectionCursor,
+    collection: AccountCollection,
+) -> roosty_core::Result<Option<roosty_db::CollectionPage<roosty_db::FollowCollectionAccount>>> {
+    let txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let local = roosty_db::find_local_account_by_id(&txn, account_id)
+        .await?
+        .is_some();
+    let page = if local {
+        match collection {
+            AccountCollection::Followers => {
+                roosty_db::followers_for_local_account(&txn, account_id, limit, cursor).await?
+            }
+            AccountCollection::Following => {
+                roosty_db::following_for_local_account(&txn, account_id, limit, cursor).await?
+            }
+            AccountCollection::Blocks | AccountCollection::Mutes => unreachable!(),
+        }
+    } else {
+        let Some(actor) = roosty_db::find_remote_actor_by_id(&txn, account_id).await? else {
+            return Ok(None);
+        };
+        if actor.deleted_at.is_some() || state.config.federation_domain_is_blocked(&actor.domain) {
+            return Ok(None);
+        }
+        match collection {
+            AccountCollection::Followers => {
+                roosty_db::followers_for_remote_account(&txn, account_id, limit, cursor).await?
+            }
+            AccountCollection::Following => {
+                roosty_db::following_for_remote_account(&txn, account_id, limit, cursor).await?
+            }
+            AccountCollection::Blocks | AccountCollection::Mutes => unreachable!(),
+        }
+    };
+    txn.commit().await?;
+
+    Ok(Some(roosty_db::CollectionPage {
+        items: page.items.into_iter().map(|entry| entry.account).collect(),
+        first_cursor: page.first_cursor,
+        last_cursor: page.last_cursor,
+        has_more: page.has_more,
+    }))
 }
 
 /// Convert local account records into Mastodon account responses.
@@ -1845,6 +1879,188 @@ mod tests {
         assert_eq!(account_usernames(&body), ["one"]);
     }
 
+    /// Given only locally observed relationships for a cached remote actor, when its graph is
+    /// requested, then accepted rows are paginated without fetching its ActivityPub collections.
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    async fn remote_account_collections_expose_only_known_accepted_relationships(
+        context: &mut AccountContext,
+    ) {
+        let remote_id = context
+            .create_remote_actor("remote_graph", "remote.test")
+            .await;
+        let (first_id, _first_token) = context
+            .create_account("remote_first", "remote-first@example.com")
+            .await;
+        let (second_id, _second_token) = context
+            .create_account("remote_second", "remote-second@example.com")
+            .await;
+        let (third_id, _third_token) = context
+            .create_account("remote_third", "remote-third@example.com")
+            .await;
+        let (pending_id, _pending_token) = context
+            .create_account("remote_pending", "remote-pending@example.com")
+            .await;
+        let (inactive_id, _inactive_token) = context
+            .create_account("remote_inactive", "remote-inactive@example.com")
+            .await;
+
+        for (account_id, name, accepted) in [
+            (first_id, "first", true),
+            (second_id, "second", true),
+            (third_id, "third", true),
+            (pending_id, "pending", false),
+            (inactive_id, "inactive", true),
+        ] {
+            let activity_id = format!("https://localhost:4000/follows/{name}");
+            roosty_db::create_remote_following(
+                &context.db,
+                account_id,
+                remote_id,
+                &activity_id,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+            if accepted {
+                assert!(
+                    roosty_db::accept_remote_following(&context.db, remote_id, &activity_id)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+        context
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE remote_following SET deactivated_at = now() WHERE activity_id = $1",
+                vec!["https://localhost:4000/follows/inactive".into()],
+            ))
+            .await
+            .unwrap();
+
+        for (account_id, name, state) in [
+            (
+                first_id,
+                "followed-first",
+                roosty_db::RemoteFollowState::Accepted,
+            ),
+            (
+                second_id,
+                "followed-second",
+                roosty_db::RemoteFollowState::Accepted,
+            ),
+            (
+                pending_id,
+                "followed-pending",
+                roosty_db::RemoteFollowState::Pending,
+            ),
+        ] {
+            let activity_id = format!("https://remote.test/follows/{name}");
+            roosty_db::upsert_remote_follow(
+                &context.db,
+                remote_id,
+                account_id,
+                &activity_id,
+                json!({"id": activity_id}),
+                state,
+            )
+            .await
+            .unwrap();
+        }
+
+        let followers = context
+            .get(&format!(
+                "/api/v1/accounts/{}/followers?limit=2",
+                remote_id.0
+            ))
+            .await;
+        assert_eq!(followers.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&followers, "next", "max_id");
+        assert_eq!(
+            account_usernames(&json_body(followers).await),
+            ["remote_third", "remote_second"]
+        );
+        let next = context
+            .get(&format!(
+                "/api/v1/accounts/{}/followers?limit=2&max_id={next_cursor}",
+                remote_id.0
+            ))
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert!(next.headers().get(header::LINK).is_none());
+        assert_eq!(account_usernames(&json_body(next).await), ["remote_first"]);
+
+        let following = context
+            .get(&format!(
+                "/api/v1/accounts/{}/following?limit=1",
+                remote_id.0
+            ))
+            .await;
+        assert_eq!(following.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&following, "next", "max_id");
+        assert_eq!(
+            account_usernames(&json_body(following).await),
+            ["remote_second"]
+        );
+        let next = context
+            .get(&format!(
+                "/api/v1/accounts/{}/following?limit=1&max_id={next_cursor}",
+                remote_id.0
+            ))
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(account_usernames(&json_body(next).await), ["remote_first"]);
+
+        let remote = json_body(
+            context
+                .get(&format!("/api/v1/accounts/{}", remote_id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(remote["followers_count"], 3);
+        assert_eq!(remote["following_count"], 2);
+
+        let local = json_body(
+            context
+                .get(&format!("/api/v1/accounts/{}", first_id.0))
+                .await,
+        )
+        .await;
+        assert_eq!(local["following_count"], 1);
+    }
+
+    /// Cached remote graph endpoints use the same target visibility rules as account lookup.
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    async fn remote_account_collections_hide_unavailable_targets(context: &mut AccountContext) {
+        let deleted_id = context
+            .create_remote_actor("deleted_graph", "remote.test")
+            .await;
+        context
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE remote_actor SET deleted_at = now() WHERE id = $1",
+                vec![deleted_id.0.into()],
+            ))
+            .await
+            .unwrap();
+        let blocked_id = context
+            .create_remote_actor("blocked_graph", "blocked.test")
+            .await;
+
+        for path in [
+            format!("/api/v1/accounts/{}/followers", uuid::Uuid::now_v7()),
+            format!("/api/v1/accounts/{}/followers", deleted_id.0),
+            format!("/api/v1/accounts/{}/following", blocked_id.0),
+        ] {
+            assert_eq!(context.get(&path).await.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
     /// Given pending remote follows, when the owner pages follow requests, then only pending
     /// requests for that owner are returned with Mastodon cursor links.
     #[test_context(AccountContext)]
@@ -2283,7 +2499,7 @@ mod tests {
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_blocked_domains: Vec::new(),
+                federation_blocked_domains: vec!["blocked.test".to_owned()],
                 federation_delivery_max_age: time::Duration::days(7),
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
@@ -2422,20 +2638,36 @@ mod tests {
             username: &str,
             state: roosty_db::RemoteFollowState,
         ) -> AccountId {
+            let actor_id = self.create_remote_actor(username, "remote.test").await;
+            roosty_db::upsert_remote_follow(
+                &self.db,
+                actor_id,
+                local_account_id,
+                &format!("https://remote.test/follows/{username}"),
+                serde_json::json!({ "id": format!("https://remote.test/follows/{username}") }),
+                state,
+            )
+            .await
+            .unwrap();
+            actor_id
+        }
+
+        /// Cache a remote actor with a deliberately unfetched followers collection.
+        async fn create_remote_actor(&self, username: &str, domain: &str) -> AccountId {
             let actor = roosty_db::RemoteActor {
                 id: AccountId(uuid::Uuid::now_v7()),
-                activitypub_id: format!("https://remote.test/users/{username}"),
+                activitypub_id: format!("https://{domain}/users/{username}"),
                 username: username.to_owned(),
-                domain: "remote.test".to_owned(),
+                domain: domain.to_owned(),
                 display_name: username.to_owned(),
                 summary: String::new(),
                 emojis: json!([]),
-                inbox_url: format!("https://remote.test/users/{username}/inbox"),
+                inbox_url: format!("https://{domain}/users/{username}/inbox"),
                 shared_inbox_url: None,
-                followers_url: None,
+                followers_url: Some(format!("https://{domain}/users/{username}/followers")),
                 featured_url: None,
                 featured_tags_url: None,
-                public_key_id: format!("https://remote.test/users/{username}#main-key"),
+                public_key_id: format!("https://{domain}/users/{username}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
                 expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
                 profile_created_at: None,
@@ -2447,16 +2679,6 @@ mod tests {
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await
                 .unwrap();
-            roosty_db::upsert_remote_follow(
-                &self.db,
-                actor.id,
-                local_account_id,
-                &format!("https://remote.test/follows/{username}"),
-                serde_json::json!({ "id": format!("https://remote.test/follows/{username}") }),
-                state,
-            )
-            .await
-            .unwrap();
             actor.id
         }
 

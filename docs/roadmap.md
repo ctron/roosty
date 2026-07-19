@@ -36,7 +36,7 @@
 - [x] Track active local mentions independently from notifications and deliver Mastodon edit/delete events plus boosted-status `update` notifications.
 - [x] Match Mastodon's push-based federation behavior: missed inbox deliveries are not backfilled by polling remote outboxes; deletion and follow-state cache repairs remain local operations.
 - [x] Implement remote follower-only Notes and replies using validated actor collection URLs, current follow relationships, explicit mentions, and cache-only traversal.
-- [ ] Expose paginated, locally known follower/following relationships for cached remote accounts through the Mastodon API, without crawling remote ActivityPub collections.
+- [x] Expose paginated, locally known follower/following relationships for cached remote accounts through the Mastodon API, without crawling remote ActivityPub collections.
 - [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
 - [x] Build cache-only remote reply contexts and conversation/thread traversal across local and cached remote parents, with Mastodon-compatible access limits and no outbox backfill.
 - [x] Support remote reply delivery and addressing for follower-only visibility.
@@ -86,10 +86,10 @@
 - [x] Retry federation deliveries with exponential backoff until the operator-configured `ROOSTY_FEDERATION_DELIVERY_MAX_AGE` horizon, then record permanent failures and emit diagnostics.
 - [x] Add signed two-instance end-to-end tests for inbound Follow, locked-account approval/rejection, Accept/Reject delivery, Undo, public-status fan-out, and failed-delivery retry scheduling.
 - [x] Add end-to-end worker tests for permanent-failure classification and expired-claim recovery.
-- [ ] Allow cached remote account IDs in Mastodon follower/following endpoints and return only accepted relationships already known to this instance.
+- [x] Allow cached remote account IDs in Mastodon follower/following endpoints and return only accepted relationships already known to this instance.
 - [x] Apply bilateral block and local mute policy to remote follow requests and remote notifications.
 - [x] Add Mastodon API v6 notification policies and requests with typed predicate actions, durable merge/cleanup jobs, sender permissions, and multi-process-safe account limiting.
-- [ ] Populate cached remote account follower/following counts from accepted relationships already known to this instance.
+- [x] Populate cached remote account follower/following counts from accepted relationships already known to this instance.
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
