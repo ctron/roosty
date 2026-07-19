@@ -376,6 +376,7 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_migration::Migrator;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -412,6 +413,176 @@ mod tests {
             let unauthorized = context.get(uri).await;
             assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn grouped_notifications_start_empty_and_report_no_unread_groups(
+        context: &mut CompatContext,
+    ) {
+        let token = context.access_token().await;
+        let response = context
+            .authenticated_get("/api/v2/notifications", &token)
+            .await;
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "accounts": [],
+                "statuses": [],
+                "notification_groups": [],
+            })
+        );
+        let unread = context
+            .authenticated_get("/api/v2/notifications/unread_count", &token)
+            .await;
+        assert_eq!(unread.status(), StatusCode::OK);
+        assert_eq!(json_body(unread).await, serde_json::json!({"count": 0}));
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn grouped_follow_notifications_share_key_and_dismiss_together(
+        context: &mut CompatContext,
+    ) {
+        let password_hash = password::hash_password("password").unwrap();
+        let first = AccountId(
+            roosty_db::create_local_account(
+                &context.db,
+                "follower_one",
+                "one@example.com",
+                &password_hash,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = AccountId(
+            roosty_db::create_local_account(
+                &context.db,
+                "follower_two",
+                "two@example.com",
+                &password_hash,
+            )
+            .await
+            .unwrap(),
+        );
+        let first_notification = roosty_db::notify_local_account(
+            &context.db,
+            context.account_id,
+            roosty_db::LocalNotificationType::Follow,
+            first,
+            None,
+        )
+        .await
+        .unwrap();
+        let second_notification = roosty_db::notify_local_account(
+            &context.db,
+            context.account_id,
+            roosty_db::LocalNotificationType::Follow,
+            second,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_notification.group_id, second_notification.group_id);
+
+        let token = context.access_token().await;
+        let grouped = json_body(
+            context
+                .authenticated_get("/api/v2/notifications", &token)
+                .await,
+        )
+        .await;
+        assert_eq!(grouped["notification_groups"].as_array().unwrap().len(), 1);
+        assert_eq!(grouped["notification_groups"][0]["notifications_count"], 2);
+        assert_eq!(grouped["accounts"].as_array().unwrap().len(), 2);
+        let group_key = grouped["notification_groups"][0]["group_key"]
+            .as_str()
+            .unwrap();
+
+        let accounts = json_body(
+            context
+                .authenticated_get(
+                    &format!("/api/v2/notifications/{group_key}/accounts"),
+                    &token,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(accounts.as_array().unwrap().len(), 2);
+        let dismissed = context
+            .authenticated_form_post(
+                &format!("/api/v2/notifications/{group_key}/dismiss"),
+                &token,
+                String::new(),
+            )
+            .await;
+        assert_eq!(dismissed.status(), StatusCode::OK);
+        let after = json_body(
+            context
+                .authenticated_get("/api/v2/notifications", &token)
+                .await,
+        )
+        .await;
+        assert!(after["notification_groups"].as_array().unwrap().is_empty());
+    }
+
+    /// Given an expired follow group, a new follow starts a distinct rolling window.
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn grouped_follow_notifications_rotate_after_twelve_hours(context: &mut CompatContext) {
+        let password_hash = password::hash_password("password").unwrap();
+        let first = AccountId(
+            roosty_db::create_local_account(
+                &context.db,
+                "old_follower",
+                "old@example.com",
+                &password_hash,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = AccountId(
+            roosty_db::create_local_account(
+                &context.db,
+                "new_follower",
+                "new@example.com",
+                &password_hash,
+            )
+            .await
+            .unwrap(),
+        );
+        let old = roosty_db::notify_local_account(
+            &context.db,
+            context.account_id,
+            roosty_db::LocalNotificationType::Follow,
+            first,
+            None,
+        )
+        .await
+        .unwrap();
+        context
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE local_notification_group_state SET started_at = now() - interval '13 hours' WHERE account_id = $1 AND notification_type = 'follow'",
+                [context.account_id.0.into()],
+            ))
+            .await
+            .unwrap();
+        let new = roosty_db::notify_local_account(
+            &context.db,
+            context.account_id,
+            roosty_db::LocalNotificationType::Follow,
+            second,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(old.group_id, new.group_id);
     }
 
     /// Roosty advertises the standard public picker API without hosting local emoji.

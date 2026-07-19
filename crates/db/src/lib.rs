@@ -11,7 +11,7 @@ use sea_orm::{
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
     FromQueryResult, IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
-    sea_query::{OnConflict, Query},
+    sea_query::{Expr, OnConflict, Query},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -3175,10 +3175,22 @@ pub struct LocalNotification {
     pub status_id: Option<StatusId>,
     /// Related cached remote status for a remote mention notification.
     pub remote_status_id: Option<StatusId>,
+    /// Persisted rolling group identity for groupable notification types.
+    pub group_id: Option<Uuid>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Soft-dismiss timestamp.
     pub dismissed_at: Option<OffsetDateTime>,
+}
+
+impl LocalNotification {
+    /// Return the opaque Mastodon group key for individual and streaming projections.
+    pub fn group_key(&self) -> String {
+        self.group_id.map_or_else(
+            || format!("ungrouped-{}", self.id),
+            |group_id| format!("{}-{group_id}", self.notification_type.as_str()),
+        )
+    }
 }
 
 /// Persisted inbound remote follow request or accepted remote follower.
@@ -3651,6 +3663,7 @@ pub async fn notify_remote_actor_follow(
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
         remote_status_id: Set(None),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3687,6 +3700,7 @@ where
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3724,6 +3738,7 @@ pub async fn notify_remote_actor_reblog(
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3764,6 +3779,7 @@ where
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
         remote_status_id: Set(Some(remote_status_id.0)),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3804,6 +3820,7 @@ pub async fn replace_local_status_update_notifications(
             remote_actor_id: Set(None),
             status_id: Set(Some(status_id.0)),
             remote_status_id: Set(None),
+            group_id: Set(None),
             created_at: Set(OffsetDateTime::now_utc()),
             dismissed_at: Set(None),
         }
@@ -3844,6 +3861,7 @@ pub async fn replace_remote_status_update_notifications(
             remote_actor_id: Set(Some(remote_actor_id.0)),
             status_id: Set(None),
             remote_status_id: Set(Some(status_id.0)),
+            group_id: Set(None),
             created_at: Set(OffsetDateTime::now_utc()),
             dismissed_at: Set(None),
         }
@@ -3886,6 +3904,7 @@ where
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
         remote_status_id: Set(Some(remote_status_id.0)),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3939,6 +3958,43 @@ pub struct NotificationFilter {
     pub exclude_types: Vec<LocalNotificationType>,
     /// Only include notifications caused by this account.
     pub account_id: Option<AccountId>,
+}
+
+/// One Mastodon-compatible grouped notification projection.
+#[derive(Clone, Debug)]
+pub struct NotificationGroup {
+    pub group_key: String,
+    pub notifications_count: u64,
+    pub notification_type: LocalNotificationType,
+    pub most_recent_notification_id: Uuid,
+    pub page_min_id: Uuid,
+    pub page_max_id: Uuid,
+    pub latest_page_notification_at: OffsetDateTime,
+    pub sample_account_ids: Vec<AccountId>,
+    pub status_id: Option<StatusId>,
+    pub remote_status: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NotificationGroupPage {
+    pub items: Vec<NotificationGroup>,
+    pub first_cursor: Option<Uuid>,
+    pub last_cursor: Option<Uuid>,
+    pub has_more: bool,
+}
+
+#[derive(FromQueryResult)]
+struct NotificationGroupRow {
+    group_key: String,
+    notification_type: LocalNotificationType,
+    notifications_count: i64,
+    most_recent_notification_id: Uuid,
+    page_min_id: Uuid,
+    page_max_id: Uuid,
+    latest_page_notification_at: OffsetDateTime,
+    sample_account_ids: JsonValue,
+    status_id: Option<Uuid>,
+    remote_status: bool,
 }
 
 /// Stored local follow relationship between two accounts.
@@ -5398,6 +5454,7 @@ pub async fn notify_local_account(
         remote_actor_id: Set(None),
         status_id: Set(status_uuid),
         remote_status_id: Set(None),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5438,6 +5495,7 @@ pub async fn notify_local_status_mention(
         remote_actor_id: Set(None),
         status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5464,8 +5522,12 @@ pub async fn local_notifications_for_account(
     let hidden_remote_ids = hidden_remote_actor_ids_for_account(db, account_id).await?;
     if !hidden_remote_ids.is_empty() {
         query = query.filter(
-            local_notification::Column::RemoteActorId
-                .is_not_in(hidden_remote_ids.into_iter().map(|id| id.0)),
+            Condition::any()
+                .add(local_notification::Column::RemoteActorId.is_null())
+                .add(
+                    local_notification::Column::RemoteActorId
+                        .is_not_in(hidden_remote_ids.into_iter().map(|id| id.0)),
+                ),
         );
     }
 
@@ -5482,7 +5544,11 @@ pub async fn local_notifications_for_account(
         );
     }
     if let Some(actor_id) = filter.account_id {
-        query = query.filter(local_notification::Column::ActorAccountId.eq(actor_id.0));
+        query = query.filter(
+            Condition::any()
+                .add(local_notification::Column::ActorAccountId.eq(actor_id.0))
+                .add(local_notification::Column::RemoteActorId.eq(actor_id.0)),
+        );
     }
 
     let rows = query.all(db).await?;
@@ -5500,6 +5566,268 @@ pub async fn local_notifications_for_account(
         last_cursor,
         has_more,
     })
+}
+
+/// List notification groups newest-first using each group's newest notification as its cursor.
+pub async fn notification_groups_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+    filter: NotificationFilter,
+    grouped_types: &[LocalNotificationType],
+) -> Result<NotificationGroupPage> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let groupable = grouped_types
+        .iter()
+        .copied()
+        .filter(|kind| {
+            matches!(
+                kind,
+                LocalNotificationType::Favourite
+                    | LocalNotificationType::Follow
+                    | LocalNotificationType::Reblog
+            )
+        })
+        .collect::<Vec<_>>();
+    let quoted = |values: &[LocalNotificationType]| {
+        values
+            .iter()
+            .map(|value| format!("'{}'", value.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut conditions = vec![
+        format!("account_id = '{}'::uuid", account_id.0),
+        "dismissed_at IS NULL".to_owned(),
+    ];
+    if !filter.include_types.is_empty() {
+        conditions.push(format!(
+            "notification_type IN ({})",
+            quoted(&filter.include_types)
+        ));
+    }
+    if !filter.exclude_types.is_empty() {
+        conditions.push(format!(
+            "notification_type NOT IN ({})",
+            quoted(&filter.exclude_types)
+        ));
+    }
+    if let Some(actor_id) = filter.account_id {
+        conditions.push(format!(
+            "(actor_account_id = '{0}'::uuid OR remote_actor_id = '{0}'::uuid)",
+            actor_id.0
+        ));
+    }
+    let hidden_remote_ids = hidden_remote_actor_ids_for_account(&txn, account_id).await?;
+    if !hidden_remote_ids.is_empty() {
+        conditions.push(format!(
+            "(remote_actor_id IS NULL OR remote_actor_id NOT IN ({}))",
+            hidden_remote_ids
+                .iter()
+                .map(|id| format!("'{}'::uuid", id.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let grouped = if groupable.is_empty() {
+        "NULL".to_owned()
+    } else {
+        quoted(&groupable)
+    };
+    let mut cursor_conditions = Vec::new();
+    if let Some(id) = cursor.max_id {
+        cursor_conditions.push(format!("most_recent_notification_id < '{}'::uuid", id));
+    }
+    if let Some(id) = cursor.since_id {
+        cursor_conditions.push(format!("most_recent_notification_id > '{}'::uuid", id));
+    }
+    if let Some(id) = cursor.min_id {
+        cursor_conditions.push(format!("most_recent_notification_id > '{}'::uuid", id));
+    }
+    let cursor_where = if cursor_conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", cursor_conditions.join(" AND "))
+    };
+    let query_limit = page_query_limit(limit);
+    let sql = format!(
+        r#"
+        WITH filtered AS (
+            SELECT *, COALESCE(actor_account_id, remote_actor_id) AS source_account_id
+            FROM local_notification WHERE {conditions}
+        ), effective AS (
+            SELECT *, CASE
+                WHEN group_id IS NOT NULL AND notification_type IN ({grouped})
+                THEN notification_type || '-' || group_id::text
+                ELSE 'ungrouped-' || id::text END AS effective_group_key
+            FROM filtered
+        ), grouped AS (
+            SELECT effective_group_key AS group_key, notification_type,
+                count(*)::bigint AS notifications_count,
+                (array_agg(id ORDER BY id DESC))[1] AS most_recent_notification_id,
+                (array_agg(id ORDER BY id ASC))[1] AS page_min_id,
+                (array_agg(id ORDER BY id DESC))[1] AS page_max_id,
+                max(created_at) AS latest_page_notification_at,
+                (array_agg(COALESCE(status_id, remote_status_id) ORDER BY id DESC)
+                    FILTER (WHERE status_id IS NOT NULL OR remote_status_id IS NOT NULL))[1] AS status_id,
+                bool_or(remote_status_id IS NOT NULL) AS remote_status
+            FROM effective GROUP BY effective_group_key, notification_type
+        )
+        SELECT grouped.*,
+            COALESCE((SELECT jsonb_agg(sample.source_account_id ORDER BY sample.id DESC)
+                FROM (SELECT distinct_actor.source_account_id, distinct_actor.id
+                    FROM (SELECT DISTINCT ON (source_account_id) source_account_id, id
+                        FROM effective e2 WHERE e2.effective_group_key = grouped.group_key
+                            AND source_account_id IS NOT NULL
+                        ORDER BY source_account_id, id DESC) distinct_actor
+                    ORDER BY distinct_actor.id DESC LIMIT 8) sample), '[]'::jsonb) AS sample_account_ids
+        FROM grouped {cursor_where}
+        ORDER BY most_recent_notification_id DESC LIMIT {query_limit}
+    "#,
+        conditions = conditions.join(" AND ")
+    );
+    let rows = NotificationGroupRow::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        sql,
+    ))
+    .all(&txn)
+    .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let first_cursor = rows.first().map(|row| row.most_recent_notification_id);
+    let last_cursor = rows.last().map(|row| row.most_recent_notification_id);
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let sample_account_ids = serde_json::from_value::<Vec<Uuid>>(row.sample_account_ids)
+                .map_err(|error| {
+                    RoostyError::InvalidInput(format!(
+                        "stored notification samples are invalid: {error}"
+                    ))
+                })?
+                .into_iter()
+                .map(AccountId)
+                .collect();
+            Ok(NotificationGroup {
+                group_key: row.group_key,
+                notifications_count: u64::try_from(row.notifications_count).map_err(|_| {
+                    RoostyError::InvalidInput("stored notification count is invalid".to_owned())
+                })?,
+                notification_type: row.notification_type,
+                most_recent_notification_id: row.most_recent_notification_id,
+                page_min_id: row.page_min_id,
+                page_max_id: row.page_max_id,
+                latest_page_notification_at: row.latest_page_notification_at,
+                sample_account_ids,
+                status_id: row.status_id.map(StatusId),
+                remote_status: row.remote_status,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let page = NotificationGroupPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    };
+    txn.commit().await?;
+    Ok(page)
+}
+
+fn parse_notification_group_key(group_key: &str) -> Option<(Option<LocalNotificationType>, Uuid)> {
+    if let Some(id) = group_key.strip_prefix("ungrouped-") {
+        return Uuid::parse_str(id).ok().map(|id| (None, id));
+    }
+    for kind in [
+        LocalNotificationType::Favourite,
+        LocalNotificationType::Follow,
+        LocalNotificationType::Reblog,
+    ] {
+        if let Some(id) = group_key.strip_prefix(&format!("{}-", kind.as_str())) {
+            return Uuid::parse_str(id).ok().map(|id| (Some(kind), id));
+        }
+    }
+    None
+}
+
+/// Return all visible rows belonging to one opaque notification group key.
+pub async fn notifications_in_group(
+    db: &DbConnection,
+    account_id: AccountId,
+    group_key: &str,
+) -> Result<Vec<LocalNotification>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let notifications = notifications_in_group_with_connection(&txn, account_id, group_key).await?;
+    txn.commit().await?;
+    Ok(notifications)
+}
+
+async fn notifications_in_group_with_connection<C>(
+    db: &C,
+    account_id: AccountId,
+    group_key: &str,
+) -> Result<Vec<LocalNotification>>
+where
+    C: ConnectionTrait,
+{
+    let Some((kind, id)) = parse_notification_group_key(group_key) else {
+        return Ok(Vec::new());
+    };
+    let mut query = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::DismissedAt.is_null());
+    query = match kind {
+        Some(kind) => query
+            .filter(local_notification::Column::NotificationType.eq(kind))
+            .filter(local_notification::Column::GroupId.eq(id)),
+        None => query.filter(local_notification::Column::Id.eq(id)),
+    };
+    let hidden = hidden_remote_actor_ids_for_account(db, account_id).await?;
+    if !hidden.is_empty() {
+        query = query.filter(
+            Condition::any()
+                .add(local_notification::Column::RemoteActorId.is_null())
+                .add(
+                    local_notification::Column::RemoteActorId
+                        .is_not_in(hidden.into_iter().map(|id| id.0)),
+                ),
+        );
+    }
+    Ok(query
+        .order_by_desc(local_notification::Column::Id)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(local_notification_from_model)
+        .collect())
+}
+
+/// Soft-dismiss every row in one notification group owned by the recipient.
+pub async fn dismiss_notification_group(
+    db: &DbConnection,
+    account_id: AccountId,
+    group_key: &str,
+) -> Result<bool> {
+    let txn = db.begin().await?;
+    let rows = notifications_in_group_with_connection(&txn, account_id, group_key).await?;
+    if rows.is_empty() {
+        txn.commit().await?;
+        return Ok(false);
+    }
+    local_notification::Entity::update_many()
+        .col_expr(
+            local_notification::Column::DismissedAt,
+            Expr::value(OffsetDateTime::now_utc()),
+        )
+        .filter(local_notification::Column::Id.is_in(rows.into_iter().map(|row| row.id)))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(true)
 }
 
 /// Find one visible local notification belonging to a recipient.
@@ -8006,6 +8334,7 @@ pub async fn notify_remote_actor_quote(
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
         remote_status_id: Set(Some(remote_status_id.0)),
+        group_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -12563,6 +12892,7 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         remote_actor_id: notification.remote_actor_id.map(AccountId),
         status_id: notification.status_id.map(StatusId),
         remote_status_id: notification.remote_status_id.map(StatusId),
+        group_id: notification.group_id,
         created_at: notification.created_at,
         dismissed_at: notification.dismissed_at,
     }

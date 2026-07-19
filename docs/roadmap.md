@@ -72,7 +72,7 @@
 
 - Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: grouped notification presentation plus poll and administrative notification events; Web Push delivery is available for currently supported notification types.
+- Notifications: poll and administrative notification events plus notification-policy APIs. Grouped notification presentation and Web Push delivery for currently supported notification types are available.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 

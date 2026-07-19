@@ -65,6 +65,7 @@ mod m20260701_000060_create_push_subscription;
 mod m20260701_000061_constrain_pkce_method;
 mod m20260701_000062_create_lists;
 mod m20260701_000063_constrain_inbox_activity_type;
+mod m20260701_000064_add_notification_groups;
 
 pub struct Migrator;
 
@@ -135,6 +136,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000061_constrain_pkce_method::Migration),
             Box::new(m20260701_000062_create_lists::Migration),
             Box::new(m20260701_000063_constrain_inbox_activity_type::Migration),
+            Box::new(m20260701_000064_add_notification_groups::Migration),
         ]
     }
 }

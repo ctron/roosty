@@ -123,9 +123,10 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and boosted-status `update` notifications with cursor pagination and basic filters. |
+| 🟡 | `/api/v2/notifications` | Lists Mastodon-compatible grouped notifications with cursor pagination, full or partial-avatar account expansion, group detail and account resources, group dismissal, and marker-based unread counts. `favourite`, `follow`, and `reblog` events use concurrency-safe rolling 12-hour groups; other supported types remain individual groups. Notification policies and fallback projections are not implemented yet. |
 | 🟢 | `GET/POST /api/v1/markers` | Persists local home and notification read positions. |
-| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, boosted-status `update`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared; grouping and Mastodon notification-policy APIs remain missing. Web Push delivery policies are implemented separately. |
-| 🟡 | Notification read state | Local home and notification markers work; grouped and remote notification state is missing. |
+| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, boosted-status `update`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared. Group identities are persisted and shared safely by multiple Roosty processes; Mastodon notification-policy APIs remain missing. Web Push delivery policies are implemented separately. |
+| 🟡 | Notification read state | Local home and notification markers drive v1 markers and v2 grouped unread counts; remote notification state is missing. |
 
 ### Tags, Push, and Media
 
@@ -136,7 +137,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | Featured hashtags | Authenticated list/create/delete and suggestion APIs, public per-account lookup, a fixed ten-tag limit, and batched visible-status statistics are implemented for local and cached-remote accounts. |
 | 🟢 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local or cached-remote posts enter the home timeline and user stream. Remote matching is limited to Notes received through normal federation delivery. |
 | 🟢 | `/api/v1/push/subscription` | OAuth `push`-scoped GET/POST/PUT/DELETE manages one subscription per token, including typed delivery policies and the VAPID server key. POST and PUT accept both Elk/Masto.js JSON and Tusky form encoding, including Tusky's `standard=true` registration. Supported alert switches are `mention`, `favourite`, `reblog`, `follow`, `follow_request`, `status`, `update`, `quote`, and `quoted_update`; `poll`, `admin.sign_up`, and `admin.report` remain unsupported because Roosty does not generate those notification types. |
-| 🟢 | Push delivery | Transactional UUIDv7 jobs deliver Mastodon payloads using RFC 8291 `aes128gcm` or legacy `aesgcm`, retry transient failures, remove rejected subscriptions, and validate public HTTPS endpoints independently at registration and delivery. Grouped notifications remain separate and unsupported. |
+| 🟢 | Push delivery | Transactional UUIDv7 jobs deliver Mastodon payloads using RFC 8291 `aes128gcm` or legacy `aesgcm`, retry transient failures, remove rejected subscriptions, and validate public HTTPS endpoints independently at registration and delivery. Push remains event-based and independent of grouped API presentation. |
 | 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
 | 🟡 | Custom emojis | `GET /api/v1/custom_emojis` is public and returns an empty local picker. Cached remote account and status projections expose valid ActivityPub Emoji tags; local emoji management and outbound emoji federation are missing. |
 
@@ -179,7 +180,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add federated direct-message media fetching and account migration.
 - [ ] Expand conversation support beyond local direct messages.
 - [x] Add cache-only remote hashtag indexing, timelines, discovery, history, and followed-tag fan-out.
-- [ ] Add grouped notifications; Web Push integration is implemented independently.
+- [x] Add grouped notification listing, detail, account expansion, dismissal, and unread counts; Web Push remains event-based and independent.
 - [ ] Add poll and administrative notifications, including their Web Push alert switches.
 - [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.
