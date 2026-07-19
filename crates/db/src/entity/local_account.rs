@@ -1,3 +1,4 @@
+use crate::{QuoteApprovalPolicy, StatusVisibility};
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -16,10 +17,10 @@ pub struct Model {
     pub locked: bool,
     pub bot: bool,
     pub discoverable: bool,
-    pub default_visibility: String,
+    pub default_visibility: StatusVisibility,
     pub default_sensitive: bool,
     pub default_language: Option<String>,
-    pub default_quote_policy: String,
+    pub default_quote_policy: QuoteApprovalPolicy,
     pub profile_fields: Json,
     pub avatar_file_path: Option<String>,
     pub header_file_path: Option<String>,

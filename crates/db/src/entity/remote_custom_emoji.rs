@@ -1,3 +1,4 @@
+use crate::RemoteMediaState;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -10,7 +11,7 @@ pub struct Model {
     pub shortcode: String,
     pub remote_url: String,
     pub content_type: Option<String>,
-    pub state: String,
+    pub state: RemoteMediaState,
     pub file_path: Option<String>,
     pub file_size: Option<i64>,
     pub fetched_at: Option<OffsetDateTime>,

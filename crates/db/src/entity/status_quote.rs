@@ -1,3 +1,4 @@
+use crate::QuoteState;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -12,7 +13,7 @@ pub struct Model {
     pub quoted_local_status_id: Option<Uuid>,
     pub quoted_remote_status_id: Option<Uuid>,
     pub quoted_activitypub_id: String,
-    pub state: String,
+    pub state: QuoteState,
     pub quote_request_id: Option<String>,
     pub authorization_id: Option<String>,
     pub created_at: OffsetDateTime,

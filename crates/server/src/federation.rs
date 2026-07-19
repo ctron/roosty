@@ -135,6 +135,54 @@ enum DeleteType {
     Delete,
 }
 
+/// Activity types recognized at the inbox JSON boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum InboundActivityType {
+    Follow,
+    Accept,
+    Reject,
+    Create,
+    Update,
+    Delete,
+    Like,
+    Announce,
+    Undo,
+    Move,
+    Block,
+    Add,
+    Remove,
+    #[serde(rename = "https://w3id.org/fep/044f#QuoteRequest")]
+    QuoteRequest,
+    #[serde(other)]
+    Other,
+}
+
+impl InboundActivityType {
+    fn persisted(self) -> Option<roosty_db::InboxActivityType> {
+        match self {
+            Self::Follow => Some(roosty_db::InboxActivityType::Follow),
+            Self::Accept => Some(roosty_db::InboxActivityType::Accept),
+            Self::Reject => Some(roosty_db::InboxActivityType::Reject),
+            Self::Create => Some(roosty_db::InboxActivityType::Create),
+            Self::Update => Some(roosty_db::InboxActivityType::Update),
+            Self::Delete => Some(roosty_db::InboxActivityType::Delete),
+            Self::Like => Some(roosty_db::InboxActivityType::Like),
+            Self::Announce => Some(roosty_db::InboxActivityType::Announce),
+            Self::Undo => Some(roosty_db::InboxActivityType::Undo),
+            Self::Move => Some(roosty_db::InboxActivityType::Move),
+            Self::Block => Some(roosty_db::InboxActivityType::Block),
+            Self::Add => Some(roosty_db::InboxActivityType::Add),
+            Self::Remove => Some(roosty_db::InboxActivityType::Remove),
+            Self::QuoteRequest => Some(roosty_db::InboxActivityType::QuoteRequest),
+            Self::Other => None,
+        }
+    }
+}
+
+fn inbound_activity_type(activity: &JsonValue) -> Option<InboundActivityType> {
+    serde_json::from_value(activity.get("type")?.clone()).ok()
+}
+
 /// Activity types that carry a remote Note object in an inbox request.
 #[derive(Clone, Copy, Deserialize)]
 enum InboundStatusType {
@@ -179,10 +227,16 @@ impl InboundActivityReference {
 #[serde(rename_all = "camelCase")]
 struct InboundQuoteAuthorization {
     id: String,
-    r#type: String,
+    r#type: InboundQuoteAuthorizationType,
     attributed_to: String,
     interacting_object: String,
     interaction_target: String,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+enum InboundQuoteAuthorizationType {
+    #[serde(rename = "https://w3id.org/fep/044f#QuoteAuthorization")]
+    QuoteAuthorization,
 }
 
 #[derive(Deserialize)]
@@ -249,7 +303,17 @@ struct InboundFollowActivity {
 #[serde(untagged)]
 enum InboundUndoFollowObject {
     Id(String),
-    Follow { id: String, r#type: String },
+    Follow {
+        id: String,
+        r#type: InboundFollowType,
+    },
+}
+
+#[derive(Deserialize)]
+enum InboundFollowType {
+    Follow,
+    #[serde(other)]
+    Other,
 }
 
 impl InboundUndoFollowObject {
@@ -257,7 +321,10 @@ impl InboundUndoFollowObject {
     fn follow_id(self) -> Option<String> {
         match self {
             Self::Id(id) => Some(id),
-            Self::Follow { id, r#type } if r#type == "Follow" => Some(id),
+            Self::Follow {
+                id,
+                r#type: InboundFollowType::Follow,
+            } => Some(id),
             Self::Follow { .. } => None,
         }
     }
@@ -281,14 +348,27 @@ struct InboundBlockActivity {
 #[serde(untagged)]
 enum InboundUndoBlockObject {
     Id(String),
-    Block { id: String, r#type: String },
+    Block {
+        id: String,
+        r#type: InboundBlockType,
+    },
+}
+
+#[derive(Deserialize)]
+enum InboundBlockType {
+    Block,
+    #[serde(other)]
+    Other,
 }
 
 impl InboundUndoBlockObject {
     fn block_id(self) -> Option<String> {
         match self {
             Self::Id(id) => Some(id),
-            Self::Block { id, r#type } if r#type == "Block" => Some(id),
+            Self::Block {
+                id,
+                r#type: InboundBlockType::Block,
+            } => Some(id),
             Self::Block { .. } => None,
         }
     }
@@ -385,7 +465,7 @@ impl InboundUndoAnnounceObject {
 #[serde(rename_all = "camelCase")]
 struct InboundNote {
     id: String,
-    r#type: String,
+    r#type: InboundNoteType,
     attributed_to: String,
     content: String,
     #[serde(default)]
@@ -415,6 +495,11 @@ struct InboundNote {
     quote: Option<String>,
     #[serde(default)]
     quote_authorization: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq)]
+enum InboundNoteType {
+    Note,
 }
 
 struct ResolvedInboundQuote {
@@ -498,7 +583,7 @@ async fn resolve_inbound_quote(
                 Err(_) => return Ok(None),
             };
         if authorization.id != authorization_id
-            || authorization.r#type != "https://w3id.org/fep/044f#QuoteAuthorization"
+            || authorization.r#type != InboundQuoteAuthorizationType::QuoteAuthorization
             || authorization.attributed_to != target_actor.activitypub_id
             || authorization.interacting_object != note.id
             || authorization.interaction_target != target.activitypub_id
@@ -564,10 +649,17 @@ impl InboundAudienceValues {
 #[serde(rename_all = "camelCase")]
 struct InboundAttachment {
     #[serde(rename = "type")]
-    r#type: String,
+    r#type: InboundAttachmentType,
     media_type: Option<String>,
     url: Option<JsonValue>,
     name: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq)]
+enum InboundAttachmentType {
+    Document,
+    #[serde(other)]
+    Other,
 }
 
 impl InboundAttachment {
@@ -906,11 +998,16 @@ struct NoteExtensionsContext {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NoteAttachment {
-    r#type: &'static str,
+    r#type: NoteAttachmentType,
     media_type: String,
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+}
+
+#[derive(Serialize)]
+enum NoteAttachmentType {
+    Document,
 }
 
 /// Typed ActivityPub mention tag emitted on locally authored Notes.
@@ -1491,29 +1588,14 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     if !verify_legacy_signature(&parts, &body, &remote_actor).unwrap_or(false) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let activity_type = activity.get("type").and_then(JsonValue::as_str);
-    let supported = matches!(
-        activity_type,
-        Some(
-            "Follow"
-                | "Accept"
-                | "Reject"
-                | "Create"
-                | "Update"
-                | "Delete"
-                | "Like"
-                | "Announce"
-                | "Undo"
-                | "Move"
-                | "Block"
-                | "Add"
-                | "Remove"
-                | "https://w3id.org/fep/044f#QuoteRequest"
-        )
-    );
-    if !supported {
+    let activity_type = inbound_activity_type(&activity);
+    if activity_type.is_none_or(|kind| kind == InboundActivityType::Other) {
         return StatusCode::ACCEPTED.into_response();
     }
+    let Some(persisted_activity_type) = activity_type.and_then(InboundActivityType::persisted)
+    else {
+        return StatusCode::ACCEPTED.into_response();
+    };
     let Some(activity_id) = activity
         .get("id")
         .and_then(JsonValue::as_str)
@@ -1536,8 +1618,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             activity_id: &activity_id,
             remote_actor_id: remote_actor.id,
             payload_digest: &digest,
-            activity_type: activity_type.unwrap_or_default(),
-            outcome: "accepted",
+            activity_type: persisted_activity_type,
+            outcome: roosty_db::InboxActivityOutcome::Accepted,
         },
     )
     .await;
@@ -1570,14 +1652,17 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             }
         };
     }
-    if matches!(activity_type, Some("Add" | "Remove")) {
+    if matches!(
+        activity_type,
+        Some(InboundActivityType::Add | InboundActivityType::Remove)
+    ) {
         let target = activity.get("target").and_then(activitypub_reference);
         if remote_actor.featured_tags_url.as_deref() == target {
             return match process_inbound_featured_tag_activity(
                 state,
                 &activity,
                 &remote_actor,
-                activity_type == Some("Add"),
+                activity_type == Some(InboundActivityType::Add),
             )
             .await
             {
@@ -1618,7 +1703,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 &txn,
                 remote_actor.id,
                 status.id,
-                activity_type == Some("Add"),
+                activity_type == Some(InboundActivityType::Add),
             )
             .await
         {
@@ -1629,7 +1714,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => internal_error(error),
         };
     }
-    if activity_type == Some("Block") {
+    if activity_type == Some(InboundActivityType::Block) {
         let block: InboundBlockActivity = match serde_json::from_value(activity.clone()) {
             Ok(block) => block,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -1665,7 +1750,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => internal_error(error),
         };
     }
-    if activity_type == Some("Undo")
+    if activity_type == Some(InboundActivityType::Undo)
         && let Ok(undo) = serde_json::from_value::<InboundUndoBlockActivity>(activity.clone())
         && let Some(original_id) = undo.object.block_id()
     {
@@ -1701,7 +1786,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             };
         }
     }
-    if activity_type == Some("https://w3id.org/fep/044f#QuoteRequest") {
+    if activity_type == Some(InboundActivityType::QuoteRequest) {
         return Box::pin(async {
             let request: InboundQuoteRequest = match serde_json::from_value(activity.clone()) {
                 Ok(request) => request,
@@ -1856,7 +1941,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         })
         .await;
     }
-    if activity_type == Some("Delete")
+    if activity_type == Some(InboundActivityType::Delete)
         && let Ok(delete) = serde_json::from_value::<InboundDeleteActivity>(activity.clone())
     {
         let object_id = match delete.object {
@@ -1909,8 +1994,10 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         }
     }
     if matches!(
-        activity.get("type").and_then(JsonValue::as_str),
-        Some("Create") | Some("Update") | Some("Delete")
+        activity_type,
+        Some(
+            InboundActivityType::Create | InboundActivityType::Update | InboundActivityType::Delete
+        )
     ) {
         return match process_remote_status_activity(state, &activity_id, &activity, &remote_actor)
             .await
@@ -1930,8 +2017,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         };
     }
     if matches!(
-        activity.get("type").and_then(JsonValue::as_str),
-        Some("Accept") | Some("Reject")
+        activity_type,
+        Some(InboundActivityType::Accept | InboundActivityType::Reject)
     ) {
         if let Ok(response) = serde_json::from_value::<InboundQuoteResponse>(activity.clone())
             && let Ok(Some(quote)) =
@@ -1955,7 +2042,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                             .await;
                     }
                 };
-                let accepted = activity_type == Some("Accept");
+                let accepted = activity_type == Some(InboundActivityType::Accept);
                 let authorization_id = if accepted {
                     let Some(auth) = response.result else {
                         return StatusCode::BAD_REQUEST.into_response();
@@ -1976,7 +2063,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                             Ok(Some(account)) => account,
                             _ => return StatusCode::BAD_REQUEST.into_response(),
                         };
-                    if auth.r#type != "https://w3id.org/fep/044f#QuoteAuthorization"
+                    if auth.r#type != InboundQuoteAuthorizationType::QuoteAuthorization
                         || auth.attributed_to != remote_actor.activitypub_id
                         || auth.interacting_object != status_url(state, &local.username, quoting.id)
                         || auth.interaction_target != target.activitypub_id
@@ -2057,7 +2144,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 Err(error) => internal_error(error),
             };
         }
-        let result = if activity.get("type").and_then(JsonValue::as_str) == Some("Accept") {
+        let result = if activity_type == Some(InboundActivityType::Accept) {
             roosty_db::accept_remote_following(&txn, remote_actor.id, object_id).await
         } else {
             roosty_db::reject_remote_following(&txn, remote_actor.id, object_id).await
@@ -2068,7 +2155,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     return internal_error(error);
                 }
                 if accepted
-                    && activity.get("type").and_then(JsonValue::as_str) == Some("Accept")
+                    && activity_type == Some(InboundActivityType::Accept)
                     && let Err(error) =
                         crate::media::enqueue_remote_profile_media_fetches(state, remote_actor.id)
                             .await
@@ -2080,7 +2167,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => internal_error(error),
         };
     }
-    if activity.get("type").and_then(JsonValue::as_str) == Some("Like") {
+    if activity_type == Some(InboundActivityType::Like) {
         let like: InboundLikeActivity = match serde_json::from_value(activity.clone()) {
             Ok(like) => like,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -2155,7 +2242,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => return internal_error(error),
         }
     }
-    if activity.get("type").and_then(JsonValue::as_str) == Some("Announce") {
+    if activity_type == Some(InboundActivityType::Announce) {
         let announce: InboundAnnounceActivity = match serde_json::from_value(activity.clone()) {
             Ok(announce) => announce,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -2275,7 +2362,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         }
         return StatusCode::ACCEPTED.into_response();
     }
-    if activity.get("type").and_then(JsonValue::as_str) == Some("Undo")
+    if activity_type == Some(InboundActivityType::Undo)
         && let Ok(undo) = serde_json::from_value::<InboundUndoAnnounceActivity>(activity.clone())
         && let Some(original_id) = undo.object.announce_id()
     {
@@ -2313,7 +2400,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => return internal_error(error),
         }
     }
-    if activity.get("type").and_then(JsonValue::as_str) == Some("Undo")
+    if activity_type == Some(InboundActivityType::Undo)
         && let Ok(undo) = serde_json::from_value::<InboundUndoLikeActivity>(activity.clone())
         && let Some(original_id) = undo.object.like_id()
     {
@@ -2342,12 +2429,12 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         }
     }
     if !matches!(
-        activity.get("type").and_then(JsonValue::as_str),
-        Some("Follow") | Some("Undo")
+        activity_type,
+        Some(InboundActivityType::Follow | InboundActivityType::Undo)
     ) {
         return StatusCode::ACCEPTED.into_response();
     }
-    if activity.get("type").and_then(JsonValue::as_str) == Some("Undo") {
+    if activity_type == Some(InboundActivityType::Undo) {
         let undo: InboundUndoFollowActivity = match serde_json::from_value(activity.clone()) {
             Ok(undo) => undo,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -2530,15 +2617,14 @@ async fn register_inbox_replay(
     txn: &sea_orm::DatabaseTransaction,
     activity: &JsonValue,
     remote_actor: &roosty_db::RemoteActor,
-    outcome: &str,
+    outcome: roosty_db::InboxActivityOutcome,
 ) -> Result<roosty_db::InboxReplayResult, RoostyError> {
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RoostyError::InvalidInput("inbox activity ID is missing".to_owned()))?;
-    let activity_type = activity
-        .get("type")
-        .and_then(JsonValue::as_str)
+    let activity_type = inbound_activity_type(activity)
+        .and_then(InboundActivityType::persisted)
         .ok_or_else(|| RoostyError::InvalidInput("inbox activity type is missing".to_owned()))?;
     let digest = canonical_activity_digest(activity)?;
     roosty_db::register_inbox_activity(
@@ -2559,7 +2645,14 @@ async fn is_new_inbox_activity(
     activity: &JsonValue,
     remote_actor: &roosty_db::RemoteActor,
 ) -> Result<bool, RoostyError> {
-    match register_inbox_replay(txn, activity, remote_actor, "accepted").await? {
+    match register_inbox_replay(
+        txn,
+        activity,
+        remote_actor,
+        roosty_db::InboxActivityOutcome::Accepted,
+    )
+    .await?
+    {
         roosty_db::InboxReplayResult::New => {
             INBOX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
             Ok(true)
@@ -2589,7 +2682,13 @@ async fn finish_ignored_inbox_activity(
         Ok(txn) => txn,
         Err(error) => return internal_error(error),
     };
-    let result = register_inbox_replay(&txn, activity, remote_actor, "ignored").await;
+    let result = register_inbox_replay(
+        &txn,
+        activity,
+        remote_actor,
+        roosty_db::InboxActivityOutcome::Ignored,
+    )
+    .await;
     match result {
         Ok(roosty_db::InboxReplayResult::New) => {
             INBOX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
@@ -2610,9 +2709,9 @@ async fn finish_ignored_inbox_activity(
 
 /// Identify actor lifecycle activities before the similarly named Note handlers.
 fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> bool {
-    match activity.get("type").and_then(JsonValue::as_str) {
-        Some("Move") => true,
-        Some("Update") => activity
+    match inbound_activity_type(activity) {
+        Some(InboundActivityType::Move) => true,
+        Some(InboundActivityType::Update) => activity
             .get("object")
             .and_then(|object| match object {
                 JsonValue::String(id) => Some(id == actor_id),
@@ -2626,7 +2725,7 @@ fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> b
                 _ => None,
             })
             .unwrap_or(false),
-        Some("Delete") => activity
+        Some(InboundActivityType::Delete) => activity
             .get("object")
             .and_then(|object| match object {
                 JsonValue::String(id) => Some(id == actor_id),
@@ -2647,8 +2746,8 @@ async fn process_remote_actor_lifecycle(
     activity: &JsonValue,
     remote_actor: &roosty_db::RemoteActor,
 ) -> Result<Option<roosty_db::RemoteDeleteRepair>, RoostyError> {
-    match activity.get("type").and_then(JsonValue::as_str) {
-        Some("Update") => {
+    match inbound_activity_type(activity) {
+        Some(InboundActivityType::Update) => {
             let object_id = activity
                 .get("object")
                 .and_then(|object| match object {
@@ -2680,7 +2779,7 @@ async fn process_remote_actor_lifecycle(
             }
             Ok(None)
         }
-        Some("Delete") => {
+        Some(InboundActivityType::Delete) => {
             let delete: InboundDeleteActivity =
                 serde_json::from_value(activity.clone()).map_err(|_| {
                     RoostyError::InvalidInput("remote actor Delete is invalid".to_owned())
@@ -2707,7 +2806,7 @@ async fn process_remote_actor_lifecycle(
             }
             Ok(repair)
         }
-        Some("Move") => {
+        Some(InboundActivityType::Move) => {
             let movement: InboundMoveActivity =
                 serde_json::from_value(activity.clone()).map_err(|_| {
                     RoostyError::InvalidInput("remote actor Move is invalid".to_owned())
@@ -2796,17 +2895,17 @@ async fn process_remote_status_activity(
             "remote status activity origin does not match signer".to_owned(),
         ));
     }
-    match activity.get("type").and_then(JsonValue::as_str) {
-        Some("Create") | Some("Update") => {
-            let activity_type = activity.get("type").and_then(JsonValue::as_str);
+    match inbound_activity_type(activity) {
+        Some(InboundActivityType::Create | InboundActivityType::Update) => {
+            let activity_type = inbound_activity_type(activity);
             let inbound: InboundStatusActivity =
                 serde_json::from_value(activity.clone()).map_err(|_| {
                     RoostyError::InvalidInput("remote status activity is invalid".to_owned())
                 })?;
             if !matches!(
                 (activity_type, inbound.r#type),
-                (Some("Create"), InboundStatusType::Create)
-                    | (Some("Update"), InboundStatusType::Update)
+                (Some(InboundActivityType::Create), InboundStatusType::Create)
+                    | (Some(InboundActivityType::Update), InboundStatusType::Update)
             ) {
                 return Err(RoostyError::InvalidInput(
                     "remote status activity type is invalid".to_owned(),
@@ -2819,7 +2918,7 @@ async fn process_remote_status_activity(
             let attachments = note
                 .attachment
                 .iter()
-                .filter(|attachment| attachment.r#type == "Document")
+                .filter(|attachment| attachment.r#type == InboundAttachmentType::Document)
                 .filter_map(|attachment| {
                     attachment
                         .url()
@@ -2840,7 +2939,7 @@ async fn process_remote_status_activity(
                 .collect::<Vec<_>>();
             if inbound.actor != remote_actor.activitypub_id
                 || note.attributed_to != remote_actor.activitypub_id
-                || note.r#type != "Note"
+                || note.r#type != InboundNoteType::Note
                 || !note.id.starts_with("https://")
                 || !same_url_origin(&note.id, &remote_actor.activitypub_id)
             {
@@ -3054,7 +3153,7 @@ async fn process_remote_status_activity(
                 edited,
             })
         }
-        Some("Delete") => {
+        Some(InboundActivityType::Delete) => {
             let inbound: InboundDeleteActivity =
                 serde_json::from_value(activity.clone()).map_err(|_| {
                     RoostyError::InvalidInput("remote Delete activity is invalid".to_owned())
@@ -3189,9 +3288,9 @@ async fn publish_remote_status_change(
                 || (edited && !mention_recipients.is_empty())
             {
                 let stream_visibility = if status.in_reply_to.is_some() {
-                    "unlisted"
+                    StatusVisibility::Unlisted
                 } else {
-                    (&status.visibility).into()
+                    status.visibility
                 };
                 if edited {
                     state.streaming_events.publish_remote_status_edit(
@@ -3238,7 +3337,7 @@ async fn publish_delete_repair(
                     state.streaming_events.publish_local_status_delete(
                         &projection.status_id,
                         projection.actor_id,
-                        (&projection.visibility).into(),
+                        projection.visibility,
                         &projection.home_recipient_ids,
                         projection.has_media,
                     );
@@ -3247,7 +3346,7 @@ async fn publish_delete_repair(
                     state.streaming_events.publish_remote_status_delete(
                         &projection.status_id,
                         projection.actor_id,
-                        (&projection.visibility).into(),
+                        projection.visibility,
                         &projection.home_recipient_ids,
                         projection.has_media,
                     );
@@ -3258,7 +3357,7 @@ async fn publish_delete_repair(
             state.streaming_events.publish_delete(
                 &projection.status_id,
                 projection.actor_id,
-                "direct",
+                StatusVisibility::Direct,
                 &projection.direct_recipient_ids,
             );
         }
@@ -5179,12 +5278,9 @@ async fn deliver_activity(
         // Domain suspension intentionally drops already queued work without retrying.
         return Ok(());
     }
-    let moderation_activity = activity.get("type").and_then(JsonValue::as_str) == Some("Block")
-        || activity
-            .get("object")
-            .and_then(|object| object.get("type"))
-            .and_then(JsonValue::as_str)
-            == Some("Block");
+    let moderation_activity = inbound_activity_type(activity) == Some(InboundActivityType::Block)
+        || activity.get("object").and_then(inbound_activity_type)
+            == Some(InboundActivityType::Block);
     if !moderation_activity
         && roosty_db::local_remote_accounts_are_blocked(
             &state.db,
@@ -5480,7 +5576,7 @@ async fn note_object_with_remote_audience(
         .await?
         .into_iter()
         .map(|media| NoteAttachment {
-            r#type: "Document",
+            r#type: NoteAttachmentType::Document,
             media_type: media.content_type,
             url: crate::media::media_url(state, &media.file_path),
             name: media.description,
@@ -6004,7 +6100,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "accepted"
+            roosty_db::RemoteFollowState::Accepted
         );
 
         let first = create_public_test_status(
@@ -6247,7 +6343,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "accepted"
+            roosty_db::RemoteFollowState::Accepted
         );
 
         follow_test_actor(&context.beta, follower.id, rejected_remote.id).await;
@@ -6333,7 +6429,7 @@ mod tests {
             author.id,
             "https://beta.test/follows/profile-update",
             serde_json::json!({}),
-            "accepted",
+            roosty_db::RemoteFollowState::Accepted,
         )
         .await
         .unwrap();
@@ -6362,10 +6458,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(
-            job.kind,
-            roosty_db::JobKind::FederationActorUpdateDelivery.as_str()
-        );
+        assert_eq!(job.kind, roosty_db::JobKind::FederationActorUpdateDelivery);
         let activity = &job.payload["activity"];
         assert_eq!(activity["type"], "Update");
         assert_eq!(activity["actor"], activity["object"]["id"]);
@@ -6777,9 +6870,9 @@ mod tests {
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: "local".to_owned(),
+            object_storage_backend: crate::config::ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
-            registration_mode: "closed".to_owned(),
+            registration_mode: crate::config::RegistrationMode::Closed,
             federation_enabled: true,
             federation_key_encryption_secret: Some(
                 "test-federation-key-encryption-secret-000".to_owned(),
@@ -6942,7 +7035,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(job.kind, kind.as_str());
+        assert_eq!(job.kind, kind);
         match kind {
             roosty_db::JobKind::FederationFollowResponse => {
                 super::deliver_follow_response(state, job.payload.clone())

@@ -8,9 +8,9 @@ use roosty_core::{
 };
 use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
-    DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult,
-    IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set,
-    Statement, TransactionTrait, TryInsertResult,
+    DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
+    FromQueryResult, IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
     sea_query::{OnConflict, Query},
 };
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,22 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Closed Mastodon status visibility values, serialized as text at persistence and API boundaries.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    DeriveValueType,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum StatusVisibility {
     Public,
     Unlisted,
@@ -38,7 +52,10 @@ pub enum StatusVisibility {
 }
 
 /// Closed event names persisted in the cross-process streaming log.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum StreamingEventKind {
     Update,
@@ -49,7 +66,10 @@ pub enum StreamingEventKind {
 }
 
 /// Origin of a status-like event used for public stream routing.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum StreamingStatusOrigin {
     Local,
@@ -85,19 +105,24 @@ pub struct RetainedStreamingEvent {
     pub has_media: bool,
 }
 
+mod entity;
+
 impl StatusVisibility {
-    /// Parse a persisted visibility without accepting unknown values.
+    /// Parse a persisted or wire visibility without accepting unknown values.
     pub fn parse(value: &str) -> Result<Self> {
         Ok(Self::from_str(value)?)
     }
-}
 
-mod entity;
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
 
 use entity::{
     job, local_account, local_account_block, local_account_mute, local_actor_key,
     local_conversation, local_conversation_account, local_conversation_remote_participant,
-    local_featured_tag, local_follow, local_media_attachment, local_notification,
+    local_featured_tag, local_follow, local_list, local_list_local_member,
+    local_list_remote_member, local_media_attachment, local_notification,
     local_remote_account_block, local_remote_account_mute, local_remote_status_favourite,
     local_remote_status_reblog, local_status, local_status_bookmark, local_status_edit,
     local_status_edit_media, local_status_favourite, local_status_local_mention,
@@ -113,12 +138,77 @@ use entity::{
 };
 
 /// Quote policy values authored by Mastodon-compatible clients.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    DeriveValueType,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum QuoteApprovalPolicy {
     Public,
     Followers,
     Nobody,
+}
+
+/// Closed reply filtering policies exposed by Mastodon's List entity.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    DeriveValueType,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ListRepliesPolicy {
+    Followed,
+    List,
+    None,
+}
+
+/// A private timeline list owned by one local account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalList {
+    pub id: Uuid,
+    pub account_id: AccountId,
+    pub title: String,
+    pub replies_policy: ListRepliesPolicy,
+    pub exclusive: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// A local or cached-remote account returned from a list membership page.
+#[derive(Clone, Debug)]
+pub enum ListAccount {
+    Local(LocalAccount),
+    Remote(RemoteActor),
+}
+
+/// Validation outcome when atomically adding accounts to a list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddListAccountsResult {
+    Added,
+    ListNotFound,
+    AccountNotFollowed,
+    AlreadyPresent,
 }
 
 impl QuoteApprovalPolicy {
@@ -128,7 +218,10 @@ impl QuoteApprovalPolicy {
 }
 
 /// Durable consent state for one quote edge.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum QuoteState {
     Pending,
@@ -173,14 +266,48 @@ pub enum InboxReplayResult {
     Conflict,
 }
 
+/// Durable processing outcome stored for an inbound ActivityPub activity.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum InboxActivityOutcome {
+    Accepted,
+    Ignored,
+}
+
+/// ActivityPub activity kinds recorded by the inbox replay ledger.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+pub enum InboxActivityType {
+    Follow,
+    Accept,
+    Reject,
+    Create,
+    Update,
+    Delete,
+    Like,
+    Announce,
+    Undo,
+    Move,
+    Block,
+    Add,
+    Remove,
+    #[strum(serialize = "https://w3id.org/fep/044f#QuoteRequest")]
+    QuoteRequest,
+}
+
 /// Immutable metadata stored for a processed inbound ActivityPub activity.
 #[derive(Clone, Copy, Debug)]
 pub struct InboxActivityMetadata<'a> {
     pub activity_id: &'a str,
     pub remote_actor_id: AccountId,
     pub payload_digest: &'a [u8; 32],
-    pub activity_type: &'a str,
-    pub outcome: &'a str,
+    pub activity_type: InboxActivityType,
+    pub outcome: InboxActivityOutcome,
 }
 
 /// A durable job to be inserted as part of a larger database operation.
@@ -221,7 +348,10 @@ pub struct NewRemoteMediaAttachment {
 }
 
 /// Lifecycle state of a locally cached remote attachment.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum RemoteMediaState {
     Pending,
@@ -342,7 +472,10 @@ pub struct RemoteMediaCacheWrite {
 }
 
 /// The two actor image slots understood by Mastodon-compatible clients.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum RemoteProfileMediaKind {
     Avatar,
@@ -404,13 +537,13 @@ pub async fn publish_streaming_event(db: &DbConnection, event: NewStreamingEvent
     let model = streaming_event::ActiveModel {
         sequence: ActiveValue::NotSet,
         origin_process_id: Set(event.origin_process_id),
-        event_kind: Set(event.kind.to_string()),
+        event_kind: Set(event.kind),
         payload: Set(event.payload),
         account_id: Set(event.account_id.0),
         recipient_ids: Set(serde_json::json!(recipient_ids)),
         notification_recipient_ids: Set(serde_json::json!(notification_recipient_ids)),
-        visibility: Set(event.visibility.to_string()),
-        status_origin: Set(event.status_origin.to_string()),
+        visibility: Set(event.visibility),
+        status_origin: Set(event.status_origin),
         has_media: Set(event.has_media),
         created_at: ActiveValue::NotSet,
     }
@@ -482,29 +615,16 @@ fn retained_streaming_event(model: streaming_event::Model) -> Result<RetainedStr
             .into_iter()
             .map(AccountId)
             .collect();
-    let kind = StreamingEventKind::from_str(&model.event_kind).map_err(|_| {
-        RoostyError::InvalidInput(format!(
-            "invalid streaming event kind: {}",
-            model.event_kind
-        ))
-    })?;
-    let status_origin = StreamingStatusOrigin::from_str(&model.status_origin).map_err(|_| {
-        RoostyError::InvalidInput(format!(
-            "invalid streaming status origin: {}",
-            model.status_origin
-        ))
-    })?;
-
     Ok(RetainedStreamingEvent {
         sequence: model.sequence,
         origin_process_id: model.origin_process_id,
-        kind,
+        kind: model.event_kind,
         payload: model.payload,
         account_id: AccountId(model.account_id),
         recipient_ids,
         notification_recipient_ids,
-        visibility: StatusVisibility::parse(&model.visibility)?,
-        status_origin,
+        visibility: model.visibility,
+        status_origin: model.status_origin,
         has_media: model.has_media,
     })
 }
@@ -634,7 +754,7 @@ pub struct LocalAccount {
     /// Default language for authored statuses.
     pub default_language: Option<String>,
     /// Default quote policy for authored statuses.
-    pub default_quote_policy: String,
+    pub default_quote_policy: QuoteApprovalPolicy,
     /// Profile metadata fields.
     pub profile_fields: JsonValue,
     /// Optional local avatar path relative to the media root.
@@ -706,6 +826,14 @@ pub enum AccountSearchResult {
     Local(LocalAccount),
     /// An active actor held in the federation cache.
     Remote(RemoteActor),
+}
+
+#[derive(Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, PartialEq)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+enum AccountSearchKind {
+    Local,
+    Remote,
 }
 
 /// Inputs controlling unified local and cached-remote account search.
@@ -834,7 +962,7 @@ pub struct RemoteFollowing {
     /// Canonical outbound Follow activity ID.
     pub activity_id: String,
     /// `pending` or `accepted`.
-    pub state: String,
+    pub state: RemoteFollowState,
     /// Whether boosts by the followed actor should appear in the home timeline.
     pub show_reblogs: bool,
     /// Whether new posts by the followed actor should create notifications.
@@ -873,7 +1001,7 @@ pub async fn create_remote_following(
         local_account_id: Set(local_account_id.0),
         remote_actor_id: Set(remote_actor_id.0),
         activity_id: Set(activity_id.to_owned()),
-        state: Set("pending".to_owned()),
+        state: Set(RemoteFollowState::Pending),
         show_reblogs: Set(show_reblogs),
         notify: Set(notify),
         ..Default::default()
@@ -916,7 +1044,7 @@ pub async fn create_remote_following_with_job(
         Some(model) => {
             let mut active = model.into_active_model();
             active.activity_id = Set(activity_id.to_owned());
-            active.state = Set("pending".to_owned());
+            active.state = Set(RemoteFollowState::Pending);
             active.show_reblogs = Set(show_reblogs);
             active.notify = Set(notify);
             active.deactivated_at = Set(None);
@@ -931,7 +1059,7 @@ pub async fn create_remote_following_with_job(
                 local_account_id: Set(local_account_id.0),
                 remote_actor_id: Set(remote_actor_id.0),
                 activity_id: Set(activity_id.to_owned()),
-                state: Set("pending".to_owned()),
+                state: Set(RemoteFollowState::Pending),
                 show_reblogs: Set(show_reblogs),
                 notify: Set(notify),
                 ..Default::default()
@@ -967,7 +1095,7 @@ pub async fn accepted_local_followers_of_remote_actor(
 ) -> Result<Vec<AccountId>> {
     let follows = remote_following::Entity::find()
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
-        .filter(remote_following::Column::State.eq("accepted"))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
         .filter(remote_following::Column::DeactivatedAt.is_null())
         .all(db)
         .await?;
@@ -1005,7 +1133,7 @@ async fn accepted_local_followers_of_remote_actor_with(
 ) -> Result<Vec<AccountId>> {
     let follows = remote_following::Entity::find()
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
-        .filter(remote_following::Column::State.eq("accepted"))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
         .filter(remote_following::Column::DeactivatedAt.is_null())
         .all(db)
         .await?;
@@ -1032,7 +1160,7 @@ pub async fn followers_for_local_account(
             .filter(local_follow::Column::FollowedAccountId.eq(account_id.0)),
         remote_follow::Entity::find()
             .filter(remote_follow::Column::LocalAccountId.eq(account_id.0))
-            .filter(remote_follow::Column::State.eq("accepted")),
+            .filter(remote_follow::Column::State.eq(RemoteFollowState::Accepted)),
         limit,
         cursor,
         |follow| (follow.id, AccountId(follow.follower_account_id)),
@@ -1054,7 +1182,7 @@ pub async fn following_for_local_account(
             .filter(local_follow::Column::FollowerAccountId.eq(account_id.0)),
         remote_following::Entity::find()
             .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
-            .filter(remote_following::Column::State.eq("accepted")),
+            .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted)),
         limit,
         cursor,
         |follow| (follow.id, AccountId(follow.followed_account_id)),
@@ -1126,7 +1254,7 @@ fn collection_cursor_matches(id: Uuid, cursor: CollectionCursor) -> bool {
 pub async fn count_remote_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
     Ok(remote_following::Entity::find()
         .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
-        .filter(remote_following::Column::State.eq("accepted"))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
         .filter(remote_following::Column::DeactivatedAt.is_null())
         .count(db)
         .await?)
@@ -1294,7 +1422,7 @@ pub async fn replace_remote_media_attachments(
             remote_url: Set(attachment.remote_url.clone()),
             content_type: Set(attachment.content_type.clone()),
             description: Set(attachment.description.clone()),
-            state: Set(RemoteMediaState::Pending.to_string()),
+            state: Set(RemoteMediaState::Pending),
             file_path: Set(None),
             preview_file_path: Set(None),
             file_size: Set(None),
@@ -1345,9 +1473,6 @@ pub async fn find_remote_media_attachment(
 fn remote_media_attachment_from_model(
     model: remote_media_attachment::Model,
 ) -> Result<RemoteMediaAttachment> {
-    let state = RemoteMediaState::from_str(&model.state).map_err(|_| {
-        RoostyError::InvalidInput("stored remote media state is invalid".to_owned())
-    })?;
     Ok(RemoteMediaAttachment {
         id: model.id,
         remote_status_id: StatusId(model.remote_status_id),
@@ -1355,7 +1480,7 @@ fn remote_media_attachment_from_model(
         remote_url: model.remote_url,
         content_type: model.content_type,
         description: model.description,
-        state,
+        state: model.state,
         file_path: model.file_path,
         preview_file_path: model.preview_file_path,
         file_size: model.file_size,
@@ -1381,7 +1506,7 @@ pub async fn queue_remote_media_fetch(
             RoostyError::InvalidInput("remote media attachment does not exist".to_owned())
         })?;
     let mut active = attachment.into_active_model();
-    active.state = Set(RemoteMediaState::Pending.to_string());
+    active.state = Set(RemoteMediaState::Pending);
     active.last_error = Set(None);
     active.updated_at = Set(OffsetDateTime::now_utc());
     active.update(txn).await?;
@@ -1402,7 +1527,7 @@ pub async fn mark_remote_media_ready(
         return Ok(());
     };
     let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Ready.to_string());
+    active.state = Set(RemoteMediaState::Ready);
     active.content_type = Set(Some(cache.content_type));
     active.file_path = Set(Some(cache.file_path));
     active.preview_file_path = Set(cache.preview_file_path);
@@ -1433,7 +1558,7 @@ pub async fn mark_remote_media_failed(
         return Ok(());
     };
     let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Failed.to_string());
+    active.state = Set(RemoteMediaState::Failed);
     active.last_error = Set(Some(error.to_owned()));
     active.updated_at = Set(OffsetDateTime::now_utc());
     active.update(db).await?;
@@ -1482,7 +1607,7 @@ async fn replace_remote_profile_media_kind(
             let mut active = existing.into_active_model();
             active.remote_url = Set(remote_url);
             active.content_type = Set(None);
-            active.state = Set(RemoteMediaState::Pending.to_string());
+            active.state = Set(RemoteMediaState::Pending);
             active.file_path = Set(None);
             active.file_size = Set(None);
             active.fetched_at = Set(None);
@@ -1501,9 +1626,9 @@ async fn replace_remote_profile_media_kind(
             remote_profile_media::ActiveModel {
                 id: Set(Uuid::now_v7()),
                 remote_actor_id: Set(remote_actor_id.0),
-                kind: Set(kind.to_string()),
+                kind: Set(kind),
                 remote_url: Set(remote_url),
-                state: Set(RemoteMediaState::Pending.to_string()),
+                state: Set(RemoteMediaState::Pending),
                 created_at: Set(now),
                 updated_at: Set(now),
                 ..Default::default()
@@ -1548,14 +1673,10 @@ fn remote_profile_media_from_model(
     Ok(RemoteProfileMedia {
         id: model.id,
         remote_actor_id: AccountId(model.remote_actor_id),
-        kind: RemoteProfileMediaKind::from_str(&model.kind).map_err(|_| {
-            RoostyError::InvalidInput("stored remote profile media kind is invalid".to_owned())
-        })?,
+        kind: model.kind,
         remote_url: model.remote_url,
         content_type: model.content_type,
-        state: RemoteMediaState::from_str(&model.state).map_err(|_| {
-            RoostyError::InvalidInput("stored remote profile media state is invalid".to_owned())
-        })?,
+        state: model.state,
         file_path: model.file_path,
         expires_at: model.expires_at,
     })
@@ -1574,7 +1695,7 @@ pub async fn queue_remote_profile_media_fetch(
             RoostyError::InvalidInput("remote profile media does not exist".to_owned())
         })?;
     let mut active = media.into_active_model();
-    active.state = Set(RemoteMediaState::Pending.to_string());
+    active.state = Set(RemoteMediaState::Pending);
     active.last_error = Set(None);
     active.updated_at = Set(OffsetDateTime::now_utc());
     active.update(txn).await?;
@@ -1595,7 +1716,7 @@ pub async fn mark_remote_profile_media_ready(
         return Ok(());
     };
     let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Ready.to_string());
+    active.state = Set(RemoteMediaState::Ready);
     active.content_type = Set(Some(content_type));
     active.file_path = Set(Some(file_path));
     active.file_size = Set(Some(file_size));
@@ -1617,7 +1738,7 @@ pub async fn mark_remote_profile_media_failed(
         return Ok(());
     };
     let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Failed.to_string());
+    active.state = Set(RemoteMediaState::Failed);
     active.last_error = Set(Some(error.to_owned()));
     active.updated_at = Set(OffsetDateTime::now_utc());
     active.update(db).await?;
@@ -1665,6 +1786,7 @@ pub async fn delete_remote_following(
         return Ok(None);
     };
     let relationship = remote_following_from_model(row.clone());
+    remove_remote_account_from_owned_lists(db, local_account_id, remote_actor_id).await?;
     row.into_active_model().delete(db).await?;
     Ok(Some(relationship))
 }
@@ -1687,6 +1809,7 @@ pub async fn delete_remote_following_with_job(
         return Ok(None);
     };
     let relationship = remote_following_from_model(row.clone());
+    remove_remote_account_from_owned_lists(txn, local_account_id, remote_actor_id).await?;
     row.into_active_model().delete(txn).await?;
     enqueue_job_in_transaction(txn, job).await?;
     Ok(Some(relationship))
@@ -1724,7 +1847,7 @@ where
         }
         let mut active = existing.into_active_model();
         active.content = Set(status.content);
-        active.visibility = Set(status.visibility.to_string());
+        active.visibility = Set(status.visibility);
         active.published_at = Set(status.published_at);
         active.updated_at = Set(status.updated_at);
         active.deleted_at = Set(None);
@@ -1744,7 +1867,7 @@ where
             activitypub_id: Set(status.activitypub_id),
             remote_actor_id: Set(status.remote_actor_id.0),
             content: Set(status.content),
-            visibility: Set(status.visibility.to_string()),
+            visibility: Set(status.visibility),
             published_at: Set(status.published_at),
             updated_at: Set(status.updated_at),
             deleted_at: Set(None),
@@ -1996,7 +2119,7 @@ async fn repair_one_remote_status_delete(
         .map(|recipient| AccountId(recipient.account_id))
         .collect::<Vec<_>>();
     let active_mention_ids = active_local_mentions_for_remote_status(txn, status_id).await?;
-    let visibility = StatusVisibility::parse(&status.visibility)?;
+    let visibility = status.visibility;
     let stream_visibility = if status.in_reply_to.is_some() {
         StatusVisibility::Unlisted
     } else {
@@ -2290,7 +2413,7 @@ pub async fn upsert_remote_custom_emojis(
                 id: Set(Uuid::now_v7()),
                 shortcode: Set(emoji.shortcode.clone()),
                 remote_url: Set(emoji.remote_url.clone()),
-                state: Set(RemoteMediaState::Pending.to_string()),
+                state: Set(RemoteMediaState::Pending),
                 created_at: Set(now),
                 updated_at: Set(now),
                 ..Default::default()
@@ -2340,7 +2463,7 @@ pub async fn mark_remote_custom_emoji_ready(
         return Ok(());
     };
     let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Ready.to_string());
+    active.state = Set(RemoteMediaState::Ready);
     active.content_type = Set(Some(content_type));
     active.file_path = Set(Some(file_path));
     active.file_size = Set(Some(file_size));
@@ -2362,7 +2485,7 @@ pub async fn mark_remote_custom_emoji_failed(
         return Ok(());
     };
     let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Failed.to_string());
+    active.state = Set(RemoteMediaState::Failed);
     active.last_error = Set(Some(error.to_owned()));
     active.updated_at = Set(OffsetDateTime::now_utc());
     active.update(db).await?;
@@ -2422,7 +2545,7 @@ pub struct LocalAccountSettingsUpdate {
     /// Default language for authored statuses.
     pub default_language: Option<Option<String>>,
     /// Default quote policy for authored statuses.
-    pub default_quote_policy: Option<String>,
+    pub default_quote_policy: Option<QuoteApprovalPolicy>,
     /// Profile metadata fields.
     pub profile_fields: Option<JsonValue>,
     /// Optional replacement avatar path relative to the media root.
@@ -2873,27 +2996,31 @@ pub struct TagTimelineOptions {
 }
 
 /// Supported local Mastodon notification kinds.
-#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    DeriveValueType,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum LocalNotificationType {
-    /// A local status mentioned the recipient.
     Mention,
-    /// A local account favourited one of the recipient's statuses.
     Favourite,
-    /// A local account followed the recipient.
     Follow,
-    /// A remote account requested to follow a locked recipient.
     FollowRequest,
-    /// A local account boosted one of the recipient's statuses.
     Reblog,
-    /// An account followed with notifications enabled published a new status.
     Status,
-    /// A status boosted by the recipient was edited.
     Update,
-    /// Someone published an accepted quote of the recipient's status.
     Quote,
-    /// A status quoted by the recipient was edited.
     QuotedUpdate,
 }
 
@@ -3062,7 +3189,7 @@ pub struct RemoteFollow {
     pub local_account_id: AccountId,
     pub activity_id: String,
     pub activity: JsonValue,
-    pub state: String,
+    pub state: RemoteFollowState,
 }
 
 /// Durable delivery work to create together with an automatically accepted Follow.
@@ -3077,40 +3204,41 @@ pub struct RemoteFollowResponseJob {
 }
 
 /// Known durable job kinds dispatched by Roosty's worker.
-#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum JobKind {
-    /// Deliver an Accept or Reject response for an inbound remote Follow.
     FederationFollowResponse,
-    /// Deliver a public or unlisted local status lifecycle activity.
     FederationStatusDelivery,
-    /// Deliver FEP-044f quote requests and authorization lifecycle activities.
     FederationQuoteDelivery,
-    /// Deliver a locally initiated Follow or Undo(Follow).
     FederationFollowDelivery,
-    /// Deliver a locally initiated Like or Undo(Like).
     FederationFavouriteDelivery,
-    /// Deliver a locally initiated Announce or Undo(Announce).
     FederationReblogDelivery,
-    /// Deliver a local actor profile update to accepted remote followers.
     FederationActorUpdateDelivery,
-    /// Deliver a locally initiated Block or Undo(Block).
     FederationModerationDelivery,
-    /// Safely fetch one remote media attachment into the local cache.
     FederationRemoteMediaFetch,
-    /// Refresh one remote actor's declared featured collection.
     FederationFeaturedRefresh,
-    /// Refresh one remote actor's declared featured-tags collection.
     FederationFeaturedTagsRefresh,
-    /// Deliver a Mastodon-compatible Web Push notification.
     WebPushDelivery,
 }
 
 impl JobKind {
-    /// Return the persisted worker kind name.
     pub fn as_str(self) -> &'static str {
         self.into()
     }
+}
+
+/// State shared by inbound and outbound remote follow relationships.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum RemoteFollowState {
+    Pending,
+    Accepted,
 }
 
 #[derive(FromQueryResult)]
@@ -3120,7 +3248,7 @@ struct RemoteFollowRow {
     local_account_id: Uuid,
     activity_id: String,
     activity: JsonValue,
-    state: String,
+    state: RemoteFollowState,
 }
 
 /// Store or refresh an inbound remote Follow request.
@@ -3130,7 +3258,7 @@ pub async fn upsert_remote_follow(
     local_account_id: AccountId,
     activity_id: &str,
     activity: JsonValue,
-    state: &str,
+    state: RemoteFollowState,
 ) -> Result<RemoteFollow> {
     let row = RemoteFollowRow::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
         INSERT INTO remote_follow (id, remote_actor_id, local_account_id, activity_id, activity, state)
@@ -3138,7 +3266,7 @@ pub async fn upsert_remote_follow(
         ON CONFLICT (remote_actor_id, local_account_id) DO UPDATE
         SET activity_id = EXCLUDED.activity_id, activity = EXCLUDED.activity, state = EXCLUDED.state, updated_at = now()
         RETURNING id, remote_actor_id, local_account_id, activity_id, activity, state
-    "#, vec![Uuid::now_v7().into(), remote_actor_id.0.into(), local_account_id.0.into(), activity_id.to_owned().into(), activity.into(), state.to_owned().into()])).one(db).await?
+    "#, vec![Uuid::now_v7().into(), remote_actor_id.0.into(), local_account_id.0.into(), activity_id.to_owned().into(), activity.into(), state.into()])).one(db).await?
         .ok_or_else(|| RoostyError::InvalidInput("remote follow could not be saved".to_owned()))?;
     Ok(remote_follow_from_row(row))
 }
@@ -3162,7 +3290,7 @@ pub async fn upsert_processed_remote_follow_with_response_job(
         local_account_id: Set(local_account_id.0),
         activity_id: Set(activity_id.to_owned()),
         activity: Set(activity),
-        state: Set("accepted".to_owned()),
+        state: Set(RemoteFollowState::Accepted),
         created_at: Set(OffsetDateTime::now_utc()),
         updated_at: Set(OffsetDateTime::now_utc()),
     })
@@ -3203,7 +3331,7 @@ pub async fn upsert_processed_pending_remote_follow(
         local_account_id: Set(local_account_id.0),
         activity_id: Set(activity_id.to_owned()),
         activity: Set(activity),
-        state: Set("pending".to_owned()),
+        state: Set(RemoteFollowState::Pending),
         created_at: Set(OffsetDateTime::now_utc()),
         updated_at: Set(OffsetDateTime::now_utc()),
     })
@@ -3232,7 +3360,7 @@ async fn insert_response_job(
 ) -> Result<()> {
     let _ = job::Entity::insert(job::ActiveModel {
         id: Set(Uuid::now_v7()),
-        kind: Set(response_job.kind.as_str().to_owned()),
+        kind: Set(response_job.kind),
         payload: Set(response_job.payload),
         deduplication_key: Set(Some(response_job.deduplication_key)),
         run_after: Set(OffsetDateTime::now_utc()),
@@ -3262,14 +3390,14 @@ pub async fn accept_remote_follow_with_response_job(
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_follow::Column::ActivityId.eq(activity_id))
-        .filter(remote_follow::Column::State.eq("pending"))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Pending))
         .one(txn)
         .await?;
     let Some(follow) = follow else {
         return Ok(false);
     };
     let mut follow = follow.into_active_model();
-    follow.state = Set("accepted".to_owned());
+    follow.state = Set(RemoteFollowState::Accepted);
     follow.updated_at = Set(OffsetDateTime::now_utc());
     follow.update(txn).await?;
     insert_response_job(txn, response_job).await?;
@@ -3316,7 +3444,7 @@ pub async fn delete_remote_follow_with_response_job(
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_follow::Column::ActivityId.eq(activity_id))
-        .filter(remote_follow::Column::State.eq("pending"))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Pending))
         .one(txn)
         .await?;
     let Some(follow) = follow else {
@@ -3334,7 +3462,7 @@ pub async fn pending_remote_follows(
 ) -> Result<Vec<RemoteFollow>> {
     Ok(remote_follow::Entity::find()
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
-        .filter(remote_follow::Column::State.eq("pending"))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Pending))
         .order_by_desc(remote_follow::Column::Id)
         .all(db)
         .await?
@@ -3352,7 +3480,7 @@ pub async fn pending_remote_follow_requests(
 ) -> Result<CollectionPage<RemoteActor>> {
     let rows = remote_follow::Entity::find()
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
-        .filter(remote_follow::Column::State.eq("pending"))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Pending))
         .apply_collection_cursor(cursor)
         .order_by_desc(remote_follow::Column::Id)
         .limit(page_query_limit(limit))
@@ -3404,7 +3532,7 @@ pub async fn local_private_status_visible_to_remote_actor(
     if remote_follow::Entity::find()
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_follow::Column::LocalAccountId.eq(status.account_id.0))
-        .filter(remote_follow::Column::State.eq("accepted"))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Accepted))
         .one(db)
         .await?
         .is_some()
@@ -3433,7 +3561,7 @@ pub async fn register_inbox_activity(
             activity_id: Set(metadata.activity_id.to_owned()),
             remote_actor_id: Set(metadata.remote_actor_id.0),
             payload_digest: Set(Some(metadata.payload_digest.to_vec())),
-            activity_type: Set(Some(metadata.activity_type.to_owned())),
+            activity_type: Set(Some(metadata.activity_type)),
             outcome: Set(Some(metadata.outcome.to_owned())),
             processed_at: Set(OffsetDateTime::now_utc()),
         })
@@ -3467,7 +3595,7 @@ pub async fn classify_inbox_activity(
         return Ok(Some(InboxReplayResult::Duplicate));
     };
     if existing_digest == metadata.payload_digest
-        && existing.activity_type.as_deref() == Some(metadata.activity_type)
+        && existing.activity_type == Some(metadata.activity_type)
     {
         Ok(Some(InboxReplayResult::Duplicate))
     } else {
@@ -3505,7 +3633,7 @@ pub async fn notify_remote_actor_follow(
     }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq(notification_type.as_str()))
+        .filter(local_notification::Column::NotificationType.eq(notification_type))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::StatusId.is_null())
         .filter(local_notification::Column::RemoteStatusId.is_null())
@@ -3518,7 +3646,7 @@ pub async fn notify_remote_actor_follow(
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set(notification_type.as_str().to_owned()),
+        notification_type: Set(notification_type),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
@@ -3543,7 +3671,7 @@ where
 {
     if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq("favourite"))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Favourite))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::StatusId.eq(Some(status_id.0)))
         .one(db)
@@ -3554,7 +3682,7 @@ where
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("favourite".to_owned()),
+        notification_type: Set(LocalNotificationType::Favourite),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(Some(status_id.0)),
@@ -3579,7 +3707,7 @@ pub async fn notify_remote_actor_reblog(
     }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq("reblog"))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Reblog))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::StatusId.eq(Some(status_id.0)))
         .one(db)
@@ -3591,7 +3719,7 @@ pub async fn notify_remote_actor_reblog(
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("reblog".to_owned()),
+        notification_type: Set(LocalNotificationType::Reblog),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(Some(status_id.0)),
@@ -3619,7 +3747,7 @@ where
     }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq("mention"))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Mention))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
         .one(db)
@@ -3631,7 +3759,7 @@ where
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("mention".to_owned()),
+        notification_type: Set(LocalNotificationType::Mention),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
@@ -3664,14 +3792,14 @@ pub async fn replace_local_status_update_notifications(
         }
         local_notification::Entity::delete_many()
             .filter(local_notification::Column::AccountId.eq(account_id.0))
-            .filter(local_notification::Column::NotificationType.eq("update"))
+            .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Update))
             .filter(local_notification::Column::StatusId.eq(status_id.0))
             .exec(db)
             .await?;
         let model = local_notification::ActiveModel {
             id: Set(Uuid::now_v7()),
             account_id: Set(account_id.0),
-            notification_type: Set("update".to_owned()),
+            notification_type: Set(LocalNotificationType::Update),
             actor_account_id: Set(Some(author_id.0)),
             remote_actor_id: Set(None),
             status_id: Set(Some(status_id.0)),
@@ -3704,14 +3832,14 @@ pub async fn replace_remote_status_update_notifications(
         }
         local_notification::Entity::delete_many()
             .filter(local_notification::Column::AccountId.eq(account_id.0))
-            .filter(local_notification::Column::NotificationType.eq("update"))
+            .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Update))
             .filter(local_notification::Column::RemoteStatusId.eq(status_id.0))
             .exec(db)
             .await?;
         let model = local_notification::ActiveModel {
             id: Set(Uuid::now_v7()),
             account_id: Set(account_id.0),
-            notification_type: Set("update".to_owned()),
+            notification_type: Set(LocalNotificationType::Update),
             actor_account_id: Set(None),
             remote_actor_id: Set(Some(remote_actor_id.0)),
             status_id: Set(None),
@@ -3741,7 +3869,7 @@ where
     }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq("status"))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Status))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
         .one(db)
@@ -3753,7 +3881,7 @@ where
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("status".to_owned()),
+        notification_type: Set(LocalNotificationType::Status),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
@@ -3767,17 +3895,23 @@ where
 }
 
 /// Timelines that support persisted Mastodon read markers.
-#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 pub enum LocalTimeline {
-    /// The authenticated account's home timeline.
     Home,
-    /// The authenticated account's notification timeline.
     Notifications,
 }
 
+impl TryFromU64 for LocalTimeline {
+    fn try_from_u64(_: u64) -> std::result::Result<Self, DbErr> {
+        Err(DbErr::ConvertFromU64("LocalTimeline"))
+    }
+}
+
 impl LocalTimeline {
-    /// Return the Mastodon wire value for this timeline.
     pub fn as_str(self) -> &'static str {
         self.into()
     }
@@ -3876,11 +4010,17 @@ pub struct OAuthAccessToken {
     /// Raw bearer token returned once to the OAuth client.
     pub token: String,
     /// OAuth token type.
-    pub token_type: &'static str,
+    pub token_type: OAuthTokenType,
     /// Space-separated scopes granted to the token.
     pub scope: String,
     /// Unix timestamp for token issuance.
     pub created_at: i64,
+}
+
+/// OAuth bearer token type returned by Mastodon-compatible token endpoints.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub enum OAuthTokenType {
+    Bearer,
 }
 
 /// Validated access-token grant used by APIs that must retain token identity.
@@ -3897,6 +4037,7 @@ pub struct AccessTokenGrant {
     Copy,
     Debug,
     Default,
+    DeriveValueType,
     Display,
     EnumString,
     Eq,
@@ -3905,6 +4046,7 @@ pub struct AccessTokenGrant {
     Serialize,
     Deserialize,
 )]
+#[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum PushPolicy {
@@ -4161,25 +4303,20 @@ pub async fn search_accounts(
         .await?;
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
-        let kind: String = row.try_get("", "account_kind")?;
+        let kind: AccountSearchKind = row.try_get("", "account_kind")?;
         let id = AccountId(row.try_get("", "id")?);
-        match kind.as_str() {
-            "local" => {
+        match kind {
+            AccountSearchKind::Local => {
                 if let Some(account) = find_local_account_by_id(db, id).await? {
                     results.push(AccountSearchResult::Local(account));
                 }
             }
-            "remote" => {
+            AccountSearchKind::Remote => {
                 if let Some(actor) = find_remote_actor_by_id(db, id).await?
                     && actor.deleted_at.is_none()
                 {
                     results.push(AccountSearchResult::Remote(actor));
                 }
-            }
-            _ => {
-                return Err(RoostyError::InvalidInput(
-                    "unknown account search kind".to_owned(),
-                ));
             }
         }
     }
@@ -4228,7 +4365,7 @@ pub async fn accepted_remote_follower_ids(
 ) -> Result<Vec<AccountId>> {
     Ok(remote_follow::Entity::find()
         .filter(remote_follow::Column::LocalAccountId.eq(account_id.0))
-        .filter(remote_follow::Column::State.eq("accepted"))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Accepted))
         .all(db)
         .await?
         .into_iter()
@@ -4350,6 +4487,7 @@ pub async fn unfollow_local_account(
     follower_account_id: AccountId,
     followed_account_id: AccountId,
 ) -> Result<()> {
+    remove_local_account_from_owned_lists(db, follower_account_id, followed_account_id).await?;
     if let Some(model) =
         local_follow::Entity::find_by_id((follower_account_id.0, followed_account_id.0))
             .one(db)
@@ -4396,6 +4534,8 @@ pub async fn block_local_account(
         .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
         .exec(txn)
         .await?;
+    remove_local_account_from_owned_lists(txn, account_id, target_account_id).await?;
+    remove_local_account_from_owned_lists(txn, target_account_id, account_id).await?;
     Ok(())
 }
 
@@ -4747,6 +4887,7 @@ where
         .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
         .exec(db)
         .await?;
+    remove_remote_account_from_owned_lists(db, local_account_id, remote_actor_id).await?;
     remote_follow::Entity::delete_many()
         .filter(remote_follow::Column::LocalAccountId.eq(local_account_id.0))
         .filter(remote_follow::Column::RemoteActorId.eq(remote_actor_id.0))
@@ -5031,6 +5172,10 @@ where
         .filter(remote_following::Column::RemoteActorId.is_in(actor_ids.clone()))
         .exec(db)
         .await?;
+    local_list_remote_member::Entity::delete_many()
+        .filter(local_list_remote_member::Column::RemoteActorId.is_in(actor_ids.clone()))
+        .exec(db)
+        .await?;
     db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "UPDATE local_notification SET dismissed_at = $2 WHERE remote_actor_id = ANY($1) AND dismissed_at IS NULL",
         vec![actor_ids.clone().into(), now.into()])).await?;
@@ -5083,6 +5228,7 @@ where
         .filter(remote_following::Column::LocalAccountId.eq(local_account_id.0))
         .exec(db)
         .await?;
+    remove_remote_account_from_owned_lists(db, local_account_id, remote_actor_id).await?;
     db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "UPDATE local_notification SET dismissed_at = now() WHERE account_id = $1 AND remote_actor_id = $2 AND dismissed_at IS NULL",
@@ -5229,11 +5375,10 @@ pub async fn notify_local_account(
             "accounts cannot notify themselves".to_owned(),
         ));
     }
-    let type_value = notification_type.as_str();
     let status_uuid = status_id.map(|id| id.0);
     if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq(type_value))
+        .filter(local_notification::Column::NotificationType.eq(notification_type))
         .filter(local_notification::Column::ActorAccountId.eq(Some(actor_account_id.0)))
         .filter(match status_uuid {
             Some(status_id) => local_notification::Column::StatusId.eq(status_id),
@@ -5248,7 +5393,7 @@ pub async fn notify_local_account(
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set(type_value.to_owned()),
+        notification_type: Set(notification_type),
         actor_account_id: Set(Some(actor_account_id.0)),
         remote_actor_id: Set(None),
         status_id: Set(status_uuid),
@@ -5276,7 +5421,7 @@ pub async fn notify_local_status_mention(
     }
     if local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq("mention"))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Mention))
         .filter(local_notification::Column::ActorAccountId.eq(Some(actor_account_id.0)))
         .filter(local_notification::Column::StatusId.eq(status_id.0))
         .one(db)
@@ -5288,7 +5433,7 @@ pub async fn notify_local_status_mention(
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("mention".to_owned()),
+        notification_type: Set(LocalNotificationType::Mention),
         actor_account_id: Set(Some(actor_account_id.0)),
         remote_actor_id: Set(None),
         status_id: Set(Some(status_id.0)),
@@ -5421,10 +5566,7 @@ pub async fn local_timeline_markers_for_account(
 
     let markers = local_timeline_marker::Entity::find()
         .filter(local_timeline_marker::Column::AccountId.eq(account_id.0))
-        .filter(
-            local_timeline_marker::Column::Timeline
-                .is_in(timelines.iter().map(|timeline| timeline.as_str())),
-        )
+        .filter(local_timeline_marker::Column::Timeline.is_in(timelines.iter().copied()))
         .all(db)
         .await?;
 
@@ -5442,10 +5584,9 @@ pub async fn save_local_timeline_marker(
     last_read_id: Uuid,
 ) -> Result<LocalTimelineMarker> {
     let now = OffsetDateTime::now_utc();
-    let marker =
-        local_timeline_marker::Entity::find_by_id((account_id.0, timeline.as_str().to_owned()))
-            .one(db)
-            .await?;
+    let marker = local_timeline_marker::Entity::find_by_id((account_id.0, timeline))
+        .one(db)
+        .await?;
 
     let marker = match marker {
         Some(marker) => {
@@ -5461,7 +5602,7 @@ pub async fn save_local_timeline_marker(
         None => {
             local_timeline_marker::ActiveModel {
                 account_id: Set(account_id.0),
-                timeline: Set(timeline.as_str().to_owned()),
+                timeline: Set(timeline),
                 last_read_id: Set(last_read_id),
                 version: Set(1),
                 updated_at: Set(now),
@@ -5555,7 +5696,7 @@ where
     set_if_some(&mut active.bot, update.bot);
     set_if_some(&mut active.discoverable, update.discoverable);
     if let Some(visibility) = update.default_visibility {
-        active.default_visibility = Set(visibility.to_string());
+        active.default_visibility = Set(visibility);
     }
     set_if_some(&mut active.default_sensitive, update.default_sensitive);
     set_if_some(&mut active.default_language, update.default_language);
@@ -5624,7 +5765,7 @@ pub async fn create_local_status(
         id: Set(status_id),
         account_id: Set(new_status.account_id.0),
         content: Set(new_status.content),
-        visibility: Set(new_status.visibility.to_string()),
+        visibility: Set(new_status.visibility),
         sensitive: Set(new_status.sensitive),
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
@@ -5634,7 +5775,7 @@ pub async fn create_local_status(
         created_at: Set(created_at),
         updated_at: Set(created_at),
         deleted_at: Set(None),
-        quote_approval_policy: Set(new_status.quote_approval_policy.to_string()),
+        quote_approval_policy: Set(new_status.quote_approval_policy),
     }
     .insert(db)
     .await?;
@@ -5679,7 +5820,7 @@ pub async fn create_local_status_with_media(
         id: Set(status_id),
         account_id: Set(account_id.0),
         content: Set(new_status.content),
-        visibility: Set(new_status.visibility.to_string()),
+        visibility: Set(new_status.visibility),
         sensitive: Set(new_status.sensitive),
         spoiler_text: Set(new_status.spoiler_text),
         language: Set(new_status.language),
@@ -5689,7 +5830,7 @@ pub async fn create_local_status_with_media(
         created_at: Set(created_at),
         updated_at: Set(created_at),
         deleted_at: Set(None),
-        quote_approval_policy: Set(new_status.quote_approval_policy.to_string()),
+        quote_approval_policy: Set(new_status.quote_approval_policy),
     }
     .insert(txn)
     .await?;
@@ -6086,7 +6227,7 @@ pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTag
     for row in rows {
         let Some(status) = local_status::Entity::find_by_id(row.status_id)
             .filter(local_status::Column::DeletedAt.is_null())
-            .filter(local_status::Column::Visibility.eq("public"))
+            .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
             .one(db)
             .await?
         else {
@@ -6105,7 +6246,7 @@ pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTag
     for row in rows {
         let Some(status) = remote_status::Entity::find_by_id(row.remote_status_id)
             .filter(remote_status::Column::DeletedAt.is_null())
-            .filter(remote_status::Column::Visibility.eq("public"))
+            .filter(remote_status::Column::Visibility.eq(StatusVisibility::Public))
             .one(db)
             .await?
         else {
@@ -6195,7 +6336,7 @@ pub async fn tag_timeline(
     let mut items = Vec::new();
     if options.origin != PublicTimelineOrigin::Remote {
         let mut query = local_status::Entity::find()
-            .filter(local_status::Column::Visibility.eq("public"))
+            .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
             .filter(local_status::Column::DeletedAt.is_null())
             .filter(local_status::Column::Id.in_subquery(status_tag_subquery(primary.id)));
         for tag_id in &all_tag_ids {
@@ -6253,7 +6394,7 @@ pub async fn tag_timeline(
             .and_where(actor_condition.into())
             .to_owned();
         let mut query = remote_status::Entity::find()
-            .filter(remote_status::Column::Visibility.eq("public"))
+            .filter(remote_status::Column::Visibility.eq(StatusVisibility::Public))
             .filter(remote_status::Column::DeletedAt.is_null())
             .filter(remote_status::Column::RemoteActorId.in_subquery(allowed_actors))
             .filter(remote_status::Column::Id.in_subquery(remote_status_tag_subquery(primary.id)));
@@ -7000,7 +7141,7 @@ pub async fn update_owned_local_status(
         .insert(txn)
         .await?;
     }
-    if status.visibility == "direct" {
+    if status.visibility == StatusVisibility::Direct {
         local_status_local_recipient::Entity::delete_many()
             .filter(local_status_local_recipient::Column::StatusId.eq(status_id.0))
             .exec(txn)
@@ -7431,7 +7572,10 @@ pub async fn pin_local_status(
     if status.account_id != account_id.0 {
         return Ok(PinStatusResult::NotOwned);
     }
-    if !matches!(status.visibility.as_str(), "public" | "unlisted") {
+    if !matches!(
+        status.visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted
+    ) {
         return Ok(PinStatusResult::UnsupportedVisibility);
     }
     if local_status_pin::Entity::find()
@@ -7769,7 +7913,7 @@ pub async fn create_local_status_quote(
         quoted_local_status_id: Set(quoted_local_status_id),
         quoted_remote_status_id: Set(quoted_remote_status_id),
         quoted_activitypub_id: Set(quoted_activitypub_id.to_owned()),
-        state: Set(state.to_string()),
+        state: Set(state),
         quote_request_id: Set(quote_request_id.map(ToOwned::to_owned)),
         authorization_id: Set(authorization_id.map(ToOwned::to_owned)),
         ..Default::default()
@@ -7807,7 +7951,7 @@ pub async fn upsert_remote_status_quote(
             ));
         }
         let mut active = existing.into_active_model();
-        active.state = Set(state.to_string());
+        active.state = Set(state);
         active.authorization_id = Set(authorization_id.map(ToOwned::to_owned));
         active.updated_at = Set(OffsetDateTime::now_utc());
         return status_quote_from_model(active.update(txn).await?);
@@ -7824,7 +7968,7 @@ pub async fn upsert_remote_status_quote(
             quoted_local_status_id: Set(quoted_local_status_id),
             quoted_remote_status_id: Set(quoted_remote_status_id),
             quoted_activitypub_id: Set(quoted_activitypub_id.to_owned()),
-            state: Set(state.to_string()),
+            state: Set(state),
             quote_request_id: Set(None),
             authorization_id: Set(authorization_id.map(ToOwned::to_owned)),
             ..Default::default()
@@ -7846,7 +7990,7 @@ pub async fn notify_remote_actor_quote(
     }
     if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::NotificationType.eq("quote"))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Quote))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
         .one(db)
@@ -7857,7 +8001,7 @@ pub async fn notify_remote_actor_quote(
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
-        notification_type: Set("quote".to_owned()),
+        notification_type: Set(LocalNotificationType::Quote),
         actor_account_id: Set(None),
         remote_actor_id: Set(Some(remote_actor_id.0)),
         status_id: Set(None),
@@ -7931,11 +8075,11 @@ pub async fn transition_quote_request(
     else {
         return Ok(None);
     };
-    if model.state != "pending" {
+    if model.state != QuoteState::Pending {
         return status_quote_from_model(model).map(Some);
     }
     let mut active = model.into_active_model();
-    active.state = Set(state.to_string());
+    active.state = Set(state);
     active.authorization_id = Set(authorization_id.map(ToOwned::to_owned));
     active.updated_at = Set(OffsetDateTime::now_utc());
     status_quote_from_model(active.update(txn).await?).map(Some)
@@ -7953,11 +8097,11 @@ pub async fn revoke_quote_authorization(
     else {
         return Ok(None);
     };
-    if model.state == "revoked" {
+    if model.state == QuoteState::Revoked {
         return status_quote_from_model(model).map(Some);
     }
     let mut active = model.into_active_model();
-    active.state = Set(QuoteState::Revoked.to_string());
+    active.state = Set(QuoteState::Revoked);
     active.updated_at = Set(OffsetDateTime::now_utc());
     status_quote_from_model(active.update(txn).await?).map(Some)
 }
@@ -7967,7 +8111,8 @@ pub async fn count_accepted_quotes(
     db: &impl ConnectionTrait,
     status: StatusReference,
 ) -> Result<u64> {
-    let query = status_quote::Entity::find().filter(status_quote::Column::State.eq("accepted"));
+    let query =
+        status_quote::Entity::find().filter(status_quote::Column::State.eq(QuoteState::Accepted));
     let query = match status {
         StatusReference::Local(id) => {
             query.filter(status_quote::Column::QuotedLocalStatusId.eq(id.0))
@@ -7987,7 +8132,8 @@ pub async fn accepted_quotes_for_status(
     since_id: Option<Uuid>,
     limit: u64,
 ) -> Result<Vec<StatusQuote>> {
-    let query = status_quote::Entity::find().filter(status_quote::Column::State.eq("accepted"));
+    let query =
+        status_quote::Entity::find().filter(status_quote::Column::State.eq(QuoteState::Accepted));
     let mut query = match status {
         StatusReference::Local(id) => {
             query.filter(status_quote::Column::QuotedLocalStatusId.eq(id.0))
@@ -8037,11 +8183,11 @@ pub async fn revoke_status_quote(
     if !target_matches {
         return Ok(None);
     }
-    if model.state == "revoked" {
+    if model.state == QuoteState::Revoked {
         return status_quote_from_model(model).map(Some);
     }
     let mut active = model.into_active_model();
-    active.state = Set(QuoteState::Revoked.to_string());
+    active.state = Set(QuoteState::Revoked);
     active.updated_at = Set(OffsetDateTime::now_utc());
     status_quote_from_model(active.update(txn).await?).map(Some)
 }
@@ -8065,7 +8211,7 @@ pub async fn mark_quotes_target_deleted(
             sea_orm::sea_query::Expr::value(OffsetDateTime::now_utc()),
         )
         .filter(filter)
-        .filter(status_quote::Column::State.eq("accepted"))
+        .filter(status_quote::Column::State.eq(QuoteState::Accepted))
         .exec(txn)
         .await?;
     Ok(())
@@ -8078,7 +8224,7 @@ pub async fn notify_local_quoted_status_update(
 ) -> Result<Vec<LocalNotification>> {
     let quotes = status_quote::Entity::find()
         .filter(status_quote::Column::QuotedLocalStatusId.eq(edited_status.id.0))
-        .filter(status_quote::Column::State.eq("accepted"))
+        .filter(status_quote::Column::State.eq(QuoteState::Accepted))
         .all(txn)
         .await?;
     let mut notifications = Vec::new();
@@ -8126,18 +8272,18 @@ pub async fn update_local_status_quote_policy(
         return Ok(None);
     };
     let effective = if matches!(
-        StatusVisibility::parse(&model.visibility)?,
+        model.visibility,
         StatusVisibility::Private | StatusVisibility::Direct
     ) {
         QuoteApprovalPolicy::Nobody
     } else {
         policy
     };
-    if model.quote_approval_policy == effective.to_string() {
+    if model.quote_approval_policy == effective {
         return local_status_from_model(model).map(Some);
     }
     let mut active = model.into_active_model();
-    active.quote_approval_policy = Set(effective.to_string());
+    active.quote_approval_policy = Set(effective);
     active.updated_at = Set(OffsetDateTime::now_utc());
     local_status_from_model(active.update(txn).await?).map(Some)
 }
@@ -8150,7 +8296,7 @@ pub async fn public_local_statuses_by_account(
 ) -> Result<Vec<LocalStatus>> {
     let statuses = local_status::Entity::find()
         .filter(local_status::Column::AccountId.eq(account_id.0))
-        .filter(local_status::Column::Visibility.eq("public"))
+        .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
         .filter(local_status::Column::DeletedAt.is_null())
         .order_by_desc(local_status::Column::CreatedAt)
         .limit(limit)
@@ -8166,7 +8312,7 @@ pub async fn count_public_local_statuses_by_account(
 ) -> Result<u64> {
     Ok(local_status::Entity::find()
         .filter(local_status::Column::AccountId.eq(account_id.0))
-        .filter(local_status::Column::Visibility.eq("public"))
+        .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
         .filter(local_status::Column::DeletedAt.is_null())
         .count(db)
         .await?)
@@ -8890,7 +9036,7 @@ pub async fn remote_status_visible_to_account(
         let follows = remote_following::Entity::find()
             .filter(remote_following::Column::LocalAccountId.eq(account_id.0))
             .filter(remote_following::Column::RemoteActorId.eq(status.remote_actor_id.0))
-            .filter(remote_following::Column::State.eq("accepted"))
+            .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
             .filter(remote_following::Column::DeactivatedAt.is_null())
             .one(db)
             .await?
@@ -10160,7 +10306,7 @@ pub async fn public_timeline_with_options(
     if options.origin != PublicTimelineOrigin::Remote {
         let mut query = apply_timeline_cursor(
             local_status::Entity::find()
-                .filter(local_status::Column::Visibility.eq("public"))
+                .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
                 .filter(local_status::Column::DeletedAt.is_null())
                 .filter(local_status::Column::InReplyToId.is_null())
                 .filter(local_status::Column::InReplyToRemoteStatusId.is_null()),
@@ -10213,7 +10359,7 @@ pub async fn public_timeline_with_options(
             .and_where(actor_condition.into())
             .to_owned();
         let mut query = remote_status::Entity::find()
-            .filter(remote_status::Column::Visibility.eq("public"))
+            .filter(remote_status::Column::Visibility.eq(StatusVisibility::Public))
             .filter(remote_status::Column::DeletedAt.is_null())
             .filter(remote_status::Column::InReplyTo.is_null())
             .filter(remote_status::Column::RemoteActorId.in_subquery(allowed_actors));
@@ -10293,7 +10439,7 @@ pub async fn local_statuses_by_account(
         if let Some(viewer) = viewer {
             visible = visible.add(
                 Condition::all()
-                    .add(local_status::Column::Visibility.eq("private"))
+                    .add(local_status::Column::Visibility.eq(StatusVisibility::Private))
                     .add(
                         Condition::any()
                             .add(
@@ -10379,7 +10525,7 @@ pub async fn remote_statuses_by_account(
     if let Some(viewer) = viewer {
         visible = visible.add(
             Condition::all()
-                .add(remote_status::Column::Visibility.eq("private"))
+                .add(remote_status::Column::Visibility.eq(StatusVisibility::Private))
                 .add(
                     Condition::any()
                         .add(
@@ -10402,7 +10548,10 @@ pub async fn remote_statuses_by_account(
                                     .and_where(
                                         remote_following::Column::LocalAccountId.eq(viewer.0),
                                     )
-                                    .and_where(remote_following::Column::State.eq("accepted"))
+                                    .and_where(
+                                        remote_following::Column::State
+                                            .eq(RemoteFollowState::Accepted),
+                                    )
                                     .and_where(remote_following::Column::DeactivatedAt.is_null())
                                     .to_owned(),
                             ),
@@ -10467,6 +10616,663 @@ pub async fn remote_statuses_by_account(
     })
 }
 
+fn local_list_from_model(model: local_list::Model) -> LocalList {
+    LocalList {
+        id: model.id,
+        account_id: AccountId(model.account_id),
+        title: model.title,
+        replies_policy: model.replies_policy,
+        exclusive: model.exclusive,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+    }
+}
+
+async fn remove_local_account_from_owned_lists(
+    db: &impl ConnectionTrait,
+    owner_id: AccountId,
+    member_id: AccountId,
+) -> Result<()> {
+    local_list_local_member::Entity::delete_many()
+        .filter(local_list_local_member::Column::AccountId.eq(member_id.0))
+        .filter(
+            local_list_local_member::Column::ListId.in_subquery(
+                Query::select()
+                    .column(local_list::Column::Id)
+                    .from(local_list::Entity)
+                    .and_where(local_list::Column::AccountId.eq(owner_id.0))
+                    .to_owned(),
+            ),
+        )
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+async fn remove_remote_account_from_owned_lists(
+    db: &impl ConnectionTrait,
+    owner_id: AccountId,
+    member_id: AccountId,
+) -> Result<()> {
+    local_list_remote_member::Entity::delete_many()
+        .filter(local_list_remote_member::Column::RemoteActorId.eq(member_id.0))
+        .filter(
+            local_list_remote_member::Column::ListId.in_subquery(
+                Query::select()
+                    .column(local_list::Column::Id)
+                    .from(local_list::Entity)
+                    .and_where(local_list::Column::AccountId.eq(owner_id.0))
+                    .to_owned(),
+            ),
+        )
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// List every private list owned by an account in creation order.
+pub async fn local_lists_for_account(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<Vec<LocalList>> {
+    Ok(local_list::Entity::find()
+        .filter(local_list::Column::AccountId.eq(account_id.0))
+        .order_by_asc(local_list::Column::CreatedAt)
+        .order_by_asc(local_list::Column::Id)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(local_list_from_model)
+        .collect())
+}
+
+/// Find a private list only when it belongs to the supplied account.
+pub async fn find_owned_local_list(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    list_id: Uuid,
+) -> Result<Option<LocalList>> {
+    Ok(local_list::Entity::find_by_id(list_id)
+        .filter(local_list::Column::AccountId.eq(account_id.0))
+        .one(db)
+        .await?
+        .map(local_list_from_model))
+}
+
+/// Create a private list.
+pub async fn create_local_list(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    title: &str,
+    replies_policy: ListRepliesPolicy,
+    exclusive: bool,
+) -> Result<LocalList> {
+    let model = local_list::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        title: Set(title.to_owned()),
+        replies_policy: Set(replies_policy),
+        exclusive: Set(exclusive),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+    Ok(local_list_from_model(model))
+}
+
+/// Update an owned private list, returning `None` when ownership does not match.
+pub async fn update_local_list(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    list_id: Uuid,
+    title: &str,
+    replies_policy: ListRepliesPolicy,
+    exclusive: bool,
+) -> Result<Option<LocalList>> {
+    let Some(model) = local_list::Entity::find_by_id(list_id)
+        .filter(local_list::Column::AccountId.eq(account_id.0))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active = model.into_active_model();
+    active.title = Set(title.to_owned());
+    active.replies_policy = Set(replies_policy);
+    active.exclusive = Set(exclusive);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    Ok(Some(local_list_from_model(active.update(db).await?)))
+}
+
+/// Delete an owned private list and all memberships.
+pub async fn delete_local_list(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    list_id: Uuid,
+) -> Result<bool> {
+    Ok(local_list::Entity::delete_many()
+        .filter(local_list::Column::Id.eq(list_id))
+        .filter(local_list::Column::AccountId.eq(account_id.0))
+        .exec(db)
+        .await?
+        .rows_affected
+        == 1)
+}
+
+/// Return owned lists containing a local or cached-remote account id.
+pub async fn local_lists_containing_account(
+    db: &impl ConnectionTrait,
+    owner_id: AccountId,
+    member_id: AccountId,
+) -> Result<Vec<LocalList>> {
+    let local_ids = local_list_local_member::Entity::find()
+        .filter(local_list_local_member::Column::AccountId.eq(member_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.list_id);
+    let remote_ids = local_list_remote_member::Entity::find()
+        .filter(local_list_remote_member::Column::RemoteActorId.eq(member_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.list_id);
+    let ids = local_ids.chain(remote_ids).collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(local_list::Entity::find()
+        .filter(local_list::Column::AccountId.eq(owner_id.0))
+        .filter(local_list::Column::Id.is_in(ids))
+        .order_by_asc(local_list::Column::CreatedAt)
+        .order_by_asc(local_list::Column::Id)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(local_list_from_model)
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+enum ListMemberReference {
+    Local(Uuid, Uuid),
+    Remote(Uuid, Uuid),
+}
+
+impl ListMemberReference {
+    fn cursor(self) -> Uuid {
+        match self {
+            Self::Local(cursor, _) | Self::Remote(cursor, _) => cursor,
+        }
+    }
+}
+
+/// Return one cursor page of list members without per-account queries.
+pub async fn local_list_accounts(
+    db: &impl ConnectionTrait,
+    owner_id: AccountId,
+    list_id: Uuid,
+    limit: Option<u64>,
+    cursor: CollectionCursor,
+) -> Result<Option<CollectionPage<ListAccount>>> {
+    if find_owned_local_list(db, owner_id, list_id)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let query_limit = limit.map(page_query_limit);
+    let mut local_query = local_list_local_member::Entity::find()
+        .filter(local_list_local_member::Column::ListId.eq(list_id));
+    let mut remote_query = local_list_remote_member::Entity::find()
+        .filter(local_list_remote_member::Column::ListId.eq(list_id));
+    if let Some(id) = cursor.max_id {
+        local_query = local_query.filter(local_list_local_member::Column::Id.lt(id));
+        remote_query = remote_query.filter(local_list_remote_member::Column::Id.lt(id));
+    }
+    if let Some(id) = cursor.since_id {
+        local_query = local_query.filter(local_list_local_member::Column::Id.gt(id));
+        remote_query = remote_query.filter(local_list_remote_member::Column::Id.gt(id));
+    }
+    if let Some(id) = cursor.min_id {
+        local_query = local_query.filter(local_list_local_member::Column::Id.gt(id));
+        remote_query = remote_query.filter(local_list_remote_member::Column::Id.gt(id));
+    }
+    local_query = local_query.order_by_desc(local_list_local_member::Column::Id);
+    remote_query = remote_query.order_by_desc(local_list_remote_member::Column::Id);
+    if let Some(query_limit) = query_limit {
+        local_query = local_query.limit(query_limit);
+        remote_query = remote_query.limit(query_limit);
+    }
+    let local_rows = local_query.all(db).await?;
+    let remote_rows = remote_query.all(db).await?;
+    let mut references = local_rows
+        .into_iter()
+        .map(|row| ListMemberReference::Local(row.id, row.account_id))
+        .chain(
+            remote_rows
+                .into_iter()
+                .map(|row| ListMemberReference::Remote(row.id, row.remote_actor_id)),
+        )
+        .collect::<Vec<_>>();
+    references.sort_by_key(|member| Reverse(member.cursor()));
+    let has_more = limit.is_some_and(|limit| references.len() > limit as usize);
+    if let Some(limit) = limit {
+        references.truncate(limit as usize);
+    }
+    let local_ids = references
+        .iter()
+        .filter_map(|member| match member {
+            ListMemberReference::Local(_, id) => Some(id.to_owned()),
+            ListMemberReference::Remote(_, _) => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_ids = references
+        .iter()
+        .filter_map(|member| match member {
+            ListMemberReference::Remote(_, id) => Some(id.to_owned()),
+            ListMemberReference::Local(_, _) => None,
+        })
+        .collect::<Vec<_>>();
+    let locals = local_account::Entity::find()
+        .filter(local_account::Column::Id.is_in(local_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| {
+            let id = model.id;
+            local_account_from_model(model).map(|account| (id, account))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    let remotes = remote_actor::Entity::find()
+        .filter(remote_actor::Column::Id.is_in(remote_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| (model.id, remote_actor_from_model(model)))
+        .collect::<HashMap<_, _>>();
+    let first_cursor = references.first().map(|member| member.cursor());
+    let last_cursor = references.last().map(|member| member.cursor());
+    let items = references
+        .into_iter()
+        .filter_map(|member| match member {
+            ListMemberReference::Local(_, id) => locals.get(&id).cloned().map(ListAccount::Local),
+            ListMemberReference::Remote(_, id) => {
+                remotes.get(&id).cloned().map(ListAccount::Remote)
+            }
+        })
+        .collect();
+    Ok(Some(CollectionPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    }))
+}
+
+/// Atomically add followed local or remote accounts to an owned list.
+pub async fn add_local_list_accounts(
+    txn: &DatabaseTransaction,
+    owner_id: AccountId,
+    list_id: Uuid,
+    account_ids: &[AccountId],
+) -> Result<AddListAccountsResult> {
+    // Serialize membership validation and insertion across server processes so
+    // concurrent duplicate requests receive Mastodon's validation outcome.
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("list:{list_id}").into()],
+    ))
+    .await?;
+    if find_owned_local_list(txn, owner_id, list_id)
+        .await?
+        .is_none()
+    {
+        return Ok(AddListAccountsResult::ListNotFound);
+    }
+    let ids = account_ids.iter().map(|id| id.0).collect::<HashSet<_>>();
+    let local_followed = local_follow::Entity::find()
+        .filter(local_follow::Column::FollowerAccountId.eq(owner_id.0))
+        .filter(local_follow::Column::FollowedAccountId.is_in(ids.iter().copied()))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|row| row.followed_account_id)
+        .collect::<HashSet<_>>();
+    let remote_followed = remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(owner_id.0))
+        .filter(remote_following::Column::RemoteActorId.is_in(ids.iter().copied()))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|row| row.remote_actor_id)
+        .collect::<HashSet<_>>();
+    if ids
+        .iter()
+        .any(|id| !local_followed.contains(id) && !remote_followed.contains(id))
+    {
+        return Ok(AddListAccountsResult::AccountNotFollowed);
+    }
+    let existing_local = local_list_local_member::Entity::find()
+        .filter(local_list_local_member::Column::ListId.eq(list_id))
+        .filter(local_list_local_member::Column::AccountId.is_in(ids.iter().copied()))
+        .count(txn)
+        .await?;
+    let existing_remote = local_list_remote_member::Entity::find()
+        .filter(local_list_remote_member::Column::ListId.eq(list_id))
+        .filter(local_list_remote_member::Column::RemoteActorId.is_in(ids.iter().copied()))
+        .count(txn)
+        .await?;
+    if existing_local + existing_remote > 0 {
+        return Ok(AddListAccountsResult::AlreadyPresent);
+    }
+    for id in ids {
+        if local_followed.contains(&id) {
+            local_list_local_member::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                list_id: Set(list_id),
+                account_id: Set(id),
+                ..Default::default()
+            }
+            .insert(txn)
+            .await?;
+        } else {
+            local_list_remote_member::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                list_id: Set(list_id),
+                remote_actor_id: Set(id),
+                ..Default::default()
+            }
+            .insert(txn)
+            .await?;
+        }
+    }
+    Ok(AddListAccountsResult::Added)
+}
+
+/// Idempotently remove accounts from an owned list.
+pub async fn remove_local_list_accounts(
+    txn: &DatabaseTransaction,
+    owner_id: AccountId,
+    list_id: Uuid,
+    account_ids: &[AccountId],
+) -> Result<bool> {
+    if find_owned_local_list(txn, owner_id, list_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let ids = account_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    local_list_local_member::Entity::delete_many()
+        .filter(local_list_local_member::Column::ListId.eq(list_id))
+        .filter(local_list_local_member::Column::AccountId.is_in(ids.clone()))
+        .exec(txn)
+        .await?;
+    local_list_remote_member::Entity::delete_many()
+        .filter(local_list_remote_member::Column::ListId.eq(list_id))
+        .filter(local_list_remote_member::Column::RemoteActorId.is_in(ids))
+        .exec(txn)
+        .await?;
+    Ok(true)
+}
+
+/// Return the mixed local and cached-remote timeline for an owned list.
+pub async fn local_list_timeline(
+    db: &DbConnection,
+    owner_id: AccountId,
+    list_id: Uuid,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<Option<TimelinePage<HomeTimelineItem>>> {
+    let Some(list) = find_owned_local_list(db, owner_id, list_id).await? else {
+        return Ok(None);
+    };
+    let local_member_ids = local_list_local_member::Entity::find()
+        .filter(local_list_local_member::Column::ListId.eq(list_id))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|member| member.account_id)
+        .collect::<Vec<_>>();
+    let remote_member_ids = local_list_remote_member::Entity::find()
+        .filter(local_list_remote_member::Column::ListId.eq(list_id))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|member| member.remote_actor_id)
+        .collect::<Vec<_>>();
+    let hidden_local = hidden_local_account_ids_for_account(db, owner_id)
+        .await?
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<HashSet<_>>();
+    let hidden_remote = hidden_remote_actor_ids_for_account(db, owner_id)
+        .await?
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<HashSet<_>>();
+    let visible_local_ids = local_member_ids
+        .iter()
+        .copied()
+        .filter(|id| !hidden_local.contains(id))
+        .collect::<Vec<_>>();
+    let visible_remote_ids = remote_member_ids
+        .iter()
+        .copied()
+        .filter(|id| !hidden_remote.contains(id))
+        .collect::<Vec<_>>();
+
+    let (reply_local_ids, reply_remote_ids) = match list.replies_policy {
+        ListRepliesPolicy::None => (Vec::new(), Vec::new()),
+        ListRepliesPolicy::List => (local_member_ids.clone(), remote_member_ids.clone()),
+        ListRepliesPolicy::Followed => {
+            let locals = local_follow::Entity::find()
+                .filter(local_follow::Column::FollowerAccountId.eq(owner_id.0))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|follow| follow.followed_account_id)
+                .collect();
+            let remotes = remote_following::Entity::find()
+                .filter(remote_following::Column::LocalAccountId.eq(owner_id.0))
+                .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+                .filter(remote_following::Column::DeactivatedAt.is_null())
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|follow| follow.remote_actor_id)
+                .collect();
+            (locals, remotes)
+        }
+    };
+
+    let mut local_query = apply_timeline_cursor(
+        local_status::Entity::find()
+            .filter(local_status::Column::AccountId.is_in(visible_local_ids.clone()))
+            .filter(local_status::Column::Visibility.is_in(["public", "unlisted", "private"]))
+            .filter(local_status::Column::DeletedAt.is_null()),
+        cursor,
+    );
+    local_query = match list.replies_policy {
+        ListRepliesPolicy::None => local_query
+            .filter(local_status::Column::InReplyToId.is_null())
+            .filter(local_status::Column::InReplyToRemoteStatusId.is_null()),
+        ListRepliesPolicy::List | ListRepliesPolicy::Followed => local_query.filter(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(local_status::Column::InReplyToId.is_null())
+                        .add(local_status::Column::InReplyToRemoteStatusId.is_null()),
+                )
+                .add(
+                    local_status::Column::InReplyToId.in_subquery(
+                        Query::select()
+                            .column(local_status::Column::Id)
+                            .from(local_status::Entity)
+                            .and_where(
+                                local_status::Column::AccountId.is_in(reply_local_ids.clone()),
+                            )
+                            .to_owned(),
+                    ),
+                )
+                .add(
+                    local_status::Column::InReplyToRemoteStatusId.in_subquery(
+                        Query::select()
+                            .column(remote_status::Column::Id)
+                            .from(remote_status::Entity)
+                            .and_where(
+                                remote_status::Column::RemoteActorId
+                                    .is_in(reply_remote_ids.clone()),
+                            )
+                            .to_owned(),
+                    ),
+                ),
+        ),
+    };
+    let statuses = local_query
+        .order_by_desc(local_status::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+
+    let mut remote_query = remote_status::Entity::find()
+        .filter(remote_status::Column::RemoteActorId.is_in(visible_remote_ids.clone()))
+        .filter(remote_status::Column::Visibility.is_in(["public", "unlisted", "private"]))
+        .filter(remote_status::Column::DeletedAt.is_null());
+    if let Some(id) = cursor.max_id {
+        remote_query = remote_query.filter(remote_status::Column::Id.lt(id.0));
+    }
+    if let Some(id) = cursor.since_id {
+        remote_query = remote_query.filter(remote_status::Column::Id.gt(id.0));
+    }
+    if let Some(id) = cursor.min_id {
+        remote_query = remote_query.filter(remote_status::Column::Id.gt(id.0));
+    }
+    remote_query = match list.replies_policy {
+        ListRepliesPolicy::None => remote_query.filter(remote_status::Column::InReplyTo.is_null()),
+        ListRepliesPolicy::List | ListRepliesPolicy::Followed => remote_query.filter(
+            Condition::any()
+                .add(remote_status::Column::InReplyTo.is_null())
+                .add(
+                    remote_status::Column::InReplyToLocalStatusId.in_subquery(
+                        Query::select()
+                            .column(local_status::Column::Id)
+                            .from(local_status::Entity)
+                            .and_where(local_status::Column::AccountId.is_in(reply_local_ids))
+                            .to_owned(),
+                    ),
+                )
+                .add(
+                    remote_status::Column::InReplyToRemoteStatusId.in_subquery(
+                        Query::select()
+                            .column(remote_status::Column::Id)
+                            .from(remote_status::Entity)
+                            .and_where(remote_status::Column::RemoteActorId.is_in(reply_remote_ids))
+                            .to_owned(),
+                    ),
+                ),
+        ),
+    };
+    let remote_statuses = remote_query
+        .order_by_desc(remote_status::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+
+    let reblog_account_ids = visible_local_ids;
+    let reblogs = apply_reblog_timeline_cursor(
+        local_status_reblog::Entity::find()
+            .filter(local_status_reblog::Column::AccountId.is_in(reblog_account_ids.clone())),
+        cursor,
+    )
+    .order_by_desc(local_status_reblog::Column::Id)
+    .limit(page_query_limit(limit))
+    .all(db)
+    .await?;
+    let mut local_remote_reblog_query = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.is_in(reblog_account_ids));
+    if let Some(id) = cursor.max_id {
+        local_remote_reblog_query =
+            local_remote_reblog_query.filter(local_remote_status_reblog::Column::Id.lt(id.0));
+    }
+    if let Some(id) = cursor.since_id {
+        local_remote_reblog_query =
+            local_remote_reblog_query.filter(local_remote_status_reblog::Column::Id.gt(id.0));
+    }
+    if let Some(id) = cursor.min_id {
+        local_remote_reblog_query =
+            local_remote_reblog_query.filter(local_remote_status_reblog::Column::Id.gt(id.0));
+    }
+    let local_remote_reblogs = local_remote_reblog_query
+        .order_by_desc(local_remote_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let mut remote_reblog_query = remote_status_reblog::Entity::find()
+        .filter(remote_status_reblog::Column::RemoteActorId.is_in(visible_remote_ids));
+    if let Some(id) = cursor.max_id {
+        remote_reblog_query = remote_reblog_query.filter(remote_status_reblog::Column::Id.lt(id.0));
+    }
+    if let Some(id) = cursor.since_id {
+        remote_reblog_query = remote_reblog_query.filter(remote_status_reblog::Column::Id.gt(id.0));
+    }
+    if let Some(id) = cursor.min_id {
+        remote_reblog_query = remote_reblog_query.filter(remote_status_reblog::Column::Id.gt(id.0));
+    }
+    let remote_reblogs = remote_reblog_query
+        .order_by_desc(remote_status_reblog::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?;
+    let mut items = statuses
+        .into_iter()
+        .map(local_status_from_model)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(HomeTimelineItem::Status)
+        .chain(
+            remote_statuses
+                .into_iter()
+                .map(remote_status_from_model)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(HomeTimelineItem::RemoteStatus),
+        )
+        .chain(
+            reblogs
+                .into_iter()
+                .map(local_status_reblog_from_model)
+                .map(HomeTimelineItem::Reblog),
+        )
+        .chain(
+            local_remote_reblogs
+                .into_iter()
+                .map(local_remote_status_reblog_from_model)
+                .map(HomeTimelineItem::LocalRemoteReblog),
+        )
+        .chain(
+            remote_reblogs
+                .into_iter()
+                .filter_map(remote_status_reblog_from_model)
+                .map(HomeTimelineItem::RemoteReblog),
+        )
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| Reverse(timeline_item_id(item)));
+    let (items, has_more) = trim_to_page(items, limit);
+    let first_cursor = items.first().map(timeline_item_id);
+    let last_cursor = items.last().map(timeline_item_id);
+    Ok(Some(TimelinePage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    }))
+}
+
 /// List statuses authored by the account and followed local accounts.
 pub async fn home_timeline_for_account(
     db: &DbConnection,
@@ -10488,12 +11294,44 @@ pub async fn home_timeline_for_account(
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .all(db)
         .await?;
+    let exclusive_list_ids = local_list::Entity::find()
+        .filter(local_list::Column::AccountId.eq(account_id.0))
+        .filter(local_list::Column::Exclusive.eq(true))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|list| list.id)
+        .collect::<Vec<_>>();
+    let exclusive_local_ids = if exclusive_list_ids.is_empty() {
+        HashSet::new()
+    } else {
+        local_list_local_member::Entity::find()
+            .filter(local_list_local_member::Column::ListId.is_in(exclusive_list_ids.clone()))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|member| member.account_id)
+            .collect::<HashSet<_>>()
+    };
+    let exclusive_remote_ids = if exclusive_list_ids.is_empty() {
+        Vec::new()
+    } else {
+        local_list_remote_member::Entity::find()
+            .filter(local_list_remote_member::Column::ListId.is_in(exclusive_list_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|member| member.remote_actor_id)
+            .collect::<Vec<_>>()
+    };
     let followed_ids = follows
         .iter()
+        .filter(|follow| !exclusive_local_ids.contains(&follow.followed_account_id))
         .map(|follow| follow.followed_account_id)
         .collect::<Vec<_>>();
     let reblog_followed_ids = follows
         .iter()
+        .filter(|follow| !exclusive_local_ids.contains(&follow.followed_account_id))
         .filter(|follow| follow.show_reblogs)
         .map(|follow| follow.followed_account_id)
         .collect::<Vec<_>>();
@@ -10514,7 +11352,7 @@ pub async fn home_timeline_for_account(
         );
     status_condition = status_condition.add(
         Condition::all()
-            .add(local_status::Column::Visibility.eq("private"))
+            .add(local_status::Column::Visibility.eq(StatusVisibility::Private))
             .add(
                 local_status::Column::Id.in_subquery(
                     Query::select()
@@ -10528,7 +11366,7 @@ pub async fn home_timeline_for_account(
     if !followed_tag_ids.is_empty() {
         status_condition = status_condition.add(
             Condition::all()
-                .add(local_status::Column::Visibility.eq("public"))
+                .add(local_status::Column::Visibility.eq(StatusVisibility::Public))
                 .add(
                     local_status::Column::Id
                         .in_subquery(status_tags_subquery(followed_tag_ids.clone())),
@@ -10544,6 +11382,10 @@ pub async fn home_timeline_for_account(
     if !hidden_account_ids.is_empty() {
         status_query = status_query
             .filter(local_status::Column::AccountId.is_not_in(hidden_account_ids.clone()));
+    }
+    if !exclusive_local_ids.is_empty() {
+        status_query =
+            status_query.filter(local_status::Column::AccountId.is_not_in(exclusive_local_ids));
     }
     let statuses = status_query
         .order_by_desc(local_status::Column::Id)
@@ -10586,13 +11428,19 @@ pub async fn home_timeline_for_account(
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
-    let followed_remote_actors = Query::select()
+    let mut followed_remote_actors = Query::select();
+    followed_remote_actors
         .column(remote_following::Column::RemoteActorId)
         .from(remote_following::Entity)
         .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
-        .and_where(remote_following::Column::State.eq("accepted"))
-        .and_where(remote_following::Column::DeactivatedAt.is_null())
-        .to_owned();
+        .and_where(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .and_where(remote_following::Column::DeactivatedAt.is_null());
+    if !exclusive_remote_ids.is_empty() {
+        followed_remote_actors.and_where(
+            remote_following::Column::RemoteActorId.is_not_in(exclusive_remote_ids.clone()),
+        );
+    }
+    let followed_remote_actors = followed_remote_actors.to_owned();
     let mut remote_status_condition = Condition::any()
         .add(
             Condition::all()
@@ -10601,7 +11449,7 @@ pub async fn home_timeline_for_account(
         )
         .add(
             Condition::all()
-                .add(remote_status::Column::Visibility.eq("private"))
+                .add(remote_status::Column::Visibility.eq(StatusVisibility::Private))
                 .add(
                     remote_status::Column::Id.in_subquery(
                         Query::select()
@@ -10617,7 +11465,7 @@ pub async fn home_timeline_for_account(
     if !followed_tag_ids.is_empty() {
         remote_status_condition = remote_status_condition.add(
             Condition::all()
-                .add(remote_status::Column::Visibility.eq("public"))
+                .add(remote_status::Column::Visibility.eq(StatusVisibility::Public))
                 .add(
                     remote_status::Column::Id
                         .in_subquery(remote_status_tags_subquery(followed_tag_ids)),
@@ -10631,6 +11479,10 @@ pub async fn home_timeline_for_account(
         remote_query = remote_query.filter(
             remote_status::Column::RemoteActorId.is_not_in(hidden_remote_actor_ids.clone()),
         );
+    }
+    if !exclusive_remote_ids.is_empty() {
+        remote_query = remote_query
+            .filter(remote_status::Column::RemoteActorId.is_not_in(exclusive_remote_ids.clone()));
     }
     if let Some(max_id) = cursor.max_id {
         remote_query = remote_query.filter(remote_status::Column::Id.lt(max_id.0));
@@ -10652,12 +11504,16 @@ pub async fn home_timeline_for_account(
                 .column(remote_following::Column::RemoteActorId)
                 .from(remote_following::Entity)
                 .and_where(remote_following::Column::LocalAccountId.eq(account_id.0))
-                .and_where(remote_following::Column::State.eq("accepted"))
+                .and_where(remote_following::Column::State.eq(RemoteFollowState::Accepted))
                 .and_where(remote_following::Column::ShowReblogs.eq(true))
                 .and_where(remote_following::Column::DeactivatedAt.is_null())
                 .to_owned(),
         ),
     );
+    if !exclusive_remote_ids.is_empty() {
+        remote_reblog_query = remote_reblog_query
+            .filter(remote_status_reblog::Column::RemoteActorId.is_not_in(exclusive_remote_ids));
+    }
     if !hidden_remote_actor_ids.is_empty() {
         remote_reblog_query = remote_reblog_query
             .filter(remote_status_reblog::Column::RemoteActorId.is_not_in(hidden_remote_actor_ids));
@@ -11019,6 +11875,18 @@ pub async fn find_oauth_application_by_client_id(
     Ok(app.map(oauth_application_from_model))
 }
 
+/// PKCE method persisted with an OAuth authorization code.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+pub enum PkceCodeChallengeMethod {
+    #[strum(serialize = "")]
+    None,
+    #[strum(serialize = "S256")]
+    S256,
+}
+
 /// Data needed to issue a short-lived OAuth authorization code.
 pub struct NewAuthorizationCode<'a> {
     /// Account granting the authorization.
@@ -11032,7 +11900,7 @@ pub struct NewAuthorizationCode<'a> {
     /// PKCE code challenge.
     pub code_challenge: &'a str,
     /// PKCE challenge method.
-    pub code_challenge_method: &'a str,
+    pub code_challenge_method: PkceCodeChallengeMethod,
 }
 
 /// Create a one-time OAuth authorization code.
@@ -11070,7 +11938,7 @@ pub async fn consume_authorization_code(
     code: &str,
     application_id: Uuid,
     redirect_uri: &str,
-) -> Result<Option<(AccountId, String, String, String)>> {
+) -> Result<Option<(AccountId, String, String, PkceCodeChallengeMethod)>> {
     let code_hash = secret_hash(token_pepper, code)?;
     let Some(code) = oauth_authorization_code::Entity::find()
         .filter(oauth_authorization_code::Column::CodeHash.eq(code_hash))
@@ -11090,7 +11958,7 @@ pub async fn consume_authorization_code(
         AccountId(code.account_id),
         code.scopes.clone(),
         code.code_challenge.clone(),
-        code.code_challenge_method.clone(),
+        code.code_challenge_method,
     );
     let mut active_code = code.into_active_model();
     active_code.consumed_at = Set(Some(OffsetDateTime::now_utc()));
@@ -11125,7 +11993,7 @@ pub async fn create_access_token(
 
     Ok(OAuthAccessToken {
         token,
-        token_type: "Bearer",
+        token_type: OAuthTokenType::Bearer,
         scope: scopes.to_owned(),
         created_at: issued_at.unix_timestamp(),
     })
@@ -11244,7 +12112,7 @@ pub async fn upsert_push_subscription(
         p256dh: Set(input.p256dh),
         auth: Set(input.auth),
         standard: Set(input.encoding == PushSubscriptionEncoding::Standard),
-        policy: Set(input.policy.to_string()),
+        policy: Set(input.policy),
         alerts: Set(push_alerts_json(input.alerts)?),
         access_token_ciphertext: Set(input.access_token_ciphertext),
         access_token_nonce: Set(input.access_token_nonce),
@@ -11295,7 +12163,7 @@ pub async fn update_push_subscription(
     };
     let mut active = model.into_active_model();
     active.alerts = Set(push_alerts_json(alerts)?);
-    active.policy = Set(policy.to_string());
+    active.policy = Set(policy);
     active.updated_at = Set(OffsetDateTime::now_utc());
     Ok(Some(push_subscription_from_model(
         active.update(db).await?,
@@ -11358,7 +12226,7 @@ pub async fn push_policy_allows(
             (None, Some(actor)) => Ok(remote_following::Entity::find()
                 .filter(remote_following::Column::LocalAccountId.eq(notification.account_id.0))
                 .filter(remote_following::Column::RemoteActorId.eq(actor.0))
-                .filter(remote_following::Column::State.eq("accepted"))
+                .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
                 .filter(remote_following::Column::DeactivatedAt.is_null())
                 .one(db)
                 .await?
@@ -11420,7 +12288,7 @@ fn local_account_from_model(account: local_account::Model) -> Result<LocalAccoun
         locked: account.locked,
         bot: account.bot,
         discoverable: account.discoverable,
-        default_visibility: StatusVisibility::parse(&account.default_visibility)?,
+        default_visibility: account.default_visibility,
         default_sensitive: account.default_sensitive,
         default_language: account.default_language,
         default_quote_policy: account.default_quote_policy,
@@ -11462,9 +12330,7 @@ fn remote_custom_emoji_from_model(model: remote_custom_emoji::Model) -> Result<R
         shortcode: model.shortcode,
         remote_url: model.remote_url,
         content_type: model.content_type,
-        state: RemoteMediaState::from_str(&model.state).map_err(|_| {
-            RoostyError::InvalidInput("stored remote custom emoji state is invalid".to_owned())
-        })?,
+        state: model.state,
         file_path: model.file_path,
         expires_at: model.expires_at,
     })
@@ -11477,7 +12343,7 @@ fn remote_status_from_model(status: remote_status::Model) -> Result<RemoteStatus
         activitypub_id: status.activitypub_id,
         remote_actor_id: AccountId(status.remote_actor_id),
         content: status.content,
-        visibility: StatusVisibility::parse(&status.visibility)?,
+        visibility: status.visibility,
         published_at: status.published_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
@@ -11593,7 +12459,7 @@ fn local_status_from_model(status: local_status::Model) -> Result<LocalStatus> {
         id: StatusId(status.id),
         account_id: AccountId(status.account_id),
         content: status.content,
-        visibility: StatusVisibility::parse(&status.visibility)?,
+        visibility: status.visibility,
         sensitive: status.sensitive,
         spoiler_text: status.spoiler_text,
         language: status.language,
@@ -11603,7 +12469,7 @@ fn local_status_from_model(status: local_status::Model) -> Result<LocalStatus> {
         created_at: status.created_at,
         updated_at: status.updated_at,
         deleted_at: status.deleted_at,
-        quote_approval_policy: QuoteApprovalPolicy::parse(&status.quote_approval_policy)?,
+        quote_approval_policy: status.quote_approval_policy,
     })
 }
 
@@ -11635,8 +12501,7 @@ fn status_quote_from_model(model: status_quote::Model) -> Result<StatusQuote> {
         quoting_status,
         quoted_status,
         quoted_activitypub_id: model.quoted_activitypub_id,
-        state: QuoteState::from_str(&model.state)
-            .map_err(|_| RoostyError::InvalidInput("stored quote state is invalid".to_owned()))?,
+        state: model.state,
         quote_request_id: model.quote_request_id,
         authorization_id: model.authorization_id,
         created_at: model.created_at,
@@ -11693,8 +12558,7 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
     LocalNotification {
         id: notification.id,
         account_id: AccountId(notification.account_id),
-        notification_type: LocalNotificationType::from_str(&notification.notification_type)
-            .unwrap_or(LocalNotificationType::Mention),
+        notification_type: notification.notification_type,
         actor_account_id: notification.actor_account_id.map(AccountId),
         remote_actor_id: notification.remote_actor_id.map(AccountId),
         status_id: notification.status_id.map(StatusId),
@@ -11707,8 +12571,6 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
 fn push_subscription_from_model(
     subscription: push_subscription::Model,
 ) -> Result<PushSubscription> {
-    let policy = PushPolicy::from_str(&subscription.policy)
-        .map_err(|_| RoostyError::InvalidInput("stored push policy is invalid".to_owned()))?;
     let alerts = serde_json::from_value(subscription.alerts).map_err(|error| {
         RoostyError::InvalidInput(format!("stored push alerts are invalid: {error}"))
     })?;
@@ -11724,7 +12586,7 @@ fn push_subscription_from_model(
         } else {
             PushSubscriptionEncoding::Legacy
         },
-        policy,
+        policy: subscription.policy,
         alerts,
         access_token_ciphertext: subscription.access_token_ciphertext,
         access_token_nonce: subscription.access_token_nonce,
@@ -11742,9 +12604,7 @@ fn local_timeline_marker_from_model(
     marker: local_timeline_marker::Model,
 ) -> Result<LocalTimelineMarker> {
     Ok(LocalTimelineMarker {
-        timeline: LocalTimeline::from_str(&marker.timeline).map_err(|_| {
-            RoostyError::InvalidInput("stored timeline marker type is invalid".to_owned())
-        })?,
+        timeline: marker.timeline,
         last_read_id: marker.last_read_id,
         version: marker.version,
         updated_at: marker.updated_at,
@@ -11793,7 +12653,7 @@ pub struct ClaimedJob {
     /// Lease identity that must accompany the final job outcome.
     pub claim_id: JobClaimId,
     /// Application job kind.
-    pub kind: String,
+    pub kind: JobKind,
     /// JSON job payload.
     pub payload: JsonValue,
     /// Number of prior failed attempts.
@@ -11898,6 +12758,14 @@ pub async fn claim_due_job(
                 WHERE completed_at IS NULL
                   AND run_after <= now()
                   AND (locked_at IS NULL OR locked_at < $3)
+                  AND kind IN (
+                    'federation_follow_response', 'federation_status_delivery',
+                    'federation_quote_delivery', 'federation_follow_delivery',
+                    'federation_favourite_delivery', 'federation_reblog_delivery',
+                    'federation_actor_update_delivery', 'federation_moderation_delivery',
+                    'federation_remote_media_fetch', 'federation_featured_refresh',
+                    'federation_featured_tags_refresh', 'web_push_delivery'
+                  )
                 ORDER BY run_after, created_at
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -11914,7 +12782,7 @@ pub async fn claim_due_job(
 
     row.map(|row| {
         let id: Uuid = row.try_get("", "id")?;
-        let kind: String = row.try_get("", "kind")?;
+        let kind: JobKind = row.try_get("", "kind")?;
         let payload: JsonValue = row.try_get("", "payload")?;
         let attempts: i32 = row.try_get("", "attempts")?;
         let attempts = u32::try_from(attempts).map_err(|_| {

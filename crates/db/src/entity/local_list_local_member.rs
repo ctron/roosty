@@ -1,21 +1,18 @@
-use crate::RemoteFollowState;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
-/// SeaORM model for an inbound remote actor following a local account.
+/// A followed local account included in a private list.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "remote_follow")]
+#[sea_orm(table_name = "local_list_local_member")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub remote_actor_id: Uuid,
-    pub local_account_id: Uuid,
-    pub activity_id: String,
-    pub activity: Json,
-    pub state: RemoteFollowState,
+    pub list_id: Uuid,
+    pub account_id: Uuid,
     pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
 }
+
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
+
 impl ActiveModelBehavior for ActiveModel {}

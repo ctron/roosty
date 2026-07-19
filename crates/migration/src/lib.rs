@@ -62,6 +62,9 @@ mod m20260701_000057_create_status_quotes;
 mod m20260701_000058_create_status_pins;
 mod m20260701_000059_create_featured_tags;
 mod m20260701_000060_create_push_subscription;
+mod m20260701_000061_constrain_pkce_method;
+mod m20260701_000062_create_lists;
+mod m20260701_000063_constrain_inbox_activity_type;
 
 pub struct Migrator;
 
@@ -129,6 +132,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000058_create_status_pins::Migration),
             Box::new(m20260701_000059_create_featured_tags::Migration),
             Box::new(m20260701_000060_create_push_subscription::Migration),
+            Box::new(m20260701_000061_constrain_pkce_method::Migration),
+            Box::new(m20260701_000062_create_lists::Migration),
+            Box::new(m20260701_000063_constrain_inbox_activity_type::Migration),
         ]
     }
 }

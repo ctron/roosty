@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use roosty_core::{Result, RoostyError};
+use strum::{Display, EnumString};
 use url::Url;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:4000";
@@ -8,6 +9,22 @@ const DEFAULT_MEDIA_ROOT: &str = "./media";
 const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
 const DEFAULT_WORKER_CONCURRENCY: &str = "4";
+
+/// Configured storage implementation for locally managed media.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum ObjectStorageBackend {
+    Local,
+}
+
+/// Operator policy controlling whether public account registration is advertised.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum RegistrationMode {
+    Closed,
+    Open,
+    Approval,
+}
 
 /// Per-process limits and timers for Mastodon-compatible streaming sockets.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,9 +116,9 @@ pub struct Config {
     pub token_pepper: String,
     /// Base64-encoded PKCS#8 P-256 private key used for VAPID.
     pub vapid_private_key: Option<String>,
-    pub object_storage_backend: String,
+    pub object_storage_backend: ObjectStorageBackend,
     pub media_root: String,
-    pub registration_mode: String,
+    pub registration_mode: RegistrationMode,
     pub federation_enabled: bool,
     /// Secret used to encrypt persisted local actor private keys.
     pub federation_key_encryption_secret: Option<String>,
@@ -200,12 +217,13 @@ impl Config {
             session_secret: required_secret("ROOSTY_SESSION_SECRET")?,
             token_pepper: required_secret("ROOSTY_TOKEN_PEPPER")?,
             vapid_private_key,
-            object_storage_backend: optional_env("ROOSTY_OBJECT_STORAGE_BACKEND")
-                .unwrap_or_else(|| DEFAULT_OBJECT_STORAGE_BACKEND.to_owned()),
+            object_storage_backend: parse_env(
+                "ROOSTY_OBJECT_STORAGE_BACKEND",
+                DEFAULT_OBJECT_STORAGE_BACKEND,
+            )?,
             media_root: optional_env("ROOSTY_MEDIA_ROOT")
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_owned()),
-            registration_mode: optional_env("ROOSTY_REGISTRATION_MODE")
-                .unwrap_or_else(|| DEFAULT_REGISTRATION_MODE.to_owned()),
+            registration_mode: parse_env("ROOSTY_REGISTRATION_MODE", DEFAULT_REGISTRATION_MODE)?,
             federation_enabled,
             federation_key_encryption_secret,
             federation_allowed_domains,
@@ -412,9 +430,9 @@ mod tests {
             session_secret: "test-session-secret".to_owned(),
             token_pepper: "test-token-pepper".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: "local".to_owned(),
+            object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
-            registration_mode: "closed".to_owned(),
+            registration_mode: RegistrationMode::Closed,
             federation_enabled: true,
             federation_key_encryption_secret: Some("test-federation-secret".to_owned()),
             federation_allowed_domains: vec!["*".to_owned()],

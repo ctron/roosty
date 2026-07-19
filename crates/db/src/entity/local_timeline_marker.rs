@@ -1,3 +1,4 @@
+use crate::LocalTimeline;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -8,7 +9,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub account_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub timeline: String,
+    pub timeline: LocalTimeline,
     pub last_read_id: Uuid,
     pub version: i64,
     pub updated_at: OffsetDateTime,

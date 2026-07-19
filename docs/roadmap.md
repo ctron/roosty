@@ -7,6 +7,7 @@
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
 - Local public/unlisted home-timeline fan-out, including streaming status creation and edit replacements, replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
+- Mastodon-compatible private lists with local/remote membership, reply policies, exclusive home-feed filtering, and cursor-paginated list timelines.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
 - Mastodon-compatible safe linkification of explicit web URLs across local API, history, streaming, and outbound ActivityPub projections.
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
@@ -51,7 +52,7 @@
 - [x] Complete remote direct conversations: persist mixed local/remote participants, support replies to cached direct Notes, and repair conversation state after remote updates/deletes.
 - [x] Add recipient-scoped direct-message audiences, per-account last-status projection, local/remote deletion repair, and transactional notification creation.
 - [x] Finish transactional remote notifications for Follow and Announce flows, matching the existing transactional mention/reply and Like handling.
-- [ ] Replace stringly persisted status visibility with the typed `StatusVisibility` model at persistence and wire boundaries.
+- [x] Replace stringly persisted status visibility with the typed `StatusVisibility` model at persistence and wire boundaries.
 - [ ] Support remote account migration, redirects, and moved-account relationship updates.
 - [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
 - [x] Fetch and expose bounded remote featured profile tags with durable refresh and signed Add/Remove synchronization.

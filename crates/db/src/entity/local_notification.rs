@@ -1,3 +1,4 @@
+use crate::LocalNotificationType;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ConnectionTrait, Statement};
 use serde_json::json;
@@ -10,7 +11,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub account_id: Uuid,
-    pub notification_type: String,
+    pub notification_type: LocalNotificationType,
     pub actor_account_id: Option<Uuid>,
     pub remote_actor_id: Option<Uuid>,
     pub status_id: Option<Uuid>,

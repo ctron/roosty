@@ -1,3 +1,4 @@
+use crate::PkceCodeChallengeMethod;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -13,7 +14,7 @@ pub struct Model {
     pub redirect_uri: String,
     pub scopes: String,
     pub code_challenge: String,
-    pub code_challenge_method: String,
+    pub code_challenge_method: PkceCodeChallengeMethod,
     pub expires_at: OffsetDateTime,
     pub consumed_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,

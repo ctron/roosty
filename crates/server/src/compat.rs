@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use tracing::{debug, warn};
@@ -261,31 +261,47 @@ async fn send_socket_message(
 
 /// Log subscribe and unsubscribe messages until real event fan-out exists.
 fn handle_streaming_text(text: &str, streams: &mut Vec<String>) {
-    match serde_json::from_str::<Value>(text) {
-        Ok(value) => {
-            let message_type = value.get("type").and_then(Value::as_str);
-            let stream = value.get("stream").and_then(Value::as_str);
-            update_stream_subscription(message_type, stream, streams);
-            debug!(?message_type, ?stream, "streaming control message");
+    match serde_json::from_str::<StreamingControlMessage>(text) {
+        Ok(message) => {
+            update_stream_subscription(message.action, message.stream.as_deref(), streams);
+            debug!(?message.action, stream = ?message.stream, "streaming control message");
         }
         Err(error) => debug!(%error, "ignored non-json streaming message"),
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamingControlMessage {
+    #[serde(rename = "type")]
+    action: Option<StreamingControlAction>,
+    stream: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum StreamingControlAction {
+    Subscribe,
+    Unsubscribe,
+    #[serde(other)]
+    Other,
+}
+
 /// Apply browser WebSocket subscribe and unsubscribe control messages.
 fn update_stream_subscription(
-    message_type: Option<&str>,
+    action: Option<StreamingControlAction>,
     stream: Option<&str>,
     streams: &mut Vec<String>,
 ) {
     let Some(stream) = stream.map(str::trim).filter(|stream| !stream.is_empty()) else {
         return;
     };
-    match message_type {
-        Some("subscribe") if !streams.iter().any(|current| current == stream) => {
+    match action {
+        Some(StreamingControlAction::Subscribe)
+            if !streams.iter().any(|current| current == stream) =>
+        {
             streams.push(stream.to_owned());
         }
-        Some("unsubscribe") => {
+        Some(StreamingControlAction::Unsubscribe) => {
             streams.retain(|current| current != stream);
         }
         _ => {}
@@ -366,7 +382,9 @@ mod tests {
     use test_context::{AsyncTestContext, test_context};
     use tower::ServiceExt;
 
-    use super::{custom_emojis, streaming_token, update_stream_subscription};
+    use super::{
+        StreamingControlAction, custom_emojis, streaming_token, update_stream_subscription,
+    };
     use crate::{config::Config, http::AppState, password};
 
     #[test_context(CompatContext)]
@@ -674,7 +692,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(job.kind, "web_push_delivery");
+        assert_eq!(job.kind, roosty_db::JobKind::WebPushDelivery);
         assert_eq!(job.id.0.get_version_num(), 7);
         assert_eq!(job.payload["notification_id"], notification.id.to_string());
         assert_eq!(job.payload["subscription_id"], created["id"]);
@@ -1031,9 +1049,12 @@ mod tests {
     ) {
         let alpha = AppState::new(context.config.clone(), context.db.clone());
         alpha.streaming_events.initialize_listener().await.unwrap();
-        alpha
-            .streaming_events
-            .publish_delete("before-startup", context.account_id, "public", &[]);
+        alpha.streaming_events.publish_delete(
+            "before-startup",
+            context.account_id,
+            roosty_db::StatusVisibility::Public,
+            &[],
+        );
         wait_for_streaming_sequence(&context.db, 1).await;
 
         let beta = AppState::new(context.config.clone(), context.db.clone());
@@ -1057,13 +1078,13 @@ mod tests {
         alpha.streaming_events.publish_status_update(
             &serde_json::json!({"id": "update"}),
             context.account_id,
-            "public",
+            roosty_db::StatusVisibility::Public,
             &[],
         );
         alpha.streaming_events.publish_status_edit(
             &serde_json::json!({"id": "status-update"}),
             context.account_id,
-            "public",
+            roosty_db::StatusVisibility::Public,
             &[],
             &[context.account_id],
         );
@@ -1075,9 +1096,12 @@ mod tests {
             &serde_json::json!({"id": "conversation"}),
             context.account_id,
         );
-        alpha
-            .streaming_events
-            .publish_delete("deleted-status", context.account_id, "public", &[]);
+        alpha.streaming_events.publish_delete(
+            "deleted-status",
+            context.account_id,
+            roosty_db::StatusVisibility::Public,
+            &[],
+        );
 
         let streams = [
             "user".to_owned(),
@@ -1164,13 +1188,25 @@ mod tests {
         // control messages; outgoing events still need a defined stream array.
         let mut streams = vec!["user".to_owned()];
 
-        update_stream_subscription(Some("subscribe"), Some("public"), &mut streams);
+        update_stream_subscription(
+            Some(StreamingControlAction::Subscribe),
+            Some("public"),
+            &mut streams,
+        );
         assert_eq!(streams, vec!["user".to_owned(), "public".to_owned()]);
 
-        update_stream_subscription(Some("unsubscribe"), Some("user"), &mut streams);
+        update_stream_subscription(
+            Some(StreamingControlAction::Unsubscribe),
+            Some("user"),
+            &mut streams,
+        );
         assert_eq!(streams, vec!["public".to_owned()]);
 
-        update_stream_subscription(Some("unsubscribe"), Some("public"), &mut streams);
+        update_stream_subscription(
+            Some(StreamingControlAction::Unsubscribe),
+            Some("public"),
+            &mut streams,
+        );
         assert_eq!(streams, vec!["user".to_owned()]);
     }
 
@@ -1242,9 +1278,9 @@ mod tests {
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 // Fixed test-only PKCS#8 key. pragma: allowlist secret
                 vapid_private_key: Some(TEST_VAPID_PRIVATE_KEY.to_owned()),
-                object_storage_backend: "local".to_owned(),
+                object_storage_backend: crate::config::ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
-                registration_mode: "closed".to_owned(),
+                registration_mode: crate::config::RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),

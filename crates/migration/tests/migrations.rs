@@ -47,6 +47,9 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_status_pin").await);
     assert!(table_exists(database.connection(), "remote_status_pin").await);
     assert!(table_exists(database.connection(), "local_featured_tag").await);
+    assert!(table_exists(database.connection(), "local_list").await);
+    assert!(table_exists(database.connection(), "local_list_local_member").await);
+    assert!(table_exists(database.connection(), "local_list_remote_member").await);
     assert!(table_exists(database.connection(), "remote_featured_tag").await);
     assert!(table_exists(database.connection(), "local_status_local_mention").await);
     assert!(table_exists(database.connection(), "remote_status_local_mention").await);
@@ -274,7 +277,7 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
         .await
         .unwrap();
 
-    Migrator::up(database.connection(), None).await.unwrap();
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
     let row = database
         .connection()
         .query_one(Statement::from_string(
@@ -290,10 +293,7 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back push subscriptions, featured tags, pins, remote tags, status history, streaming
-    // metadata, edit delivery, subscription extensions, streaming-kind extension, remote
-    // moderation, the streaming log, and the URL.
-    Migrator::down(database.connection(), Some(14))
+    Migrator::down(database.connection(), Some(1))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -485,7 +485,7 @@ async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut Embedded
         .await
         .unwrap();
 
-    Migrator::up(database.connection(), None).await.unwrap();
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
     let row = database
         .connection()
         .query_one(Statement::from_string(
@@ -497,7 +497,7 @@ async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut Embedded
         .unwrap();
     assert_eq!(row.try_get::<i64>("", "count").unwrap(), 2);
 
-    Migrator::down(database.connection(), Some(5))
+    Migrator::down(database.connection(), Some(1))
         .await
         .unwrap();
     assert!(!table_exists(database.connection(), "remote_status_tag").await);

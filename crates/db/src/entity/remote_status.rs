@@ -1,3 +1,4 @@
+use crate::StatusVisibility;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -10,7 +11,7 @@ pub struct Model {
     pub activitypub_id: String,
     pub remote_actor_id: Uuid,
     pub content: String,
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     pub published_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub deleted_at: Option<OffsetDateTime>,

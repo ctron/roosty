@@ -202,7 +202,7 @@ struct CollectionParams {
 #[derive(Deserialize)]
 struct StatusInput {
     status: Option<String>,
-    visibility: Option<String>,
+    visibility: Option<StatusVisibility>,
     sensitive: Option<bool>,
     #[serde(alias = "spoilerText")]
     spoiler_text: Option<String>,
@@ -216,7 +216,7 @@ struct StatusInput {
     #[serde(alias = "quotedStatusId")]
     quoted_status_id: Option<String>,
     #[serde(alias = "quoteApprovalPolicy")]
-    quote_approval_policy: Option<String>,
+    quote_approval_policy: Option<roosty_db::QuoteApprovalPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -235,7 +235,7 @@ pub(crate) struct StatusResponse {
     in_reply_to_account_id: Option<String>,
     sensitive: bool,
     spoiler_text: String,
-    visibility: String,
+    visibility: StatusVisibility,
     language: Option<String>,
     uri: String,
     url: String,
@@ -262,15 +262,58 @@ pub(crate) struct StatusResponse {
 
 #[derive(Serialize)]
 struct QuoteResponse {
-    state: String,
+    state: QuoteResponseState,
     quoted_status: Option<Box<StatusResponse>>,
 }
 
 #[derive(Serialize)]
 struct QuoteApprovalResponse {
-    automatic: Vec<String>,
-    manual: Vec<String>,
-    current_user: String,
+    automatic: Vec<QuoteApprovalAudience>,
+    manual: Vec<QuoteApprovalAudience>,
+    current_user: QuoteApprovalDecision,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuoteResponseState {
+    Pending,
+    Accepted,
+    Rejected,
+    Revoked,
+    Deleted,
+    Unauthorized,
+    BlockedAccount,
+    BlockedDomain,
+    MutedAccount,
+}
+
+impl From<roosty_db::QuoteState> for QuoteResponseState {
+    fn from(value: roosty_db::QuoteState) -> Self {
+        match value {
+            roosty_db::QuoteState::Pending => Self::Pending,
+            roosty_db::QuoteState::Accepted => Self::Accepted,
+            roosty_db::QuoteState::Rejected => Self::Rejected,
+            roosty_db::QuoteState::Revoked => Self::Revoked,
+            roosty_db::QuoteState::Deleted => Self::Deleted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuoteApprovalAudience {
+    Public,
+    Followers,
+    UnsupportedPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuoteApprovalDecision {
+    Automatic,
+    Manual,
+    Denied,
+    Unknown,
 }
 
 /// Plain-text source fields used to populate Mastodon-compatible status editors.
@@ -538,7 +581,7 @@ async fn resolve_quote_target(
     let follows =
         roosty_db::find_remote_following(&state.db, quoting_account.id, target.remote_actor_id)
             .await?
-            .is_some_and(|follow| follow.state == "accepted");
+            .is_some_and(|follow| follow.state == roosty_db::RemoteFollowState::Accepted);
     let audience_matches = |values: &[String]| {
         values.iter().any(|value| {
             value == PUBLIC
@@ -606,13 +649,7 @@ async fn create_status(
         return bad_request(&error.to_string());
     }
 
-    let visibility = input
-        .visibility
-        .unwrap_or_else(|| account.default_visibility.to_string());
-    let mut visibility = match StatusVisibility::parse(&visibility) {
-        Ok(visibility) => visibility,
-        Err(error) => return bad_request(&error.to_string()),
-    };
+    let mut visibility = input.visibility.unwrap_or(account.default_visibility);
     let quote_target = match input.quoted_status_id.as_deref() {
         Some(id) => match resolve_quote_target(
             &state,
@@ -638,15 +675,9 @@ async fn create_status(
     ) {
         roosty_db::QuoteApprovalPolicy::Nobody
     } else {
-        match roosty_db::QuoteApprovalPolicy::parse(
-            input
-                .quote_approval_policy
-                .as_deref()
-                .unwrap_or(&account.default_quote_policy),
-        ) {
-            Ok(policy) => policy,
-            Err(error) => return bad_request(&error.to_string()),
-        }
+        input
+            .quote_approval_policy
+            .unwrap_or(account.default_quote_policy)
     };
     let mut in_reply_to_id = match parse_optional_status_id(input.in_reply_to_id.as_deref()) {
         Ok(status_id) => status_id,
@@ -902,9 +933,9 @@ async fn create_status(
                     let stream_visibility = if status.in_reply_to_id.is_some()
                         || status.in_reply_to_remote_status_id.is_some()
                     {
-                        "unlisted"
+                        StatusVisibility::Unlisted
                     } else {
-                        &response.visibility
+                        status.visibility
                     };
                     state.streaming_events.publish_status_update(
                         &response,
@@ -1296,13 +1327,7 @@ async fn update_status(
     if input.quoted_status_id.is_some() {
         return bad_request("a quote target cannot be added or changed after publication");
     }
-    let quote_policy_update = match input.quote_approval_policy.as_deref() {
-        Some(value) => match roosty_db::QuoteApprovalPolicy::parse(value) {
-            Ok(policy) => Some(policy),
-            Err(error) => return bad_request(&error.to_string()),
-        },
-        None => None,
-    };
+    let quote_policy_update = input.quote_approval_policy;
     let media_ids = match input.media_ids.as_deref() {
         Some(values) => match parse_media_ids(values) {
             Ok(media_ids) => Some(media_ids),
@@ -1461,7 +1486,7 @@ async fn update_status(
                 state.streaming_events.publish_delete(
                     &status.id.0.to_string(),
                     status.account_id,
-                    "direct",
+                    StatusVisibility::Direct,
                     &refresh.removed_account_ids,
                 );
             }
@@ -1510,9 +1535,9 @@ async fn update_status(
                     let stream_visibility = if status.in_reply_to_id.is_some()
                         || status.in_reply_to_remote_status_id.is_some()
                     {
-                        "unlisted"
+                        StatusVisibility::Unlisted
                     } else {
-                        &response.visibility
+                        status.visibility
                     };
                     state.streaming_events.publish_status_edit(
                         &response,
@@ -1626,7 +1651,7 @@ async fn delete_status(
                     state.streaming_events.publish_delete(
                         &status.id.0.to_string(),
                         status.account_id,
-                        "direct",
+                        StatusVisibility::Direct,
                         &refresh.removed_account_ids,
                     );
                 }
@@ -1660,12 +1685,8 @@ async fn update_interaction_policy(
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
     };
-    let Some(raw_policy) = input.quote_approval_policy.as_deref() else {
+    let Some(policy) = input.quote_approval_policy else {
         return bad_request("quote_approval_policy is required");
-    };
-    let policy = match roosty_db::QuoteApprovalPolicy::parse(raw_policy) {
-        Ok(policy) => policy,
-        Err(error) => return bad_request(&error.to_string()),
     };
     let status_id = StatusId(path.status_id);
     let existing = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
@@ -1891,9 +1912,9 @@ async fn publish_status_delete(
     recipients.dedup();
     let stream_visibility =
         if status.in_reply_to_id.is_some() || status.in_reply_to_remote_status_id.is_some() {
-            "unlisted"
+            StatusVisibility::Unlisted
         } else {
-            (&status.visibility).into()
+            status.visibility
         };
     state.streaming_events.publish_local_status_delete(
         &status.id.0.to_string(),
@@ -1907,7 +1928,7 @@ async fn publish_status_delete(
         state.streaming_events.publish_delete(
             &reblog.id.to_string(),
             reblog.account_id,
-            "direct",
+            StatusVisibility::Direct,
             &recipients,
         );
     }
@@ -2727,7 +2748,7 @@ async fn status_collection_action(
                         state.streaming_events.publish_delete(
                             &reblog_id.to_string(),
                             account_id,
-                            "unlisted",
+                            StatusVisibility::Unlisted,
                             &recipients,
                         );
                     }
@@ -2839,7 +2860,7 @@ async fn status_collection_action(
                 state.streaming_events.publish_delete(
                     &removed_reblog.id.to_string(),
                     account_id,
-                    "direct",
+                    StatusVisibility::Direct,
                     &recipients,
                 );
             }
@@ -3171,7 +3192,7 @@ async fn home_timeline_models(
 }
 
 /// Build a Mastodon home timeline response from statuses and boosts.
-async fn home_timeline_response(
+pub(crate) async fn home_timeline_response(
     state: &AppState,
     page: roosty_db::TimelinePage<roosty_db::HomeTimelineItem>,
     limit: u64,
@@ -3441,7 +3462,7 @@ pub(crate) async fn remote_reblog_response(
         in_reply_to_account_id: None,
         sensitive: original.sensitive,
         spoiler_text: String::new(),
-        visibility: original.visibility.clone(),
+        visibility: original.visibility,
         language: None,
         uri: reblog.activity_id.clone(),
         url: reblog.activity_id,
@@ -3467,7 +3488,7 @@ pub(crate) async fn remote_reblog_response(
         quote_approval: QuoteApprovalResponse {
             automatic: Vec::new(),
             manual: Vec::new(),
-            current_user: "denied".to_owned(),
+            current_user: QuoteApprovalDecision::Denied,
         },
         application: None,
     }))
@@ -3600,7 +3621,7 @@ async fn remote_status_response_base(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        visibility: status.visibility.to_string(),
+        visibility: status.visibility,
         language: None,
         uri: status.activitypub_id.clone(),
         url: status.activitypub_id,
@@ -3747,7 +3768,7 @@ async fn reblog_response(
         in_reply_to_account_id: None,
         sensitive: original.sensitive,
         spoiler_text: String::new(),
-        visibility: original.visibility.clone(),
+        visibility: original.visibility,
         language: None,
         uri: url.clone(),
         url,
@@ -3771,7 +3792,7 @@ async fn reblog_response(
         quote_approval: QuoteApprovalResponse {
             automatic: Vec::new(),
             manual: Vec::new(),
-            current_user: "denied".to_owned(),
+            current_user: QuoteApprovalDecision::Denied,
         },
         application: None,
     }))
@@ -3806,7 +3827,7 @@ async fn local_remote_reblog_response(
         in_reply_to_account_id: None,
         sensitive: original.sensitive,
         spoiler_text: String::new(),
-        visibility: original.visibility.clone(),
+        visibility: original.visibility,
         language: None,
         uri: url.clone(),
         url,
@@ -3830,7 +3851,7 @@ async fn local_remote_reblog_response(
         quote_approval: QuoteApprovalResponse {
             automatic: Vec::new(),
             manual: Vec::new(),
-            current_user: "denied".to_owned(),
+            current_user: QuoteApprovalDecision::Denied,
         },
         application: None,
     }))
@@ -3964,7 +3985,7 @@ async fn status_response_base(
         in_reply_to_account_id,
         sensitive: status.sensitive,
         spoiler_text: status.spoiler_text,
-        visibility: status.visibility.to_string(),
+        visibility: status.visibility,
         language: status.language,
         uri: url.clone(),
         url,
@@ -4004,19 +4025,19 @@ async fn status_quote_response(
     let Some(quote) = roosty_db::quote_for_status(&state.db, quoting_status).await? else {
         return Ok(None);
     };
-    let mut state_name = quote.state.to_string();
+    let mut state_name = QuoteResponseState::from(quote.state);
     let quoted_status = if quote.state == roosty_db::QuoteState::Accepted {
         match quote.quoted_status {
             Some(roosty_db::StatusReference::Local(id)) => {
                 let Some(status) = roosty_db::find_local_status_by_id(&state.db, id).await? else {
-                    state_name = "deleted".to_owned();
+                    state_name = QuoteResponseState::Deleted;
                     return Ok(Some(QuoteResponse {
                         state: state_name,
                         quoted_status: None,
                     }));
                 };
                 if !status_visible_to_viewer(state, &status, viewer).await? {
-                    state_name = "unauthorized".to_owned();
+                    state_name = QuoteResponseState::Unauthorized;
                     None
                 } else {
                     let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
@@ -4034,7 +4055,7 @@ async fn status_quote_response(
                         )
                         .await?
                         {
-                            state_name = "blocked_account".to_owned();
+                            state_name = QuoteResponseState::BlockedAccount;
                         } else if roosty_db::active_local_account_mute(
                             &state.db,
                             viewer,
@@ -4043,7 +4064,7 @@ async fn status_quote_response(
                         .await?
                         .is_some()
                         {
-                            state_name = "muted_account".to_owned();
+                            state_name = QuoteResponseState::MutedAccount;
                         }
                     }
                     let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
@@ -4054,7 +4075,7 @@ async fn status_quote_response(
             }
             Some(roosty_db::StatusReference::Remote(id)) => {
                 let Some(status) = roosty_db::find_remote_status_by_id(&state.db, id).await? else {
-                    state_name = "deleted".to_owned();
+                    state_name = QuoteResponseState::Deleted;
                     return Ok(Some(QuoteResponse {
                         state: state_name,
                         quoted_status: None,
@@ -4066,7 +4087,7 @@ async fn status_quote_response(
                     .as_ref()
                     .is_some_and(|actor| state.config.federation_domain_is_blocked(&actor.domain))
                 {
-                    state_name = "blocked_domain".to_owned();
+                    state_name = QuoteResponseState::BlockedDomain;
                 } else if let Some(viewer) = viewer {
                     if roosty_db::local_remote_accounts_are_blocked(
                         &state.db,
@@ -4075,7 +4096,7 @@ async fn status_quote_response(
                     )
                     .await?
                     {
-                        state_name = "blocked_account".to_owned();
+                        state_name = QuoteResponseState::BlockedAccount;
                     } else if roosty_db::active_local_remote_account_mute(
                         &state.db,
                         viewer,
@@ -4084,7 +4105,7 @@ async fn status_quote_response(
                     .await?
                     .is_some()
                     {
-                        state_name = "muted_account".to_owned();
+                        state_name = QuoteResponseState::MutedAccount;
                     }
                 }
                 let visible = match viewer {
@@ -4098,7 +4119,7 @@ async fn status_quote_response(
                     ),
                 };
                 if !visible {
-                    state_name = "unauthorized".to_owned();
+                    state_name = QuoteResponseState::Unauthorized;
                     None
                 } else {
                     let pinned = roosty_db::is_remote_status_pinned(&state.db, status.id).await?;
@@ -4108,7 +4129,7 @@ async fn status_quote_response(
                 }
             }
             None => {
-                state_name = "deleted".to_owned();
+                state_name = QuoteResponseState::Deleted;
                 None
             }
         }
@@ -4127,20 +4148,20 @@ async fn local_quote_approval(
     viewer: Option<AccountId>,
 ) -> Result<QuoteApprovalResponse, RoostyError> {
     let automatic = match status.quote_approval_policy {
-        roosty_db::QuoteApprovalPolicy::Public => vec!["public".to_owned()],
-        roosty_db::QuoteApprovalPolicy::Followers => vec!["followers".to_owned()],
+        roosty_db::QuoteApprovalPolicy::Public => vec![QuoteApprovalAudience::Public],
+        roosty_db::QuoteApprovalPolicy::Followers => vec![QuoteApprovalAudience::Followers],
         roosty_db::QuoteApprovalPolicy::Nobody => Vec::new(),
     };
     let current_user = match viewer {
-        Some(viewer) if viewer == status.account_id => "automatic",
+        Some(viewer) if viewer == status.account_id => QuoteApprovalDecision::Automatic,
         Some(viewer)
             if roosty_db::local_accounts_are_blocked(&state.db, viewer, status.account_id)
                 .await? =>
         {
-            "denied"
+            QuoteApprovalDecision::Denied
         }
         Some(_) if status.quote_approval_policy == roosty_db::QuoteApprovalPolicy::Public => {
-            "automatic"
+            QuoteApprovalDecision::Automatic
         }
         Some(viewer)
             if status.quote_approval_policy == roosty_db::QuoteApprovalPolicy::Followers
@@ -4148,14 +4169,14 @@ async fn local_quote_approval(
                     .await?
                     .is_some() =>
         {
-            "automatic"
+            QuoteApprovalDecision::Automatic
         }
-        _ => "denied",
+        _ => QuoteApprovalDecision::Denied,
     };
     Ok(QuoteApprovalResponse {
         automatic,
         manual: Vec::new(),
-        current_user: current_user.to_owned(),
+        current_user,
     })
 }
 
@@ -4169,18 +4190,18 @@ async fn remote_quote_approval(
         let mut projected = Vec::new();
         for value in values {
             let category = if value == "https://www.w3.org/ns/activitystreams#Public" {
-                "public"
+                QuoteApprovalAudience::Public
             } else if actor
                 .as_ref()
                 .and_then(|actor| actor.followers_url.as_ref())
                 .is_some_and(|url| url == value)
             {
-                "followers"
+                QuoteApprovalAudience::Followers
             } else {
-                "unsupported_policy"
+                QuoteApprovalAudience::UnsupportedPolicy
             };
-            if !projected.iter().any(|item| item == category) {
-                projected.push(category.to_owned());
+            if !projected.contains(&category) {
+                projected.push(category);
             }
         }
         projected
@@ -4188,22 +4209,22 @@ async fn remote_quote_approval(
     let automatic = project(&status.quote_automatic_policy);
     let manual = project(&status.quote_manual_policy);
     let current_user = if viewer.is_none() {
-        "denied"
-    } else if automatic.iter().any(|value| value == "public") {
-        "automatic"
-    } else if manual.iter().any(|value| value == "public") {
-        "manual"
-    } else if automatic.iter().any(|value| value == "unsupported_policy")
-        || manual.iter().any(|value| value == "unsupported_policy")
+        QuoteApprovalDecision::Denied
+    } else if automatic.contains(&QuoteApprovalAudience::Public) {
+        QuoteApprovalDecision::Automatic
+    } else if manual.contains(&QuoteApprovalAudience::Public) {
+        QuoteApprovalDecision::Manual
+    } else if automatic.contains(&QuoteApprovalAudience::UnsupportedPolicy)
+        || manual.contains(&QuoteApprovalAudience::UnsupportedPolicy)
     {
-        "unknown"
+        QuoteApprovalDecision::Unknown
     } else {
-        "denied"
+        QuoteApprovalDecision::Denied
     };
     Ok(QuoteApprovalResponse {
         automatic,
         manual,
-        current_user: current_user.to_owned(),
+        current_user,
     })
 }
 
@@ -8974,9 +8995,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: "local".to_owned(),
+                object_storage_backend: crate::config::ObjectStorageBackend::Local,
                 media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
-                registration_mode: "closed".to_owned(),
+                registration_mode: crate::config::RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),

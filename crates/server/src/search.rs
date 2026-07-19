@@ -30,11 +30,22 @@ pub fn router() -> Router<AppState> {
 struct SearchParams {
     q: Option<String>,
     #[serde(rename = "type")]
-    search_type: Option<String>,
+    search_type: Option<SearchType>,
     limit: Option<u64>,
     offset: Option<u64>,
     resolve: Option<bool>,
     following: Option<bool>,
+}
+
+/// Mastodon search result categories, retaining unknown extensions as unsupported.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SearchType {
+    Accounts,
+    Hashtags,
+    Statuses,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Serialize)]
@@ -69,7 +80,7 @@ async fn search(
     if privileged && account.is_none() {
         return unauthorized();
     }
-    let accounts = if matches!(params.search_type.as_deref(), None | Some("accounts")) {
+    let accounts = if matches!(params.search_type, None | Some(SearchType::Accounts)) {
         search_accounts(
             &state,
             account.as_ref().map(|account| account.id),
@@ -80,7 +91,7 @@ async fn search(
     } else {
         Ok(Vec::new())
     };
-    let hashtags = if matches!(params.search_type.as_deref(), None | Some("hashtags")) {
+    let hashtags = if matches!(params.search_type, None | Some(SearchType::Hashtags)) {
         search_hashtags(&state, &params).await
     } else {
         Ok(Vec::new())
@@ -525,9 +536,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: "local".to_owned(),
+                object_storage_backend: crate::config::ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
-                registration_mode: "closed".to_owned(),
+                registration_mode: crate::config::RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),

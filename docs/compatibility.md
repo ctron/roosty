@@ -74,6 +74,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | Follow graph | Local and remote follow/unfollow, relationships, followers, and following with cursor pagination are implemented. Local and remote follows honor `reblogs` and `notify`; remote graph fetching and language filters remain missing. |
 | 🟢 | `GET /api/v1/follow_requests` | Authenticated pending remote follow requests support `limit`, `max_id`, `since_id`, `min_id`, and Mastodon `Link` headers. |
 | 🟢 | Mutes and blocks | Local and remote mute/unmute and block/unblock, relationship state, mute duration/expiry, and mixed cursor-paginated collections work. Remote mutes remain local-only; blocks federate. |
+| 🟢 | Lists | Private list CRUD, local and cached-remote followed-account membership, account-to-list lookup, cursor-paginated member collections, reply policies, exclusive home-feed filtering, and mixed list timelines are implemented. |
 
 ### Search
 
@@ -114,6 +115,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed and explicitly addressed local/cached-remote follower-only statuses, public/unlisted followed statuses, local boosts, and inbound remote boosts. |
 | 🟢 | `GET /api/v1/timelines/public` | Chronological local and already-cached remote public statuses with `local`, `remote`, `only_media`, cursor pagination, `Link` headers, federation-domain policy, and authenticated mute/block filtering. Replies and boosts are excluded to match Mastodon's live feeds. |
 | 🟢 | `GET /api/v1/timelines/tag/:tag` | Mixed local and cached-remote public hashtag timeline with `local`, `remote`, `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, `Link` headers, domain policy, and viewer moderation filtering. |
+| 🟢 | `GET /api/v1/timelines/list/:list_id` | Authenticated mixed local/cached-remote list timelines honor ownership, reply policy, moderation, boosts, cursor pagination, and `Link` headers. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
 
 ### Notifications and Markers

@@ -351,8 +351,8 @@ pub(crate) fn remote_custom_emojis(tags: &Value) -> Vec<Value> {
     };
     tags.iter()
         .filter_map(|tag| {
-            let kind = tag.get("type").and_then(Value::as_str)?;
-            if kind != "Emoji" && kind != "http://joinmastodon.org/ns#Emoji" {
+            let kind = serde_json::from_value::<RemoteEmojiType>(tag.get("type")?.clone()).ok()?;
+            if kind == RemoteEmojiType::Other {
                 return None;
             }
             let name = tag.get("name").and_then(Value::as_str)?;
@@ -377,6 +377,15 @@ pub(crate) fn remote_custom_emojis(tags: &Value) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+#[derive(Deserialize, Eq, PartialEq)]
+enum RemoteEmojiType {
+    Emoji,
+    #[serde(rename = "http://joinmastodon.org/ns#Emoji")]
+    MastodonEmoji,
+    #[serde(other)]
+    Other,
 }
 
 /// Return a public local account profile by account id.
@@ -1176,7 +1185,7 @@ async fn relationship_model(
         following: following.is_some()
             || remote_following
                 .as_ref()
-                .is_some_and(|follow| follow.state == "accepted"),
+                .is_some_and(|follow| follow.state == roosty_db::RemoteFollowState::Accepted),
         showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs)
             || remote_following
                 .as_ref()
@@ -1197,7 +1206,7 @@ async fn relationship_model(
             .map(crate::statuses::format_timestamp),
         requested: remote_following
             .as_ref()
-            .is_some_and(|follow| follow.state == "pending"),
+            .is_some_and(|follow| follow.state == roosty_db::RemoteFollowState::Pending),
         domain_blocking: false,
         endorsed: false,
     })
@@ -1600,7 +1609,11 @@ mod tests {
             .create_account("alice_remote_follow", "alice-remote-follow@example.com")
             .await;
         let remote_id = context
-            .create_remote_follow_request(alice_id, "remote_follow_target", "accepted")
+            .create_remote_follow_request(
+                alice_id,
+                "remote_follow_target",
+                roosty_db::RemoteFollowState::Accepted,
+            )
             .await;
 
         let first = context
@@ -1835,19 +1848,27 @@ mod tests {
         let (owner_id, owner_token) = context.create_account("owner", "owner@example.com").await;
         let (other_id, _other_token) = context.create_account("other", "other@example.com").await;
         context
-            .create_remote_follow_request(owner_id, "first", "pending")
+            .create_remote_follow_request(owner_id, "first", roosty_db::RemoteFollowState::Pending)
             .await;
         context
-            .create_remote_follow_request(owner_id, "second", "pending")
+            .create_remote_follow_request(owner_id, "second", roosty_db::RemoteFollowState::Pending)
             .await;
         context
-            .create_remote_follow_request(owner_id, "third", "pending")
+            .create_remote_follow_request(owner_id, "third", roosty_db::RemoteFollowState::Pending)
             .await;
         context
-            .create_remote_follow_request(owner_id, "accepted", "accepted")
+            .create_remote_follow_request(
+                owner_id,
+                "accepted",
+                roosty_db::RemoteFollowState::Accepted,
+            )
             .await;
         context
-            .create_remote_follow_request(other_id, "other-request", "pending")
+            .create_remote_follow_request(
+                other_id,
+                "other-request",
+                roosty_db::RemoteFollowState::Pending,
+            )
             .await;
 
         let page = context
@@ -2097,7 +2118,11 @@ mod tests {
             .create_account("alice_remote_mod", "alice-remote-mod@example.com")
             .await;
         let remote_id = context
-            .create_remote_follow_request(alice_id, "remote_mod", "accepted")
+            .create_remote_follow_request(
+                alice_id,
+                "remote_mod",
+                roosty_db::RemoteFollowState::Accepted,
+            )
             .await;
 
         let block = context
@@ -2247,9 +2272,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: "local".to_owned(),
+                object_storage_backend: crate::config::ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
-                registration_mode: "closed".to_owned(),
+                registration_mode: crate::config::RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
@@ -2390,7 +2415,7 @@ mod tests {
             &self,
             local_account_id: AccountId,
             username: &str,
-            state: &str,
+            state: roosty_db::RemoteFollowState,
         ) -> AccountId {
             let actor = roosty_db::RemoteActor {
                 id: AccountId(uuid::Uuid::now_v7()),

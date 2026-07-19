@@ -61,7 +61,7 @@ struct NotificationParams {
 struct NotificationResponse {
     id: String,
     #[serde(rename = "type")]
-    notification_type: String,
+    notification_type: LocalNotificationType,
     group_key: String,
     created_at: String,
     account: NotificationAccountResponse,
@@ -292,7 +292,7 @@ async fn notification_response(
 
     Ok(Some(NotificationResponse {
         id: notification.id.to_string(),
-        notification_type: notification.notification_type.as_str().to_owned(),
+        notification_type: notification.notification_type,
         group_key: format!("ungrouped-{}", notification.id),
         created_at: crate::statuses::format_timestamp(notification.created_at),
         account: actor,

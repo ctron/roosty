@@ -16,7 +16,9 @@ use ring::{
     hmac as ring_hmac,
 };
 use roosty_core::{Result, RoostyError};
-use roosty_db::{PushAlerts, PushPolicy, PushSubscription, PushSubscriptionEncoding};
+use roosty_db::{
+    LocalNotificationType, PushAlerts, PushPolicy, PushSubscription, PushSubscriptionEncoding,
+};
 use roosty_web_push::{
     Client, DeliveryOutcome, Encoding, SendOptions, Subscription, VapidIdentity,
 };
@@ -697,17 +699,19 @@ fn alerts_with_defaults(
                 ));
             }
         };
-        match name {
-            "mention" => alerts.mention = enabled,
-            "favourite" => alerts.favourite = enabled,
-            "follow" => alerts.follow = enabled,
-            "follow_request" => alerts.follow_request = enabled,
-            "reblog" => alerts.reblog = enabled,
-            "status" => alerts.status = enabled,
-            "update" => alerts.update = enabled,
-            "quote" => alerts.quote = enabled,
-            "quoted_update" => alerts.quoted_update = enabled,
-            _ => {}
+        let Ok(notification_type) = LocalNotificationType::from_str(name) else {
+            continue;
+        };
+        match notification_type {
+            LocalNotificationType::Mention => alerts.mention = enabled,
+            LocalNotificationType::Favourite => alerts.favourite = enabled,
+            LocalNotificationType::Follow => alerts.follow = enabled,
+            LocalNotificationType::FollowRequest => alerts.follow_request = enabled,
+            LocalNotificationType::Reblog => alerts.reblog = enabled,
+            LocalNotificationType::Status => alerts.status = enabled,
+            LocalNotificationType::Update => alerts.update = enabled,
+            LocalNotificationType::Quote => alerts.quote = enabled,
+            LocalNotificationType::QuotedUpdate => alerts.quoted_update = enabled,
         }
     }
     Ok(alerts)

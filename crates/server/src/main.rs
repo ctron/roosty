@@ -20,6 +20,7 @@ mod featured_tags;
 mod federation;
 mod http;
 mod instance;
+mod lists;
 mod markers;
 mod media;
 mod notifications;
@@ -403,46 +404,45 @@ async fn worker_iteration(
     };
 
     let state = AppState::new(config.clone(), db.clone());
-    let result = match job.kind.as_str() {
-        "federation_follow_response" => {
+    let result = match job.kind {
+        roosty_db::JobKind::FederationFollowResponse => {
             federation::deliver_follow_response(&state, job.payload.clone()).await
         }
-        "federation_status_delivery" => {
+        roosty_db::JobKind::FederationStatusDelivery => {
             federation::deliver_status_activity(&state, job.payload.clone()).await
         }
-        "federation_quote_delivery" => {
+        roosty_db::JobKind::FederationQuoteDelivery => {
             federation::deliver_quote_activity(&state, job.payload.clone()).await
         }
-        "federation_follow_delivery" => {
+        roosty_db::JobKind::FederationFollowDelivery => {
             federation::deliver_follow_activity(&state, job.payload.clone()).await
         }
-        "federation_favourite_delivery" => {
+        roosty_db::JobKind::FederationFavouriteDelivery => {
             federation::deliver_favourite_activity(&state, job.payload.clone()).await
         }
-        "federation_reblog_delivery" => {
+        roosty_db::JobKind::FederationReblogDelivery => {
             federation::deliver_reblog_activity(&state, job.payload.clone()).await
         }
-        "federation_actor_update_delivery" => {
+        roosty_db::JobKind::FederationActorUpdateDelivery => {
             federation::deliver_actor_update(&state, job.payload.clone()).await
         }
-        "federation_moderation_delivery" => {
+        roosty_db::JobKind::FederationModerationDelivery => {
             federation::deliver_moderation_activity(&state, job.payload.clone()).await
         }
-        "federation_remote_media_fetch" => {
+        roosty_db::JobKind::FederationRemoteMediaFetch => {
             media::fetch_remote_media(&state, job.payload.clone()).await
         }
-        "federation_featured_refresh" => {
+        roosty_db::JobKind::FederationFeaturedRefresh => {
             federation::refresh_remote_featured(&state, job.payload.clone()).await
         }
-        "federation_featured_tags_refresh" => {
+        roosty_db::JobKind::FederationFeaturedTagsRefresh => {
             federation::refresh_remote_featured_tags(&state, job.payload.clone()).await
         }
-        "web_push_delivery" => state
+        roosty_db::JobKind::WebPushDelivery => state
             .push
             .deliver(job.payload.clone())
             .await
             .map_err(|error| roosty_core::RoostyError::Configuration(error.to_string())),
-        _ => Ok(()),
     };
     match result {
         Ok(()) => {
@@ -718,7 +718,7 @@ mod tests {
     }
 
     /// Given a job claimed by a worker that stopped, when its claim expires, then the next poll
-    /// reclaims and completes it.
+    /// reclaims it and records the new attempt.
     #[tokio::test]
     async fn recovers_expired_job_claims() {
         let (postgresql, db, _temp_dir) = migrated_test_database().await;
@@ -727,7 +727,7 @@ mod tests {
             DatabaseBackend::Postgres,
             r#"
             INSERT INTO job (id, kind, payload, run_after, locked_at, locked_by)
-            VALUES ($1, 'unknown_worker_job', '{}'::jsonb, now() - interval '10 minutes',
+            VALUES ($1, 'federation_follow_delivery', '{}'::jsonb, now() - interval '10 minutes',
                     now() - interval '10 minutes', 'stopped-worker')
             "#,
             vec![job_id.into()],
@@ -744,7 +744,7 @@ mod tests {
         let job = db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT completed_at, locked_at, locked_by, last_error FROM job WHERE id = $1",
+                "SELECT completed_at, locked_at, locked_by, last_error, attempts FROM job WHERE id = $1",
                 vec![job_id.into()],
             ))
             .await
@@ -754,11 +754,53 @@ mod tests {
         let locked_at: Option<time::OffsetDateTime> = job.try_get("", "locked_at").unwrap();
         let locked_by: Option<String> = job.try_get("", "locked_by").unwrap();
         let last_error: Option<String> = job.try_get("", "last_error").unwrap();
+        let attempts: i32 = job.try_get("", "attempts").unwrap();
 
-        assert!(completed_at.is_some());
+        assert!(completed_at.is_none());
         assert!(locked_at.is_none());
         assert!(locked_by.is_none());
-        assert!(last_error.is_none());
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            last_error.as_deref(),
+            Some("invalid input: invalid follow delivery payload")
+        );
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given a job introduced by a newer deployment, an older worker leaves it available for a
+    /// worker that understands its typed dispatch contract.
+    #[tokio::test]
+    async fn skips_unknown_future_job_kinds() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let job_id = uuid::Uuid::now_v7();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO job (id, kind, payload, run_after) VALUES ($1, 'future_job', '{}'::jsonb, now())",
+            vec![job_id.into()],
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            roosty_db::claim_due_job(&db, "older-worker", time::Duration::minutes(5))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let locked_by: Option<String> = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT locked_by FROM job WHERE id = $1",
+                vec![job_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "locked_by")
+            .unwrap();
+        assert!(locked_by.is_none());
 
         db.close().await.unwrap();
         postgresql.stop().await.unwrap();
@@ -881,9 +923,9 @@ mod tests {
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: "local".to_owned(),
+            object_storage_backend: crate::config::ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
-            registration_mode: "closed".to_owned(),
+            registration_mode: crate::config::RegistrationMode::Closed,
             federation_enabled: true,
             federation_key_encryption_secret: Some(
                 "test-federation-key-encryption-secret-000".to_owned(),

@@ -1,3 +1,4 @@
+use crate::{StatusVisibility, StreamingEventKind, StreamingStatusOrigin};
 use sea_orm::entity::prelude::*;
 
 /// One retained cross-process Mastodon streaming event.
@@ -7,13 +8,13 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub sequence: i64,
     pub origin_process_id: Uuid,
-    pub event_kind: String,
+    pub event_kind: StreamingEventKind,
     pub payload: String,
     pub account_id: Uuid,
     pub recipient_ids: Json,
     pub notification_recipient_ids: Json,
-    pub visibility: String,
-    pub status_origin: String,
+    pub visibility: StatusVisibility,
+    pub status_origin: StreamingStatusOrigin,
     pub has_media: bool,
     pub created_at: TimeDateTimeWithTimeZone,
 }

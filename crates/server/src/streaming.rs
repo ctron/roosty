@@ -10,7 +10,7 @@ use roosty_core::{Result as RoostyResult, RoostyError};
 use roosty_db::{NewStreamingEvent, StatusVisibility, StreamingEventKind, StreamingStatusOrigin};
 use serde::Serialize;
 use sqlx::postgres::PgListener;
-use strum::IntoStaticStr;
+use strum::EnumString;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -204,7 +204,7 @@ impl StreamingEvents {
         &self,
         status: &T,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
     ) where
         T: Serialize,
@@ -226,7 +226,7 @@ impl StreamingEvents {
         &self,
         status: &T,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
     ) where
         T: Serialize,
@@ -248,7 +248,7 @@ impl StreamingEvents {
         &self,
         status: &T,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
         notification_recipient_ids: &[AccountId],
     ) where
@@ -272,7 +272,7 @@ impl StreamingEvents {
         &self,
         status: &T,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
         notification_recipient_ids: &[AccountId],
     ) where
@@ -318,7 +318,7 @@ impl StreamingEvents {
         &self,
         status_id: &str,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
     ) {
         let event = streaming_delete_message(
@@ -337,7 +337,7 @@ impl StreamingEvents {
         &self,
         status_id: &str,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
         has_media: bool,
     ) {
@@ -356,7 +356,7 @@ impl StreamingEvents {
         &self,
         status_id: &str,
         author_id: AccountId,
-        visibility: &str,
+        visibility: StatusVisibility,
         user_recipient_ids: &[AccountId],
         has_media: bool,
     ) {
@@ -375,7 +375,7 @@ impl StreamingEvents {
     where
         T: Serialize,
     {
-        self.publish_status_update(status, author_id, "unlisted", recipients);
+        self.publish_status_update(status, author_id, StatusVisibility::Unlisted, recipients);
     }
 
     /// Publish a status deletion exclusively to selected users' home-capable streams.
@@ -385,7 +385,7 @@ impl StreamingEvents {
         author_id: AccountId,
         recipients: &[AccountId],
     ) {
-        self.publish_delete(status_id, author_id, "unlisted", recipients);
+        self.publish_delete(status_id, author_id, StatusVisibility::Unlisted, recipients);
     }
 
     fn publish(&self, event: StreamingEvent) {
@@ -396,14 +396,7 @@ impl StreamingEvents {
             return;
         };
 
-        let Some(persisted) = event.to_persisted(self.inner.origin_process_id) else {
-            self.inner
-                .metrics
-                .publication_failures
-                .fetch_add(1, Ordering::Relaxed);
-            warn!(visibility = %event.visibility, "failed to persist streaming event with invalid visibility");
-            return;
-        };
+        let persisted = event.to_persisted(self.inner.origin_process_id);
         if let Err(error) = publication_tx.try_send(persisted) {
             self.inner
                 .metrics
@@ -547,24 +540,24 @@ pub struct StreamingEvent {
     account_id: AccountId,
     user_recipient_ids: Vec<AccountId>,
     notification_recipient_ids: Vec<AccountId>,
-    visibility: String,
+    visibility: StatusVisibility,
     status_origin: StreamingStatusOrigin,
     has_media: bool,
 }
 
 impl StreamingEvent {
-    fn to_persisted(&self, origin_process_id: Uuid) -> Option<NewStreamingEvent> {
-        Some(NewStreamingEvent {
+    fn to_persisted(&self, origin_process_id: Uuid) -> NewStreamingEvent {
+        NewStreamingEvent {
             origin_process_id,
             kind: self.event.into(),
             payload: self.payload.clone(),
             account_id: self.account_id,
             recipient_ids: self.user_recipient_ids.clone(),
             notification_recipient_ids: self.notification_recipient_ids.clone(),
-            visibility: StatusVisibility::parse(&self.visibility).ok()?,
+            visibility: self.visibility,
             status_origin: self.status_origin,
             has_media: self.has_media,
-        })
+        }
     }
 
     fn from_retained(event: roosty_db::RetainedStreamingEvent) -> Self {
@@ -574,7 +567,7 @@ impl StreamingEvent {
             account_id: event.account_id,
             user_recipient_ids: event.recipient_ids,
             notification_recipient_ids: event.notification_recipient_ids,
-            visibility: event.visibility.to_string(),
+            visibility: event.visibility,
             status_origin: event.status_origin,
             has_media: event.has_media,
         }
@@ -593,7 +586,7 @@ impl StreamingEvent {
 
         serde_json::to_string(&SocketMessage {
             stream: &matching_streams,
-            event: self.event.as_str(),
+            event: self.event,
             payload: &self.payload,
         })
         .map(Some)
@@ -603,77 +596,100 @@ impl StreamingEvent {
     fn matching_streams(&self, account_id: AccountId, streams: &[String]) -> Vec<String> {
         streams
             .iter()
-            .filter(|stream| self.is_visible_to_stream(account_id, stream))
+            .filter(|stream| {
+                stream
+                    .parse()
+                    .is_ok_and(|stream| self.is_visible_to_stream(account_id, stream))
+            })
             .cloned()
             .collect()
     }
 
     /// Return whether one subscribed stream should receive this event.
-    fn is_visible_to_stream(&self, account_id: AccountId, stream: &str) -> bool {
+    fn is_visible_to_stream(&self, account_id: AccountId, stream: StreamingChannel) -> bool {
         match stream {
-            "user" => {
+            StreamingChannel::User => {
                 self.event != StreamingEventType::Conversation
                     && (self.account_id == account_id
                         || self.user_recipient_ids.contains(&account_id)
                         || self.notification_recipient_ids.contains(&account_id))
             }
-            "user:notification" => {
+            StreamingChannel::UserNotification => {
                 (self.event == StreamingEventType::Notification && self.account_id == account_id)
                     || (self.event == StreamingEventType::StatusUpdate
                         && self.notification_recipient_ids.contains(&account_id))
             }
-            "direct" => {
+            StreamingChannel::Direct => {
                 self.event == StreamingEventType::Conversation && self.account_id == account_id
             }
-            "public" => self.visibility == "public",
-            "public:media" => self.visibility == "public" && self.has_media,
-            "public:local" => {
-                self.visibility == "public" && self.status_origin == StreamingStatusOrigin::Local
+            StreamingChannel::Public => self.visibility == StatusVisibility::Public,
+            StreamingChannel::PublicMedia => {
+                self.visibility == StatusVisibility::Public && self.has_media
             }
-            "public:local:media" => {
-                self.visibility == "public"
+            StreamingChannel::PublicLocal => {
+                self.visibility == StatusVisibility::Public
+                    && self.status_origin == StreamingStatusOrigin::Local
+            }
+            StreamingChannel::PublicLocalMedia => {
+                self.visibility == StatusVisibility::Public
                     && self.status_origin == StreamingStatusOrigin::Local
                     && self.has_media
             }
-            "public:remote" => {
-                self.visibility == "public" && self.status_origin == StreamingStatusOrigin::Remote
+            StreamingChannel::PublicRemote => {
+                self.visibility == StatusVisibility::Public
+                    && self.status_origin == StreamingStatusOrigin::Remote
             }
-            "public:remote:media" => {
-                self.visibility == "public"
+            StreamingChannel::PublicRemoteMedia => {
+                self.visibility == StatusVisibility::Public
                     && self.status_origin == StreamingStatusOrigin::Remote
                     && self.has_media
             }
-            _ => false,
         }
     }
+}
+
+/// Streaming channels currently routed by Roosty.
+#[derive(Clone, Copy, Debug, EnumString, Eq, PartialEq)]
+enum StreamingChannel {
+    #[strum(serialize = "user")]
+    User,
+    #[strum(serialize = "user:notification")]
+    UserNotification,
+    #[strum(serialize = "direct")]
+    Direct,
+    #[strum(serialize = "public")]
+    Public,
+    #[strum(serialize = "public:media")]
+    PublicMedia,
+    #[strum(serialize = "public:local")]
+    PublicLocal,
+    #[strum(serialize = "public:local:media")]
+    PublicLocalMedia,
+    #[strum(serialize = "public:remote")]
+    PublicRemote,
+    #[strum(serialize = "public:remote:media")]
+    PublicRemoteMedia,
 }
 
 #[derive(Serialize)]
 struct SocketMessage<'a> {
     stream: &'a [String],
-    event: &'static str,
+    event: StreamingEventType,
     payload: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 enum StreamingEventType {
-    #[strum(serialize = "update")]
+    #[serde(rename = "update")]
     Update,
-    #[strum(serialize = "status.update")]
+    #[serde(rename = "status.update")]
     StatusUpdate,
-    #[strum(serialize = "notification")]
+    #[serde(rename = "notification")]
     Notification,
-    #[strum(serialize = "conversation")]
+    #[serde(rename = "conversation")]
     Conversation,
-    #[strum(serialize = "delete")]
+    #[serde(rename = "delete")]
     Delete,
-}
-
-impl StreamingEventType {
-    /// Return the Mastodon streaming event name.
-    fn as_str(self) -> &'static str {
-        self.into()
-    }
 }
 
 impl From<StreamingEventType> for StreamingEventKind {
@@ -704,7 +720,7 @@ impl From<StreamingEventKind> for StreamingEventType {
 fn streaming_update_message<T>(
     status: &T,
     author_id: AccountId,
-    visibility: &str,
+    visibility: StatusVisibility,
     user_recipient_ids: &[AccountId],
     status_origin: StreamingStatusOrigin,
 ) -> Result<StreamingEvent, serde_json::Error>
@@ -720,7 +736,7 @@ where
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
         notification_recipient_ids: Vec::new(),
-        visibility: visibility.to_owned(),
+        visibility,
         status_origin,
         has_media,
     })
@@ -730,7 +746,7 @@ where
 fn streaming_status_update_message<T>(
     status: &T,
     author_id: AccountId,
-    visibility: &str,
+    visibility: StatusVisibility,
     user_recipient_ids: &[AccountId],
     notification_recipient_ids: &[AccountId],
     status_origin: StreamingStatusOrigin,
@@ -747,7 +763,7 @@ where
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
         notification_recipient_ids: notification_recipient_ids.to_owned(),
-        visibility: visibility.to_owned(),
+        visibility,
         status_origin,
         has_media,
     })
@@ -768,7 +784,7 @@ where
         account_id: recipient_id,
         user_recipient_ids: Vec::new(),
         notification_recipient_ids: Vec::new(),
-        visibility: "direct".to_owned(),
+        visibility: StatusVisibility::Direct,
         status_origin: StreamingStatusOrigin::Local,
         has_media: false,
     })
@@ -789,7 +805,7 @@ where
         account_id: recipient_id,
         user_recipient_ids: Vec::new(),
         notification_recipient_ids: Vec::new(),
-        visibility: "direct".to_owned(),
+        visibility: StatusVisibility::Direct,
         status_origin: StreamingStatusOrigin::Local,
         has_media: false,
     })
@@ -799,7 +815,7 @@ where
 fn streaming_delete_message(
     status_id: &str,
     author_id: AccountId,
-    visibility: &str,
+    visibility: StatusVisibility,
     user_recipient_ids: &[AccountId],
     status_origin: StreamingStatusOrigin,
     has_media: bool,
@@ -810,7 +826,7 @@ fn streaming_delete_message(
         account_id: author_id,
         user_recipient_ids: user_recipient_ids.to_owned(),
         notification_recipient_ids: Vec::new(),
-        visibility: visibility.to_owned(),
+        visibility,
         status_origin,
         has_media,
     }
@@ -828,7 +844,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use roosty_core::AccountId;
-    use roosty_db::StreamingStatusOrigin;
+    use roosty_db::{StatusVisibility, StreamingStatusOrigin};
     use serde_json::Value;
     use uuid::Uuid;
 
@@ -871,7 +887,7 @@ mod tests {
         let event = streaming_update_message(
             &serde_json::json!({"id": "1"}),
             account_id,
-            "public",
+            StatusVisibility::Public,
             &[],
             StreamingStatusOrigin::Local,
         )
@@ -899,7 +915,7 @@ mod tests {
         let event = streaming_status_update_message(
             &serde_json::json!({"id": "1"}),
             account_id,
-            "public",
+            StatusVisibility::Public,
             &[],
             &[],
             StreamingStatusOrigin::Local,
@@ -929,7 +945,7 @@ mod tests {
         let event = streaming_update_message(
             &serde_json::json!({"id": "1"}),
             author_id,
-            "public",
+            StatusVisibility::Public,
             &[],
             StreamingStatusOrigin::Local,
         )
@@ -966,7 +982,7 @@ mod tests {
         let event = streaming_update_message(
             &serde_json::json!({"id": "1", "media_attachments": [{"id": "media"}]}),
             author_id,
-            "public",
+            StatusVisibility::Public,
             &[],
             StreamingStatusOrigin::Remote,
         )
@@ -1049,7 +1065,7 @@ mod tests {
         let event = streaming_update_message(
             &serde_json::json!({"id": "1"}),
             account_id,
-            "public",
+            StatusVisibility::Public,
             &[],
             StreamingStatusOrigin::Local,
         )
@@ -1070,7 +1086,7 @@ mod tests {
         let event = streaming_status_update_message(
             &serde_json::json!({"id": "1"}),
             author_id,
-            "public",
+            StatusVisibility::Public,
             &[],
             &[mentioned_id],
             StreamingStatusOrigin::Local,
@@ -1133,7 +1149,7 @@ mod tests {
         let event = streaming_update_message(
             &serde_json::json!({"id": "1"}),
             author_id,
-            "public",
+            StatusVisibility::Public,
             &[follower_id],
             StreamingStatusOrigin::Local,
         )
@@ -1163,7 +1179,7 @@ mod tests {
         let event = streaming_delete_message(
             "boost-id",
             author_id,
-            "direct",
+            StatusVisibility::Direct,
             &[follower_id],
             StreamingStatusOrigin::Local,
             false,

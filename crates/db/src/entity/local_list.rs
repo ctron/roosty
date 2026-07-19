@@ -1,24 +1,18 @@
-use crate::PushPolicy;
 use sea_orm::entity::prelude::*;
-use serde_json::Value;
 use time::OffsetDateTime;
 
-/// SeaORM model for one access token's Web Push subscription.
+use crate::ListRepliesPolicy;
+
+/// One private Mastodon list owned by a local account.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "push_subscription")]
+#[sea_orm(table_name = "local_list")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub access_token_id: Uuid,
     pub account_id: Uuid,
-    pub endpoint: String,
-    pub p256dh: Vec<u8>,
-    pub auth: Vec<u8>,
-    pub standard: bool,
-    pub policy: PushPolicy,
-    pub alerts: Value,
-    pub access_token_ciphertext: Vec<u8>,
-    pub access_token_nonce: Vec<u8>,
+    pub title: String,
+    pub replies_policy: ListRepliesPolicy,
+    pub exclusive: bool,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

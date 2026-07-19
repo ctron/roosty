@@ -21,6 +21,7 @@ use serde::{
 };
 use serde_json::{Value, json};
 use sha2::Sha256;
+use strum::{Display, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -442,13 +443,52 @@ async fn register_app(
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AuthorizeParams {
-    response_type: String,
+    response_type: OAuthResponseType,
     client_id: String,
     redirect_uri: String,
     scope: Option<String>,
     state: Option<String>,
     code_challenge: Option<String>,
-    code_challenge_method: Option<String>,
+    code_challenge_method: Option<PkceMethod>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Display, Eq, IntoStaticStr, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum OAuthResponseType {
+    Code,
+    #[serde(other)]
+    Other,
+}
+
+impl OAuthResponseType {
+    fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum OAuthGrantType {
+    AuthorizationCode,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, IntoStaticStr, PartialEq, Serialize)]
+enum PkceMethod {
+    #[serde(rename = "S256")]
+    #[strum(serialize = "S256")]
+    S256,
+    #[serde(other)]
+    #[strum(serialize = "other")]
+    Other,
+}
+
+impl PkceMethod {
+    fn as_str(self) -> &'static str {
+        self.into()
+    }
 }
 
 #[derive(Template)]
@@ -547,7 +587,10 @@ async fn authorize_form(
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let state_value = params.state.as_deref().unwrap_or_default();
     let challenge = optional_non_empty(params.code_challenge.as_deref()).unwrap_or_default();
-    let method = optional_non_empty(params.code_challenge_method.as_deref()).unwrap_or_default();
+    let method = params
+        .code_challenge_method
+        .map(PkceMethod::as_str)
+        .unwrap_or_default();
     let action = public_url(&state, "/oauth/authorize");
     match (AuthorizeTemplate {
         action: &action,
@@ -583,7 +626,11 @@ async fn authorize(
 
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let challenge = optional_non_empty(params.code_challenge.as_deref()).unwrap_or_default();
-    let method = optional_non_empty(params.code_challenge_method.as_deref()).unwrap_or_default();
+    let method = if challenge.is_empty() {
+        roosty_db::PkceCodeChallengeMethod::None
+    } else {
+        roosty_db::PkceCodeChallengeMethod::S256
+    };
     let code = match roosty_db::create_authorization_code(
         &state.db,
         &state.config.token_pepper,
@@ -632,7 +679,7 @@ async fn validate_authorize_request(
     state: &AppState,
     params: &AuthorizeParams,
 ) -> Result<roosty_db::OAuthApplication, Response> {
-    if params.response_type != "code" {
+    if params.response_type != OAuthResponseType::Code {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -640,8 +687,8 @@ async fn validate_authorize_request(
         ));
     }
     let challenge = optional_non_empty(params.code_challenge.as_deref());
-    let method = optional_non_empty(params.code_challenge_method.as_deref());
-    if challenge.is_some() && method.unwrap_or("S256") != "S256" {
+    let method = params.code_challenge_method;
+    if challenge.is_some() && method.unwrap_or(PkceMethod::S256) != PkceMethod::S256 {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -666,7 +713,7 @@ async fn validate_authorize_request(
 
 #[derive(Deserialize)]
 struct TokenForm {
-    grant_type: String,
+    grant_type: OAuthGrantType,
     code: String,
     client_id: String,
     client_secret: Option<String>,
@@ -677,13 +724,13 @@ struct TokenForm {
 #[derive(Serialize)]
 struct TokenResponse {
     access_token: String,
-    token_type: &'static str,
+    token_type: roosty_db::OAuthTokenType,
     scope: String,
     created_at: i64,
 }
 
 async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<TokenForm>) -> Response {
-    if form.grant_type != "authorization_code" {
+    if form.grant_type != OAuthGrantType::AuthorizationCode {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
@@ -742,7 +789,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
     };
 
     if !challenge.is_empty()
-        && (method != "S256"
+        && (method != roosty_db::PkceCodeChallengeMethod::S256
             || form
                 .code_verifier
                 .as_deref()
@@ -821,10 +868,10 @@ pub(crate) struct AccountResponse {
 pub(crate) struct AccountSource {
     note: String,
     fields: Vec<serde_json::Value>,
-    privacy: String,
+    privacy: roosty_db::StatusVisibility,
     sensitive: bool,
     language: String,
-    quote_policy: String,
+    quote_policy: roosty_db::QuoteApprovalPolicy,
     follow_requests_count: u64,
 }
 
@@ -841,13 +888,13 @@ pub(crate) struct AccountRole {
 #[derive(Serialize)]
 struct PreferencesResponse {
     #[serde(rename = "posting:default:visibility")]
-    posting_default_visibility: String,
+    posting_default_visibility: roosty_db::StatusVisibility,
     #[serde(rename = "posting:default:sensitive")]
     posting_default_sensitive: bool,
     #[serde(rename = "posting:default:language")]
     posting_default_language: Option<String>,
     #[serde(rename = "posting:default:quote_policy")]
-    posting_default_quote_policy: String,
+    posting_default_quote_policy: roosty_db::QuoteApprovalPolicy,
     #[serde(rename = "reading:expand:media")]
     reading_expand_media: &'static str,
     #[serde(rename = "reading:expand:spoilers")]
@@ -1021,7 +1068,7 @@ async fn verify_credentials(
 
 async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Response {
     Json(PreferencesResponse {
-        posting_default_visibility: account.default_visibility.to_string(),
+        posting_default_visibility: account.default_visibility,
         posting_default_sensitive: account.default_sensitive,
         posting_default_language: account.default_language,
         posting_default_quote_policy: account.default_quote_policy,
@@ -1037,14 +1084,14 @@ async fn update_credentials(
     mut input: UpdateCredentialsInput,
 ) -> Response {
     if let Some(avatar) = input.avatar.take() {
-        match store_profile_image(&state, account.id, "avatar", avatar).await {
+        match store_profile_image(&state, account.id, ProfileImageKind::Avatar, avatar).await {
             Ok(path) => input.avatar_file_path = Some(path),
             Err(RoostyError::InvalidInput(error)) => return bad_request(&error),
             Err(error) => return server_error(error),
         }
     }
     if let Some(header) = input.header.take() {
-        match store_profile_image(&state, account.id, "header", header).await {
+        match store_profile_image(&state, account.id, ProfileImageKind::Header, header).await {
             Ok(path) => input.header_file_path = Some(path),
             Err(RoostyError::InvalidInput(error)) => return bad_request(&error),
             Err(error) => return server_error(error),
@@ -1180,7 +1227,7 @@ pub(crate) async fn account_response(
         source: AccountSource {
             note: account.note,
             fields: profile_fields,
-            privacy: account.default_visibility.to_string(),
+            privacy: account.default_visibility,
             sensitive: account.default_sensitive,
             language: account.default_language.unwrap_or_default(),
             quote_policy: account.default_quote_policy,
@@ -1226,9 +1273,12 @@ fn settings_update_from_input(
         .map(StatusVisibility::parse)
         .transpose()
         .map_err(|_| UpdateCredentialsError::Visibility)?;
-    if let Some(quote_policy) = input.default_quote_policy.as_deref() {
-        validate_quote_policy(quote_policy)?;
-    }
+    let default_quote_policy = input
+        .default_quote_policy
+        .as_deref()
+        .map(roosty_db::QuoteApprovalPolicy::parse)
+        .transpose()
+        .map_err(|_| UpdateCredentialsError::QuotePolicy)?;
     if let Some(Some(language)) = input.default_language.as_ref() {
         validate_language(language)?;
     }
@@ -1242,7 +1292,7 @@ fn settings_update_from_input(
         default_visibility,
         default_sensitive: input.default_sensitive,
         default_language: input.default_language,
-        default_quote_policy: input.default_quote_policy,
+        default_quote_policy,
         profile_fields: input.profile_fields,
         avatar_file_path: input.avatar_file_path,
         header_file_path: input.header_file_path,
@@ -1306,7 +1356,7 @@ async fn profile_image_upload(
 async fn store_profile_image(
     state: &AppState,
     account_id: AccountId,
-    kind: &str,
+    kind: ProfileImageKind,
     upload: ProfileImageUpload,
 ) -> Result<String, RoostyError> {
     let format = crate::media::supported_image_format(&upload.content_type)
@@ -1330,12 +1380,11 @@ async fn store_profile_image(
     Ok(relative_path)
 }
 
-/// Validate default quote policy values accepted by Mastodon clients.
-fn validate_quote_policy(value: &str) -> Result<(), UpdateCredentialsError> {
-    match value {
-        "public" | "followers" | "nobody" => Ok(()),
-        _ => Err(UpdateCredentialsError::QuotePolicy),
-    }
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+enum ProfileImageKind {
+    Avatar,
+    Header,
 }
 
 /// Validate a short language tag for default posting language.
@@ -1547,8 +1596,8 @@ fn authorize_query_string(params: &AuthorizeParams) -> String {
     if let Some(challenge) = params.code_challenge.as_deref() {
         pairs.push(("code_challenge", challenge));
     }
-    if let Some(method) = params.code_challenge_method.as_deref() {
-        pairs.push(("code_challenge_method", method));
+    if let Some(method) = params.code_challenge_method {
+        pairs.push(("code_challenge_method", method.as_str()));
     }
 
     pairs
@@ -2736,9 +2785,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: "local".to_owned(),
+                object_storage_backend: crate::config::ObjectStorageBackend::Local,
                 media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
-                registration_mode: "closed".to_owned(),
+                registration_mode: crate::config::RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),

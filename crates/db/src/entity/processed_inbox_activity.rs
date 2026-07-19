@@ -1,3 +1,4 @@
+use crate::{InboxActivityOutcome, InboxActivityType};
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -9,8 +10,8 @@ pub struct Model {
     pub activity_id: String,
     pub remote_actor_id: Uuid,
     pub payload_digest: Option<Vec<u8>>,
-    pub activity_type: Option<String>,
-    pub outcome: Option<String>,
+    pub activity_type: Option<InboxActivityType>,
+    pub outcome: Option<InboxActivityOutcome>,
     pub processed_at: OffsetDateTime,
 }
 

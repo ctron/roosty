@@ -2,7 +2,11 @@ use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{config::Config, http::AppState, media};
+use crate::{
+    config::{Config, RegistrationMode},
+    http::AppState,
+    media,
+};
 
 const NODEINFO_REL_2_1: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
 const IMAGE_MATRIX_LIMIT: u64 = 4096 * 4096;
@@ -210,11 +214,14 @@ fn vapid_public_key(config: &Config) -> String {
 
 /// Return whether the configured registration mode allows user signups.
 fn registrations_enabled(config: &Config) -> bool {
-    matches!(config.registration_mode.as_str(), "open" | "approval")
+    matches!(
+        config.registration_mode,
+        RegistrationMode::Open | RegistrationMode::Approval
+    )
 }
 
 fn registrations_approval_required(config: &Config) -> bool {
-    config.registration_mode == "approval"
+    config.registration_mode == RegistrationMode::Approval
 }
 
 /// Return the Roosty release version without build-specific metadata.
@@ -266,7 +273,7 @@ mod tests {
 
     #[test]
     fn nodeinfo_discovery_points_to_public_nodeinfo_url() {
-        let config = test_config("closed");
+        let config = test_config(RegistrationMode::Closed);
 
         let discovery = nodeinfo_discovery_response(&config);
 
@@ -280,7 +287,7 @@ mod tests {
 
     #[test]
     fn instance_v2_uses_configured_instance_metadata() {
-        let config = test_config("closed");
+        let config = test_config(RegistrationMode::Closed);
 
         let body = instance_v2_response(&config);
 
@@ -303,7 +310,7 @@ mod tests {
 
     #[test]
     fn instance_v1_maps_legacy_field_names() {
-        let config = test_config("approval");
+        let config = test_config(RegistrationMode::Approval);
 
         let body = instance_v1_response(&config);
 
@@ -317,7 +324,7 @@ mod tests {
 
     #[test]
     fn nodeinfo_reports_roosty_and_registration_status() {
-        let config = test_config("open");
+        let config = test_config(RegistrationMode::Open);
 
         let body = nodeinfo_response(&config);
 
@@ -327,7 +334,7 @@ mod tests {
         assert_eq!(body["metadata"]["nodeName"], "Roosty Test");
     }
 
-    fn test_config(registration_mode: &str) -> Arc<Config> {
+    fn test_config(registration_mode: RegistrationMode) -> Arc<Config> {
         Arc::new(Config {
             database_url: "postgres://roosty:roosty@localhost/roosty".to_owned(),
             public_base_url: "https://roosty.localhost:4000".parse().unwrap(),
@@ -336,9 +343,9 @@ mod tests {
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: "local".to_owned(),
+            object_storage_backend: crate::config::ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
-            registration_mode: registration_mode.to_owned(),
+            registration_mode,
             federation_enabled: false,
             federation_key_encryption_secret: None,
             federation_allowed_domains: Vec::new(),

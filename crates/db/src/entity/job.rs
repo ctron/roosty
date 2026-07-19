@@ -1,3 +1,4 @@
+use crate::JobKind;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -7,7 +8,7 @@ use time::OffsetDateTime;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub kind: String,
+    pub kind: JobKind,
     pub payload: Json,
     pub deduplication_key: Option<String>,
     pub run_after: OffsetDateTime,

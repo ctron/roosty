@@ -1,3 +1,4 @@
+use crate::{QuoteApprovalPolicy, StatusVisibility};
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
@@ -9,7 +10,7 @@ pub struct Model {
     pub id: Uuid,
     pub account_id: Uuid,
     pub content: String,
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     pub sensitive: bool,
     pub spoiler_text: String,
     pub language: Option<String>,
@@ -19,7 +20,7 @@ pub struct Model {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub deleted_at: Option<OffsetDateTime>,
-    pub quote_approval_policy: String,
+    pub quote_approval_policy: QuoteApprovalPolicy,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

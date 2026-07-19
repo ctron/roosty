@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthenticatedAccount, OptionalAuthenticatedAccount},
+    config::ObjectStorageBackend,
     http::AppState,
 };
 
@@ -558,13 +559,13 @@ pub(crate) fn remote_profile_media_url(state: &AppState, media_id: Uuid) -> Stri
     )
 }
 
-fn remote_media_type(content_type: Option<&str>) -> &'static str {
+fn remote_media_type(content_type: Option<&str>) -> MediaAttachmentType {
     match content_type.unwrap_or_default() {
-        "image/gif" => "gifv",
-        value if value.starts_with("image/") => "image",
-        value if value.starts_with("video/") => "video",
-        value if value.starts_with("audio/") => "audio",
-        _ => "unknown",
+        "image/gif" => MediaAttachmentType::Gifv,
+        value if value.starts_with("image/") => MediaAttachmentType::Image,
+        value if value.starts_with("video/") => MediaAttachmentType::Video,
+        value if value.starts_with("audio/") => MediaAttachmentType::Audio,
+        _ => MediaAttachmentType::Unknown,
     }
 }
 
@@ -674,13 +675,24 @@ struct MediaFilePath {
 pub(crate) struct MediaAttachmentResponse {
     id: String,
     #[serde(rename = "type")]
-    media_type: &'static str,
+    media_type: MediaAttachmentType,
     url: String,
     preview_url: String,
     remote_url: Option<String>,
     meta: MediaMeta,
     description: Option<String>,
     blurhash: Option<String>,
+}
+
+/// Closed Mastodon media attachment type labels emitted by Roosty.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MediaAttachmentType {
+    Image,
+    Gifv,
+    Video,
+    Audio,
+    Unknown,
 }
 
 /// Mastodon media metadata object for local image attachments.
@@ -932,7 +944,10 @@ pub(crate) fn status_edit_media_response(
         });
     MediaAttachmentResponse {
         id: media.id.to_string(),
-        media_type: media.content_type.as_deref().map_or("unknown", media_type),
+        media_type: media
+            .content_type
+            .as_deref()
+            .map_or(MediaAttachmentType::Unknown, media_type),
         url,
         preview_url,
         remote_url: media.remote_url,
@@ -1116,7 +1131,7 @@ fn decode_image_guessed(bytes: &[u8]) -> Result<image::DynamicImage, MediaStoreE
 
 /// Ensure media writes use the local filesystem backend implemented by this module.
 fn ensure_local_storage(state: &AppState) -> Result<(), RoostyError> {
-    if state.config.object_storage_backend == "local" {
+    if state.config.object_storage_backend == ObjectStorageBackend::Local {
         Ok(())
     } else {
         Err(RoostyError::Configuration(format!(
@@ -1196,17 +1211,17 @@ fn image_meta(width: Option<i32>, height: Option<i32>) -> Option<ImageMeta> {
 }
 
 /// Map upload MIME types to Mastodon media attachment type labels.
-fn media_type(content_type: &str) -> &'static str {
+fn media_type(content_type: &str) -> MediaAttachmentType {
     match content_type {
-        "image/gif" => "gifv",
+        "image/gif" => MediaAttachmentType::Gifv,
         value
             if SUPPORTED_IMAGE_FORMATS
                 .iter()
                 .any(|format| format.content_type == value) =>
         {
-            "image"
+            MediaAttachmentType::Image
         }
-        _ => "unknown",
+        _ => MediaAttachmentType::Unknown,
     }
 }
 
