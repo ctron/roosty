@@ -166,7 +166,7 @@ fn configuration(config: &Config) -> Value {
             "terms_of_service": null,
         },
         "vapid": {
-            "public_key": "",
+            "public_key": vapid_public_key(config),
         },
         "accounts": {
             "max_featured_tags": 10,
@@ -197,6 +197,15 @@ fn configuration(config: &Config) -> Value {
         },
         "limited_federation": !config.federation_enabled,
     })
+}
+
+fn vapid_public_key(config: &Config) -> String {
+    let Some(key) = config.vapid_private_key.as_deref() else {
+        return String::new();
+    };
+    let subject = config.public_base_url.origin().ascii_serialization();
+    roosty_web_push::VapidIdentity::from_base64_pkcs8(key, subject)
+        .map_or_else(|_| String::new(), |identity| identity.public_key_base64())
 }
 
 /// Return whether the configured registration mode allows user signups.
@@ -326,6 +335,7 @@ mod tests {
             infra_listen_addr: None,
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+            vapid_private_key: None,
             object_storage_backend: "local".to_owned(),
             media_root: "./media".to_owned(),
             registration_mode: registration_mode.to_owned(),

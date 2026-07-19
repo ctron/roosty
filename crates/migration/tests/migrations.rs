@@ -42,6 +42,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "remote_local_account_block").await);
     assert!(table_exists(database.connection(), "local_remote_account_mute").await);
     assert!(table_exists(database.connection(), "streaming_event").await);
+    assert!(table_exists(database.connection(), "push_subscription").await);
     assert!(table_exists(database.connection(), "status_quote").await);
     assert!(table_exists(database.connection(), "local_status_pin").await);
     assert!(table_exists(database.connection(), "remote_status_pin").await);
@@ -289,10 +290,10 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
             .is_none()
     );
 
-    // Roll back featured tags, pins, remote tags, status history, streaming metadata, edit
-    // delivery, subscription extensions, streaming-kind extension, remote moderation, the
-    // streaming log, and the URL.
-    Migrator::down(database.connection(), Some(13))
+    // Roll back push subscriptions, featured tags, pins, remote tags, status history, streaming
+    // metadata, edit delivery, subscription extensions, streaming-kind extension, remote
+    // moderation, the streaming log, and the URL.
+    Migrator::down(database.connection(), Some(14))
         .await
         .unwrap();
     assert!(!column_exists(database.connection(), "remote_actor", "followers_url").await);
@@ -324,6 +325,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_account_block").await);
     assert!(table_exists(database.connection(), "local_account_mute").await);
     assert!(table_exists(database.connection(), "streaming_event").await);
+    assert!(table_exists(database.connection(), "push_subscription").await);
 
     Migrator::down(database.connection(), None).await.unwrap();
     assert!(!table_exists(database.connection(), "job").await);
@@ -346,6 +348,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_account_mute").await);
     assert!(!table_exists(database.connection(), "status_quote").await);
     assert!(!table_exists(database.connection(), "streaming_event").await);
+    assert!(!table_exists(database.connection(), "push_subscription").await);
 }
 
 /// A legacy ID-only replay marker survives the payload-aware ledger upgrade.
@@ -494,7 +497,7 @@ async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut Embedded
         .unwrap();
     assert_eq!(row.try_get::<i64>("", "count").unwrap(), 2);
 
-    Migrator::down(database.connection(), Some(4))
+    Migrator::down(database.connection(), Some(5))
         .await
         .unwrap();
     assert!(!table_exists(database.connection(), "remote_status_tag").await);

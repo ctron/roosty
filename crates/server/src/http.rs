@@ -27,6 +27,8 @@ pub struct AppState {
     pub streaming_events: StreamingEvents,
     /// Per-process permit pool held for each upgraded streaming socket.
     pub streaming_connections: Arc<Semaphore>,
+    /// Web Push API, credential protection, and delivery service.
+    pub push: crate::push::PushService,
 }
 
 impl AppState {
@@ -38,11 +40,13 @@ impl AppState {
             config.streaming.event_retention,
         );
         let streaming_connections = Arc::new(Semaphore::new(config.streaming.max_connections));
+        let push = crate::push::PushService::new(&config, db.clone());
         Self {
             config: Arc::new(config),
             db,
             streaming_events,
             streaming_connections,
+            push,
         }
     }
 }
@@ -60,6 +64,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::media::router())
         .merge(crate::markers::router())
         .merge(crate::notifications::router())
+        .merge(crate::push::router())
         .merge(crate::search::router())
         .merge(crate::statuses::router())
         .merge(crate::version::router())

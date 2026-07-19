@@ -24,6 +24,7 @@ mod markers;
 mod media;
 mod notifications;
 mod password;
+mod push;
 mod search;
 mod statuses;
 mod streaming;
@@ -436,6 +437,11 @@ async fn worker_iteration(
         "federation_featured_tags_refresh" => {
             federation::refresh_remote_featured_tags(&state, job.payload.clone()).await
         }
+        "web_push_delivery" => state
+            .push
+            .deliver(job.payload.clone())
+            .await
+            .map_err(|error| roosty_core::RoostyError::Configuration(error.to_string())),
         _ => Ok(()),
     };
     match result {
@@ -874,6 +880,7 @@ mod tests {
             infra_listen_addr: None,
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+            vapid_private_key: None,
             object_storage_backend: "local".to_owned(),
             media_root: "./media".to_owned(),
             registration_mode: "closed".to_owned(),

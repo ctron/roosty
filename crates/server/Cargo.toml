@@ -10,6 +10,7 @@ repository.workspace = true
 roosty-core = { workspace = true }
 roosty-db = { workspace = true }
 roosty-migration = { workspace = true }
+roosty-web-push = { workspace = true }
 argon2 = { workspace = true }
 askama = { workspace = true }
 axum = { workspace = true }

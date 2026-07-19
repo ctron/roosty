@@ -13,6 +13,7 @@ use sea_orm::{
     Statement, TransactionTrait, TryInsertResult,
     sea_query::{OnConflict, Query},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
@@ -103,12 +104,12 @@ use entity::{
     local_status_local_recipient, local_status_pin, local_status_reblog,
     local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
     local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    processed_inbox_activity, remote_actor, remote_custom_emoji, remote_featured_tag,
-    remote_follow, remote_following, remote_local_account_block, remote_media_attachment,
-    remote_profile_media, remote_status, remote_status_edit, remote_status_edit_media,
-    remote_status_favourite, remote_status_local_mention, remote_status_local_recipient,
-    remote_status_pin, remote_status_reblog, remote_status_remote_recipient, remote_status_tag,
-    status_quote, streaming_event,
+    processed_inbox_activity, push_subscription, remote_actor, remote_custom_emoji,
+    remote_featured_tag, remote_follow, remote_following, remote_local_account_block,
+    remote_media_attachment, remote_profile_media, remote_status, remote_status_edit,
+    remote_status_edit_media, remote_status_favourite, remote_status_local_mention,
+    remote_status_local_recipient, remote_status_pin, remote_status_reblog,
+    remote_status_remote_recipient, remote_status_tag, status_quote, streaming_event,
 };
 
 /// Quote policy values authored by Mastodon-compatible clients.
@@ -2872,8 +2873,9 @@ pub struct TagTimelineOptions {
 }
 
 /// Supported local Mastodon notification kinds.
-#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq, Serialize, Deserialize)]
 #[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum LocalNotificationType {
     /// A local status mentioned the recipient.
     Mention,
@@ -3100,6 +3102,8 @@ pub enum JobKind {
     FederationFeaturedRefresh,
     /// Refresh one remote actor's declared featured-tags collection.
     FederationFeaturedTagsRefresh,
+    /// Deliver a Mastodon-compatible Web Push notification.
+    WebPushDelivery,
 }
 
 impl JobKind {
@@ -3877,6 +3881,116 @@ pub struct OAuthAccessToken {
     pub scope: String,
     /// Unix timestamp for token issuance.
     pub created_at: i64,
+}
+
+/// Validated access-token grant used by APIs that must retain token identity.
+#[derive(Clone, Debug)]
+pub struct AccessTokenGrant {
+    pub id: Uuid,
+    pub account: LocalAccount,
+    pub scopes: String,
+}
+
+/// Subscription delivery policy accepted by Mastodon-compatible clients.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum PushPolicy {
+    #[default]
+    All,
+    Followed,
+    Follower,
+    None,
+}
+
+/// Stored Web Push content-encoding selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PushSubscriptionEncoding {
+    #[default]
+    Legacy,
+    Standard,
+}
+
+/// Closed set of notification switches supported by Roosty.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PushAlerts {
+    #[serde(default)]
+    pub mention: bool,
+    #[serde(default)]
+    pub favourite: bool,
+    #[serde(default)]
+    pub follow: bool,
+    #[serde(default)]
+    pub follow_request: bool,
+    #[serde(default)]
+    pub reblog: bool,
+    #[serde(default)]
+    pub status: bool,
+    #[serde(default)]
+    pub update: bool,
+    #[serde(default)]
+    pub quote: bool,
+    #[serde(default)]
+    pub quoted_update: bool,
+}
+
+impl PushAlerts {
+    pub fn enabled(&self, notification_type: LocalNotificationType) -> bool {
+        match notification_type {
+            LocalNotificationType::Mention => self.mention,
+            LocalNotificationType::Favourite => self.favourite,
+            LocalNotificationType::Follow => self.follow,
+            LocalNotificationType::FollowRequest => self.follow_request,
+            LocalNotificationType::Reblog => self.reblog,
+            LocalNotificationType::Status => self.status,
+            LocalNotificationType::Update => self.update,
+            LocalNotificationType::Quote => self.quote,
+            LocalNotificationType::QuotedUpdate => self.quoted_update,
+        }
+    }
+}
+
+/// Persisted Web Push subscription and encrypted Mastodon payload credential.
+#[derive(Clone, Debug)]
+pub struct PushSubscription {
+    pub id: Uuid,
+    pub access_token_id: Uuid,
+    pub account_id: AccountId,
+    pub endpoint: String,
+    pub p256dh: Vec<u8>,
+    pub auth: Vec<u8>,
+    pub encoding: PushSubscriptionEncoding,
+    pub policy: PushPolicy,
+    pub alerts: PushAlerts,
+    pub access_token_ciphertext: Vec<u8>,
+    pub access_token_nonce: Vec<u8>,
+}
+
+/// Values that replace one access token's Web Push subscription atomically.
+#[derive(Clone, Debug)]
+pub struct NewPushSubscription {
+    pub access_token_id: Uuid,
+    pub account_id: AccountId,
+    pub endpoint: String,
+    pub p256dh: Vec<u8>,
+    pub auth: Vec<u8>,
+    pub encoding: PushSubscriptionEncoding,
+    pub policy: PushPolicy,
+    pub alerts: PushAlerts,
+    pub access_token_ciphertext: Vec<u8>,
+    pub access_token_nonce: Vec<u8>,
 }
 
 /// Find a local account by username or email for password login.
@@ -11048,6 +11162,40 @@ pub async fn find_account_by_access_token(
         .transpose()
 }
 
+/// Resolve a raw access token while preserving the persisted token identifier.
+pub async fn find_access_token_grant(
+    db: &DbConnection,
+    token_pepper: &str,
+    raw_token: &str,
+) -> Result<Option<AccessTokenGrant>> {
+    let token_hash = secret_hash(token_pepper, raw_token)?;
+    let Some(token) = oauth_access_token::Entity::find()
+        .filter(oauth_access_token::Column::TokenHash.eq(token_hash))
+        .filter(oauth_access_token::Column::RevokedAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if token
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
+    {
+        return Ok(None);
+    }
+    let Some(account) = local_account::Entity::find_by_id(token.account_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AccessTokenGrant {
+        id: token.id,
+        account: local_account_from_model(account)?,
+        scopes: token.scopes,
+    }))
+}
+
 /// Revoke an OAuth access token if it exists.
 pub async fn revoke_access_token(db: &DbConnection, token_pepper: &str, token: &str) -> Result<()> {
     let token_hash = secret_hash(token_pepper, token)?;
@@ -11056,11 +11204,187 @@ pub async fn revoke_access_token(db: &DbConnection, token_pepper: &str, token: &
         .one(db)
         .await?
     {
+        push_subscription::Entity::delete_many()
+            .filter(push_subscription::Column::AccessTokenId.eq(token.id))
+            .exec(db)
+            .await?;
         let mut active_token = token.into_active_model();
         active_token.revoked_at = Set(Some(OffsetDateTime::now_utc()));
         active_token.update(db).await?;
     }
 
+    Ok(())
+}
+
+/// Return the Web Push subscription belonging to one access token.
+pub async fn push_subscription_for_access_token(
+    db: &DbConnection,
+    access_token_id: Uuid,
+) -> Result<Option<PushSubscription>> {
+    push_subscription::Entity::find()
+        .filter(push_subscription::Column::AccessTokenId.eq(access_token_id))
+        .one(db)
+        .await?
+        .map(push_subscription_from_model)
+        .transpose()
+}
+
+/// Replace the Web Push subscription belonging to an access token.
+pub async fn upsert_push_subscription(
+    db: &DbConnection,
+    input: NewPushSubscription,
+) -> Result<PushSubscription> {
+    let now = OffsetDateTime::now_utc();
+    let access_token_id = input.access_token_id;
+    push_subscription::Entity::insert(push_subscription::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        access_token_id: Set(access_token_id),
+        account_id: Set(input.account_id.0),
+        endpoint: Set(input.endpoint),
+        p256dh: Set(input.p256dh),
+        auth: Set(input.auth),
+        standard: Set(input.encoding == PushSubscriptionEncoding::Standard),
+        policy: Set(input.policy.to_string()),
+        alerts: Set(push_alerts_json(input.alerts)?),
+        access_token_ciphertext: Set(input.access_token_ciphertext),
+        access_token_nonce: Set(input.access_token_nonce),
+        created_at: Set(now),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(push_subscription::Column::AccessTokenId)
+            .update_columns([
+                push_subscription::Column::AccountId,
+                push_subscription::Column::Endpoint,
+                push_subscription::Column::P256dh,
+                push_subscription::Column::Auth,
+                push_subscription::Column::Standard,
+                push_subscription::Column::Policy,
+                push_subscription::Column::Alerts,
+                push_subscription::Column::AccessTokenCiphertext,
+                push_subscription::Column::AccessTokenNonce,
+                push_subscription::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec(db)
+    .await?;
+    let model = push_subscription::Entity::find()
+        .filter(push_subscription::Column::AccessTokenId.eq(access_token_id))
+        .one(db)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("push subscription disappeared after upsert".to_owned())
+        })?;
+    push_subscription_from_model(model)
+}
+
+/// Update alert and policy settings without replacing endpoint key material.
+pub async fn update_push_subscription(
+    db: &DbConnection,
+    access_token_id: Uuid,
+    alerts: PushAlerts,
+    policy: PushPolicy,
+) -> Result<Option<PushSubscription>> {
+    let Some(model) = push_subscription::Entity::find()
+        .filter(push_subscription::Column::AccessTokenId.eq(access_token_id))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active = model.into_active_model();
+    active.alerts = Set(push_alerts_json(alerts)?);
+    active.policy = Set(policy.to_string());
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    Ok(Some(push_subscription_from_model(
+        active.update(db).await?,
+    )?))
+}
+
+/// Delete one token's subscription, returning whether it existed.
+pub async fn delete_push_subscription(db: &DbConnection, access_token_id: Uuid) -> Result<bool> {
+    Ok(push_subscription::Entity::delete_many()
+        .filter(push_subscription::Column::AccessTokenId.eq(access_token_id))
+        .exec(db)
+        .await?
+        .rows_affected
+        > 0)
+}
+
+/// Load a queued subscription only while it still belongs to the notification recipient.
+pub async fn push_delivery(
+    db: &DbConnection,
+    notification_id: Uuid,
+    subscription_id: Uuid,
+) -> Result<Option<(LocalNotification, PushSubscription)>> {
+    let Some(notification) = local_notification::Entity::find_by_id(notification_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(subscription) = push_subscription::Entity::find_by_id(subscription_id)
+        .filter(push_subscription::Column::AccountId.eq(notification.account_id))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        local_notification_from_model(notification),
+        push_subscription_from_model(subscription)?,
+    )))
+}
+
+/// Evaluate a Mastodon push policy against the actor that caused a notification.
+pub async fn push_policy_allows(
+    db: &DbConnection,
+    notification: &LocalNotification,
+    policy: PushPolicy,
+) -> Result<bool> {
+    match policy {
+        PushPolicy::All => Ok(true),
+        PushPolicy::None => Ok(false),
+        PushPolicy::Followed => match (notification.actor_account_id, notification.remote_actor_id)
+        {
+            (Some(actor), None) => Ok(local_follow::Entity::find_by_id((
+                notification.account_id.0,
+                actor.0,
+            ))
+            .one(db)
+            .await?
+            .is_some()),
+            (None, Some(actor)) => Ok(remote_following::Entity::find()
+                .filter(remote_following::Column::LocalAccountId.eq(notification.account_id.0))
+                .filter(remote_following::Column::RemoteActorId.eq(actor.0))
+                .filter(remote_following::Column::State.eq("accepted"))
+                .filter(remote_following::Column::DeactivatedAt.is_null())
+                .one(db)
+                .await?
+                .is_some()),
+            _ => Ok(false),
+        },
+        PushPolicy::Follower => match (notification.actor_account_id, notification.remote_actor_id)
+        {
+            (Some(actor), None) => Ok(local_follow::Entity::find_by_id((
+                actor.0,
+                notification.account_id.0,
+            ))
+            .one(db)
+            .await?
+            .is_some()),
+            (None, Some(actor)) => {
+                remote_actor_follows_local_account(db, actor, notification.account_id).await
+            }
+            _ => Ok(false),
+        },
+    }
+}
+
+/// Remove a subscription after a push service permanently rejects it.
+pub async fn delete_push_subscription_by_id(db: &DbConnection, id: Uuid) -> Result<()> {
+    push_subscription::Entity::delete_by_id(id).exec(db).await?;
     Ok(())
 }
 
@@ -11378,6 +11702,39 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         created_at: notification.created_at,
         dismissed_at: notification.dismissed_at,
     }
+}
+
+fn push_subscription_from_model(
+    subscription: push_subscription::Model,
+) -> Result<PushSubscription> {
+    let policy = PushPolicy::from_str(&subscription.policy)
+        .map_err(|_| RoostyError::InvalidInput("stored push policy is invalid".to_owned()))?;
+    let alerts = serde_json::from_value(subscription.alerts).map_err(|error| {
+        RoostyError::InvalidInput(format!("stored push alerts are invalid: {error}"))
+    })?;
+    Ok(PushSubscription {
+        id: subscription.id,
+        access_token_id: subscription.access_token_id,
+        account_id: AccountId(subscription.account_id),
+        endpoint: subscription.endpoint,
+        p256dh: subscription.p256dh,
+        auth: subscription.auth,
+        encoding: if subscription.standard {
+            PushSubscriptionEncoding::Standard
+        } else {
+            PushSubscriptionEncoding::Legacy
+        },
+        policy,
+        alerts,
+        access_token_ciphertext: subscription.access_token_ciphertext,
+        access_token_nonce: subscription.access_token_nonce,
+    })
+}
+
+fn push_alerts_json(alerts: PushAlerts) -> Result<JsonValue> {
+    serde_json::to_value(alerts).map_err(|error| {
+        RoostyError::InvalidInput(format!("push alerts cannot be serialized: {error}"))
+    })
 }
 
 /// Convert a SeaORM timeline marker row into its database API representation.
@@ -11705,6 +12062,36 @@ mod tests {
             JobKind::FederationFeaturedTagsRefresh.as_str(),
             "federation_featured_tags_refresh"
         );
+        assert_eq!(JobKind::WebPushDelivery.as_str(), "web_push_delivery");
+    }
+
+    #[test]
+    fn push_alerts_use_typed_notification_dispatch() {
+        let enabled = PushAlerts {
+            mention: true,
+            favourite: true,
+            follow: true,
+            follow_request: true,
+            reblog: true,
+            status: true,
+            update: true,
+            quote: true,
+            quoted_update: true,
+        };
+        for notification_type in [
+            LocalNotificationType::Mention,
+            LocalNotificationType::Favourite,
+            LocalNotificationType::Follow,
+            LocalNotificationType::FollowRequest,
+            LocalNotificationType::Reblog,
+            LocalNotificationType::Status,
+            LocalNotificationType::Update,
+            LocalNotificationType::Quote,
+            LocalNotificationType::QuotedUpdate,
+        ] {
+            assert!(enabled.enabled(notification_type));
+            assert!(!PushAlerts::default().enabled(notification_type));
+        }
     }
 
     /// Featured hashtag input is normalized while malformed and numeric-only names are rejected.

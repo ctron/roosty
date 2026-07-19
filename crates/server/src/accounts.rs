@@ -2246,6 +2246,7 @@ mod tests {
                 infra_listen_addr: None,
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+                vapid_private_key: None,
                 object_storage_backend: "local".to_owned(),
                 media_root: "./media".to_owned(),
                 registration_mode: "closed".to_owned(),

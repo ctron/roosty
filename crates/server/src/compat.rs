@@ -27,7 +27,6 @@ use crate::{
 /// Build compatibility routes probed by Mastodon browser clients.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/push/subscription", get(push_subscription))
         .route("/api/v1/custom_emojis", get(custom_emojis))
         .route("/api/v1/followed_tags", get(followed_tags))
         .route("/api/v1/streaming", get(streaming))
@@ -43,16 +42,6 @@ async fn custom_emojis() -> Json<Vec<Value>> {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
-}
-
-async fn push_subscription(AuthenticatedAccount(_account): AuthenticatedAccount) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Record not found".to_owned(),
-        }),
-    )
-        .into_response()
 }
 
 async fn followed_tags(
@@ -356,7 +345,10 @@ fn server_error(error: roosty_core::RoostyError) -> Response {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        pin::Pin,
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -496,8 +488,6 @@ mod tests {
     #[test_context(CompatContext)]
     #[tokio::test]
     async fn push_subscription_reports_missing_subscription(context: &mut CompatContext) {
-        // Push delivery is not implemented yet, but authenticated clients expect
-        // the probe to distinguish "no subscription" from "unknown endpoint".
         let token = context.access_token().await;
 
         let response = context
@@ -506,6 +496,417 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(json_body(response).await["error"], "Record not found");
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_subscription_lifecycle_accepts_valid_typed_data(context: &mut CompatContext) {
+        let token = context.access_token().await;
+        let response = context
+            .authenticated_form_request(
+                axum::http::Method::POST,
+                "/api/v1/push/subscription",
+                &token,
+                valid_push_form("https://1.1.1.1/push"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_body(response).await;
+        assert_eq!(created["endpoint"], "https://1.1.1.1/push");
+        assert_eq!(created["standard"], true);
+        assert_eq!(created["policy"], "all");
+        assert_eq!(created["alerts"]["mention"], true);
+        assert!(
+            created["server_key"]
+                .as_str()
+                .is_some_and(|key| !key.is_empty())
+        );
+        let created_id = uuid::Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+        assert_eq!(created_id.get_version_num(), 7);
+
+        let first = context.authenticated_form_request(
+            axum::http::Method::POST,
+            "/api/v1/push/subscription",
+            &token,
+            valid_push_form("https://8.8.8.8/push"),
+        );
+        let second = context.authenticated_form_request(
+            axum::http::Method::POST,
+            "/api/v1/push/subscription",
+            &token,
+            valid_push_form("https://9.9.9.9/push"),
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let response = context
+            .authenticated_get("/api/v1/push/subscription", &token)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let current = json_body(response).await;
+        assert_eq!(current["id"], created["id"]);
+        assert!(matches!(
+            current["endpoint"].as_str(),
+            Some("https://8.8.8.8/push") | Some("https://9.9.9.9/push")
+        ));
+
+        let actor_id = AccountId(
+            roosty_db::create_local_account(
+                &context.db,
+                "push_actor",
+                "push-actor@example.com",
+                &password::hash_password("password").unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let notification = roosty_db::notify_local_account(
+            &context.db,
+            context.account_id,
+            roosty_db::LocalNotificationType::Follow,
+            actor_id,
+            None,
+        )
+        .await
+        .unwrap();
+        for notification_type in [
+            roosty_db::LocalNotificationType::Mention,
+            roosty_db::LocalNotificationType::Favourite,
+            roosty_db::LocalNotificationType::Reblog,
+            roosty_db::LocalNotificationType::Follow,
+            roosty_db::LocalNotificationType::FollowRequest,
+            roosty_db::LocalNotificationType::Status,
+            roosty_db::LocalNotificationType::Update,
+            roosty_db::LocalNotificationType::Quote,
+            roosty_db::LocalNotificationType::QuotedUpdate,
+        ] {
+            let mut typed_notification = notification.clone();
+            typed_notification.notification_type = notification_type;
+            let payload = crate::notifications::push_payload(
+                &context.db,
+                &context.config.public_base_url,
+                typed_notification,
+                token.clone(),
+            )
+            .await
+            .unwrap();
+            let payload = serde_json::to_value(payload).unwrap();
+            assert_eq!(payload["access_token"], token);
+            assert_eq!(payload["notification_id"], notification.id.to_string());
+            assert_eq!(payload["notification_type"], notification_type.as_str());
+            assert_eq!(payload["preferred_locale"], "en");
+            assert!(
+                payload["body"]
+                    .as_str()
+                    .is_some_and(|body| !body.is_empty())
+            );
+        }
+        let mut invalid_actor = notification.clone();
+        invalid_actor.remote_actor_id = Some(AccountId(uuid::Uuid::now_v7()));
+        assert!(matches!(
+            crate::notifications::push_payload(
+                &context.db,
+                &context.config.public_base_url,
+                invalid_actor,
+                token.clone(),
+            )
+            .await,
+            Err(roosty_core::RoostyError::InvalidInput(_))
+        ));
+        assert!(
+            roosty_db::push_policy_allows(&context.db, &notification, roosty_db::PushPolicy::All)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !roosty_db::push_policy_allows(
+                &context.db,
+                &notification,
+                roosty_db::PushPolicy::None,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !roosty_db::push_policy_allows(
+                &context.db,
+                &notification,
+                roosty_db::PushPolicy::Followed,
+            )
+            .await
+            .unwrap()
+        );
+        roosty_db::follow_local_account(&context.db, context.account_id, actor_id, true, false)
+            .await
+            .unwrap();
+        assert!(
+            roosty_db::push_policy_allows(
+                &context.db,
+                &notification,
+                roosty_db::PushPolicy::Followed,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !roosty_db::push_policy_allows(
+                &context.db,
+                &notification,
+                roosty_db::PushPolicy::Follower,
+            )
+            .await
+            .unwrap()
+        );
+        roosty_db::follow_local_account(&context.db, actor_id, context.account_id, true, false)
+            .await
+            .unwrap();
+        assert!(
+            roosty_db::push_policy_allows(
+                &context.db,
+                &notification,
+                roosty_db::PushPolicy::Follower,
+            )
+            .await
+            .unwrap()
+        );
+        let job = roosty_db::claim_due_job(&context.db, "push-test", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.kind, "web_push_delivery");
+        assert_eq!(job.id.0.get_version_num(), 7);
+        assert_eq!(job.payload["notification_id"], notification.id.to_string());
+        assert_eq!(job.payload["subscription_id"], created["id"]);
+        assert!(
+            roosty_db::mark_job_completed(&context.db, &job)
+                .await
+                .unwrap()
+        );
+
+        let response = context
+            .authenticated_form_request(
+                axum::http::Method::PUT,
+                "/api/v1/push/subscription",
+                &token,
+                "data%5Bpolicy%5D=followed&data%5Balerts%5D%5Bmention%5D=false&data%5Balerts%5D%5Bfollow%5D=1".to_owned(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = json_body(response).await;
+        assert_eq!(updated["policy"], "followed");
+        assert_eq!(updated["alerts"]["mention"], false);
+        assert_eq!(updated["alerts"]["follow"], true);
+
+        for _ in 0..2 {
+            let response = context
+                .authenticated_request(
+                    axum::http::Method::DELETE,
+                    "/api/v1/push/subscription",
+                    &token,
+                    Body::empty(),
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await, serde_json::json!({}));
+        }
+        let response = context
+            .authenticated_form_request(
+                axum::http::Method::POST,
+                "/api/v1/push/subscription",
+                &token,
+                valid_push_form("https://1.0.0.1/push"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let grant =
+            roosty_db::find_access_token_grant(&context.db, &context.config.token_pepper, &token)
+                .await
+                .unwrap()
+                .unwrap();
+        roosty_db::revoke_access_token(&context.db, &context.config.token_pepper, &token)
+            .await
+            .unwrap();
+        assert!(
+            roosty_db::push_subscription_for_access_token(&context.db, grant.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_subscription_rejects_invalid_data_without_persisting(
+        context: &mut CompatContext,
+    ) {
+        let token = context.access_token().await;
+        let valid = valid_push_form("https://1.1.1.1/push");
+        let cases = [
+            valid.replace(
+                "subscription%5Bendpoint%5D=https%3A%2F%2F1.1.1.1%2Fpush&",
+                "",
+            ),
+            valid.replace(
+                &format!("subscription%5Bkeys%5D%5Bp256dh%5D={PUSH_P256DH}&"),
+                "",
+            ),
+            valid.replace(
+                &format!("subscription%5Bkeys%5D%5Bauth%5D={PUSH_AUTH}&"),
+                "",
+            ),
+            valid.replace(PUSH_AUTH, "not-base64!"),
+            valid.replace(PUSH_AUTH, "AQID"),
+            valid.replace("data%5Bpolicy%5D=all", "data%5Bpolicy%5D=somebody"),
+            valid.replace(
+                "data%5Balerts%5D%5Bmention%5D=true",
+                "data%5Balerts%5D%5Bmention%5D=maybe",
+            ),
+            valid.replace(
+                "subscription%5Bstandard%5D=true",
+                "subscription%5Bstandard%5D=maybe",
+            ),
+            valid_push_form("https://127.0.0.1/push"),
+            valid_push_form("http://1.1.1.1/push"),
+            valid_push_form("https://user:password@1.1.1.1/push"),
+        ];
+        for body in cases {
+            let response = context
+                .authenticated_form_request(
+                    axum::http::Method::POST,
+                    "/api/v1/push/subscription",
+                    &token,
+                    body,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(json_body(response).await["error"].as_str().is_some());
+        }
+        assert!(
+            roosty_db::find_access_token_grant(&context.db, &context.config.token_pepper, &token)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let grant =
+            roosty_db::find_access_token_grant(&context.db, &context.config.token_pepper, &token)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            roosty_db::push_subscription_for_access_token(&context.db, grant.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_subscription_requires_push_scope(context: &mut CompatContext) {
+        let token = roosty_db::create_access_token(
+            &context.db,
+            &context.config.token_pepper,
+            context.account_id,
+            context.application_id,
+            "read write",
+        )
+        .await
+        .unwrap()
+        .token;
+        let response = context
+            .authenticated_form_request(
+                axum::http::Method::POST,
+                "/api/v1/push/subscription",
+                &token,
+                valid_push_form("https://1.1.1.1/push"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_delivery_classifies_success_retry_and_permanent_rejection(
+        context: &mut CompatContext,
+    ) {
+        let token = context.access_token().await;
+        let response = context
+            .authenticated_form_request(
+                axum::http::Method::POST,
+                "/api/v1/push/subscription",
+                &token,
+                valid_push_form("https://1.1.1.1/push"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let actor_id = AccountId(
+            roosty_db::create_local_account(
+                &context.db,
+                "delivery_actor",
+                "delivery-actor@example.com",
+                &password::hash_password("password").unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        roosty_db::notify_local_account(
+            &context.db,
+            context.account_id,
+            roosty_db::LocalNotificationType::Follow,
+            actor_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let job =
+            roosty_db::claim_due_job(&context.db, "delivery-test", time::Duration::minutes(1))
+                .await
+                .unwrap()
+                .unwrap();
+
+        let service = crate::push::PushService::with_sender(
+            &context.config,
+            context.db.clone(),
+            Arc::new(StaticPushSender(roosty_web_push::DeliveryOutcome::Success)),
+        );
+        service.deliver(job.payload.clone()).await.unwrap();
+
+        let retry = crate::push::PushService::with_sender(
+            &context.config,
+            context.db.clone(),
+            Arc::new(StaticPushSender(
+                roosty_web_push::DeliveryOutcome::Retryable {
+                    status: Some(429),
+                    retry_after: Some(std::time::Duration::from_secs(30)),
+                },
+            )),
+        );
+        assert!(matches!(
+            retry.deliver(job.payload.clone()).await,
+            Err(crate::push::PushDeliveryError::Retryable { status: Some(429) })
+        ));
+
+        let permanent = crate::push::PushService::with_sender(
+            &context.config,
+            context.db.clone(),
+            Arc::new(StaticPushSender(
+                roosty_web_push::DeliveryOutcome::PermanentFailure { status: 410 },
+            )),
+        );
+        permanent.deliver(job.payload).await.unwrap();
+        let grant =
+            roosty_db::find_access_token_grant(&context.db, &context.config.token_pepper, &token)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            roosty_db::push_subscription_for_access_token(&context.db, grant.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test_context(CompatContext)]
@@ -734,6 +1135,8 @@ mod tests {
                 infra_listen_addr: None,
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
+                // Fixed test-only PKCS#8 key. pragma: allowlist secret
+                vapid_private_key: Some(TEST_VAPID_PRIVATE_KEY.to_owned()),
                 object_storage_backend: "local".to_owned(),
                 media_root: "./media".to_owned(),
                 registration_mode: "closed".to_owned(),
@@ -821,6 +1224,41 @@ mod tests {
             .await
         }
 
+        async fn authenticated_request(
+            &self,
+            method: axum::http::Method,
+            uri: &str,
+            token: &str,
+            body: Body,
+            content_type: Option<&str>,
+        ) -> axum::http::Response<Body> {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, format!("Bearer {token}"));
+            if let Some(content_type) = content_type {
+                request = request.header(axum::http::header::CONTENT_TYPE, content_type);
+            }
+            self.request(request.body(body).unwrap()).await
+        }
+
+        async fn authenticated_form_request(
+            &self,
+            method: axum::http::Method,
+            uri: &str,
+            token: &str,
+            body: String,
+        ) -> axum::http::Response<Body> {
+            self.authenticated_request(
+                method,
+                uri,
+                token,
+                Body::from(body),
+                Some("application/x-www-form-urlencoded"),
+            )
+            .await
+        }
+
         async fn access_token(&self) -> String {
             roosty_db::create_access_token(
                 &self.db,
@@ -864,5 +1302,44 @@ mod tests {
             .as_nanos();
 
         format!("roosty_compat_{}_{}", std::process::id(), timestamp)
+    }
+
+    const TEST_VAPID_PRIVATE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7ki2JNeU+GLhnNacatYTpVJNFd3uIKWr+Inj/vYFMAShRANCAAQyUFnxhJ7CSBxmKk5Qj6d0UWOBJ68nwsB+XAxsp4hAJ/mVfmeryWYGKx9JaZaAWBfSybFhK0inH6o1XIJH5CRW";
+    const PUSH_AUTH: &str = "MTIzNDU2Nzg5MGFiY2RlZg";
+    const PUSH_P256DH: &str =
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
+
+    fn valid_push_form(endpoint: &str) -> String {
+        let endpoint: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
+        format!(
+            "subscription%5Bendpoint%5D={endpoint}&subscription%5Bkeys%5D%5Bp256dh%5D={PUSH_P256DH}&subscription%5Bkeys%5D%5Bauth%5D={PUSH_AUTH}&subscription%5Bstandard%5D=true&data%5Bpolicy%5D=all&data%5Balerts%5D%5Bmention%5D=true&data%5Balerts%5D%5Bfollow%5D=true"
+        )
+    }
+
+    struct StaticPushSender(roosty_web_push::DeliveryOutcome);
+
+    impl crate::push::PushSender for StaticPushSender {
+        fn send<'a>(
+            &'a self,
+            _subscription: &'a roosty_web_push::Subscription,
+            _payload: &'a [u8],
+            _options: roosty_web_push::SendOptions,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            roosty_web_push::DeliveryOutcome,
+                            roosty_web_push::WebPushError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(self.0) })
+        }
+
+        fn public_key(&self) -> String {
+            "test-public-key".to_owned()
+        }
     }
 }

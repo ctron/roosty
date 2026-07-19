@@ -8,6 +8,8 @@ The project is early. The current local setup brings up the Rust server, Postgre
 
 Every commit pushed to `main` that passes CI publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
 
+Web Push is enabled by setting `ROOSTY_VAPID_PRIVATE_KEY` to a base64-encoded PKCS#8 P-256 private key. The production Ansible role creates and preserves this key automatically; every Roosty process sharing a database must use the same value.
+
 ## Local Development
 
 Prerequisites:

@@ -61,6 +61,7 @@ mod m20260701_000056_create_remote_status_tag;
 mod m20260701_000057_create_status_quotes;
 mod m20260701_000058_create_status_pins;
 mod m20260701_000059_create_featured_tags;
+mod m20260701_000060_create_push_subscription;
 
 pub struct Migrator;
 
@@ -127,6 +128,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000057_create_status_quotes::Migration),
             Box::new(m20260701_000058_create_status_pins::Migration),
             Box::new(m20260701_000059_create_featured_tags::Migration),
+            Box::new(m20260701_000060_create_push_subscription::Migration),
         ]
     }
 }

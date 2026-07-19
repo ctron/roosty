@@ -60,15 +60,34 @@
       session_secret="$(openssl rand -hex 48)"
       token_pepper="$(openssl rand -hex 48)"
       federation_secret="$(openssl rand -hex 48)"
+      vapid_private_key="$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 | openssl pkcs8 -topk8 -nocrypt -outform DER | base64 -w0)"
       printf '%s\n' \
         "POSTGRES_PASSWORD=${postgres_password}" \
         "ROOSTY_DATABASE_URL=postgres://roosty:${postgres_password}@postgres:5432/roosty" \
         "ROOSTY_SESSION_SECRET=${session_secret}" \
         "ROOSTY_TOKEN_PEPPER=${token_pepper}" \
         "ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET=${federation_secret}" \
+        "ROOSTY_VAPID_PRIVATE_KEY=${vapid_private_key}" \
         > secrets.env
     chdir: "{{ roosty_deploy_dir }}"
     creates: "{{ roosty_deploy_dir }}/secrets.env"
+  no_log: true
+
+- name: Add a persistent VAPID key to existing deployments
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      if grep -q '^ROOSTY_VAPID_PRIVATE_KEY=' secrets.env; then
+        printf '%s\n' unchanged
+      else
+        umask 077
+        vapid_private_key="$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 | openssl pkcs8 -topk8 -nocrypt -outform DER | base64 -w0)"
+        printf '%s\n' "ROOSTY_VAPID_PRIVATE_KEY=${vapid_private_key}" >> secrets.env
+        printf '%s\n' changed
+      fi
+    chdir: "{{ roosty_deploy_dir }}"
+  register: roosty_vapid_secret
+  changed_when: "'changed' in roosty_vapid_secret.stdout_lines"
   no_log: true
 
 - name: Protect persistent deployment secrets

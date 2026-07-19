@@ -34,6 +34,7 @@ pub mod oauth_access_token;
 pub mod oauth_application;
 pub mod oauth_authorization_code;
 pub mod processed_inbox_activity;
+pub mod push_subscription;
 pub mod remote_actor;
 pub mod remote_custom_emoji;
 pub mod remote_featured_tag;

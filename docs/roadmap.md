@@ -45,7 +45,7 @@
 - [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
 - [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
 - [x] Federate the underlying Follow, addressed Create/Update/Delete, Like/Undo, and Announce/Undo activities that produce remote follow, mention, reply, favourite, and boost notifications. Replies always address and reach a cached remote parent author even when the text omits an explicit mention.
-- [ ] Add grouped notifications and Web Push integration.
+- [x] Add Mastodon-compatible Web Push subscriptions and durable delivery with standard and legacy payload encryption; grouped notifications remain separate.
 - [x] Apply local mute/block and suspend-level domain-policy decisions to discovery, inbox processing, delivery, timelines, conversations, streams, and notifications.
 - [x] Deliver remote Block/Undo activities, accept validated inbound Block/Undo, and project remote mute/block relationship state.
 - [x] Complete remote direct conversations: persist mixed local/remote participants, support replies to cached direct Notes, and repair conversation state after remote updates/deletes.
@@ -71,7 +71,7 @@
 
 - Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: grouped notifications and push integration.
+- Notifications: grouped notification presentation; Web Push delivery is available.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 

@@ -5,12 +5,13 @@ services:
       dockerfile: deploy/Containerfile
     command: ["serve", "--with-migrations", "--with-worker"]
     environment:
-      ROOSTY_DATABASE_URL: postgres://roosty:roosty@postgres:5432/roosty
+      ROOSTY_DATABASE_URL: postgres://roosty:roosty@postgres:5432/roosty # pragma: allowlist secret
       ROOSTY_PUBLIC_BASE_URL: https://roosty.localhost:4000
       ROOSTY_LISTEN_ADDR: 0.0.0.0:4000
       ROOSTY_INFRA_LISTEN_ADDR: 0.0.0.0:3001
-      ROOSTY_SESSION_SECRET: development-session-secret-change-me-000
-      ROOSTY_TOKEN_PEPPER: development-token-pepper-change-me-0000
+      ROOSTY_SESSION_SECRET: development-session-secret-change-me-000 # pragma: allowlist secret
+      ROOSTY_TOKEN_PEPPER: development-token-pepper-change-me-0000 # pragma: allowlist secret
+      ROOSTY_VAPID_PRIVATE_KEY: MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7ki2JNeU+GLhnNacatYTpVJNFd3uIKWr+Inj/vYFMAShRANCAAQyUFnxhJ7CSBxmKk5Qj6d0UWOBJ68nwsB+XAxsp4hAJ/mVfmeryWYGKx9JaZaAWBfSybFhK0inH6o1XIJH5CRW # pragma: allowlist secret
       ROOSTY_INSTANCE_NAME: Roosty Development
       ROOSTY_INSTANCE_DESCRIPTION: Local Roosty development instance
       ROOSTY_OBJECT_STORAGE_BACKEND: local
@@ -66,7 +67,7 @@ services:
     environment:
       POSTGRES_DB: roosty
       POSTGRES_USER: roosty
-      POSTGRES_PASSWORD: roosty
+      POSTGRES_PASSWORD: roosty # pragma: allowlist secret
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U roosty -d roosty"]
       interval: 5s

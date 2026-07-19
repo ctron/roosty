@@ -133,8 +133,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `GET /api/v1/followed_tags` | Lists locally followed hashtags for the authenticated account. |
 | 🟢 | Featured hashtags | Authenticated list/create/delete and suggestion APIs, public per-account lookup, a fixed ten-tag limit, and batched visible-status statistics are implemented for local and cached-remote accounts. |
 | 🟢 | `POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow` | Local tag follow state is stored and matching public local or cached-remote posts enter the home timeline and user stream. Remote matching is limited to Notes received through normal federation delivery. |
-| 🔴 | `GET /api/v1/push/subscription` | Placeholder currently returns authenticated `404`. |
-| 🔴 | Push subscriptions | Create/update/delete APIs are missing. |
+| 🟢 | `/api/v1/push/subscription` | Authenticated GET/POST/PUT/DELETE manages one subscription per OAuth token, including alert switches, delivery policy, VAPID server key, and Tusky's `standard=true` registration. |
+| 🟢 | Push delivery | Transactional UUIDv7 jobs deliver full Mastodon payloads using RFC 8291 `aes128gcm` or legacy `aesgcm`, retry transient failures, remove rejected subscriptions, and protect endpoints with independent SSRF validation. Grouped notifications remain missing. |
 | 🟡 | Media upload | `POST /api/v1/media`, `POST /api/v2/media`, media lookup/update/delete, status attachments, thumbnails, dimensions, `meta.small`, previews, and blurhash work for local image formats advertised by `/api/v2/instance`. Video, audio, async processing, and object storage are missing. |
 | 🟡 | Custom emojis | `GET /api/v1/custom_emojis` is public and returns an empty local picker. Cached remote account and status projections expose valid ActivityPub Emoji tags; local emoji management and outbound emoji federation are missing. |
 
@@ -177,7 +177,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Add federated direct-message media fetching and account migration.
 - [ ] Expand conversation support beyond local direct messages.
 - [x] Add cache-only remote hashtag indexing, timelines, discovery, history, and followed-tag fan-out.
-- [ ] Add grouped notifications and push integration.
+- [ ] Add grouped notifications; Web Push integration is implemented.
 - [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.
 - [x] Add per-account moderation APIs and configured suspend-level domain policy.

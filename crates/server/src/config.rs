@@ -97,6 +97,8 @@ pub struct Config {
     pub infra_listen_addr: Option<SocketAddr>,
     pub session_secret: String,
     pub token_pepper: String,
+    /// Base64-encoded PKCS#8 P-256 private key used for VAPID.
+    pub vapid_private_key: Option<String>,
     pub object_storage_backend: String,
     pub media_root: String,
     pub registration_mode: String,
@@ -137,6 +139,13 @@ impl Config {
                         "ROOSTY_PUBLIC_BASE_URL is invalid: {error}"
                     ))
                 })?;
+        let vapid_private_key = optional_env("ROOSTY_VAPID_PRIVATE_KEY");
+        if let Some(key) = vapid_private_key.as_deref() {
+            let subject = public_base_url.origin().ascii_serialization();
+            roosty_web_push::VapidIdentity::from_base64_pkcs8(key, subject).map_err(|error| {
+                RoostyError::Configuration(format!("ROOSTY_VAPID_PRIVATE_KEY is invalid: {error}"))
+            })?;
+        }
         let federation_enabled = optional_bool_env("ROOSTY_FEDERATION_ENABLED")?.unwrap_or(false);
         let federation_key_encryption_secret =
             optional_env("ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET");
@@ -190,6 +199,7 @@ impl Config {
             infra_listen_addr: optional_parse_env("ROOSTY_INFRA_LISTEN_ADDR")?,
             session_secret: required_secret("ROOSTY_SESSION_SECRET")?,
             token_pepper: required_secret("ROOSTY_TOKEN_PEPPER")?,
+            vapid_private_key,
             object_storage_backend: optional_env("ROOSTY_OBJECT_STORAGE_BACKEND")
                 .unwrap_or_else(|| DEFAULT_OBJECT_STORAGE_BACKEND.to_owned()),
             media_root: optional_env("ROOSTY_MEDIA_ROOT")
@@ -401,6 +411,7 @@ mod tests {
             infra_listen_addr: None,
             session_secret: "test-session-secret".to_owned(),
             token_pepper: "test-token-pepper".to_owned(),
+            vapid_private_key: None,
             object_storage_backend: "local".to_owned(),
             media_root: "./media".to_owned(),
             registration_mode: "closed".to_owned(),

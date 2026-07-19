@@ -300,6 +300,93 @@ async fn notification_response(
     }))
 }
 
+/// Compact payload encrypted into a Mastodon-compatible Web Push message.
+#[derive(Serialize)]
+pub(crate) struct MastodonPushPayload {
+    access_token: String,
+    preferred_locale: String,
+    notification_id: String,
+    notification_type: LocalNotificationType,
+    icon: String,
+    title: String,
+    body: String,
+}
+
+/// Build the compact Mastodon Web Push payload from typed domain records.
+pub(crate) async fn push_payload(
+    db: &roosty_db::DbConnection,
+    public_base_url: &url::Url,
+    notification: LocalNotification,
+    access_token: String,
+) -> Result<MastodonPushPayload, RoostyError> {
+    let notification_id = notification.id.to_string();
+    let notification_type = notification.notification_type;
+    let recipient = roosty_db::find_local_account_by_id(db, notification.account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("push notification recipient is missing".to_owned())
+        })?;
+    let (actor, icon) = match (notification.actor_account_id, notification.remote_actor_id) {
+        (Some(actor_id), None) => {
+            let actor = roosty_db::find_local_account_by_id(db, actor_id)
+                .await?
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("push notification actor is missing".to_owned())
+                })?;
+            let title = if actor.display_name.is_empty() {
+                actor.username
+            } else {
+                actor.display_name
+            };
+            let icon = public_base_url
+                .join("avatars/original/missing.png")
+                .map_or_else(|_| String::new(), |url| url.to_string());
+            (title, icon)
+        }
+        (None, Some(actor_id)) => {
+            let actor = roosty_db::find_remote_actor_by_id(db, actor_id)
+                .await?
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("push notification actor is missing".to_owned())
+                })?;
+            let title = if actor.display_name.is_empty() {
+                actor.username
+            } else {
+                actor.display_name
+            };
+            (title, String::new())
+        }
+        _ => {
+            return Err(RoostyError::InvalidInput(
+                "push notification actor is invalid".to_owned(),
+            ));
+        }
+    };
+    let body = match notification_type {
+        LocalNotificationType::Mention => format!("{actor} mentioned you"),
+        LocalNotificationType::Favourite => format!("{actor} favourited your post"),
+        LocalNotificationType::Reblog => format!("{actor} boosted your post"),
+        LocalNotificationType::Follow => format!("{actor} followed you"),
+        LocalNotificationType::FollowRequest => format!("{actor} requested to follow you"),
+        LocalNotificationType::Status => format!("{actor} posted a new status"),
+        LocalNotificationType::Update | LocalNotificationType::QuotedUpdate => {
+            "A related post was edited".to_owned()
+        }
+        LocalNotificationType::Quote => format!("{actor} quoted your post"),
+    };
+    Ok(MastodonPushPayload {
+        access_token,
+        preferred_locale: recipient
+            .default_language
+            .unwrap_or_else(|| "en".to_owned()),
+        notification_id,
+        notification_type,
+        icon,
+        title: actor,
+        body,
+    })
+}
+
 fn notification_params(query: Option<&str>) -> Result<NotificationParams, ()> {
     let Some(query) = query else {
         return Ok(NotificationParams::default());
