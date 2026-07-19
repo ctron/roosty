@@ -97,6 +97,7 @@ pub(crate) struct RemoteAccountResponse {
     locked: bool,
     bot: bool,
     discoverable: Option<bool>,
+    limited: bool,
     group: bool,
     created_at: String,
     note: String,
@@ -290,6 +291,7 @@ pub(crate) fn unresolved_remote_account_response(
         locked: false,
         bot: false,
         discoverable: None,
+        limited: false,
         group: false,
         created_at: crate::statuses::format_timestamp(time::OffsetDateTime::now_utc()),
         note: String::new(),
@@ -321,6 +323,7 @@ fn remote_account_response_from_media(
         locked: false,
         bot: false,
         discoverable: None,
+        limited: actor.limited_at.is_some(),
         group: false,
         created_at: crate::statuses::format_timestamp(
             actor.profile_created_at.unwrap_or(actor.first_seen_at),
@@ -1416,6 +1419,7 @@ mod tests {
             first_seen_at,
             deleted_at: None,
             moved_to_remote_actor_id: None,
+            limited_at: None,
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1469,6 +1473,7 @@ mod tests {
             first_seen_at,
             deleted_at: None,
             moved_to_remote_actor_id: None,
+            limited_at: None,
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -2437,6 +2442,7 @@ mod tests {
                 first_seen_at: time::OffsetDateTime::now_utc(),
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
+                limited_at: None,
             };
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

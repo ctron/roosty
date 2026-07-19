@@ -58,6 +58,20 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "remote_status_edit").await);
     assert!(table_exists(database.connection(), "remote_status_edit_media").await);
     assert!(table_exists(database.connection(), "remote_status_tag").await);
+    assert!(table_exists(database.connection(), "local_notification_policy").await);
+    assert!(table_exists(database.connection(), "local_notification_permission").await);
+    assert!(table_exists(database.connection(), "local_notification_request").await);
+    assert!(column_exists(database.connection(), "local_notification", "filtered").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_notification",
+            "notification_request_id"
+        )
+        .await
+    );
+    assert!(column_exists(database.connection(), "local_account", "limited_at").await);
+    assert!(column_exists(database.connection(), "remote_actor", "limited_at").await);
     assert!(
         column_exists(
             database.connection(),

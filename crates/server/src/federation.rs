@@ -6964,6 +6964,7 @@ mod tests {
             first_seen_at: time::OffsetDateTime::now_utc(),
             deleted_at: None,
             moved_to_remote_actor_id: None,
+            limited_at: None,
         };
         roosty_db::upsert_remote_actor(&state.db, &actor)
             .await
@@ -7090,7 +7091,9 @@ mod tests {
             // Featured-tag refresh tests invoke the worker directly; keeping its large future out
             // of this shared two-instance delivery helper avoids inflating every scenario future.
             roosty_db::JobKind::FederationFeaturedTagsRefresh => {}
-            roosty_db::JobKind::WebPushDelivery => {}
+            roosty_db::JobKind::WebPushDelivery
+            | roosty_db::JobKind::NotificationRequestMerge
+            | roosty_db::JobKind::NotificationRequestCleanup => {}
         }
         assert!(
             roosty_db::mark_job_completed(&state.db, &job)

@@ -13,6 +13,7 @@
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
 - Mastodon-compatible consent-aware quote posts with transactional policy, authorization, listing, revocation, notifications, and FEP-044f delivery.
 - Mastodon-compatible public/unlisted status pins with a five-pin transactional limit, pinned account collections, ActivityPub featured collections, durable Add/Remove delivery, and bounded remote featured caching.
+- Mastodon-compatible notification policies and sender-scoped requests, with durable multi-process merges/cleanup, completion streaming, unread counts, and operator-managed local/remote account limits that leave ActivityPub ingestion intact.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
@@ -72,7 +73,7 @@
 
 - Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: poll and administrative notification events plus notification-policy APIs. Grouped notification presentation and Web Push delivery for currently supported notification types are available.
+- Notifications: poll and administrative notification events remain. Notification-policy/request APIs, grouped presentation, merge completion streaming, and Web Push delivery for currently supported visible notification types are available.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 
@@ -87,6 +88,7 @@
 - [x] Add end-to-end worker tests for permanent-failure classification and expired-claim recovery.
 - [ ] Expand accepted remote follower collections from count-only metadata to paginated remote actor items.
 - [x] Apply bilateral block and local mute policy to remote follow requests and remote notifications.
+- [x] Add Mastodon API v6 notification policies and requests with typed predicate actions, durable merge/cleanup jobs, sender permissions, and multi-process-safe account limiting.
 - [ ] Enrich remote account projections with remote relationship/status counts as those data become available.
 - [x] Add remote public status Create/Update/Delete delivery to accepted remote followers.
 - [x] Add signed inbound public/unlisted remote status caching with Create/Update/Delete handling.

@@ -37,7 +37,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟢 | Domain policy | Remote discovery and delivery use an operator allow/block policy. Configured blocks suspend a domain and its subdomains, including cached exposure, startup relationship reconciliation, and queued-delivery dropping. |
 | 🟢 | SSRF protections | Remote discovery and delivery require HTTPS, reject unsafe resolved addresses, disable redirects, and enforce timeouts and response limits. |
-| 🟡 | Federation moderation | Per-account signed Block/Undo is delivered and accepted with replay-safe identity matching. Configured domain suspension is enforced; reports and administrative moderation APIs remain out of scope. |
+| 🟡 | Federation moderation | Per-account signed Block/Undo is delivered and accepted with replay-safe identity matching. Configured domain suspension is enforced. Operator-managed local and cached-remote account limits suppress discovery/public timelines and participate in notification policy without rejecting ActivityPub activities; reports and administrative moderation APIs remain out of scope. |
 
 ## Mastodon API
 
@@ -67,7 +67,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
 | 🟢 | `GET /api/v1/accounts/search` | Authenticated mixed local/cached-remote account search with deterministic ranking, follow filtering, pagination, and exact-handle resolution. |
 | 🟢 | `GET /api/v1/accounts/lookup` | Public local and cached-remote address lookup; `resolve=true` performs policy-controlled WebFinger resolution. |
-| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, remote status metadata reflects active locally cached posts, and remote avatar/header fields use locally cached proxy URLs when advertised. |
+| 🟢 | Account metadata | Local `created_at`, `statuses_count`, and `last_status_at` are populated; remote `created_at` uses ActivityPub profile `published` with first-seen fallback, remote status metadata reflects active locally cached posts, and remote avatar/header fields use locally cached proxy URLs when advertised. Account projections expose operator-managed `limited` state. |
 | 🔴 | `POST /api/v1/accounts` | Public registration is missing; local users are operator-created with the admin CLI. |
 | 🟢 | `GET /api/v1/accounts/:id` | Public local and active cached-remote account lookup. |
 | 🟢 | Account statuses | `GET /api/v1/accounts/:id/statuses` returns statuses authorized for the viewer, including local or cached-remote `pinned=true` results, with cursor pagination, `Link` headers, media/reply/tag filters, and viewer state. |
@@ -113,8 +113,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟡 | `GET /api/v1/timelines/home` | Authenticated user's own statuses, followed and explicitly addressed local/cached-remote follower-only statuses, public/unlisted followed statuses, local boosts, and inbound remote boosts. |
-| 🟢 | `GET /api/v1/timelines/public` | Chronological local and already-cached remote public statuses with `local`, `remote`, `only_media`, cursor pagination, `Link` headers, federation-domain policy, and authenticated mute/block filtering. Replies and boosts are excluded to match Mastodon's live feeds. |
-| 🟢 | `GET /api/v1/timelines/tag/:tag` | Mixed local and cached-remote public hashtag timeline with `local`, `remote`, `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, `Link` headers, domain policy, and viewer moderation filtering. |
+| 🟢 | `GET /api/v1/timelines/public` | Chronological local and already-cached remote public statuses with `local`, `remote`, `only_media`, cursor pagination, `Link` headers, federation-domain and account-limit policy, and authenticated mute/block filtering. Replies and boosts are excluded to match Mastodon's live feeds. |
+| 🟢 | `GET /api/v1/timelines/tag/:tag` | Mixed local and cached-remote public hashtag timeline with `local`, `remote`, `any[]`, `all[]`, `none[]`, `only_media`, cursor pagination, `Link` headers, domain/account-limit policy, and viewer moderation filtering. |
 | 🟢 | `GET /api/v1/timelines/list/:list_id` | Authenticated mixed local/cached-remote list timelines honor ownership, reply policy, moderation, boosts, cursor pagination, and `Link` headers. |
 | 🟢 | Cursor pagination | `max_id`, `since_id`, `min_id`, and `Link` headers are supported for implemented timeline and collection endpoints. |
 
@@ -122,10 +122,11 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟡 | `GET /api/v1/notifications` | Local `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, and boosted-status `update` notifications with cursor pagination and basic filters. |
-| 🟡 | `/api/v2/notifications` | Lists Mastodon-compatible grouped notifications with cursor pagination, full or partial-avatar account expansion, group detail and account resources, group dismissal, and marker-based unread counts. `favourite`, `follow`, and `reblog` events use concurrency-safe rolling 12-hour groups; other supported types remain individual groups. Notification policies and fallback projections are not implemented yet. |
+| 🟡 | `GET /api/v1/notifications` | Local and remote `mention`/`quote`, `favourite`, `reblog`, `follow`, followed-account `status`, and boosted-status `update` notifications with cursor pagination, basic filters, `include_filtered`, and a marker-based `/unread_count`. Poll and administrative types remain missing. |
+| 🟢 | Notification policies and requests | Mastodon API v6 policy GET/PATCH, summary, cursor-paginated request list/detail, single/batch accept/dismiss, and merge-state polling are implemented. The five Mastodon predicates use typed `accept`/`filter`/`drop` actions; accepted requests create sender permissions and merge through retryable database jobs. Filtered notifications do not produce push or streaming notification events. |
+| 🟡 | `/api/v2/notifications` | Lists Mastodon-compatible grouped notifications with cursor pagination, full or partial-avatar account expansion, group detail and account resources, group dismissal, and marker-based unread counts. `favourite`, `follow`, and `reblog` events use concurrency-safe rolling 12-hour groups; other supported types remain individual groups. Filtered rows are hidden unless explicitly requested. |
 | 🟢 | `GET/POST /api/v1/markers` | Persists local home and notification read positions. |
-| 🟡 | Persisted notifications | Local and signed-remote `mention`, `favourite`, `reblog`, `follow`, followed-account `status`, boosted-status `update`, and locked-account `follow_request` notifications are stored transactionally and can be dismissed or cleared. Group identities are persisted and shared safely by multiple Roosty processes; Mastodon notification-policy APIs remain missing. Web Push delivery policies are implemented separately. |
+| 🟢 | Persisted notifications | Local and signed-remote supported notifications are stored transactionally and can be dismissed or cleared. Policy-filtered mention/quote rows are sender-grouped, invisible to normal collections, push, and notification streams until a durable accepted-request merge completes; dismiss cleanup and merge work coordinate safely across Roosty processes. Web Push delivery policies remain separate. |
 | 🟡 | Notification read state | Local home and notification markers drive v1 markers and v2 grouped unread counts; remote notification state is missing. |
 
 ### Tags, Push, and Media
@@ -181,6 +182,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 - [ ] Expand conversation support beyond local direct messages.
 - [x] Add cache-only remote hashtag indexing, timelines, discovery, history, and followed-tag fan-out.
 - [x] Add grouped notification listing, detail, account expansion, dismissal, and unread counts; Web Push remains event-based and independent.
+- [x] Add Mastodon notification policies, sender-scoped requests, durable accept/dismiss processing, and merge completion streaming.
 - [ ] Add poll and administrative notifications, including their Web Push alert switches.
 - [x] Support multiple Roosty processes with PostgreSQL-backed streaming fan-out and cross-process coordination.
 - [ ] Add video/audio media handling, async processing, and object storage.

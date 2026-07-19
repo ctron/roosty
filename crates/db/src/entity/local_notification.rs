@@ -17,6 +17,8 @@ pub struct Model {
     pub status_id: Option<Uuid>,
     pub remote_status_id: Option<Uuid>,
     pub group_id: Option<Uuid>,
+    pub filtered: bool,
+    pub notification_request_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
     pub dismissed_at: Option<OffsetDateTime>,
 }
@@ -86,7 +88,7 @@ impl ActiveModelBehavior for ActiveModel {
     where
         C: ConnectionTrait,
     {
-        if insert {
+        if insert && !model.filtered {
             let subscriptions = super::push_subscription::Entity::find()
                 .filter(super::push_subscription::Column::AccountId.eq(model.account_id))
                 .all(db)

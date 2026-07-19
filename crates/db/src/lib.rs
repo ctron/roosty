@@ -51,6 +51,41 @@ pub enum StatusVisibility {
     Direct,
 }
 
+/// Action applied when a Mastodon notification-policy predicate matches.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    DeriveValueType,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationPolicyAction {
+    Accept,
+    Filter,
+    Drop,
+}
+
+/// Lifecycle state of a sender-scoped filtered-notification request.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum NotificationRequestState {
+    Pending,
+    Merging,
+    Dismissed,
+}
+
 /// Closed event names persisted in the cross-process streaming log.
 #[derive(
     Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
@@ -63,6 +98,7 @@ pub enum StreamingEventKind {
     Notification,
     Conversation,
     Delete,
+    NotificationsMerged,
 }
 
 /// Origin of a status-like event used for public stream routing.
@@ -123,6 +159,7 @@ use entity::{
     local_conversation, local_conversation_account, local_conversation_remote_participant,
     local_featured_tag, local_follow, local_list, local_list_local_member,
     local_list_remote_member, local_media_attachment, local_notification,
+    local_notification_permission, local_notification_policy, local_notification_request,
     local_remote_account_block, local_remote_account_mute, local_remote_status_favourite,
     local_remote_status_reblog, local_status, local_status_bookmark, local_status_edit,
     local_status_edit_media, local_status_favourite, local_status_local_mention,
@@ -761,6 +798,8 @@ pub struct LocalAccount {
     pub avatar_file_path: Option<String>,
     /// Optional local header image path relative to the media root.
     pub header_file_path: Option<String>,
+    /// When an operator limited this account locally.
+    pub limited_at: Option<OffsetDateTime>,
     /// Timestamp when the local account was created.
     pub created_at: OffsetDateTime,
 }
@@ -817,6 +856,8 @@ pub struct RemoteActor {
     pub deleted_at: Option<OffsetDateTime>,
     /// Verified replacement actor declared through a signed Move activity.
     pub moved_to_remote_actor_id: Option<AccountId>,
+    /// When an operator limited this cached actor locally.
+    pub limited_at: Option<OffsetDateTime>,
 }
 
 /// One account returned by the unified Mastodon account search.
@@ -3177,10 +3218,67 @@ pub struct LocalNotification {
     pub remote_status_id: Option<StatusId>,
     /// Persisted rolling group identity for groupable notification types.
     pub group_id: Option<Uuid>,
+    /// Whether the recipient's policy hid this notification.
+    pub filtered: bool,
+    /// Sender-scoped request collecting this filtered notification.
+    pub notification_request_id: Option<Uuid>,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Soft-dismiss timestamp.
     pub dismissed_at: Option<OffsetDateTime>,
+}
+
+/// Persisted Mastodon notification policy for one local account.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct NotificationPolicy {
+    pub for_not_following: NotificationPolicyAction,
+    pub for_not_followers: NotificationPolicyAction,
+    pub for_new_accounts: NotificationPolicyAction,
+    pub for_private_mentions: NotificationPolicyAction,
+    pub for_limited_accounts: NotificationPolicyAction,
+}
+
+/// Partial policy update accepted by Mastodon's PATCH endpoint.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NotificationPolicyUpdate {
+    pub for_not_following: Option<NotificationPolicyAction>,
+    pub for_not_followers: Option<NotificationPolicyAction>,
+    pub for_new_accounts: Option<NotificationPolicyAction>,
+    pub for_private_mentions: Option<NotificationPolicyAction>,
+    pub for_limited_accounts: Option<NotificationPolicyAction>,
+}
+
+/// Local or cached-remote sender of a notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotificationActor {
+    Local(AccountId),
+    Remote(AccountId),
+}
+
+/// One sender-scoped request returned by the Mastodon notification API.
+#[derive(Clone, Debug)]
+pub struct NotificationRequest {
+    pub id: Uuid,
+    pub account_id: AccountId,
+    pub actor: NotificationActor,
+    pub last_status_id: Option<StatusId>,
+    pub last_remote_status_id: Option<StatusId>,
+    pub notifications_count: u64,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(FromQueryResult)]
+struct NotificationRequestRow {
+    id: Uuid,
+    account_id: Uuid,
+    actor_account_id: Option<Uuid>,
+    remote_actor_id: Option<Uuid>,
+    last_status_id: Option<Uuid>,
+    last_remote_status_id: Option<Uuid>,
+    notifications_count: i64,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 impl LocalNotification {
@@ -3234,6 +3332,8 @@ pub enum JobKind {
     FederationFeaturedRefresh,
     FederationFeaturedTagsRefresh,
     WebPushDelivery,
+    NotificationRequestMerge,
+    NotificationRequestCleanup,
 }
 
 impl JobKind {
@@ -3655,6 +3755,18 @@ pub async fn notify_remote_actor_follow(
     {
         return Ok(None);
     }
+    let action =
+        remote_notification_policy_action(db, account_id, remote_actor_id, notification_type, None)
+            .await?;
+    if action == NotificationPolicyAction::Drop {
+        return Ok(None);
+    }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        active_notification_request_id(db, account_id, NotificationActor::Remote(remote_actor_id))
+            .await?
+    } else {
+        None
+    };
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -3664,6 +3776,8 @@ pub async fn notify_remote_actor_follow(
         status_id: Set(None),
         remote_status_id: Set(None),
         group_id: Set(None),
+        filtered: Set(action == NotificationPolicyAction::Filter),
+        notification_request_id: Set(request_id),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3678,7 +3792,7 @@ pub async fn notify_remote_actor_favourite<C>(
     account_id: AccountId,
     remote_actor_id: AccountId,
     status_id: StatusId,
-) -> Result<LocalNotification>
+) -> Result<Option<LocalNotification>>
 where
     C: ConnectionTrait,
 {
@@ -3690,8 +3804,28 @@ where
         .one(db)
         .await?
     {
-        return Ok(local_notification_from_model(existing));
+        return Ok(Some(local_notification_from_model(existing)));
     }
+    if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
+        return Ok(None);
+    }
+    let action = remote_notification_policy_action(
+        db,
+        account_id,
+        remote_actor_id,
+        LocalNotificationType::Favourite,
+        None,
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
+        return Ok(None);
+    }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        active_notification_request_id(db, account_id, NotificationActor::Remote(remote_actor_id))
+            .await?
+    } else {
+        None
+    };
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -3701,12 +3835,14 @@ where
         status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
         group_id: Set(None),
+        filtered: Set(action == NotificationPolicyAction::Filter),
+        notification_request_id: Set(request_id),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
     .insert(db)
     .await?;
-    Ok(local_notification_from_model(model))
+    Ok(Some(local_notification_from_model(model)))
 }
 
 /// Create an idempotent boost notification caused by a remote actor.
@@ -3730,6 +3866,23 @@ pub async fn notify_remote_actor_reblog(
     {
         return Ok(None);
     }
+    let action = remote_notification_policy_action(
+        db,
+        account_id,
+        remote_actor_id,
+        LocalNotificationType::Reblog,
+        None,
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
+        return Ok(None);
+    }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        active_notification_request_id(db, account_id, NotificationActor::Remote(remote_actor_id))
+            .await?
+    } else {
+        None
+    };
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -3739,6 +3892,8 @@ pub async fn notify_remote_actor_reblog(
         status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
         group_id: Set(None),
+        filtered: Set(action == NotificationPolicyAction::Filter),
+        notification_request_id: Set(request_id),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3760,17 +3915,40 @@ where
     if !remote_account_allows_notification(db, account_id, remote_actor_id).await? {
         return Ok(None);
     }
-    if local_notification::Entity::find()
+    if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Mention))
         .filter(local_notification::Column::RemoteActorId.eq(Some(remote_actor_id.0)))
         .filter(local_notification::Column::RemoteStatusId.eq(Some(remote_status_id.0)))
         .one(db)
         .await?
-        .is_some()
     {
+        return Ok((!existing.filtered).then(|| local_notification_from_model(existing)));
+    }
+    let action = remote_notification_policy_action(
+        db,
+        account_id,
+        remote_actor_id,
+        LocalNotificationType::Mention,
+        Some(remote_status_id),
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
         return Ok(None);
     }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        Some(
+            upsert_notification_request(
+                db,
+                account_id,
+                NotificationActor::Remote(remote_actor_id),
+                remote_status_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -3780,12 +3958,16 @@ where
         status_id: Set(None),
         remote_status_id: Set(Some(remote_status_id.0)),
         group_id: Set(None),
+        filtered: Set(request_id.is_some()),
+        notification_request_id: Set(request_id),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
     .insert(db)
     .await?;
-    Ok(Some(local_notification_from_model(model)))
+    Ok(request_id
+        .is_none()
+        .then(|| local_notification_from_model(model)))
 }
 
 /// Replace Mastodon `update` notifications for local accounts that boosted a local status.
@@ -3821,6 +4003,8 @@ pub async fn replace_local_status_update_notifications(
             status_id: Set(Some(status_id.0)),
             remote_status_id: Set(None),
             group_id: Set(None),
+            filtered: Set(false),
+            notification_request_id: Set(None),
             created_at: Set(OffsetDateTime::now_utc()),
             dismissed_at: Set(None),
         }
@@ -3862,6 +4046,8 @@ pub async fn replace_remote_status_update_notifications(
             status_id: Set(None),
             remote_status_id: Set(Some(status_id.0)),
             group_id: Set(None),
+            filtered: Set(false),
+            notification_request_id: Set(None),
             created_at: Set(OffsetDateTime::now_utc()),
             dismissed_at: Set(None),
         }
@@ -3905,6 +4091,8 @@ where
         status_id: Set(None),
         remote_status_id: Set(Some(remote_status_id.0)),
         group_id: Set(None),
+        filtered: Set(false),
+        notification_request_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -3958,6 +4146,8 @@ pub struct NotificationFilter {
     pub exclude_types: Vec<LocalNotificationType>,
     /// Only include notifications caused by this account.
     pub account_id: Option<AccountId>,
+    /// Include notifications held in notification requests.
+    pub include_filtered: bool,
 }
 
 /// One Mastodon-compatible grouped notification projection.
@@ -4236,6 +4426,54 @@ pub async fn find_local_account_by_username(
     account.map(local_account_from_model).transpose()
 }
 
+/// Set or clear the notification/discovery limit on a local account.
+pub async fn set_local_account_limited(
+    db: &DbConnection,
+    username: &str,
+    limited: bool,
+) -> Result<Option<LocalAccount>> {
+    let txn = db.begin().await?;
+    let Some(account) = local_account::Entity::find()
+        .filter(local_account::Column::Username.eq(username))
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+    else {
+        txn.commit().await?;
+        return Ok(None);
+    };
+    let mut active = account.into_active_model();
+    active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
+    let account = local_account_from_model(active.update(&txn).await?)?;
+    txn.commit().await?;
+    Ok(Some(account))
+}
+
+/// Set or clear the notification/discovery limit on a cached remote actor.
+pub async fn set_remote_actor_limited(
+    db: &DbConnection,
+    username: &str,
+    domain: &str,
+    limited: bool,
+) -> Result<Option<RemoteActor>> {
+    let txn = db.begin().await?;
+    let Some(actor) = remote_actor::Entity::find()
+        .filter(remote_actor::Column::Username.eq(username))
+        .filter(remote_actor::Column::Domain.eq(domain))
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+    else {
+        txn.commit().await?;
+        return Ok(None);
+    };
+    let mut active = actor.into_active_model();
+    active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
+    let actor = remote_actor_from_model(active.update(&txn).await?);
+    txn.commit().await?;
+    Ok(Some(actor))
+}
+
 /// Search local accounts by username or display name for Mastodon autocomplete.
 pub async fn search_local_accounts(
     db: &DbConnection,
@@ -4249,11 +4487,13 @@ pub async fn search_local_accounts(
     }
 
     let hidden_account_ids = blocked_local_account_ids_for_account(db, viewer_account_id).await?;
-    let mut accounts = local_account::Entity::find().filter(
-        local_account::Column::Username
-            .contains(query)
-            .or(local_account::Column::DisplayName.contains(query)),
-    );
+    let mut accounts = local_account::Entity::find()
+        .filter(local_account::Column::LimitedAt.is_null())
+        .filter(
+            local_account::Column::Username
+                .contains(query)
+                .or(local_account::Column::DisplayName.contains(query)),
+        );
     if !hidden_account_ids.is_empty() {
         accounts = accounts.filter(
             local_account::Column::Id.is_not_in(hidden_account_ids.into_iter().map(|id| id.0)),
@@ -4292,7 +4532,8 @@ pub async fn search_accounts(
                              AND follow.followed_account_id = account.id
                        ) AS followed
                 FROM local_account account
-                WHERE NOT EXISTS (
+                WHERE account.limited_at IS NULL
+                  AND NOT EXISTS (
                     SELECT 1 FROM local_account_block block
                     WHERE block.account_id = $1 AND block.target_account_id = account.id
                 )
@@ -4309,6 +4550,7 @@ pub async fn search_accounts(
                        ) AS followed
                 FROM remote_actor actor
                 WHERE $4
+                  AND actor.limited_at IS NULL
                   AND ($8 OR actor.domain IN (
                     SELECT jsonb_array_elements_text($9::jsonb)
                   ))
@@ -5455,6 +5697,8 @@ pub async fn notify_local_account(
         status_id: Set(status_uuid),
         remote_status_id: Set(None),
         group_id: Set(None),
+        filtered: Set(false),
+        notification_request_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5462,6 +5706,534 @@ pub async fn notify_local_account(
     .await?;
 
     Ok(local_notification_from_model(model))
+}
+
+/// Create a local notification while applying Mastodon's filterable-type policy.
+pub async fn notify_local_account_with_policy(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    notification_type: LocalNotificationType,
+    actor_account_id: AccountId,
+    status_id: Option<StatusId>,
+) -> Result<Option<LocalNotification>> {
+    if account_id == actor_account_id
+        || !local_account_allows_notification(db, account_id, actor_account_id).await?
+    {
+        return Ok(None);
+    }
+    let filterable = matches!(
+        notification_type,
+        LocalNotificationType::Mention
+            | LocalNotificationType::Reblog
+            | LocalNotificationType::Follow
+            | LocalNotificationType::FollowRequest
+            | LocalNotificationType::Favourite
+            | LocalNotificationType::Quote
+    );
+    if !filterable {
+        return notify_local_account(
+            db,
+            account_id,
+            notification_type,
+            actor_account_id,
+            status_id,
+        )
+        .await
+        .map(Some);
+    }
+    let status_uuid = status_id.map(|id| id.0);
+    if let Some(existing) = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq(notification_type))
+        .filter(local_notification::Column::ActorAccountId.eq(actor_account_id.0))
+        .filter(match status_uuid {
+            Some(status_id) => local_notification::Column::StatusId.eq(status_id),
+            None => local_notification::Column::StatusId.is_null(),
+        })
+        .one(db)
+        .await?
+    {
+        return Ok(Some(local_notification_from_model(existing)));
+    }
+    let action = local_notification_policy_action(
+        db,
+        account_id,
+        actor_account_id,
+        notification_type,
+        status_id,
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
+        return Ok(None);
+    }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        if matches!(
+            notification_type,
+            LocalNotificationType::Mention | LocalNotificationType::Quote
+        ) && let Some(status_id) = status_id
+        {
+            Some(
+                upsert_notification_request(
+                    db,
+                    account_id,
+                    NotificationActor::Local(actor_account_id),
+                    status_id,
+                )
+                .await?,
+            )
+        } else {
+            active_notification_request_id(
+                db,
+                account_id,
+                NotificationActor::Local(actor_account_id),
+            )
+            .await?
+        }
+    } else {
+        None
+    };
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set(notification_type),
+        actor_account_id: Set(Some(actor_account_id.0)),
+        remote_actor_id: Set(None),
+        status_id: Set(status_uuid),
+        remote_status_id: Set(None),
+        group_id: Set(None),
+        filtered: Set(action == NotificationPolicyAction::Filter),
+        notification_request_id: Set(request_id),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(Some(local_notification_from_model(model)))
+}
+
+/// Load the recipient's notification policy, creating the Mastodon defaults when necessary.
+pub async fn notification_policy(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<NotificationPolicy> {
+    let policy = if let Some(policy) = local_notification_policy::Entity::find_by_id(account_id.0)
+        .one(db)
+        .await?
+    {
+        policy
+    } else {
+        local_notification_policy::ActiveModel {
+            account_id: Set(account_id.0),
+            for_not_following: Set(NotificationPolicyAction::Accept),
+            for_not_followers: Set(NotificationPolicyAction::Accept),
+            for_new_accounts: Set(NotificationPolicyAction::Accept),
+            for_private_mentions: Set(NotificationPolicyAction::Filter),
+            for_limited_accounts: Set(NotificationPolicyAction::Filter),
+            updated_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await?
+    };
+    Ok(notification_policy_from_model(policy))
+}
+
+/// Apply a partial Mastodon notification-policy update.
+pub async fn update_notification_policy(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    update: NotificationPolicyUpdate,
+) -> Result<NotificationPolicy> {
+    let policy = local_notification_policy::Entity::find_by_id(account_id.0)
+        .one(db)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("notification policy does not exist".to_owned())
+        })?;
+    let mut active = policy.into_active_model();
+    if let Some(value) = update.for_not_following {
+        active.for_not_following = Set(value);
+    }
+    if let Some(value) = update.for_not_followers {
+        active.for_not_followers = Set(value);
+    }
+    if let Some(value) = update.for_new_accounts {
+        active.for_new_accounts = Set(value);
+    }
+    if let Some(value) = update.for_private_mentions {
+        active.for_private_mentions = Set(value);
+    }
+    if let Some(value) = update.for_limited_accounts {
+        active.for_limited_accounts = Set(value);
+    }
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    Ok(notification_policy_from_model(active.update(db).await?))
+}
+
+fn strongest_notification_policy_action(
+    actions: impl IntoIterator<Item = NotificationPolicyAction>,
+) -> NotificationPolicyAction {
+    actions
+        .into_iter()
+        .max_by_key(|action| match action {
+            NotificationPolicyAction::Accept => 0,
+            NotificationPolicyAction::Filter => 1,
+            NotificationPolicyAction::Drop => 2,
+        })
+        .unwrap_or(NotificationPolicyAction::Accept)
+}
+
+/// Check up to 100 mixed local/remote ancestors for a private mention initiated by the recipient.
+async fn recipient_started_private_thread(
+    db: &impl ConnectionTrait,
+    recipient: AccountId,
+    actor: NotificationActor,
+    local_parent_id: Option<Uuid>,
+    remote_parent_id: Option<Uuid>,
+) -> Result<bool> {
+    if local_parent_id.is_none() && remote_parent_id.is_none() {
+        return Ok(false);
+    }
+    let (local_actor_id, remote_actor_id) = match actor {
+        NotificationActor::Local(id) => (Some(id.0), None),
+        NotificationActor::Remote(id) => (None, Some(id.0)),
+    };
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            WITH RECURSIVE ancestors(local_id, remote_id, depth, path) AS (
+                SELECT $1::uuid, $2::uuid, 0,
+                    ARRAY[COALESCE('l:' || $1::text, 'r:' || $2::text)]::text[]
+                UNION ALL
+                SELECT next.local_id, next.remote_id, ancestors.depth + 1,
+                    ancestors.path || next.key
+                FROM ancestors
+                CROSS JOIN LATERAL (
+                    SELECT status.in_reply_to_id AS local_id,
+                           status.in_reply_to_remote_status_id AS remote_id,
+                           COALESCE('l:' || status.in_reply_to_id::text,
+                                    'r:' || status.in_reply_to_remote_status_id::text) AS key
+                    FROM local_status status WHERE status.id = ancestors.local_id
+                    UNION ALL
+                    SELECT status.in_reply_to_local_status_id,
+                           status.in_reply_to_remote_status_id,
+                           COALESCE('l:' || status.in_reply_to_local_status_id::text,
+                                    'r:' || status.in_reply_to_remote_status_id::text)
+                    FROM remote_status status WHERE status.id = ancestors.remote_id
+                ) next
+                WHERE ancestors.depth < 100
+                  AND next.key IS NOT NULL
+                  AND NOT next.key = ANY(ancestors.path)
+            )
+            SELECT EXISTS (
+                SELECT 1 FROM ancestors
+                JOIN local_status status ON status.id = ancestors.local_id
+                WHERE status.account_id = $3
+                  AND status.visibility = 'direct'
+                  AND (($4::uuid IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM local_status_local_mention mention
+                        WHERE mention.status_id = status.id AND mention.account_id = $4
+                      )) OR ($5::uuid IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM local_status_remote_mention mention
+                        WHERE mention.status_id = status.id AND mention.remote_actor_id = $5
+                      )))
+            ) AS trusted
+            "#,
+            vec![
+                local_parent_id.into(),
+                remote_parent_id.into(),
+                recipient.0.into(),
+                local_actor_id.into(),
+                remote_actor_id.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("private notification policy result is missing".to_owned())
+        })?;
+    Ok(row.try_get("", "trusted")?)
+}
+
+async fn local_notification_policy_action(
+    db: &impl ConnectionTrait,
+    recipient: AccountId,
+    actor: AccountId,
+    notification_type: LocalNotificationType,
+    status_id: Option<StatusId>,
+) -> Result<NotificationPolicyAction> {
+    if local_notification_permission::Entity::find()
+        .filter(local_notification_permission::Column::AccountId.eq(recipient.0))
+        .filter(local_notification_permission::Column::ActorAccountId.eq(actor.0))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(NotificationPolicyAction::Accept);
+    }
+    let policy = notification_policy(db, recipient).await?;
+    let recipient_follows_actor = local_follow::Entity::find_by_id((recipient.0, actor.0))
+        .one(db)
+        .await?
+        .is_some();
+    let actor_follow = local_follow::Entity::find_by_id((actor.0, recipient.0))
+        .one(db)
+        .await?;
+    let actor_model = local_account::Entity::find_by_id(actor.0)
+        .one(db)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("notification actor does not exist".to_owned()))?;
+    let status = if let Some(status_id) = status_id {
+        Some(
+            local_status::Entity::find_by_id(status_id.0)
+                .one(db)
+                .await?
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("notification status does not exist".to_owned())
+                })?,
+        )
+    } else {
+        None
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut actions = Vec::new();
+    if !recipient_follows_actor {
+        actions.push(policy.for_not_following);
+    }
+    if actor_follow.is_none() {
+        actions.push(policy.for_not_followers);
+    }
+    if !recipient_follows_actor {
+        if actor_model.created_at > now - Duration::days(30) {
+            actions.push(policy.for_new_accounts);
+        }
+        let user_initiated_private_thread = if status
+            .as_ref()
+            .is_some_and(|status| status.visibility == StatusVisibility::Direct)
+        {
+            let status = status.as_ref().ok_or_else(|| {
+                RoostyError::InvalidInput("notification status does not exist".to_owned())
+            })?;
+            recipient_started_private_thread(
+                db,
+                recipient,
+                NotificationActor::Local(actor),
+                status.in_reply_to_id,
+                status.in_reply_to_remote_status_id,
+            )
+            .await?
+        } else {
+            false
+        };
+        if notification_type == LocalNotificationType::Mention
+            && status
+                .as_ref()
+                .is_some_and(|status| status.visibility == StatusVisibility::Direct)
+            && !user_initiated_private_thread
+        {
+            actions.push(policy.for_private_mentions);
+        }
+        if actor_model.limited_at.is_some() {
+            actions.push(policy.for_limited_accounts);
+        }
+    }
+    // Mastodon only trusts an inbound follow after three days for the follower predicate.
+    if actor_follow.is_some_and(|follow| follow.created_at > now - Duration::days(3)) {
+        actions.push(policy.for_not_followers);
+    }
+    Ok(strongest_notification_policy_action(actions))
+}
+
+async fn remote_notification_policy_action<C>(
+    db: &C,
+    recipient: AccountId,
+    actor: AccountId,
+    notification_type: LocalNotificationType,
+    status_id: Option<StatusId>,
+) -> Result<NotificationPolicyAction>
+where
+    C: ConnectionTrait,
+{
+    if local_notification_permission::Entity::find()
+        .filter(local_notification_permission::Column::AccountId.eq(recipient.0))
+        .filter(local_notification_permission::Column::RemoteActorId.eq(actor.0))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(NotificationPolicyAction::Accept);
+    }
+    let policy = notification_policy(db, recipient).await?;
+    let recipient_follows_actor = remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(recipient.0))
+        .filter(remote_following::Column::RemoteActorId.eq(actor.0))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .one(db)
+        .await?
+        .is_some();
+    let actor_follow = remote_follow::Entity::find()
+        .filter(remote_follow::Column::RemoteActorId.eq(actor.0))
+        .filter(remote_follow::Column::LocalAccountId.eq(recipient.0))
+        .filter(remote_follow::Column::State.eq(RemoteFollowState::Accepted))
+        .one(db)
+        .await?;
+    let actor_model = remote_actor::Entity::find_by_id(actor.0)
+        .one(db)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("remote notification actor does not exist".to_owned())
+        })?;
+    let status = if let Some(status_id) = status_id {
+        Some(
+            remote_status::Entity::find_by_id(status_id.0)
+                .one(db)
+                .await?
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput(
+                        "remote notification status does not exist".to_owned(),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut actions = Vec::new();
+    if !recipient_follows_actor {
+        actions.push(policy.for_not_following);
+    }
+    if actor_follow.is_none()
+        || actor_follow
+            .as_ref()
+            .is_some_and(|follow| follow.created_at > now - Duration::days(3))
+    {
+        actions.push(policy.for_not_followers);
+    }
+    if !recipient_follows_actor {
+        if actor_model
+            .profile_created_at
+            .unwrap_or(actor_model.created_at)
+            > now - Duration::days(30)
+        {
+            actions.push(policy.for_new_accounts);
+        }
+        let user_initiated_private_thread = if status
+            .as_ref()
+            .is_some_and(|status| status.visibility == StatusVisibility::Direct)
+        {
+            let status = status.as_ref().ok_or_else(|| {
+                RoostyError::InvalidInput("remote notification status does not exist".to_owned())
+            })?;
+            recipient_started_private_thread(
+                db,
+                recipient,
+                NotificationActor::Remote(actor),
+                status.in_reply_to_local_status_id,
+                status.in_reply_to_remote_status_id,
+            )
+            .await?
+        } else {
+            false
+        };
+        if notification_type == LocalNotificationType::Mention
+            && status
+                .as_ref()
+                .is_some_and(|status| status.visibility == StatusVisibility::Direct)
+            && !user_initiated_private_thread
+        {
+            actions.push(policy.for_private_mentions);
+        }
+        if actor_model.limited_at.is_some() {
+            actions.push(policy.for_limited_accounts);
+        }
+    }
+    Ok(strongest_notification_policy_action(actions))
+}
+
+async fn upsert_notification_request(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    actor: NotificationActor,
+    status_id: StatusId,
+) -> Result<Uuid> {
+    let (actor_account_id, remote_actor_id, last_status_id, last_remote_status_id) = match actor {
+        NotificationActor::Local(actor_id) => (Some(actor_id.0), None, Some(status_id.0), None),
+        NotificationActor::Remote(actor_id) => (None, Some(actor_id.0), None, Some(status_id.0)),
+    };
+    let conflict_target = if actor_account_id.is_some() {
+        "(account_id, actor_account_id) WHERE actor_account_id IS NOT NULL AND state IN ('pending', 'merging')"
+    } else {
+        "(account_id, remote_actor_id) WHERE remote_actor_id IS NOT NULL AND state IN ('pending', 'merging')"
+    };
+    let sql = format!(
+        "INSERT INTO local_notification_request
+            (id, account_id, actor_account_id, remote_actor_id, last_status_id,
+             last_remote_status_id, state, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', now(), now())
+         ON CONFLICT {conflict_target} DO UPDATE SET
+            last_status_id = EXCLUDED.last_status_id,
+            last_remote_status_id = EXCLUDED.last_remote_status_id,
+            updated_at = now()
+         RETURNING id"
+    );
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                Uuid::now_v7().into(),
+                account_id.0.into(),
+                actor_account_id.into(),
+                remote_actor_id.into(),
+                last_status_id.into(),
+                last_remote_status_id.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("notification request could not be saved".to_owned())
+        })?;
+    let request_id: Uuid = row.try_get("", "id")?;
+    let mut notifications = local_notification::Entity::update_many()
+        .col_expr(
+            local_notification::Column::NotificationRequestId,
+            Expr::value(Some(request_id)),
+        )
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::Filtered.eq(true))
+        .filter(local_notification::Column::NotificationRequestId.is_null());
+    notifications = match actor {
+        NotificationActor::Local(actor_id) => {
+            notifications.filter(local_notification::Column::ActorAccountId.eq(actor_id.0))
+        }
+        NotificationActor::Remote(actor_id) => {
+            notifications.filter(local_notification::Column::RemoteActorId.eq(actor_id.0))
+        }
+    };
+    notifications.exec(db).await?;
+    Ok(request_id)
+}
+
+async fn active_notification_request_id(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    actor: NotificationActor,
+) -> Result<Option<Uuid>> {
+    let mut query = local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.is_in([
+            NotificationRequestState::Pending,
+            NotificationRequestState::Merging,
+        ]));
+    query = match actor {
+        NotificationActor::Local(actor_id) => {
+            query.filter(local_notification_request::Column::ActorAccountId.eq(actor_id.0))
+        }
+        NotificationActor::Remote(actor_id) => {
+            query.filter(local_notification_request::Column::RemoteActorId.eq(actor_id.0))
+        }
+    };
+    Ok(query.one(db).await?.map(|request| request.id))
 }
 
 /// Create a local mention notification only when the logical event is new.
@@ -5476,17 +6248,40 @@ pub async fn notify_local_status_mention(
     {
         return Ok(None);
     }
-    if local_notification::Entity::find()
+    if let Some(existing) = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Mention))
         .filter(local_notification::Column::ActorAccountId.eq(Some(actor_account_id.0)))
         .filter(local_notification::Column::StatusId.eq(status_id.0))
         .one(db)
         .await?
-        .is_some()
     {
+        return Ok((!existing.filtered).then(|| local_notification_from_model(existing)));
+    }
+    let action = local_notification_policy_action(
+        db,
+        account_id,
+        actor_account_id,
+        LocalNotificationType::Mention,
+        Some(status_id),
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
         return Ok(None);
     }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        Some(
+            upsert_notification_request(
+                db,
+                account_id,
+                NotificationActor::Local(actor_account_id),
+                status_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -5496,12 +6291,16 @@ pub async fn notify_local_status_mention(
         status_id: Set(Some(status_id.0)),
         remote_status_id: Set(None),
         group_id: Set(None),
+        filtered: Set(request_id.is_some()),
+        notification_request_id: Set(request_id),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
     .insert(db)
     .await?;
-    Ok(Some(local_notification_from_model(model)))
+    Ok(request_id
+        .is_none()
+        .then(|| local_notification_from_model(model)))
 }
 
 /// List visible local notifications for one recipient with Mastodon cursor filters.
@@ -5518,6 +6317,10 @@ pub async fn local_notifications_for_account(
         .apply_collection_cursor(cursor)
         .order_by_desc(local_notification::Column::Id)
         .limit(page_query_limit(limit));
+
+    if !filter.include_filtered {
+        query = query.filter(local_notification::Column::Filtered.eq(false));
+    }
 
     let hidden_remote_ids = hidden_remote_actor_ids_for_account(db, account_id).await?;
     if !hidden_remote_ids.is_empty() {
@@ -5603,6 +6406,9 @@ pub async fn notification_groups_for_account(
         format!("account_id = '{}'::uuid", account_id.0),
         "dismissed_at IS NULL".to_owned(),
     ];
+    if !filter.include_filtered {
+        conditions.push("filtered = false".to_owned());
+    }
     if !filter.include_types.is_empty() {
         conditions.push(format!(
             "notification_type IN ({})",
@@ -5779,7 +6585,8 @@ where
     };
     let mut query = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
-        .filter(local_notification::Column::DismissedAt.is_null());
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .filter(local_notification::Column::Filtered.eq(false));
     query = match kind {
         Some(kind) => query
             .filter(local_notification::Column::NotificationType.eq(kind))
@@ -5839,6 +6646,7 @@ pub async fn find_local_notification_for_account(
     let notification = local_notification::Entity::find_by_id(notification_id)
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::DismissedAt.is_null())
+        .filter(local_notification::Column::Filtered.eq(false))
         .one(db)
         .await?;
 
@@ -5854,6 +6662,7 @@ pub async fn dismiss_local_notification(
     let Some(model) = local_notification::Entity::find_by_id(notification_id)
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::DismissedAt.is_null())
+        .filter(local_notification::Column::Filtered.eq(false))
         .one(db)
         .await?
     else {
@@ -5871,6 +6680,7 @@ pub async fn clear_local_notifications(db: &DbConnection, account_id: AccountId)
     let notifications = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::DismissedAt.is_null())
+        .filter(local_notification::Column::Filtered.eq(false))
         .all(db)
         .await?;
     let now = OffsetDateTime::now_utc();
@@ -5879,6 +6689,326 @@ pub async fn clear_local_notifications(db: &DbConnection, account_id: AccountId)
         active.dismissed_at = Set(Some(now));
         active.update(db).await?;
     }
+    Ok(())
+}
+
+/// List pending notification requests with their notification counts in one query.
+pub async fn notification_requests_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<NotificationRequest>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let mut conditions = vec![
+        "r.account_id = $1".to_owned(),
+        "r.state = 'pending'".to_owned(),
+    ];
+    let mut values = vec![account_id.0.into()];
+    for (column, value) in [
+        ("r.id <", cursor.max_id),
+        ("r.id >", cursor.since_id),
+        ("r.id >", cursor.min_id),
+    ] {
+        if let Some(value) = value {
+            values.push(value.into());
+            conditions.push(format!("{column} ${}", values.len()));
+        }
+    }
+    let query_limit = page_query_limit(limit);
+    let sql = format!(
+        "SELECT r.id, r.account_id, r.actor_account_id, r.remote_actor_id,
+                r.last_status_id, r.last_remote_status_id, r.created_at, r.updated_at,
+                count(n.id)::bigint AS notifications_count
+         FROM local_notification_request r
+         LEFT JOIN local_notification n ON n.notification_request_id = r.id
+         WHERE {}
+         GROUP BY r.id ORDER BY r.id DESC LIMIT {query_limit}",
+        conditions.join(" AND ")
+    );
+    let rows = NotificationRequestRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(&txn)
+    .await?;
+    let (rows, has_more) = trim_to_page(rows, limit);
+    let first_cursor = rows.first().map(|row| row.id);
+    let last_cursor = rows.last().map(|row| row.id);
+    let items = rows
+        .into_iter()
+        .map(notification_request_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    txn.commit().await?;
+    Ok(CollectionPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
+}
+
+/// Return pending request and held-notification counts for a policy summary.
+pub async fn notification_request_summary(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<(u64, u64)> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let requests_count = local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.eq(NotificationRequestState::Pending))
+        .count(&txn)
+        .await?;
+    let notifications_count = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::Filtered.eq(true))
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .count(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok((requests_count, notifications_count))
+}
+
+/// Find one pending notification request belonging to an account.
+pub async fn find_notification_request_for_account(
+    db: &DbConnection,
+    account_id: AccountId,
+    request_id: Uuid,
+) -> Result<Option<NotificationRequest>> {
+    let row = NotificationRequestRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT r.id, r.account_id, r.actor_account_id, r.remote_actor_id,
+                r.last_status_id, r.last_remote_status_id, r.created_at, r.updated_at,
+                count(n.id)::bigint AS notifications_count
+         FROM local_notification_request r
+         LEFT JOIN local_notification n ON n.notification_request_id = r.id
+         WHERE r.id = $1 AND r.account_id = $2 AND r.state = 'pending'
+         GROUP BY r.id",
+        vec![request_id.into(), account_id.0.into()],
+    ))
+    .one(db)
+    .await?;
+    row.map(notification_request_from_row).transpose()
+}
+
+/// Count visible unread notifications newer than the account marker.
+pub async fn notification_unread_count(
+    db: &DbConnection,
+    account_id: AccountId,
+    since_id: Option<Uuid>,
+) -> Result<u64> {
+    let mut query = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::DismissedAt.is_null())
+        .filter(local_notification::Column::Filtered.eq(false));
+    if let Some(since_id) = since_id {
+        query = query.filter(local_notification::Column::Id.gt(since_id));
+    }
+    Ok(query.count(db).await?)
+}
+
+/// Accept pending notification requests and enqueue their durable merge.
+pub async fn accept_notification_requests(
+    db: &DbConnection,
+    account_id: AccountId,
+    request_ids: &[Uuid],
+) -> Result<bool> {
+    let txn = db.begin().await?;
+    let mut query = local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.eq(NotificationRequestState::Pending));
+    if !request_ids.is_empty() {
+        query =
+            query.filter(local_notification_request::Column::Id.is_in(request_ids.iter().copied()));
+    }
+    let requests = query.lock_exclusive().all(&txn).await?;
+    if requests.is_empty() || (!request_ids.is_empty() && requests.len() != request_ids.len()) {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    for request in &requests {
+        let (conflict_target, actor_id) = if let Some(actor_id) = request.actor_account_id {
+            (
+                "(account_id, actor_account_id) WHERE actor_account_id IS NOT NULL",
+                actor_id,
+            )
+        } else if let Some(actor_id) = request.remote_actor_id {
+            (
+                "(account_id, remote_actor_id) WHERE remote_actor_id IS NOT NULL",
+                actor_id,
+            )
+        } else {
+            return Err(RoostyError::InvalidInput(
+                "notification request actor is invalid".to_owned(),
+            ));
+        };
+        let (local_actor, remote_actor) = if request.actor_account_id.is_some() {
+            (Some(actor_id), None)
+        } else {
+            (None, Some(actor_id))
+        };
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO local_notification_permission
+                    (id, account_id, actor_account_id, remote_actor_id, created_at)
+                 VALUES ($1, $2, $3, $4, now())
+                 ON CONFLICT {conflict_target} DO NOTHING"
+            ),
+            vec![
+                Uuid::now_v7().into(),
+                account_id.0.into(),
+                local_actor.into(),
+                remote_actor.into(),
+            ],
+        ))
+        .await?;
+    }
+    local_notification_request::Entity::update_many()
+        .col_expr(
+            local_notification_request::Column::State,
+            Expr::value(NotificationRequestState::Merging),
+        )
+        .col_expr(
+            local_notification_request::Column::UpdatedAt,
+            Expr::value(OffsetDateTime::now_utc()),
+        )
+        .filter(local_notification_request::Column::Id.is_in(requests.iter().map(|row| row.id)))
+        .exec(&txn)
+        .await?;
+    enqueue_job_in_transaction(
+        &txn,
+        NewJob {
+            kind: JobKind::NotificationRequestMerge,
+            payload: serde_json::json!({ "account_id": account_id.0 }),
+            deduplication_key: Some(format!("notification-request-merge:{}", account_id.0)),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// Dismiss pending notification requests and enqueue durable cleanup.
+pub async fn dismiss_notification_requests(
+    db: &DbConnection,
+    account_id: AccountId,
+    request_ids: &[Uuid],
+) -> Result<bool> {
+    let txn = db.begin().await?;
+    let mut query = local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.eq(NotificationRequestState::Pending));
+    if !request_ids.is_empty() {
+        query =
+            query.filter(local_notification_request::Column::Id.is_in(request_ids.iter().copied()));
+    }
+    let requests = query.lock_exclusive().all(&txn).await?;
+    if requests.is_empty() || (!request_ids.is_empty() && requests.len() != request_ids.len()) {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    local_notification_request::Entity::update_many()
+        .col_expr(
+            local_notification_request::Column::State,
+            Expr::value(NotificationRequestState::Dismissed),
+        )
+        .col_expr(
+            local_notification_request::Column::UpdatedAt,
+            Expr::value(OffsetDateTime::now_utc()),
+        )
+        .filter(local_notification_request::Column::Id.is_in(requests.iter().map(|row| row.id)))
+        .exec(&txn)
+        .await?;
+    enqueue_job_in_transaction(
+        &txn,
+        NewJob {
+            kind: JobKind::NotificationRequestCleanup,
+            payload: serde_json::json!({ "account_id": account_id.0 }),
+            deduplication_key: Some(format!("notification-request-cleanup:{}", account_id.0)),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// Return whether no accepted notification requests are awaiting a merge.
+pub async fn notification_requests_merged(
+    db: &DbConnection,
+    account_id: AccountId,
+) -> Result<bool> {
+    Ok(local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.eq(NotificationRequestState::Merging))
+        .one(db)
+        .await?
+        .is_none())
+}
+
+/// Merge all accepted requests for one account. Safe to retry after worker interruption.
+pub async fn merge_notification_requests(db: &DbConnection, account_id: AccountId) -> Result<()> {
+    let txn = db.begin().await?;
+    let requests = local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.eq(NotificationRequestState::Merging))
+        .lock_exclusive()
+        .all(&txn)
+        .await?;
+    if !requests.is_empty() {
+        let ids = requests
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+        local_notification::Entity::update_many()
+            .col_expr(local_notification::Column::Filtered, Expr::value(false))
+            .col_expr(
+                local_notification::Column::NotificationRequestId,
+                Expr::value(None::<Uuid>),
+            )
+            .filter(local_notification::Column::NotificationRequestId.is_in(ids.clone()))
+            .exec(&txn)
+            .await?;
+        local_notification_request::Entity::delete_many()
+            .filter(local_notification_request::Column::Id.is_in(ids))
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Delete notifications belonging to dismissed requests. Safe to retry.
+pub async fn cleanup_notification_requests(db: &DbConnection, account_id: AccountId) -> Result<()> {
+    let txn = db.begin().await?;
+    let requests = local_notification_request::Entity::find()
+        .filter(local_notification_request::Column::AccountId.eq(account_id.0))
+        .filter(local_notification_request::Column::State.eq(NotificationRequestState::Dismissed))
+        .lock_exclusive()
+        .all(&txn)
+        .await?;
+    if !requests.is_empty() {
+        let ids = requests
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+        local_notification::Entity::delete_many()
+            .filter(local_notification::Column::NotificationRequestId.is_in(ids.clone()))
+            .exec(&txn)
+            .await?;
+        local_notification_request::Entity::delete_many()
+            .filter(local_notification_request::Column::Id.is_in(ids))
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
     Ok(())
 }
 
@@ -6666,7 +7796,16 @@ pub async fn tag_timeline(
         let mut query = local_status::Entity::find()
             .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
             .filter(local_status::Column::DeletedAt.is_null())
-            .filter(local_status::Column::Id.in_subquery(status_tag_subquery(primary.id)));
+            .filter(local_status::Column::Id.in_subquery(status_tag_subquery(primary.id)))
+            .filter(
+                local_status::Column::AccountId.in_subquery(
+                    Query::select()
+                        .column(local_account::Column::Id)
+                        .from(local_account::Entity)
+                        .and_where(local_account::Column::LimitedAt.is_null())
+                        .to_owned(),
+                ),
+            );
         for tag_id in &all_tag_ids {
             query =
                 query.filter(local_status::Column::Id.in_subquery(status_tag_subquery(*tag_id)));
@@ -6702,7 +7841,9 @@ pub async fn tag_timeline(
     }
 
     if options.origin != PublicTimelineOrigin::Local && !options.allowed_remote_domains.is_empty() {
-        let mut actor_condition = Condition::all().add(remote_actor::Column::DeletedAt.is_null());
+        let mut actor_condition = Condition::all()
+            .add(remote_actor::Column::DeletedAt.is_null())
+            .add(remote_actor::Column::LimitedAt.is_null());
         if !options
             .allowed_remote_domains
             .iter()
@@ -8324,8 +9465,32 @@ pub async fn notify_remote_actor_quote(
         .one(db)
         .await?
     {
-        return Ok(Some(local_notification_from_model(existing)));
+        return Ok((!existing.filtered).then(|| local_notification_from_model(existing)));
     }
+    let action = remote_notification_policy_action(
+        db,
+        account_id,
+        remote_actor_id,
+        LocalNotificationType::Quote,
+        Some(remote_status_id),
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
+        return Ok(None);
+    }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        Some(
+            upsert_notification_request(
+                db,
+                account_id,
+                NotificationActor::Remote(remote_actor_id),
+                remote_status_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let model = local_notification::ActiveModel {
         id: Set(Uuid::now_v7()),
         account_id: Set(account_id.0),
@@ -8335,12 +9500,83 @@ pub async fn notify_remote_actor_quote(
         status_id: Set(None),
         remote_status_id: Set(Some(remote_status_id.0)),
         group_id: Set(None),
+        filtered: Set(request_id.is_some()),
+        notification_request_id: Set(request_id),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
     .insert(db)
     .await?;
-    Ok(Some(local_notification_from_model(model)))
+    Ok(request_id
+        .is_none()
+        .then(|| local_notification_from_model(model)))
+}
+
+/// Create a policy-aware quote notification caused by a local account.
+pub async fn notify_local_status_quote(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    actor_account_id: AccountId,
+    status_id: StatusId,
+) -> Result<Option<LocalNotification>> {
+    if account_id == actor_account_id
+        || !local_account_allows_notification(db, account_id, actor_account_id).await?
+    {
+        return Ok(None);
+    }
+    if let Some(existing) = local_notification::Entity::find()
+        .filter(local_notification::Column::AccountId.eq(account_id.0))
+        .filter(local_notification::Column::NotificationType.eq(LocalNotificationType::Quote))
+        .filter(local_notification::Column::ActorAccountId.eq(actor_account_id.0))
+        .filter(local_notification::Column::StatusId.eq(status_id.0))
+        .one(db)
+        .await?
+    {
+        return Ok((!existing.filtered).then(|| local_notification_from_model(existing)));
+    }
+    let action = local_notification_policy_action(
+        db,
+        account_id,
+        actor_account_id,
+        LocalNotificationType::Quote,
+        Some(status_id),
+    )
+    .await?;
+    if action == NotificationPolicyAction::Drop {
+        return Ok(None);
+    }
+    let request_id = if action == NotificationPolicyAction::Filter {
+        Some(
+            upsert_notification_request(
+                db,
+                account_id,
+                NotificationActor::Local(actor_account_id),
+                status_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let model = local_notification::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        account_id: Set(account_id.0),
+        notification_type: Set(LocalNotificationType::Quote),
+        actor_account_id: Set(Some(actor_account_id.0)),
+        remote_actor_id: Set(None),
+        status_id: Set(Some(status_id.0)),
+        remote_status_id: Set(None),
+        group_id: Set(None),
+        filtered: Set(request_id.is_some()),
+        notification_request_id: Set(request_id),
+        created_at: Set(OffsetDateTime::now_utc()),
+        dismissed_at: Set(None),
+    }
+    .insert(db)
+    .await?;
+    Ok(request_id
+        .is_none()
+        .then(|| local_notification_from_model(model)))
 }
 
 /// Load the quote attached to a local or cached-remote status.
@@ -9773,10 +11009,7 @@ pub async fn process_remote_like(
     let notification = if matches!(inserted, TryInsertResult::Inserted(_))
         && remote_account_allows_notification(txn, recipient_account_id, remote_actor_id).await?
     {
-        Some(
-            notify_remote_actor_favourite(txn, recipient_account_id, remote_actor_id, status_id)
-                .await?,
-        )
+        notify_remote_actor_favourite(txn, recipient_account_id, remote_actor_id, status_id).await?
     } else {
         None
     };
@@ -10641,6 +11874,15 @@ pub async fn public_timeline_with_options(
                 .filter(local_status::Column::InReplyToRemoteStatusId.is_null()),
             cursor,
         );
+        query = query.filter(
+            local_status::Column::AccountId.in_subquery(
+                Query::select()
+                    .column(local_account::Column::Id)
+                    .from(local_account::Entity)
+                    .and_where(local_account::Column::LimitedAt.is_null())
+                    .to_owned(),
+            ),
+        );
         if !hidden_local_ids.is_empty() {
             query = query.filter(local_status::Column::AccountId.is_not_in(hidden_local_ids));
         }
@@ -10668,7 +11910,9 @@ pub async fn public_timeline_with_options(
     }
 
     if options.origin != PublicTimelineOrigin::Local && !options.allowed_remote_domains.is_empty() {
-        let mut actor_condition = Condition::all().add(remote_actor::Column::DeletedAt.is_null());
+        let mut actor_condition = Condition::all()
+            .add(remote_actor::Column::DeletedAt.is_null())
+            .add(remote_actor::Column::LimitedAt.is_null());
         if !options
             .allowed_remote_domains
             .iter()
@@ -12624,6 +13868,7 @@ fn local_account_from_model(account: local_account::Model) -> Result<LocalAccoun
         profile_fields: account.profile_fields,
         avatar_file_path: account.avatar_file_path,
         header_file_path: account.header_file_path,
+        limited_at: account.limited_at,
         created_at: account.created_at,
     })
 }
@@ -12650,6 +13895,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         first_seen_at: actor.created_at,
         deleted_at: actor.deleted_at,
         moved_to_remote_actor_id: actor.moved_to_remote_actor_id.map(AccountId),
+        limited_at: actor.limited_at,
     }
 }
 
@@ -12893,9 +14139,45 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         status_id: notification.status_id.map(StatusId),
         remote_status_id: notification.remote_status_id.map(StatusId),
         group_id: notification.group_id,
+        filtered: notification.filtered,
+        notification_request_id: notification.notification_request_id,
         created_at: notification.created_at,
         dismissed_at: notification.dismissed_at,
     }
+}
+
+fn notification_policy_from_model(policy: local_notification_policy::Model) -> NotificationPolicy {
+    NotificationPolicy {
+        for_not_following: policy.for_not_following,
+        for_not_followers: policy.for_not_followers,
+        for_new_accounts: policy.for_new_accounts,
+        for_private_mentions: policy.for_private_mentions,
+        for_limited_accounts: policy.for_limited_accounts,
+    }
+}
+
+fn notification_request_from_row(row: NotificationRequestRow) -> Result<NotificationRequest> {
+    let actor = match (row.actor_account_id, row.remote_actor_id) {
+        (Some(id), None) => NotificationActor::Local(AccountId(id)),
+        (None, Some(id)) => NotificationActor::Remote(AccountId(id)),
+        _ => {
+            return Err(RoostyError::InvalidInput(
+                "stored notification request actor is invalid".to_owned(),
+            ));
+        }
+    };
+    Ok(NotificationRequest {
+        id: row.id,
+        account_id: AccountId(row.account_id),
+        actor,
+        last_status_id: row.last_status_id.map(StatusId),
+        last_remote_status_id: row.last_remote_status_id.map(StatusId),
+        notifications_count: u64::try_from(row.notifications_count).map_err(|_| {
+            RoostyError::InvalidInput("stored notification request count is invalid".to_owned())
+        })?,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 fn push_subscription_from_model(
@@ -13094,7 +14376,8 @@ pub async fn claim_due_job(
                     'federation_favourite_delivery', 'federation_reblog_delivery',
                     'federation_actor_update_delivery', 'federation_moderation_delivery',
                     'federation_remote_media_fetch', 'federation_featured_refresh',
-                    'federation_featured_tags_refresh', 'web_push_delivery'
+                    'federation_featured_tags_refresh', 'web_push_delivery',
+                    'notification_request_merge', 'notification_request_cleanup'
                   )
                 ORDER BY run_after, created_at
                 LIMIT 1
@@ -13211,6 +14494,31 @@ pub fn next_retry_at(attempts: u32) -> OffsetDateTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Given overlapping policy predicates, when actions differ, then drop wins over filter and
+    /// filter wins over accept.
+    #[test]
+    fn notification_policy_uses_strongest_matching_action() {
+        assert_eq!(
+            strongest_notification_policy_action([
+                NotificationPolicyAction::Accept,
+                NotificationPolicyAction::Filter,
+                NotificationPolicyAction::Drop,
+            ]),
+            NotificationPolicyAction::Drop
+        );
+        assert_eq!(
+            strongest_notification_policy_action([
+                NotificationPolicyAction::Accept,
+                NotificationPolicyAction::Filter,
+            ]),
+            NotificationPolicyAction::Filter
+        );
+        assert_eq!(
+            strongest_notification_policy_action([]),
+            NotificationPolicyAction::Accept
+        );
+    }
 
     #[test]
     fn hashes_secrets_with_pepper() {

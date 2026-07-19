@@ -172,6 +172,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         first_seen_at: OffsetDateTime::now_utc(),
         deleted_at: None,
         moved_to_remote_actor_id: None,
+        limited_at: None,
     };
     let actor = store_remote_actor_on(
         &lock,
@@ -377,6 +378,7 @@ async fn fetch_remote_actor_by_id(
             first_seen_at: OffsetDateTime::now_utc(),
             deleted_at: None,
             moved_to_remote_actor_id: None,
+            limited_at: None,
         },
         document.icon,
         document.image,
@@ -441,6 +443,7 @@ pub async fn resolve_remote_move_target(
             first_seen_at: OffsetDateTime::now_utc(),
             deleted_at: None,
             moved_to_remote_actor_id: None,
+            limited_at: None,
         },
         document.icon,
         document.image,

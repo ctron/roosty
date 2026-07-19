@@ -1,6 +1,6 @@
 use axum::{
-    Json, Router,
-    extract::{Path, RawQuery, State},
+    Form, Json, Router,
+    extract::{Path, RawForm, RawQuery, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -8,6 +8,7 @@ use axum::{
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
     CollectionCursor, CollectionPage, LocalNotification, LocalNotificationType, NotificationFilter,
+    NotificationPolicyAction,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,6 +29,7 @@ const MAX_NOTIFICATION_LIMIT: u64 = 80;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/notifications", get(notifications))
+        .route("/api/v1/notifications/unread_count", get(unread_count))
         .route("/api/v1/notifications/clear", post(clear_notifications))
         .route(
             "/api/v1/notifications/{notification_id}",
@@ -38,6 +40,35 @@ pub fn router() -> Router<AppState> {
             post(dismiss_notification),
         )
         .route("/api/v2/notifications", get(grouped_notifications))
+        .route(
+            "/api/v2/notifications/policy",
+            get(show_notification_policy).patch(update_notification_policy),
+        )
+        .route("/api/v1/notifications/requests", get(notification_requests))
+        .route(
+            "/api/v1/notifications/requests/accept",
+            post(accept_notification_requests),
+        )
+        .route(
+            "/api/v1/notifications/requests/dismiss",
+            post(dismiss_notification_requests),
+        )
+        .route(
+            "/api/v1/notifications/requests/merged",
+            get(notification_requests_merged),
+        )
+        .route(
+            "/api/v1/notifications/requests/{request_id}",
+            get(show_notification_request),
+        )
+        .route(
+            "/api/v1/notifications/requests/{request_id}/accept",
+            post(accept_notification_request),
+        )
+        .route(
+            "/api/v1/notifications/requests/{request_id}/dismiss",
+            post(dismiss_notification_request),
+        )
         .route(
             "/api/v2/notifications/unread_count",
             get(grouped_unread_count),
@@ -81,7 +112,7 @@ struct NotificationParams {
     grouped_types: Option<Vec<String>>,
     expand_accounts: Option<ExpandAccounts>,
     #[serde(rename = "include_filtered")]
-    _include_filtered: Option<bool>,
+    include_filtered: Option<bool>,
     #[serde(default)]
     #[serde(rename = "supported_types")]
     _supported_types: Option<Vec<String>>,
@@ -156,6 +187,334 @@ struct GroupedNotificationsResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Deserialize)]
+struct NotificationRequestPath {
+    request_id: Uuid,
+}
+
+#[derive(Deserialize, Default)]
+struct NotificationRequestParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct NotificationRequestBatch {
+    #[serde(default, rename = "id")]
+    ids: Vec<Uuid>,
+}
+
+#[derive(Deserialize, Default)]
+struct NotificationPolicyForm {
+    for_not_following: Option<NotificationPolicyAction>,
+    for_not_followers: Option<NotificationPolicyAction>,
+    for_new_accounts: Option<NotificationPolicyAction>,
+    for_private_mentions: Option<NotificationPolicyAction>,
+    for_limited_accounts: Option<NotificationPolicyAction>,
+}
+
+#[derive(Serialize)]
+struct NotificationPolicyResponse {
+    for_not_following: NotificationPolicyAction,
+    for_not_followers: NotificationPolicyAction,
+    for_new_accounts: NotificationPolicyAction,
+    for_private_mentions: NotificationPolicyAction,
+    for_limited_accounts: NotificationPolicyAction,
+    summary: NotificationPolicySummaryResponse,
+}
+
+#[derive(Serialize)]
+struct NotificationPolicySummaryResponse {
+    pending_requests_count: u64,
+    pending_notifications_count: u64,
+}
+
+#[derive(Serialize)]
+struct NotificationRequestResponse {
+    id: String,
+    created_at: String,
+    updated_at: String,
+    notifications_count: String,
+    account: NotificationAccountResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_status: Option<StatusResponse>,
+}
+
+async fn show_notification_policy(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+) -> Response {
+    match policy_response(&state, account.id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn update_notification_policy(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Form(form): Form<NotificationPolicyForm>,
+) -> Response {
+    let update = roosty_db::NotificationPolicyUpdate {
+        for_not_following: form.for_not_following,
+        for_not_followers: form.for_not_followers,
+        for_new_accounts: form.for_new_accounts,
+        for_private_mentions: form.for_private_mentions,
+        for_limited_accounts: form.for_limited_accounts,
+    };
+    match roosty_db::update_notification_policy(&state.db, account.id, update).await {
+        Ok(_) => match policy_response(&state, account.id).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => server_error(error),
+        },
+        Err(error) => server_error(error),
+    }
+}
+
+async fn policy_response(
+    state: &AppState,
+    account_id: AccountId,
+) -> Result<NotificationPolicyResponse, RoostyError> {
+    let policy = roosty_db::notification_policy(&state.db, account_id).await?;
+    let (pending_requests_count, pending_notifications_count) =
+        roosty_db::notification_request_summary(&state.db, account_id).await?;
+    Ok(NotificationPolicyResponse {
+        for_not_following: policy.for_not_following,
+        for_not_followers: policy.for_not_followers,
+        for_new_accounts: policy.for_new_accounts,
+        for_private_mentions: policy.for_private_mentions,
+        for_limited_accounts: policy.for_limited_accounts,
+        summary: NotificationPolicySummaryResponse {
+            pending_requests_count,
+            pending_notifications_count,
+        },
+    })
+}
+
+async fn notification_requests(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let params = match query.as_deref() {
+        Some(query) => match serde_qs::Config::new()
+            .use_form_encoding(true)
+            .deserialize_str(query)
+        {
+            Ok(params) => params,
+            Err(_) => return bad_request("notification request query is invalid"),
+        },
+        None => NotificationRequestParams::default(),
+    };
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_NOTIFICATION_LIMIT)
+        .clamp(1, MAX_NOTIFICATION_LIMIT);
+    let cursor = match request_collection_cursor(&params) {
+        Ok(cursor) => cursor,
+        Err(()) => return bad_request("notification request cursor is invalid"),
+    };
+    match roosty_db::notification_requests_for_account(&state.db, account.id, limit, cursor).await {
+        Ok(page) => {
+            let link = CollectionLink::new(
+                limit,
+                page.first_cursor,
+                page.last_cursor,
+                page.has_more,
+                "/api/v1/notifications/requests",
+            )
+            .header_value();
+            let mut responses = Vec::with_capacity(page.items.len());
+            for request in page.items {
+                match notification_request_response(&state, account.id, request).await {
+                    Ok(Some(response)) => responses.push(response),
+                    Ok(None) => {}
+                    Err(error) => return server_error(error),
+                }
+            }
+            let mut response = Json(responses).into_response();
+            if let Some(link) = link {
+                response.headers_mut().insert(header::LINK, link);
+            }
+            response
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn show_notification_request(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<NotificationRequestPath>,
+) -> Response {
+    match roosty_db::find_notification_request_for_account(&state.db, account.id, path.request_id)
+        .await
+    {
+        Ok(Some(request)) => match notification_request_response(&state, account.id, request).await
+        {
+            Ok(Some(response)) => Json(response).into_response(),
+            Ok(None) => not_found(),
+            Err(error) => server_error(error),
+        },
+        Ok(None) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn accept_notification_request(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<NotificationRequestPath>,
+) -> Response {
+    notification_request_action(&state, account.id, &[path.request_id], true).await
+}
+
+async fn dismiss_notification_request(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    Path(path): Path<NotificationRequestPath>,
+) -> Response {
+    notification_request_action(&state, account.id, &[path.request_id], false).await
+}
+
+async fn accept_notification_requests(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    RawForm(body): RawForm,
+) -> Response {
+    let batch = match notification_request_batch(&body) {
+        Ok(batch) => batch,
+        Err(()) => return bad_request("notification request ids are invalid"),
+    };
+    if batch.ids.is_empty() {
+        return bad_request("at least one notification request id is required");
+    }
+    notification_request_action(&state, account.id, &batch.ids, true).await
+}
+
+async fn dismiss_notification_requests(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    RawForm(body): RawForm,
+) -> Response {
+    let batch = match notification_request_batch(&body) {
+        Ok(batch) => batch,
+        Err(()) => return bad_request("notification request ids are invalid"),
+    };
+    if batch.ids.is_empty() {
+        return bad_request("at least one notification request id is required");
+    }
+    notification_request_action(&state, account.id, &batch.ids, false).await
+}
+
+async fn notification_request_action(
+    state: &AppState,
+    account_id: AccountId,
+    request_ids: &[Uuid],
+    accept: bool,
+) -> Response {
+    let result = if accept {
+        roosty_db::accept_notification_requests(&state.db, account_id, request_ids).await
+    } else {
+        roosty_db::dismiss_notification_requests(&state.db, account_id, request_ids).await
+    };
+    match result {
+        Ok(true) => Json(json!({})).into_response(),
+        Ok(false) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn notification_requests_merged(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+) -> Response {
+    match roosty_db::notification_requests_merged(&state.db, account.id).await {
+        Ok(merged) => Json(json!({ "merged": merged })).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn unread_count(
+    State(state): State<AppState>,
+    AuthenticatedAccount(account): AuthenticatedAccount,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let params = match notification_params(query.as_deref()) {
+        Ok(params) => params,
+        Err(()) => return bad_request("notification query is invalid"),
+    };
+    let limit = params.limit.unwrap_or(100).clamp(1, 1_000);
+    let mut filter = match notification_filter(&params) {
+        Ok(filter) => filter,
+        Err(()) => return bad_request("notification account id is invalid"),
+    };
+    filter.include_filtered = false;
+    let marker = match roosty_db::local_timeline_markers_for_account(
+        &state.db,
+        account.id,
+        &[roosty_db::LocalTimeline::Notifications],
+    )
+    .await
+    {
+        Ok(markers) => markers.first().map(|marker| marker.last_read_id),
+        Err(error) => return server_error(error),
+    };
+    let cursor = CollectionCursor {
+        max_id: None,
+        since_id: marker,
+        min_id: None,
+    };
+    match roosty_db::local_notifications_for_account(&state.db, account.id, limit, cursor, filter)
+        .await
+    {
+        Ok(page) => Json(json!({ "count": page.items.len() })).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn notification_request_response(
+    state: &AppState,
+    viewer_id: AccountId,
+    request: roosty_db::NotificationRequest,
+) -> Result<Option<NotificationRequestResponse>, RoostyError> {
+    let actor_id = match request.actor {
+        roosty_db::NotificationActor::Local(id) | roosty_db::NotificationActor::Remote(id) => id,
+    };
+    let Some(account) = notification_accounts(state, vec![actor_id]).await?.pop() else {
+        return Ok(None);
+    };
+    let last_status = if let Some(status_id) = request.last_status_id {
+        if let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
+            && crate::statuses::status_visible_to_viewer(state, &status, Some(viewer_id)).await?
+        {
+            Some(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?)
+        } else {
+            None
+        }
+    } else if let Some(status_id) = request.last_remote_status_id {
+        if let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await?
+            && roosty_db::remote_status_visible_to_account(&state.db, &status, viewer_id).await?
+        {
+            Some(remote_status_response(state, status).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(Some(NotificationRequestResponse {
+        id: request.id.to_string(),
+        created_at: crate::statuses::format_timestamp(request.created_at),
+        updated_at: crate::statuses::format_timestamp(request.updated_at),
+        notifications_count: request.notifications_count.to_string(),
+        account,
+        last_status,
+    }))
 }
 
 /// Return local notifications for the authenticated account.
@@ -470,19 +829,20 @@ pub(crate) async fn create_and_stream_notification(
     if account_id == actor_account_id {
         return Ok(());
     }
-    if !roosty_db::local_account_allows_notification(&state.db, account_id, actor_account_id)
-        .await?
-    {
-        return Ok(());
-    }
-    let notification = roosty_db::notify_local_account(
+    let Some(notification) = roosty_db::notify_local_account_with_policy(
         &state.db,
         account_id,
         notification_type,
         actor_account_id,
         status_id,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
+    if notification.filtered {
+        return Ok(());
+    }
     if let Some(response) = notification_response(state, account_id, notification).await? {
         state
             .streaming_events
@@ -498,6 +858,9 @@ pub(crate) fn publish_committed_notification(
     notification: LocalNotification,
 ) -> Pin<Box<dyn Future<Output = Result<(), RoostyError>> + Send + '_>> {
     Box::pin(async move {
+        if notification.filtered {
+            return Ok(());
+        }
         if let Some(response) = notification_response(state, account_id, notification).await? {
             state
                 .streaming_events
@@ -847,7 +1210,25 @@ fn notification_filter(params: &NotificationParams) -> Result<NotificationFilter
         include_types: parse_notification_types(params.types.as_deref()),
         exclude_types: parse_notification_types(params.exclude_types.as_deref()),
         account_id: parse_optional_account_id(params.account_id.as_deref())?,
+        include_filtered: params.include_filtered.unwrap_or(false),
     })
+}
+
+fn request_collection_cursor(params: &NotificationRequestParams) -> Result<CollectionCursor, ()> {
+    Ok(CollectionCursor {
+        max_id: parse_optional_uuid(params.max_id.as_deref())?,
+        since_id: parse_optional_uuid(params.since_id.as_deref())?,
+        min_id: parse_optional_uuid(params.min_id.as_deref())?,
+    })
+}
+
+fn notification_request_batch(body: &[u8]) -> Result<NotificationRequestBatch, ()> {
+    let body = std::str::from_utf8(body).map_err(|_| ())?;
+    serde_qs::Config::new()
+        .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+        .use_form_encoding(true)
+        .deserialize_str(body)
+        .map_err(|_| ())
 }
 
 fn only_unsupported_types_requested(
@@ -908,4 +1289,22 @@ fn server_error(error: RoostyError) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Given Mastodon's bracketed form encoding, when multiple request IDs are submitted, then all
+    /// IDs are retained for the batch action.
+    #[test]
+    fn parses_notification_request_batch_ids() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let body = format!("id[]={first}&id[]={second}");
+
+        let batch = notification_request_batch(body.as_bytes()).unwrap();
+
+        assert_eq!(batch.ids, vec![first, second]);
+    }
 }

@@ -4,7 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::Router;
 use clap::{Parser, Subcommand};
-use roosty_core::{Result, RoostyError};
+use roosty_core::{AccountId, Result, RoostyError};
 use roosty_migration::Migrator;
 use sea_orm_migration::MigratorTrait;
 use tokio::{sync::watch, task::JoinSet};
@@ -104,6 +104,18 @@ enum AdminCommand {
         #[arg(long)]
         username: String,
     },
+
+    /// Limit a local or cached remote account in discovery and notification policy.
+    LimitAccount {
+        /// Local username or remote handle such as user@example.org.
+        account: String,
+    },
+
+    /// Remove an account limit.
+    UnlimitAccount {
+        /// Local username or remote handle such as user@example.org.
+        account: String,
+    },
 }
 
 #[tokio::main]
@@ -128,6 +140,8 @@ async fn main() -> Result<()> {
                 admin,
             } => create_user(&username, &email, admin).await,
             AdminCommand::ResetPassword { username } => reset_password(&username).await,
+            AdminCommand::LimitAccount { account } => set_account_limited(&account, true).await,
+            AdminCommand::UnlimitAccount { account } => set_account_limited(&account, false).await,
         },
     }
 }
@@ -213,6 +227,28 @@ async fn reset_password(username: &str) -> Result<()> {
     println!("Username: {}", account.username);
     println!("Temporary password: {temporary_password}");
 
+    Ok(())
+}
+
+/// Apply an operator-managed account limit without changing ActivityPub reachability.
+async fn set_account_limited(account: &str, limited: bool) -> Result<()> {
+    let account = account.trim().trim_start_matches('@');
+    let database_url = database_url_from_env()?;
+    let db = roosty_db::connect(&database_url).await?;
+    let found = if let Some((username, domain)) = account.split_once('@') {
+        roosty_db::set_remote_actor_limited(&db, username, domain, limited)
+            .await?
+            .map(|actor| actor.activitypub_id)
+    } else {
+        roosty_db::set_local_account_limited(&db, account, limited)
+            .await?
+            .map(|account| account.username)
+    };
+    let target = found.ok_or_else(|| {
+        RoostyError::InvalidInput("local or cached remote account does not exist".to_owned())
+    })?;
+    let action = if limited { "Limited" } else { "Unlimited" };
+    println!("{action} account {target}");
     Ok(())
 }
 
@@ -443,6 +479,56 @@ async fn worker_iteration(
             .deliver(job.payload.clone())
             .await
             .map_err(|error| roosty_core::RoostyError::Configuration(error.to_string())),
+        roosty_db::JobKind::NotificationRequestMerge => {
+            let account_id = job
+                .payload
+                .get("account_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput(
+                        "notification merge job account_id is missing".to_owned(),
+                    )
+                })?
+                .parse()
+                .map(AccountId)
+                .map_err(|_| {
+                    RoostyError::InvalidInput(
+                        "notification merge job account_id is invalid".to_owned(),
+                    )
+                });
+            match account_id {
+                Ok(account_id) => roosty_db::merge_notification_requests(db, account_id)
+                    .await
+                    .map(|()| {
+                        state
+                            .streaming_events
+                            .publish_notifications_merged(account_id);
+                    }),
+                Err(error) => Err(error),
+            }
+        }
+        roosty_db::JobKind::NotificationRequestCleanup => {
+            let account_id = job
+                .payload
+                .get("account_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput(
+                        "notification cleanup job account_id is missing".to_owned(),
+                    )
+                })?
+                .parse()
+                .map(AccountId)
+                .map_err(|_| {
+                    RoostyError::InvalidInput(
+                        "notification cleanup job account_id is invalid".to_owned(),
+                    )
+                });
+            match account_id {
+                Ok(account_id) => roosty_db::cleanup_notification_requests(db, account_id).await,
+                Err(error) => Err(error),
+            }
+        }
     };
     match result {
         Ok(()) => {
@@ -451,12 +537,14 @@ async fn worker_iteration(
             }
         }
         Err(error) => {
-            let permanent = roosty_db::job_has_exceeded_max_age(
-                job.created_at,
-                config.federation_delivery_max_age,
-            ) || error
-                .to_string()
-                .starts_with("permanent federation delivery failure:");
+            let is_federation_job = job.kind.as_str().starts_with("federation_");
+            let permanent = is_federation_job
+                && (roosty_db::job_has_exceeded_max_age(
+                    job.created_at,
+                    config.federation_delivery_max_age,
+                ) || error
+                    .to_string()
+                    .starts_with("permanent federation delivery failure:"));
             if permanent {
                 if roosty_db::mark_job_permanently_failed(db, &job, &error.to_string()).await? {
                     warn!(job_id = %job.id.0, %error, "federation delivery failed permanently");

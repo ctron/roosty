@@ -797,26 +797,11 @@ async fn create_status(
                 .filter(|recipient| recipient.id != author_id)
                 .map(|recipient| recipient.id)
             {
-                let allowed =
-                    match roosty_db::local_account_allows_notification(&txn, account_id, author_id)
-                        .await
-                    {
-                        Ok(allowed) => allowed,
-                        Err(error) => return server_error(error),
-                    };
-                if !allowed {
-                    continue;
-                }
-                match roosty_db::notify_local_account(
-                    &txn,
-                    account_id,
-                    LocalNotificationType::Mention,
-                    author_id,
-                    Some(status.id),
-                )
-                .await
+                match roosty_db::notify_local_status_mention(&txn, account_id, author_id, status.id)
+                    .await
                 {
-                    Ok(notification) => notifications.push(notification),
+                    Ok(Some(notification)) => notifications.push(notification),
+                    Ok(None) => {}
                     Err(error) => return server_error(error),
                 }
             }
@@ -893,16 +878,13 @@ async fn create_status(
                     && let Some(recipient) = target.local_author_id
                     && recipient != author_id
                 {
-                    match roosty_db::notify_local_account(
-                        &txn,
-                        recipient,
-                        LocalNotificationType::Quote,
-                        author_id,
-                        Some(status.id),
+                    match roosty_db::notify_local_status_quote(
+                        &txn, recipient, author_id, status.id,
                     )
                     .await
                     {
-                        Ok(notification) => notifications.push(notification),
+                        Ok(Some(notification)) => notifications.push(notification),
+                        Ok(None) => {}
                         Err(error) => return server_error(error),
                     }
                 }
@@ -7047,18 +7029,20 @@ mod tests {
             )
             .await;
         assert_eq!(edit.status(), StatusCode::OK);
-        let event = timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let message = event
-            .to_socket_message(
-                mentioned.id,
-                &["user".to_owned(), "user:notification".to_owned()],
-            )
-            .unwrap()
-            .unwrap();
-        let message: Value = serde_json::from_str(&message).unwrap();
+        let streams = ["user".to_owned(), "user:notification".to_owned()];
+        let message: Value = loop {
+            let event = timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let Some(message) = event.to_socket_message(mentioned.id, &streams).unwrap() else {
+                continue;
+            };
+            let message: Value = serde_json::from_str(&message).unwrap();
+            if message["event"] == "status.update" {
+                break message;
+            }
+        };
         assert_eq!(message["event"], "status.update");
         assert_eq!(
             message["stream"],
@@ -7987,6 +7971,155 @@ mod tests {
                 "account": "bob",
                 "status": status["id"],
             })]
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a filter policy for accounts the recipient does not follow, when a local account
+    /// favourites and mentions them, then both notifications stay hidden, only the mention creates
+    /// a request, and accepting that request makes its notification visible after the durable merge.
+    async fn notification_policy_filters_and_merges_requests(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let actor_token = context
+            .access_token_for("policyactor", "policy-actor@example.com")
+            .await;
+        roosty_db::update_notification_policy(
+            &context.db,
+            context.account_id,
+            roosty_db::NotificationPolicyUpdate {
+                for_not_following: Some(roosty_db::NotificationPolicyAction::Filter),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let target = context
+            .create_status(&owner_token, "policy target", None, None)
+            .await;
+        let favourite = context
+            .authenticated_empty(
+                "POST",
+                &format!(
+                    "/api/v1/statuses/{}/favourite",
+                    target["id"].as_str().unwrap()
+                ),
+                &actor_token,
+            )
+            .await;
+        assert_eq!(favourite.status(), StatusCode::OK);
+        context
+            .create_status(&actor_token, "@admin filtered mention", None, None)
+            .await;
+
+        let visible = context
+            .authenticated_get("/api/v1/notifications", &owner_token)
+            .await;
+        assert_eq!(json_body(visible).await, serde_json::json!([]));
+        let filtered = context
+            .authenticated_get("/api/v1/notifications?include_filtered=true", &owner_token)
+            .await;
+        assert_eq!(json_body(filtered).await.as_array().unwrap().len(), 2);
+
+        let requests = roosty_db::notification_requests_for_account(
+            &context.db,
+            context.account_id,
+            40,
+            roosty_db::CollectionCursor::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requests.items.len(), 1);
+        assert_eq!(requests.items[0].notifications_count, 2);
+        assert!(
+            roosty_db::accept_notification_requests(
+                &context.db,
+                context.account_id,
+                &[requests.items[0].id],
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !roosty_db::notification_requests_merged(&context.db, context.account_id)
+                .await
+                .unwrap()
+        );
+        roosty_db::merge_notification_requests(&context.db, context.account_id)
+            .await
+            .unwrap();
+
+        let visible = context
+            .authenticated_get("/api/v1/notifications", &owner_token)
+            .await;
+        let visible = json_body(visible).await;
+        assert_eq!(visible.as_array().unwrap().len(), 2);
+        assert!(
+            visible
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|notification| notification["type"] == "mention")
+        );
+        assert!(
+            visible
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|notification| notification["type"] == "favourite")
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a private-mention drop policy, when an unfollowed sender replies within 100 ancestors
+    /// to a private thread initiated by the recipient, then Mastodon's reply exception accepts it.
+    async fn notification_policy_allows_recipient_initiated_private_replies(
+        context: &mut StatusContext,
+    ) {
+        let recipient_token = context.access_token().await;
+        let sender_token = context
+            .access_token_for("privatereply", "private-reply@example.com")
+            .await;
+        roosty_db::update_notification_policy(
+            &context.db,
+            context.account_id,
+            roosty_db::NotificationPolicyUpdate {
+                for_private_mentions: Some(roosty_db::NotificationPolicyAction::Drop),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        context
+            .create_status(&sender_token, "@admin unsolicited", Some("direct"), None)
+            .await;
+        let initial = context
+            .create_status(
+                &recipient_token,
+                "@privatereply initiated",
+                Some("direct"),
+                None,
+            )
+            .await;
+        context
+            .create_status(
+                &sender_token,
+                "@admin accepted reply",
+                Some("direct"),
+                initial["id"].as_str(),
+            )
+            .await;
+
+        let notifications = context
+            .authenticated_get("/api/v1/notifications?types[]=mention", &recipient_token)
+            .await;
+        let notifications = json_body(notifications).await;
+        assert_eq!(notifications.as_array().unwrap().len(), 1);
+        assert!(
+            notifications[0]["status"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("accepted reply"))
         );
     }
 
@@ -9264,6 +9397,7 @@ mod tests {
                 first_seen_at: now,
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
+                limited_at: None,
             };
             roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

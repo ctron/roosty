@@ -25,6 +25,7 @@ pub struct Model {
     pub profile_created_at: Option<OffsetDateTime>,
     pub deleted_at: Option<OffsetDateTime>,
     pub moved_to_remote_actor_id: Option<Uuid>,
+    pub limited_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

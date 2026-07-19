@@ -302,6 +302,20 @@ impl StreamingEvents {
         }
     }
 
+    /// Tell Mastodon clients that accepted filtered notifications are visible.
+    pub fn publish_notifications_merged(&self, recipient_id: AccountId) {
+        self.publish(StreamingEvent {
+            event: StreamingEventType::NotificationsMerged,
+            payload: "{}".to_owned(),
+            account_id: recipient_id,
+            user_recipient_ids: Vec::new(),
+            notification_recipient_ids: Vec::new(),
+            visibility: StatusVisibility::Direct,
+            status_origin: StreamingStatusOrigin::Local,
+            has_media: false,
+        });
+    }
+
     /// Publish a Mastodon `conversation` event to the recipient's direct stream.
     pub fn publish_conversation<T>(&self, conversation: &T, recipient_id: AccountId)
     where
@@ -690,6 +704,8 @@ enum StreamingEventType {
     Conversation,
     #[serde(rename = "delete")]
     Delete,
+    #[serde(rename = "notifications_merged")]
+    NotificationsMerged,
 }
 
 impl From<StreamingEventType> for StreamingEventKind {
@@ -700,6 +716,7 @@ impl From<StreamingEventType> for StreamingEventKind {
             StreamingEventType::Notification => Self::Notification,
             StreamingEventType::Conversation => Self::Conversation,
             StreamingEventType::Delete => Self::Delete,
+            StreamingEventType::NotificationsMerged => Self::NotificationsMerged,
         }
     }
 }
@@ -712,6 +729,7 @@ impl From<StreamingEventKind> for StreamingEventType {
             StreamingEventKind::Notification => Self::Notification,
             StreamingEventKind::Conversation => Self::Conversation,
             StreamingEventKind::Delete => Self::Delete,
+            StreamingEventKind::NotificationsMerged => Self::NotificationsMerged,
         }
     }
 }
