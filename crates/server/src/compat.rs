@@ -736,6 +736,111 @@ mod tests {
         );
     }
 
+    /// Given Elk's Masto.js payload, creating and partially updating a subscription succeeds.
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_subscription_accepts_elk_json(context: &mut CompatContext) {
+        let token = context.access_token().await;
+        let response = context
+            .authenticated_json_request(
+                axum::http::Method::POST,
+                "/api/v1/push/subscription",
+                &token,
+                serde_json::json!({
+                    "policy": "all",
+                    "subscription": {
+                        "endpoint": "https://1.1.1.1/push",
+                        "keys": {
+                            "p256dh": PUSH_P256DH,
+                            "auth": PUSH_AUTH,
+                        },
+                    },
+                    "data": {
+                        "alerts": {
+                            "follow": true,
+                            "favourite": true,
+                            "reblog": true,
+                            "mention": true,
+                            "poll": true,
+                        },
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_body(response).await;
+        assert_eq!(created["standard"], false);
+        assert_eq!(created["policy"], "all");
+        assert_eq!(created["alerts"]["mention"], true);
+        assert_eq!(created["alerts"]["follow"], true);
+        assert!(created["alerts"].get("poll").is_none());
+
+        let response = context
+            .authenticated_json_request(
+                axum::http::Method::PUT,
+                "/api/v1/push/subscription",
+                &token,
+                serde_json::json!({
+                    "data": {
+                        "alerts": {
+                            "mention": false,
+                        },
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = json_body(response).await;
+        assert_eq!(updated["alerts"]["mention"], false);
+        assert_eq!(updated["alerts"]["follow"], true);
+        assert_eq!(updated["policy"], "all");
+    }
+
+    /// Invalid typed JSON is rejected before a push subscription is persisted.
+    #[test_context(CompatContext)]
+    #[tokio::test]
+    async fn push_subscription_rejects_invalid_json(context: &mut CompatContext) {
+        let token = context.access_token().await;
+        for body in [
+            serde_json::json!({
+                "policy": "somebody",
+                "subscription": {
+                    "endpoint": "https://1.1.1.1/push",
+                    "keys": { "p256dh": PUSH_P256DH, "auth": PUSH_AUTH },
+                },
+            }),
+            serde_json::json!({
+                "policy": "all",
+                "subscription": {
+                    "endpoint": "https://1.1.1.1/push",
+                    "keys": { "p256dh": PUSH_P256DH, "auth": "AQID" },
+                },
+            }),
+        ] {
+            let response = context
+                .authenticated_json_request(
+                    axum::http::Method::POST,
+                    "/api/v1/push/subscription",
+                    &token,
+                    body,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(json_body(response).await["error"].as_str().is_some());
+        }
+        let grant =
+            roosty_db::find_access_token_grant(&context.db, &context.config.token_pepper, &token)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            roosty_db::push_subscription_for_access_token(&context.db, grant.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test_context(CompatContext)]
     #[tokio::test]
     async fn push_subscription_rejects_invalid_data_without_persisting(
@@ -1255,6 +1360,23 @@ mod tests {
                 token,
                 Body::from(body),
                 Some("application/x-www-form-urlencoded"),
+            )
+            .await
+        }
+
+        async fn authenticated_json_request(
+            &self,
+            method: axum::http::Method,
+            uri: &str,
+            token: &str,
+            body: Value,
+        ) -> axum::http::Response<Body> {
+            self.authenticated_request(
+                method,
+                uri,
+                token,
+                Body::from(serde_json::to_vec(&body).unwrap()),
+                Some("application/json"),
             )
             .await
         }

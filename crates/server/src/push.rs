@@ -4,8 +4,8 @@ use std::{
 
 use axum::{
     Form, Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{FromRequest, Request, State},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -20,7 +20,7 @@ use roosty_db::{PushAlerts, PushPolicy, PushSubscription, PushSubscriptionEncodi
 use roosty_web_push::{
     Client, DeliveryOutcome, Encoding, SendOptions, Subscription, VapidIdentity,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
 use url::Url;
@@ -287,6 +287,8 @@ enum PushApiError {
     NotFound,
     #[error("{0}")]
     InvalidInput(Cow<'static, str>),
+    #[error("push subscriptions require JSON or form-encoded data")]
+    UnsupportedMediaType,
     #[error("This action requires the push OAuth scope")]
     InsufficientScope,
     #[error(transparent)]
@@ -300,6 +302,7 @@ impl IntoResponse for PushApiError {
         let status = match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidInput(_) | Self::Protocol(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::InsufficientScope => StatusCode::FORBIDDEN,
             Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -319,6 +322,121 @@ struct DeliveryJob {
     subscription_id: Uuid,
 }
 
+/// Request body accepted from both JSON clients such as Elk and form clients such as Tusky.
+enum PushRequest<T> {
+    Json(T),
+    Form(HashMap<String, String>),
+}
+
+impl<S, T> FromRequest<S> for PushRequest<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = PushApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let content_type = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if content_type.starts_with("application/json") {
+            return Json::<T>::from_request(request, state)
+                .await
+                .map(|Json(value)| Self::Json(value))
+                .map_err(|error| PushApiError::InvalidInput(error.to_string().into()));
+        }
+        if content_type.starts_with("application/x-www-form-urlencoded") {
+            return Form::<HashMap<String, String>>::from_request(request, state)
+                .await
+                .map(|Form(fields)| Self::Form(fields))
+                .map_err(|error| PushApiError::InvalidInput(error.to_string().into()));
+        }
+        Err(PushApiError::UnsupportedMediaType)
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateSubscriptionJson {
+    subscription: SubscriptionJson,
+    #[serde(default)]
+    data: PushDataJson,
+    #[serde(default)]
+    policy: Option<PushPolicy>,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionJson {
+    endpoint: String,
+    keys: SubscriptionKeysJson,
+    #[serde(default)]
+    standard: bool,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionKeysJson {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Default, Deserialize)]
+struct PushDataJson {
+    #[serde(default)]
+    alerts: PushAlertChanges,
+    #[serde(default)]
+    policy: Option<PushPolicy>,
+}
+
+#[derive(Default, Deserialize)]
+struct PushAlertChanges {
+    mention: Option<bool>,
+    favourite: Option<bool>,
+    follow: Option<bool>,
+    follow_request: Option<bool>,
+    reblog: Option<bool>,
+    status: Option<bool>,
+    update: Option<bool>,
+    quote: Option<bool>,
+    quoted_update: Option<bool>,
+}
+
+impl PushAlertChanges {
+    fn apply(self, alerts: &mut PushAlerts) {
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(enabled) = self.$field {
+                    alerts.$field = enabled;
+                }
+            };
+        }
+        apply!(mention);
+        apply!(favourite);
+        apply!(follow);
+        apply!(follow_request);
+        apply!(reblog);
+        apply!(status);
+        apply!(update);
+        apply!(quote);
+        apply!(quoted_update);
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateSubscriptionJson {
+    #[serde(default)]
+    data: PushDataJson,
+}
+
+struct CreateSubscriptionInput {
+    endpoint: Url,
+    p256dh: Vec<u8>,
+    auth: Vec<u8>,
+    encoding: PushSubscriptionEncoding,
+    policy: PushPolicy,
+    alerts: PushAlerts,
+}
+
 async fn get_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
@@ -335,26 +453,25 @@ async fn get_subscription(
 async fn create_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
-    Form(fields): Form<HashMap<String, String>>,
+    request: PushRequest<CreateSubscriptionJson>,
 ) -> std::result::Result<Json<SubscriptionResponse>, PushApiError> {
     require_push_scope(&token)?;
     let client = state.push.client().ok_or(PushApiError::NotFound)?;
-    let endpoint = Url::parse(required_field(&fields, "subscription[endpoint]")?)
-        .map_err(|_| PushApiError::InvalidInput("subscription endpoint is invalid".into()))?;
-    let p256dh = decode_key(&fields, "subscription[keys][p256dh]", 65)?;
-    let auth = decode_key(&fields, "subscription[keys][auth]", 16)?;
-    let encoding = if boolean_field(&fields, "subscription[standard]")?.unwrap_or(false) {
-        PushSubscriptionEncoding::Standard
-    } else {
-        PushSubscriptionEncoding::Legacy
-    };
+    let input = create_subscription_input(request)?;
+    let CreateSubscriptionInput {
+        endpoint,
+        p256dh,
+        auth,
+        encoding,
+        policy,
+        alerts,
+    } = input;
     let wire_encoding = match encoding {
         PushSubscriptionEncoding::Standard => Encoding::Aes128Gcm,
         PushSubscriptionEncoding::Legacy => Encoding::AesGcm,
     };
     Subscription::new(endpoint.clone(), &p256dh, &auth, wire_encoding)?;
     roosty_web_push::validate_endpoint(&endpoint).await?;
-    let policy = policy(&fields)?;
     let (access_token_nonce, access_token_ciphertext) = state
         .push
         .encrypt_access_token(token.grant.id, &token.raw_token)?;
@@ -366,7 +483,7 @@ async fn create_subscription(
         auth,
         encoding,
         policy,
-        alerts: alerts(&fields)?,
+        alerts,
         access_token_ciphertext,
         access_token_nonce,
     };
@@ -377,15 +494,24 @@ async fn create_subscription(
 async fn update_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
-    Form(fields): Form<HashMap<String, String>>,
+    request: PushRequest<UpdateSubscriptionJson>,
 ) -> std::result::Result<Json<SubscriptionResponse>, PushApiError> {
     require_push_scope(&token)?;
     let client = state.push.client().ok_or(PushApiError::NotFound)?;
     let existing = roosty_db::push_subscription_for_access_token(&state.push.db, token.grant.id)
         .await?
         .ok_or(PushApiError::NotFound)?;
-    let policy = optional_policy(&fields)?.unwrap_or(existing.policy);
-    let alerts = alerts_with_defaults(&fields, existing.alerts)?;
+    let (alerts, policy) = match request {
+        PushRequest::Json(request) => {
+            let mut alerts = existing.alerts;
+            request.data.alerts.apply(&mut alerts);
+            (alerts, request.data.policy.unwrap_or(existing.policy))
+        }
+        PushRequest::Form(fields) => (
+            alerts_with_defaults(&fields, existing.alerts)?,
+            optional_policy(&fields)?.unwrap_or(existing.policy),
+        ),
+    };
     let subscription =
         roosty_db::update_push_subscription(&state.push.db, token.grant.id, alerts, policy)
             .await?
@@ -426,6 +552,56 @@ fn subscription_response(
     }
 }
 
+fn create_subscription_input(
+    request: PushRequest<CreateSubscriptionJson>,
+) -> std::result::Result<CreateSubscriptionInput, PushApiError> {
+    match request {
+        PushRequest::Json(request) => {
+            let endpoint = parse_endpoint(&request.subscription.endpoint)?;
+            let p256dh = decode_key_value(&request.subscription.keys.p256dh, 65)?;
+            let auth = decode_key_value(&request.subscription.keys.auth, 16)?;
+            let encoding = if request.subscription.standard {
+                PushSubscriptionEncoding::Standard
+            } else {
+                PushSubscriptionEncoding::Legacy
+            };
+            let mut alerts = PushAlerts::default();
+            request.data.alerts.apply(&mut alerts);
+            Ok(CreateSubscriptionInput {
+                endpoint,
+                p256dh,
+                auth,
+                encoding,
+                policy: request.data.policy.or(request.policy).unwrap_or_default(),
+                alerts,
+            })
+        }
+        PushRequest::Form(fields) => {
+            let endpoint = parse_endpoint(required_field(&fields, "subscription[endpoint]")?)?;
+            let p256dh = decode_key(&fields, "subscription[keys][p256dh]", 65)?;
+            let auth = decode_key(&fields, "subscription[keys][auth]", 16)?;
+            let encoding = if boolean_field(&fields, "subscription[standard]")?.unwrap_or(false) {
+                PushSubscriptionEncoding::Standard
+            } else {
+                PushSubscriptionEncoding::Legacy
+            };
+            Ok(CreateSubscriptionInput {
+                endpoint,
+                p256dh,
+                auth,
+                encoding,
+                policy: policy(&fields)?,
+                alerts: alerts(&fields)?,
+            })
+        }
+    }
+}
+
+fn parse_endpoint(value: &str) -> std::result::Result<Url, PushApiError> {
+    Url::parse(value)
+        .map_err(|_| PushApiError::InvalidInput("subscription endpoint is invalid".into()))
+}
+
 fn required_field<'a>(
     fields: &'a HashMap<String, String>,
     name: &'static str,
@@ -445,6 +621,10 @@ fn decode_key(
     length: usize,
 ) -> std::result::Result<Vec<u8>, PushApiError> {
     let value = required_field(fields, name)?;
+    decode_key_value(value, length)
+}
+
+fn decode_key_value(value: &str, length: usize) -> std::result::Result<Vec<u8>, PushApiError> {
     let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
         PushApiError::InvalidInput("subscription key is not valid base64url".into())
     })?;
