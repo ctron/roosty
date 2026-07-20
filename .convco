@@ -1,0 +1,45 @@
+types:
+  - type: feat
+    increment: Minor
+    section: Features
+    hidden: false
+  - type: fix
+    increment: Patch
+    section: Fixes
+    hidden: false
+  - type: perf
+    increment: Patch
+    section: Performance
+    hidden: false
+  - type: refactor
+    increment: None
+    section: Refactoring
+    hidden: false
+  - type: docs
+    increment: None
+    section: Documentation
+    hidden: false
+  - type: test
+    increment: None
+    section: Tests
+    hidden: false
+  - type: build
+    increment: None
+    section: Build
+    hidden: false
+  - type: ci
+    increment: None
+    section: Continuous Integration
+    hidden: false
+  - type: chore
+    increment: None
+    section: Maintenance
+    hidden: false
+  - type: style
+    increment: None
+    section: Styling
+    hidden: false
+  - type: revert
+    increment: Patch
+    section: Reverts
+    hidden: false

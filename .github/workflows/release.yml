@@ -7,12 +7,70 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   LEPTOS_WASM_OPT_VERSION: version_131
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.96
+
+      - name: Verify tag matches Cargo version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v.+ ]]; then
+            printf 'release tag %s must start with a lowercase v\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          cargo_version="$(
+            cargo metadata --locked --no-deps --format-version=1 \
+              | jq -er '.packages[] | select(.name == "roosty") | .version'
+          )"
+          if [[ "$RELEASE_TAG" != "v${cargo_version}" ]]; then
+            printf 'release tag %s does not match Cargo version %s\n' \
+              "$RELEASE_TAG" "$cargo_version" >&2
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            printf 'release tag %s is not a valid OCI image tag\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          version_without_build="${cargo_version%%+*}"
+          prerelease=false
+          if [[ "$version_without_build" == *-* ]]; then
+            prerelease=true
+          fi
+
+          printf 'prerelease=%s\n' "$prerelease" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$cargo_version" >> "$GITHUB_OUTPUT"
+
+  archive:
+    needs: validate
     runs-on: ubuntu-24.04
 
     steps:
@@ -30,31 +88,16 @@ jobs:
       - name: Install wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
-      - name: Verify tag matches Cargo version
-        id: version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -eu
-          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "roosty") | .version')"
-          case "$RELEASE_TAG" in
-            "$version"|"v$version") ;;
-            *)
-              printf 'tag %s does not match Cargo version %s\n' "$RELEASE_TAG" "$version" >&2
-              exit 1
-              ;;
-          esac
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-
-      - name: Build release binary
+      - name: Build release archive
         run: cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked
 
-      - name: Package release binary
+      - name: Package release archive
         id: package
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        shell: bash
         run: |
-          set -eu
+          set -euo pipefail
           asset="roosty-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
           mkdir -p dist/package
           cp target/release/roosty dist/package/roosty
@@ -63,10 +106,192 @@ jobs:
           sha256sum "dist/$asset" > "dist/$asset.sha256"
           printf 'asset=%s\n' "$asset" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
         with:
-          generate_release_notes: true
-          files: |
+          name: release-assets
+          path: |
             dist/${{ steps.package.outputs.asset }}
             dist/${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  notes:
+    needs: validate
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out complete release history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Cargo Binstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+            | bash
+
+      - name: Install Convco
+        run: cargo binstall --no-confirm --locked --disable-telemetry convco@0.7.0
+
+      - name: Generate release notes
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: convco changelog --max-versions 1 --output release-notes.md "$RELEASE_TAG"
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 1
+
+  container:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Restore Cargo build cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/cargo-build-cache
+          key: ${{ runner.os }}-${{ matrix.architecture }}-cargo-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.architecture }}-cargo-build-
+
+      - name: Inject Cargo build cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723  # v3.4.0
+        with:
+          dockerfile: deploy/Containerfile
+          cache-dir: ${{ runner.temp }}/cargo-build-cache
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push platform image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Containerfile
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=roosty-release-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=roosty-release-${{ matrix.architecture }}
+
+      - name: Export image digest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-digests-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs:
+      - validate
+      - container
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: release-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-architecture image
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          references=()
+          for digest in "${RUNNER_TEMP}"/digests/*; do
+            references+=("ghcr.io/${{ github.repository }}@sha256:${digest##*/}")
+          done
+          docker buildx imagetools create \
+            --tag "ghcr.io/${{ github.repository }}:${RELEASE_TAG}" \
+            "${references[@]}"
+
+  release:
+    needs:
+      - validate
+      - archive
+      - notes
+      - manifest
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download release archive
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Download release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            "$RELEASE_TAG"
+            --verify-tag
+            --title "$RELEASE_TAG"
+            --notes-file notes/release-notes.md
+          )
+          if [[ "$PRERELEASE" == true ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "${args[@]}" dist/*

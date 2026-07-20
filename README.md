@@ -8,9 +8,11 @@ as an external Mastodon-compatible UI for compatibility testing as API support i
 ## Builds and Releases
 
 Every commit pushed to `main` that passes CI publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container
-image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release
-only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release
-includes an `x86_64-unknown-linux-gnu` binary, its required first-party UI assets, and a SHA-256 checksum.
+image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a tag creates a release only when it
+is exactly `v<workspace-version>` for the `roosty` Cargo package. The release includes an
+`x86_64-unknown-linux-gnu` binary, its required first-party UI assets, a SHA-256 checksum, Convco-generated release
+notes, and a multi-architecture container tagged with the exact release tag. Cargo pre-release versions create GitHub
+pre-releases and are not marked as the latest release.
 
 Web Push is enabled by setting `ROOSTY_VAPID_PRIVATE_KEY` to a base64-encoded PKCS#8 P-256 private key. The production
 Ansible role creates and preserves this key automatically. Every Roosty process sharing a database must use the same
