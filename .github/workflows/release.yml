@@ -272,6 +272,9 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+
       - name: Download release archive
         uses: actions/download-artifact@v8
         with:
