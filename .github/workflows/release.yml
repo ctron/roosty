@@ -82,6 +82,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Restore archive build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-archive
+          workspaces: . -> target
+
       - name: Install Cargo Binstall
         shell: bash
         run: |
