@@ -82,11 +82,18 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install Cargo Leptos
-        run: cargo install cargo-leptos --version 0.3.7 --locked
+      - name: Install Cargo Binstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+            | bash
 
-      - name: Install wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Install release build tools
+        run: >-
+          cargo binstall --no-confirm --locked --disable-telemetry
+          cargo-leptos@0.3.7 wasm-bindgen-cli@0.2.126
 
       - name: Build release archive
         run: cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked
