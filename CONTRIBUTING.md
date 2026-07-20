@@ -16,7 +16,7 @@ To prepare and publish a release, replace `<version>` with the Cargo version wit
 `roosty_image_tag` in `deploy/ansible/inventories/production/group_vars/roosty.yml` to `<version>`:
 
 ```sh
-cargo release version <version>
+cargo release version <version> --execute --no-confirm
 cargo update
 git add Cargo.toml Cargo.lock deploy/ansible/inventories/production/group_vars/roosty.yml
 git commit -m "chore(release): prepare v<version>"
