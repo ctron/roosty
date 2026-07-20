@@ -54,8 +54,8 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            printf 'release tag %s is not a valid OCI image tag\n' "$RELEASE_TAG" >&2
+          if [[ ! "$cargo_version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            printf 'Cargo version %s is not a valid OCI image tag\n' "$cargo_version" >&2
             exit 1
           fi
 
@@ -251,7 +251,7 @@ jobs:
 
       - name: Publish multi-architecture image
         env:
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          IMAGE_TAG: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -260,7 +260,7 @@ jobs:
             references+=("ghcr.io/${{ github.repository }}@sha256:${digest##*/}")
           done
           docker buildx imagetools create \
-            --tag "ghcr.io/${{ github.repository }}:${RELEASE_TAG}" \
+            --tag "ghcr.io/${{ github.repository }}:${IMAGE_TAG}" \
             "${references[@]}"
 
   release:

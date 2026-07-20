@@ -9,11 +9,11 @@ Every commit pushed to `main` that passes CI publishes a multi-architecture (`li
 image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a tag creates a release only when it
 is exactly `v<workspace-version>` for the `roosty` Cargo package. The release includes an
 `x86_64-unknown-linux-gnu` binary, its required first-party UI assets, a SHA-256 checksum, Convco-generated release
-notes, and a multi-architecture container tagged with the exact release tag. Cargo pre-release versions create GitHub
+notes, and a multi-architecture container tagged with the Cargo version without the `v` prefix. Cargo pre-release versions create GitHub
 pre-releases and are not marked as the latest release.
 
 To prepare and publish a release, replace `<version>` with the Cargo version without the `v` prefix. Also update
-`roosty_image_tag` in `deploy/ansible/inventories/production/group_vars/roosty.yml` to `v<version>`:
+`roosty_image_tag` in `deploy/ansible/inventories/production/group_vars/roosty.yml` to `<version>`:
 
 ```sh
 cargo release version <version>

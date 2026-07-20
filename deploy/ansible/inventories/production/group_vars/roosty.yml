@@ -1,7 +1,7 @@
 ---
 roosty_domain: roosty.example.com
 roosty_acme_email: admin@example.com
-roosty_image_tag: v0.1.0-alpha.1
+roosty_image_tag: 0.1.0-alpha.1
 roosty_instance_name: Roosty
 roosty_instance_description: A Roosty instance
 roosty_registration_mode: closed
