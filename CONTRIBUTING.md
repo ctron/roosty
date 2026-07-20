@@ -12,12 +12,13 @@ is exactly `v<workspace-version>` for the `roosty` Cargo package. The release in
 notes, and a multi-architecture container tagged with the exact release tag. Cargo pre-release versions create GitHub
 pre-releases and are not marked as the latest release.
 
-To prepare and publish a release, replace `<version>` with the Cargo version without the `v` prefix:
+To prepare and publish a release, replace `<version>` with the Cargo version without the `v` prefix. Also update
+`roosty_image_tag` in `deploy/ansible/inventories/production/group_vars/roosty.yml` to `v<version>`:
 
 ```sh
 cargo set-version <version>
 cargo update
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock deploy/ansible/inventories/production/group_vars/roosty.yml
 git commit -m "chore(release): prepare v<version>"
 git tag v<version>
 git push origin main --tags
