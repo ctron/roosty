@@ -3,6 +3,7 @@
 FROM docker.io/library/rust:bookworm AS builder
 
 ARG TARGETPLATFORM
+ENV LEPTOS_WASM_OPT_VERSION=version_131
 
 WORKDIR /src
 RUN rustup target add wasm32-unknown-unknown \

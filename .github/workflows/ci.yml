@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  LEPTOS_WASM_OPT_VERSION: version_131
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

@@ -27,6 +27,7 @@ Prerequisites:
 
 - Rust 1.96+
 - `wasm32-unknown-unknown` Rust target and Cargo Leptos 0.3.7 for native frontend development
+- Binaryen `wasm-opt` version 131 when `wasm-opt` is already installed on `PATH`
 - Podman with Compose support
 
 Install the frontend build tools and build both the native SSR binary and browser hydration bundle:
@@ -35,11 +36,16 @@ Install the frontend build tools and build both the native SSR binary and browse
 rustup target add wasm32-unknown-unknown
 cargo install cargo-leptos --version 0.3.7 --locked
 cargo install wasm-bindgen-cli --version 0.2.126 --locked
+export LEPTOS_WASM_OPT_VERSION=version_131
 cargo leptos build
 ```
 
-`cargo leptos watch` provides the corresponding rebuild loop when running Roosty directly. The
-Compose build performs a release frontend build automatically.
+The build environment pins Cargo Leptos's automatically downloaded `wasm-opt` to Binaryen
+`version_131`. Cargo Leptos prefers an existing `wasm-opt` on `PATH`, so verify that installation
+with `wasm-opt --version` or remove it from `PATH` to use the pinned download.
+
+`cargo leptos watch` uses the exported version pin and provides the corresponding rebuild loop when
+running Roosty directly. The Compose build performs a release frontend build automatically.
 
 Start the local stack:
 

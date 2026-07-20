@@ -62,9 +62,12 @@ render a local result. Elk and Phanpy remain independent full Mastodon clients.
 ## Packaging and failures
 
 Install Cargo Leptos 0.3.7 and the wasm-bindgen CLI matching the workspace's wasm-bindgen
-dependency (currently 0.2.126). `cargo leptos build` then produces the native binary and
-`target/site`. Container and archive releases ship both, and `ROOSTY_WEB_ROOT` locates the site
-directory at runtime. The backend serves `/pkg` from that directory.
+dependency (currently 0.2.126). Set `LEPTOS_WASM_OPT_VERSION=version_131` when invoking Cargo
+Leptos; CI, release, and container builds set this automatically. Because Cargo Leptos prefers an
+existing executable, any `wasm-opt` already on `PATH` must also be version 131. `cargo leptos build`
+then produces the native binary and `target/site`. Container and archive releases ship both, and
+`ROOSTY_WEB_ROOT` locates the site directory at runtime. The backend serves `/pkg` from that
+directory.
 
 The hydrated entry point installs `browser-panic-hook` before starting Leptos. Browser panics keep
 their diagnostics in the console while replacing the page body with a small, non-diagnostic
