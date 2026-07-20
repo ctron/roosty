@@ -78,6 +78,7 @@ impl UiBackend for RoostyUiBackend {
                 instance_name: state.config.instance_name.clone(),
                 instance_description: state.config.instance_description.clone(),
                 public_base_url: state.config.public_base_url.to_string(),
+                server_version: env!("CARGO_PKG_VERSION").to_owned(),
                 account,
             })
         })
@@ -118,11 +119,11 @@ mod tests {
     #[tokio::test]
     async fn renders_deep_links_with_metadata_and_session_navigation() {
         let app = test_router();
-        for (path, heading, title, login_next) in [
-            ("/", "Welcome to Roosty", "Welcome · Test Roosty", "/"),
+        for (path, marker, title, login_next) in [
+            ("/", "Welcome to", "Welcome · Test Roosty", "/"),
             (
                 "/about",
-                "Social networking, with an open protocol",
+                "About this instance",
                 "About · Test Roosty",
                 "/about",
             ),
@@ -136,14 +137,44 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
-            assert!(html.contains(heading), "missing heading in {path}");
+            assert!(html.contains(marker), "missing page marker in {path}");
+            assert!(html.contains("<h1>Test Roosty</h1>"));
+            assert!(html.contains("class=\"brand\">Test Roosty</a>"));
+            assert!(html.contains("A test social server"));
+            assert!(html.contains("Powered by Roosty v"));
+            assert!(html.contains("1.2.3"));
             assert!(html.contains(&format!("<title>{title}</title>")));
             assert!(html.contains(&format!(
                 "href=\"https://roosty.test{path}\" rel=\"canonical\""
             )));
             assert!(html.contains(&format!("href=\"/login?next={login_next}\"")));
+            assert!(html.contains(&format!(
+                "href=\"/login?next={login_next}\" rel=\"external\""
+            )));
             assert!(html.contains("/pkg/roosty-web.js"));
+            if path == "/" {
+                assert!(html.contains(">About this instance</a>"));
+            }
         }
+    }
+
+    /// Given an instance without an operator description, when its welcome page is rendered, then
+    /// visitors see neutral instance copy rather than project marketing or an empty lead.
+    #[tokio::test]
+    async fn renders_neutral_missing_description_fallback() {
+        let response = test_router_with_description(None)
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("A place to connect on the social web."));
+        assert!(html.contains(
+            "<meta name=\"description\" content=\"A place to connect on the social web.\">"
+        ));
+        assert!(!html.contains("built in Rust"));
     }
 
     /// Given a session cookie, when the welcome page is rendered, then the server-side bootstrap
@@ -165,7 +196,7 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Welcome, "));
         assert!(html.contains("alice"));
-        assert!(html.contains("href=\"/auth/edit\""));
+        assert!(html.contains("href=\"/auth/edit\" rel=\"external\""));
         assert!(!html.contains("/login?next="));
     }
 
@@ -181,13 +212,16 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestBackend;
+    struct TestBackend {
+        instance_description: Option<String>,
+    }
 
     impl UiBackend for TestBackend {
         fn bootstrap(
             &self,
             cookie_header: Option<String>,
         ) -> Pin<Box<dyn Future<Output = Result<UiBootstrap, String>> + Send + 'static>> {
+            let instance_description = self.instance_description.clone();
             Box::pin(async move {
                 let account = cookie_header
                     .filter(|value| value.contains("roosty_session=test-session"))
@@ -198,8 +232,9 @@ mod tests {
                     });
                 Ok(UiBootstrap {
                     instance_name: "Test Roosty".to_owned(),
-                    instance_description: Some("A test social server".to_owned()),
+                    instance_description,
                     public_base_url: "https://roosty.test".to_owned(),
+                    server_version: "1.2.3".to_owned(),
                     account,
                 })
             })
@@ -207,6 +242,10 @@ mod tests {
     }
 
     fn test_router() -> Router {
+        test_router_with_description(Some("A test social server".to_owned()))
+    }
+
+    fn test_router_with_description(instance_description: Option<String>) -> Router {
         let options = LeptosOptions::builder()
             .output_name("roosty-web")
             .site_root("target/site")
@@ -215,7 +254,9 @@ mod tests {
         let state = TestState {
             options: options.clone(),
         };
-        let context = UiServerContext(Arc::new(TestBackend));
+        let context = UiServerContext(Arc::new(TestBackend {
+            instance_description,
+        }));
 
         Router::new()
             .leptos_routes_with_context(

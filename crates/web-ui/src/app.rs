@@ -8,6 +8,7 @@ use leptos_router::{
 use crate::bootstrap::{UiBootstrap, load_bootstrap};
 
 type BootstrapResource = Resource<Result<UiBootstrap, ServerFnError>>;
+const DEFAULT_INSTANCE_DESCRIPTION: &str = "A place to connect on the social web.";
 
 /// Render the complete HTML document used for SSR and hydration.
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -52,14 +53,12 @@ fn WelcomePage() -> impl IntoView {
     view! {
         <PageMetadata bootstrap page_title="Welcome" path="/"/>
         <PageFrame bootstrap login_next="/">
-            <section class="hero">
-                <p class="eyebrow">"A small place for a wider social web"</p>
-                <h1>"Welcome to Roosty"</h1>
-                <p class="hero__lede">
-                    "Roosty is an ActivityPub server with Mastodon-compatible APIs, built in Rust."
-                </p>
-                <p><A attr:class="button" href="/about">"Learn more"</A></p>
-            </section>
+            <Suspense fallback=|| welcome_content("Roosty".to_owned(), DEFAULT_INSTANCE_DESCRIPTION.to_owned())>
+                {Suspend::new(async move {
+                    let (name, description) = instance_identity(bootstrap.await.ok());
+                    welcome_content(name, description)
+                })}
+            </Suspense>
         </PageFrame>
     }
 }
@@ -70,16 +69,41 @@ fn AboutPage() -> impl IntoView {
     view! {
         <PageMetadata bootstrap page_title="About" path="/about"/>
         <PageFrame bootstrap login_next="/about">
-            <article class="prose">
-                <p class="eyebrow">"About"</p>
-                <h1>"Social networking, with an open protocol"</h1>
-                <p>
-                    "Roosty speaks ActivityPub and exposes Mastodon-compatible APIs, so people can use the clients they already know while the server remains focused and lightweight."
-                </p>
-                <p><A href="/">"Return to the welcome page"</A></p>
-            </article>
+            <Suspense fallback=|| about_content("Roosty".to_owned(), DEFAULT_INSTANCE_DESCRIPTION.to_owned())>
+                {Suspend::new(async move {
+                    let (name, description) = instance_identity(bootstrap.await.ok());
+                    about_content(name, description)
+                })}
+            </Suspense>
         </PageFrame>
     }
+}
+
+fn welcome_content(name: String, description: String) -> AnyView {
+    view! {
+        <section class="hero">
+            <p class="eyebrow">"Welcome to"</p>
+            <h1>{name}</h1>
+            <p class="hero__lede">{description}</p>
+            <p><A attr:class="button" href="/about">"About this instance"</A></p>
+        </section>
+    }
+    .into_any()
+}
+
+fn about_content(name: String, description: String) -> AnyView {
+    view! {
+        <article class="prose">
+            <p class="eyebrow">"About this instance"</p>
+            <h1>{name}</h1>
+            <p>{description}</p>
+            <p>
+                "This instance is part of the decentralized social web. People can connect across compatible servers without needing an account on the same site."
+            </p>
+            <p><A href="/">"Return to the welcome page"</A></p>
+        </article>
+    }
+    .into_any()
 }
 
 #[component]
@@ -91,7 +115,9 @@ fn PageFrame(
     view! {
         <div class="site-shell">
             <header class="site-header">
-                <A attr:class="brand" href="/">"Roosty"</A>
+                <Suspense fallback=|| view! { <A attr:class="brand" href="/">"Roosty"</A> }>
+                    {move || bootstrap.get().map(instance_brand)}
+                </Suspense>
                 <nav aria-label="Primary navigation">
                     <A href="/about">"About"</A>
                     <Suspense fallback=move || view! { <span class="session-placeholder">"Checking session…"</span> }>
@@ -105,9 +131,40 @@ fn PageFrame(
             </header>
             <main>{children()}</main>
             <footer class="site-footer">
-                <p>"Built for the open social web."</p>
+                <Suspense fallback=|| view! { <p>"Powered by Roosty"</p> }>
+                    {move || bootstrap.get().map(version_attribution)}
+                </Suspense>
             </footer>
         </div>
+    }
+}
+
+fn instance_identity(bootstrap: Option<UiBootstrap>) -> (String, String) {
+    match bootstrap {
+        Some(bootstrap) => {
+            let description = bootstrap
+                .instance_description
+                .filter(|description| !description.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_INSTANCE_DESCRIPTION.to_owned());
+            (bootstrap.instance_name, description)
+        }
+        None => ("Roosty".to_owned(), DEFAULT_INSTANCE_DESCRIPTION.to_owned()),
+    }
+}
+
+fn instance_brand(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
+    let name = result
+        .map(|bootstrap| bootstrap.instance_name)
+        .unwrap_or_else(|_| "Roosty".to_owned());
+    view! { <A attr:class="brand" href="/">{name}</A> }.into_any()
+}
+
+fn version_attribution(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
+    match result {
+        Ok(bootstrap) => {
+            view! { <p>"Powered by Roosty v" {bootstrap.server_version}</p> }.into_any()
+        }
+        Err(_) => view! { <p>"Powered by Roosty"</p> }.into_any(),
     }
 }
 
@@ -119,12 +176,12 @@ fn session_navigation(
         Ok(bootstrap) => match bootstrap.account {
             Some(account) => view! {
                 <span class="session-account">"Welcome, " {account.username}</span>
-                <a href="/auth/edit">"Account"</a>
+                <a href="/auth/edit" rel="external">"Account"</a>
             }
             .into_any(),
             None => {
                 let href = format!("/login?next={login_next}");
-                view! { <a href=href>"Sign in"</a> }.into_any()
+                view! { <a href=href rel="external">"Sign in"</a> }.into_any()
             }
         },
         Err(_) => view! { <span class="session-error">"Session unavailable"</span> }.into_any(),
@@ -147,10 +204,13 @@ fn PageMetadata(
                     .unwrap_or_else(|| format!("{page_title} · Roosty"));
                 let description = bootstrap
                     .as_ref()
-                    .and_then(|value| value.instance_description.clone())
-                    .unwrap_or_else(|| {
-                        "An ActivityPub server with Mastodon-compatible APIs.".to_owned()
-                    });
+                    .and_then(|value| {
+                        value
+                            .instance_description
+                            .clone()
+                            .filter(|description| !description.trim().is_empty())
+                    })
+                    .unwrap_or_else(|| DEFAULT_INSTANCE_DESCRIPTION.to_owned());
                 let canonical = bootstrap
                     .as_ref()
                     .map(|value| {

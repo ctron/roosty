@@ -10,6 +10,7 @@ pub struct UiBootstrap {
     pub instance_name: String,
     pub instance_description: Option<String>,
     pub public_base_url: String,
+    pub server_version: String,
     pub account: Option<UiAccount>,
 }
 

@@ -24,6 +24,10 @@ description, canonical URL, and Open Graph metadata through Leptos Meta. Route d
 blocking SSR resource when it affects visible content or metadata; hydration reuses the serialized
 resource result instead of replacing server-rendered content after startup.
 
+The welcome and about pages present the operator-configured instance name and description rather
+than Roosty project marketing. A missing or blank description uses neutral social-web copy. Roosty
+appears as software attribution with its release version in the shared footer.
+
 The shared `roosty-web-ui` crate is compiled once with `ssr` for the native server and once with
 `hydrate` for `wasm32-unknown-unknown`. Server-only database and authentication services cross that
 boundary through `UiBackend`; they are never compiled into or exposed to the browser bundle.
@@ -36,8 +40,10 @@ function projects only public instance metadata and a small optional account sum
 expired, and deleted-account sessions render as anonymous.
 
 The existing `/login` handler remains authoritative during the first UI increment. UI links pass a
-sanitized same-origin `next` path, and the server redirects back after login. Future state-changing
-UI server functions must validate both the session and a CSRF token.
+sanitized same-origin `next` path, and the server redirects back after login. Links to server-owned
+login and account routes use `rel="external"` so Leptos performs a full document navigation instead
+of resolving them as client-side UI routes. Future state-changing UI server functions must validate
+both the session and a CSRF token.
 
 ## Static-page migration
 

@@ -162,7 +162,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟢 | Welcome and about pages | `GET /` and `GET /about` are explicitly routed, server-rendered, hydrated Rust/WebAssembly pages served by Roosty, including direct-entry and refresh support. |
+| 🟢 | Welcome and about pages | `GET /` and `GET /about` are explicitly routed, server-rendered, hydrated Rust/WebAssembly pages that present the configured instance identity, include versioned Roosty attribution, and support direct entry and refresh. |
 | 🟢 | Metadata | Each current UI route renders a title, description, canonical URL, and Open Graph metadata in the initial HTML response. |
 | 🟡 | Authentication | Navigation reflects the existing signed browser session and sends anonymous users through `/login` with a same-origin return path. Login, account editing, and OAuth consent still use the existing server-rendered forms. |
 | 🔴 | Profile and status pages | Human-facing first-party profile and status views are planned; ActivityPub actor and Note URLs remain protocol endpoints. |
