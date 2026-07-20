@@ -12,6 +12,17 @@ is exactly `v<workspace-version>` for the `roosty` Cargo package. The release in
 notes, and a multi-architecture container tagged with the exact release tag. Cargo pre-release versions create GitHub
 pre-releases and are not marked as the latest release.
 
+To prepare and publish a release, replace `<version>` with the Cargo version without the `v` prefix:
+
+```sh
+cargo set-version <version>
+cargo update
+git add Cargo.toml Cargo.lock
+git commit -m "chore(release): prepare v<version>"
+git tag v<version>
+git push origin main --tags
+```
+
 Web Push is enabled by setting `ROOSTY_VAPID_PRIVATE_KEY` to a base64-encoded PKCS#8 P-256 private key. The production
 Ansible role creates and preserves this key automatically. Every Roosty process sharing a database must use the same
 VAPID key and `ROOSTY_SESSION_SECRET`: rotating the VAPID key requires clients to subscribe again, while rotating the
