@@ -3,7 +3,7 @@ use tokio::sync::Semaphore;
 
 use axum::{
     Router,
-    extract::State,
+    extract::{FromRef, State},
     http::{Method, StatusCode, header},
     response::IntoResponse,
     routing::get,
@@ -29,6 +29,8 @@ pub struct AppState {
     pub streaming_connections: Arc<Semaphore>,
     /// Web Push API, credential protection, and delivery service.
     pub push: crate::push::PushService,
+    /// Asset and hydration settings for the first-party web UI.
+    pub leptos_options: leptos::config::LeptosOptions,
 }
 
 impl AppState {
@@ -47,7 +49,24 @@ impl AppState {
             streaming_events,
             streaming_connections,
             push,
+            leptos_options: leptos::config::LeptosOptions::builder()
+                .output_name("roosty-web")
+                .site_root("target/site")
+                .site_pkg_dir("pkg")
+                .build(),
         }
+    }
+
+    /// Override the default UI settings with Cargo Leptos build configuration.
+    pub fn with_leptos_options(mut self, leptos_options: leptos::config::LeptosOptions) -> Self {
+        self.leptos_options = leptos_options;
+        self
+    }
+}
+
+impl FromRef<AppState> for leptos::config::LeptosOptions {
+    fn from_ref(state: &AppState) -> Self {
+        state.leptos_options.clone()
     }
 }
 
@@ -69,6 +88,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::search::router())
         .merge(crate::statuses::router())
         .merge(crate::version::router())
+        .merge(crate::web::router(&state))
         .fallback(public_fallback)
         .layer(request_trace_layer())
         .layer(public_cors_layer());

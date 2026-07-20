@@ -16,6 +16,7 @@ services:
       ROOSTY_INSTANCE_DESCRIPTION: Local Roosty development instance
       ROOSTY_OBJECT_STORAGE_BACKEND: local
       ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
+      ROOSTY_WEB_ROOT: /usr/local/share/roosty/site
       ROOSTY_REGISTRATION_MODE: closed
       ROOSTY_WORKER_CONCURRENCY: "4"
       ROOSTY_FEDERATION_ENABLED: "false"
@@ -55,7 +56,7 @@ services:
       - "4001:4001"
       - "4002:4002"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,Z
       - caddy-data:/data
       - caddy-config:/config
     depends_on:

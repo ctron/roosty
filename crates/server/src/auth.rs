@@ -1487,7 +1487,7 @@ fn profile_field(name: String, value: String) -> Option<Value> {
     }))
 }
 
-fn account_id_from_session(
+pub(crate) fn account_id_from_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<AccountId>, RoostyError> {

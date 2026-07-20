@@ -25,6 +25,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Install Cargo Leptos
+        run: cargo install cargo-leptos --version 0.3.7 --locked
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -34,3 +41,6 @@ jobs:
 
       - name: Test Rust workspace
         run: cargo test --workspace --locked -- --test-threads=8
+
+      - name: Build server-rendered and hydrated frontend
+        run: cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked

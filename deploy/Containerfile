@@ -5,13 +5,17 @@ FROM docker.io/library/rust:bookworm AS builder
 ARG TARGETPLATFORM
 
 WORKDIR /src
+RUN rustup target add wasm32-unknown-unknown \
+    && cargo install cargo-leptos --version 0.3.7 --locked \
+    && cargo install wasm-bindgen-cli --version 0.2.126 --locked
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-${TARGETPLATFORM},target=/cargo-target,sharing=locked \
-    CARGO_TARGET_DIR=/cargo-target cargo build --release --locked -p roosty \
-    && cp /cargo-target/release/roosty /usr/local/bin/roosty
+    CARGO_TARGET_DIR=/cargo-target cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked \
+    && cp /cargo-target/release/roosty /usr/local/bin/roosty \
+    && cp -R target/site /usr/local/share/roosty-site
 
 FROM docker.io/library/debian:bookworm-slim
 
@@ -21,6 +25,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/roosty /usr/local/bin/roosty
+COPY --from=builder /usr/local/share/roosty-site /usr/local/share/roosty/site
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/roosty"]

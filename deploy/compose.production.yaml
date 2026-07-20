@@ -9,6 +9,7 @@ services:
       ROOSTY_LISTEN_ADDR: 0.0.0.0:4000
       ROOSTY_INFRA_LISTEN_ADDR: 0.0.0.0:3001
       ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
+      ROOSTY_WEB_ROOT: /usr/local/share/roosty/site
     volumes:
       - roosty-media:/var/lib/roosty/media
     depends_on:
@@ -33,7 +34,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,Z
       - caddy-data:/data
       - caddy-config:/config
     depends_on:

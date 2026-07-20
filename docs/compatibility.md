@@ -158,6 +158,15 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | 🟡 | `delete` events | Emitted for local status deletes, including current followed-tag recipients, and removed local or followed remote boost timeline entries. |
 | 🟢 | Multi-process fan-out | PostgreSQL notifications and a retained ordered event log provide reconnect recovery without startup replay. |
 
+## First-party Web UI
+
+| Support | Area | Details |
+| --- | --- | --- |
+| 🟢 | Welcome and about pages | `GET /` and `GET /about` are explicitly routed, server-rendered, hydrated Rust/WebAssembly pages served by Roosty, including direct-entry and refresh support. |
+| 🟢 | Metadata | Each current UI route renders a title, description, canonical URL, and Open Graph metadata in the initial HTML response. |
+| 🟡 | Authentication | Navigation reflects the existing signed browser session and sends anonymous users through `/login` with a same-origin return path. Login, account editing, and OAuth consent still use the existing server-rendered forms. |
+| 🔴 | Profile and status pages | Human-facing first-party profile and status views are planned; ActivityPub actor and Note URLs remain protocol endpoints. |
+
 ## Federation
 
 | Support | Area | Details |

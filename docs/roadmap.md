@@ -15,6 +15,7 @@
 - Mastodon-compatible public/unlisted status pins with a five-pin transactional limit, pinned account collections, ActivityPub featured collections, durable Add/Remove delivery, and bounded remote featured caching.
 - Mastodon-compatible notification policies and sender-scoped requests, with durable multi-process merges/cleanup, completion streaming, unread counts, and operator-managed local/remote account limits that leave ActivityPub ingestion intact.
 - Mastodon-compatible browser OAuth, including PKCE, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
+- A first-party Rust/WebAssembly frontend foundation with server-rendered, hydrated welcome and about pages, SEO metadata, deep-link support, and session-aware navigation served by the backend.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
@@ -95,6 +96,7 @@
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
+- [ ] Add SEO-friendly first-party profile and status pages, then migrate the remaining Askama login, account, and OAuth views onto the shared Leptos shell.
 - [ ] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, and multi-process-safe publication.
 - [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients.
 - [ ] Improve local account administration now that multiple local users can be operator-created.

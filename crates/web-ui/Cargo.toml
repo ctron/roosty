@@ -1,0 +1,36 @@
+[package]
+name = "roosty-web-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["ssr"]
+hydrate = [
+    "dep:browser-panic-hook",
+    "dep:wasm-bindgen",
+    "leptos/hydrate",
+]
+ssr = [
+    "dep:axum",
+    "dep:leptos_axum",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+browser-panic-hook = { workspace = true, optional = true }
+leptos = { workspace = true }
+leptos_axum = { workspace = true, optional = true }
+leptos_meta = { workspace = true }
+leptos_router = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true, features = ["js"] }
+wasm-bindgen = { workspace = true, optional = true }

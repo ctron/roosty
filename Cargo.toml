@@ -4,6 +4,7 @@ members = [
     "crates/db",
     "crates/migration",
     "crates/server",
+    "crates/web-ui",
     "crates/web-push",
 ]
 resolver = "3"
@@ -19,6 +20,7 @@ repository = "https://github.com/jreimann/mastodon-rs"
 roosty-core = { path = "crates/core" }
 roosty-db = { path = "crates/db" }
 roosty-migration = { path = "crates/migration" }
+roosty-web-ui = { path = "crates/web-ui" }
 roosty-web-push = { path = "crates/web-push" }
 
 aes-gcm = "0.11.0"
@@ -28,6 +30,7 @@ axum = { version = "0.8.4", features = ["macros", "ws"] }
 axum-params = "0.4.1"
 base64 = "0.22.1"
 blurhash = "0.2.3"
+browser-panic-hook = "0.2.0"
 build-info = "0.0.45"
 build-info-build = "0.0.45"
 bytesize = "2.4.2"
@@ -37,6 +40,10 @@ hkdf = "0.13.0"
 humantime = "2.3.0"
 httpdate = "1.0.3"
 image = "0.25.10"
+leptos = "0.8.20"
+leptos_axum = "0.8.10"
+leptos_meta = "0.8.5"
+leptos_router = "0.8.6"
 linkify = "0.11.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 ring = "0.17.14"
@@ -60,8 +67,33 @@ thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["serde"] }
 tokio = { version = "1.45.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5.2", features = ["util"] }
-tower-http = { version = "0.6.11", features = ["cors", "trace"] }
+tower-http = { version = "0.6.11", features = ["cors", "fs", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 url = { version = "2.5.4", features = ["serde"] }
 uuid = { version = "1.17.0", features = ["serde", "v7"] }
+wasm-bindgen = "0.2.126"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[[workspace.metadata.leptos]]
+name = "roosty-web"
+bin-package = "roosty"
+lib-package = "roosty-web-ui"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "crates/web-ui/style/main.css"
+assets-dir = "crates/web-ui/public"
+site-addr = "127.0.0.1:4000"
+reload-port = 4003
+browserquery = "defaults"
+bin-features = []
+bin-default-features = true
+lib-features = ["hydrate"]
+lib-default-features = false
+lib-profile-release = "wasm-release"

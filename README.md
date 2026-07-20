@@ -6,7 +6,7 @@ The project is early. The current local setup brings up the Rust server, Postgre
 
 ## Builds and Releases
 
-Every commit pushed to `main` that passes CI publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary archive and SHA-256 checksum.
+Every commit pushed to `main` that passes CI publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container image to `ghcr.io/ctron/roosty`, tagged as both `main` and `sha-<commit>`. Pushing a Git tag creates a GitHub release only when the tag is either `<workspace-version>` or `v<workspace-version>` from the `roosty` Cargo package; the release includes an `x86_64-unknown-linux-gnu` binary, its required first-party UI assets, and a SHA-256 checksum.
 
 Web Push is enabled by setting `ROOSTY_VAPID_PRIVATE_KEY` to a base64-encoded PKCS#8 P-256 private key. The production Ansible role creates and preserves this key automatically. Every Roosty process sharing a database must use the same VAPID key and `ROOSTY_SESSION_SECRET`: rotating the VAPID key requires clients to subscribe again, while rotating the session secret makes stored push credentials undecryptable and removes affected subscriptions on their next queued delivery.
 
@@ -17,7 +17,20 @@ Push-service endpoints must use HTTPS and resolve exclusively to public addresse
 Prerequisites:
 
 - Rust 1.96+
+- `wasm32-unknown-unknown` Rust target and Cargo Leptos 0.3.7 for native frontend development
 - Podman with Compose support
+
+Install the frontend build tools and build both the native SSR binary and browser hydration bundle:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install cargo-leptos --version 0.3.7 --locked
+cargo install wasm-bindgen-cli --version 0.2.126 --locked
+cargo leptos build
+```
+
+`cargo leptos watch` provides the corresponding rebuild loop when running Roosty directly. The
+Compose build performs a release frontend build automatically.
 
 Start the local stack:
 
@@ -31,7 +44,7 @@ The local stack uses Caddy with an internal development certificate so Roosty an
 
 This starts:
 
-- Roosty API server through Caddy: `https://roosty.localhost:4000`
+- Roosty first-party welcome UI and API server through Caddy: `https://roosty.localhost:4000`
 - Roosty infrastructure endpoints: `http://localhost:3001`
 - Elk web client through Caddy: `https://localhost:4001`
 - Phanpy web client through Caddy: `https://localhost:4002`

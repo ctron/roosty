@@ -10,6 +10,7 @@ repository.workspace = true
 roosty-core = { workspace = true }
 roosty-db = { workspace = true }
 roosty-migration = { workspace = true }
+roosty-web-ui = { workspace = true, features = ["ssr"] }
 roosty-web-push = { workspace = true }
 argon2 = { workspace = true }
 askama = { workspace = true }
@@ -24,6 +25,8 @@ hmac = { workspace = true }
 humantime = { workspace = true }
 httpdate = { workspace = true }
 image = { workspace = true }
+leptos = { workspace = true, features = ["ssr"] }
+leptos_axum = { workspace = true }
 linkify = { workspace = true }
 rand_core = { workspace = true }
 reqwest = { workspace = true }

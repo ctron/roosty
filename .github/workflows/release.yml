@@ -18,6 +18,14 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.96
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Cargo Leptos
+        run: cargo install cargo-leptos --version 0.3.7 --locked
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
       - name: Verify tag matches Cargo version
         id: version
@@ -36,7 +44,7 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: cargo build --release --locked -p roosty
+        run: cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked
 
       - name: Package release binary
         id: package
@@ -45,8 +53,10 @@ jobs:
         run: |
           set -eu
           asset="roosty-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          mkdir -p dist
-          tar -C target/release -czf "dist/$asset" roosty
+          mkdir -p dist/package
+          cp target/release/roosty dist/package/roosty
+          cp -R target/site dist/package/site
+          tar -C dist/package -czf "dist/$asset" roosty site
           sha256sum "dist/$asset" > "dist/$asset.sha256"
           printf 'asset=%s\n' "$asset" >> "$GITHUB_OUTPUT"
 

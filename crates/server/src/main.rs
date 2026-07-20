@@ -32,6 +32,7 @@ mod streaming;
 #[cfg(test)]
 mod test_postgres;
 mod version;
+mod web;
 
 use crate::{
     config::{Config, database_url_from_env},
@@ -266,6 +267,16 @@ async fn serve(
     reconcile_domain_suspensions(&db, &config).await?;
 
     let state = AppState::new(config.clone(), db.clone());
+    let mut leptos_options = leptos::config::get_configuration(None)
+        .map_err(|error| RoostyError::Configuration(error.to_string()))?
+        .leptos_options;
+    if !cfg!(debug_assertions) {
+        leptos_options.env = leptos::config::Env::PROD;
+    }
+    if let Ok(site_root) = std::env::var("ROOSTY_WEB_ROOT") {
+        leptos_options.site_root = site_root.into();
+    }
+    let state = state.with_leptos_options(leptos_options);
     state.streaming_events.initialize_listener().await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
