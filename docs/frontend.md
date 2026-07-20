@@ -39,23 +39,25 @@ an OAuth client and does not store bearer tokens in browser storage. A read-only
 function projects only public instance metadata and a small optional account summary. Invalid,
 expired, and deleted-account sessions render as anonymous.
 
-The existing `/login` handler remains authoritative during the first UI increment. UI links pass a
-sanitized same-origin `next` path, and the server redirects back after login. Links to server-owned
-login and account routes use `rel="external"` so Leptos performs a full document navigation instead
-of resolving them as client-side UI routes. Future state-changing UI server functions must validate
-both the session and a CSRF token.
+Leptos renders the `/login`, `/auth/edit`, and OAuth authorization views, while the existing server
+handlers remain authoritative for credential verification, session cookies, password updates, and
+OAuth grants. Native HTML form submissions use POST/Redirect/GET; fixed Strum-backed values select
+user-facing results and OAuth consent decisions without putting credentials or arbitrary errors in
+URLs. Login return paths remain sanitized and same-origin. The password page and OAuth consent flow
+redirect anonymous visitors through login.
 
-## Static-page migration
+Links to server-owned account routes use `rel="external"` so Leptos performs a full document
+navigation instead of resolving them as client-side UI routes. Future state-changing UI server
+functions must validate both the session and a CSRF token.
 
-Replace the existing Askama views without changing their underlying protocol or mutation handlers:
+## OAuth views
 
-1. Login form and errors.
-2. Password-change form and validation results.
-3. OAuth authorization consent.
-4. Out-of-band authorization code display.
-
-Askama can be removed only after the final view is migrated. Elk and Phanpy remain independent full
-Mastodon clients throughout this migration.
+OAuth consent and out-of-band code results use SSR-only Leptos documents with the shared instance
+chrome and stylesheet. They intentionally use native forms without hydration: consent needs no
+browser-side state, and an out-of-band one-time code must stay in the POST response rather than a
+redirect URL. Consent lists the requested scopes and supports typed approve or deny decisions;
+regular denials return `access_denied` to the exact registered callback, while out-of-band denials
+render a local result. Elk and Phanpy remain independent full Mastodon clients.
 
 ## Packaging and failures
 

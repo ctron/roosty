@@ -1,10 +1,20 @@
 //! Server-rendered and hydrated browser UI for Roosty.
 
 mod app;
+#[cfg(feature = "ssr")]
+mod authorization;
 mod bootstrap;
+mod forms;
 
 pub use app::{App, shell};
+#[cfg(feature = "ssr")]
+pub use authorization::{
+    AuthorizationConsent, AuthorizationDecision, AuthorizationPageContext, AuthorizationPermission,
+    AuthorizationPermissionKind, AuthorizationResult, OutOfBandAuthorization,
+    render_authorization_consent, render_out_of_band_authorization,
+};
 pub use bootstrap::{UiAccount, UiBackend, UiBootstrap, UiServerContext};
+pub use forms::{LoginError, PasswordChangeResult};
 
 #[cfg(feature = "hydrate")]
 fn panic_body(_: browser_panic_hook::PanicDetails<'_>) -> String {

@@ -8,7 +8,11 @@ use std::{
 
 use axum::{
     Router,
-    http::{HeaderMap, HeaderValue, header},
+    body::Body,
+    extract::State,
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
 };
 use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
@@ -41,6 +45,35 @@ pub fn router(state: &AppState) -> Router<AppState> {
             move || shell(options.clone()),
         )
         .nest_service("/pkg", assets)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            protect_password_form,
+        ))
+}
+
+async fn protect_password_form(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request.uri().path() != "/auth/edit" {
+        return next.run(request).await;
+    }
+
+    match account_id_from_session(&state, request.headers()) {
+        Ok(Some(_)) => next.run(request).await,
+        Ok(None) => {
+            let mut location = state.config.public_base_url.clone();
+            location.set_path("/login");
+            location.set_query(Some("next=%2Fauth%2Fedit"));
+            location.set_fragment(None);
+            Redirect::to(location.as_str()).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to validate browser session");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error\n").into_response()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -112,6 +145,57 @@ mod tests {
 
         assert!(paths.iter().any(|path| path == "/"));
         assert!(paths.iter().any(|path| path == "/about"));
+        assert!(paths.iter().any(|path| path == "/login"));
+        assert!(paths.iter().any(|path| path == "/auth/edit"));
+    }
+
+    /// Given a failed credential submission, when the redirected login page renders, then the new
+    /// shell preserves the safe return path and displays an accessible error beside the form.
+    #[tokio::test]
+    async fn renders_login_form_with_redirect_state() {
+        let response = test_router()
+            .oneshot(
+                Request::get("/login?next=%2Fabout&error=invalid_credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<h1>Sign in</h1>"));
+        assert!(html.contains("action=\"/login\""));
+        assert!(html.contains("name=\"next\" value=\"/about\""));
+        assert!(html.contains("Invalid username or password."));
+        assert!(html.contains("role=\"alert\""));
+    }
+
+    /// Given a signed-in visitor, when the password form is requested, then all fields retain the
+    /// existing server handler names and a typed redirect result is presented accessibly.
+    #[tokio::test]
+    async fn renders_authenticated_password_form_and_result() {
+        let response = test_router()
+            .oneshot(
+                Request::get("/auth/edit?result=current_password_incorrect")
+                    .header(header::COOKIE, "roosty_session=test-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<h1>Change password</h1>"));
+        assert!(html.contains("action=\"/auth\""));
+        assert!(html.contains("name=\"user[current_password]\""));
+        assert!(html.contains("name=\"user[password]\""));
+        assert!(html.contains("name=\"user[password_confirmation]\""));
+        assert!(html.contains("Current password is incorrect."));
+        assert!(html.contains("role=\"alert\""));
     }
 
     /// Given an anonymous visitor, when either UI route is requested directly, then the initial

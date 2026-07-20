@@ -54,7 +54,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟢 | `POST /api/v1/apps` | OAuth app registration. |
-| 🟢 | `GET/POST /oauth/authorize` | Local authorization flow, including the trailing-slash form and out-of-band code display used by CLI clients such as toot. |
+| 🟢 | `GET/POST /oauth/authorize` | SSR consent lists requested scopes and supports approve or standards-compatible `access_denied` decisions. The flow includes Elk callbacks with nested percent-encoded origins, the trailing-slash form, and styled out-of-band results used by CLI clients such as toot. Redirects always use the exact registered callback. |
 | 🟢 | `POST /oauth/token` | Authorization code and Elk-compatible token flow. |
 | 🟢 | `POST /oauth/revoke` | Bearer token revocation. |
 
@@ -64,7 +64,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟢 | `GET /api/v1/accounts/verify_credentials` | Returns local credential account. |
 | 🟡 | `PATCH /api/v1/accounts/update_credentials` | Profile basics, avatar/header images, and posting defaults. |
-| 🟢 | `GET /auth/edit`, `PUT/PATCH /auth` | Signed-in users can change their password through Mastodon's browser settings flow. |
+| 🟢 | `GET /auth/edit`, `POST/PUT/PATCH /auth` | Signed-in users can change their password through the first-party SSR/hydrated settings form with typed redirect results. |
 | 🟢 | `GET /api/v1/preferences` | Posting defaults and basic reading preferences. |
 | 🟢 | `GET /api/v1/accounts/search` | Authenticated mixed local/cached-remote account search with deterministic ranking, follow filtering, pagination, and exact-handle resolution. |
 | 🟢 | `GET /api/v1/accounts/lookup` | Public local and cached-remote address lookup; `resolve=true` performs policy-controlled WebFinger resolution. |
@@ -164,7 +164,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟢 | Welcome and about pages | `GET /` and `GET /about` are explicitly routed, server-rendered, hydrated Rust/WebAssembly pages that present the configured instance identity, include versioned Roosty attribution, and support direct entry and refresh. |
 | 🟢 | Metadata | Each current UI route renders a title, description, canonical URL, and Open Graph metadata in the initial HTML response. |
-| 🟡 | Authentication | Navigation reflects the existing signed browser session and sends anonymous users through `/login` with a same-origin return path. Login, account editing, and OAuth consent still use the existing server-rendered forms. |
+| 🟢 | Authentication | Navigation reflects the existing signed browser session. Leptos renders login, password-change, OAuth consent, and out-of-band result views while backend handlers retain credential, session, and grant authority. |
 | 🔴 | Profile and status pages | Human-facing first-party profile and status views are planned; ActivityPub actor and Note URLs remain protocol endpoints. |
 
 ## Federation

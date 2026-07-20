@@ -2,10 +2,12 @@ use leptos::prelude::*;
 use leptos_meta::{Link, Meta, MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
     components::{A, Route, Router, Routes},
+    hooks::use_query_map,
     path,
 };
 
 use crate::bootstrap::{UiBootstrap, load_bootstrap};
+use crate::forms::{LoginError, PasswordChangeResult};
 
 type BootstrapResource = Resource<Result<UiBootstrap, ServerFnError>>;
 const DEFAULT_INSTANCE_DESCRIPTION: &str = "A place to connect on the social web.";
@@ -42,6 +44,8 @@ pub fn App() -> impl IntoView {
             <Routes fallback=|| view! { <NotFoundPage/> }>
                 <Route path=path!("") view=WelcomePage/>
                 <Route path=path!("about") view=AboutPage/>
+                <Route path=path!("login") view=LoginPage/>
+                <Route path=path!("auth/edit") view=ChangePasswordPage/>
             </Routes>
         </Router>
     }
@@ -76,6 +80,158 @@ fn AboutPage() -> impl IntoView {
                 })}
             </Suspense>
         </PageFrame>
+    }
+}
+
+#[component]
+fn LoginPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let query = use_query_map().get();
+    let next = query.get("next").unwrap_or_else(|| "/".to_owned());
+    let error = query
+        .get_str("error")
+        .and_then(|value| value.parse::<LoginError>().ok());
+
+    view! {
+        <PageMetadata bootstrap page_title="Sign in" path="/login"/>
+        <PageFrame bootstrap login_next="/login">
+            <section class="form-card">
+                <p class="eyebrow">"Account access"</p>
+                <h1>"Sign in"</h1>
+                {error.map(|error| view! {
+                    <p class="form-message form-message--error" role="alert">
+                        {login_error_message(error)}
+                    </p>
+                })}
+                <form method="post" action="/login">
+                    <input type="hidden" name="next" value=next/>
+                    <label class="form-field">
+                        <span>"Username or email"</span>
+                        <input name="login" autocomplete="username" required autofocus/>
+                    </label>
+                    <label class="form-field">
+                        <span>"Password"</span>
+                        <input
+                            name="password"
+                            type="password"
+                            autocomplete="current-password"
+                            required
+                        />
+                    </label>
+                    <button type="submit">"Sign in"</button>
+                </form>
+            </section>
+        </PageFrame>
+    }
+}
+
+#[component]
+fn ChangePasswordPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let result = use_query_map()
+        .get()
+        .get_str("result")
+        .and_then(|value| value.parse::<PasswordChangeResult>().ok());
+
+    view! {
+        <PageMetadata bootstrap page_title="Change password" path="/auth/edit"/>
+        <PageFrame bootstrap login_next="/auth/edit">
+            <Suspense fallback=|| ()>
+                {Suspend::new(async move {
+                    match bootstrap.await {
+                        Ok(bootstrap) if bootstrap.account.is_some() => {
+                            change_password_content(result)
+                        }
+                        _ => {
+                            view! {
+                                <section class="form-card">
+                                    <h1>"Sign in required"</h1>
+                                    <p>"Sign in before changing your password."</p>
+                                    <p><a href="/login?next=%2Fauth%2Fedit" rel="external">"Sign in"</a></p>
+                                </section>
+                            }
+                            .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+        </PageFrame>
+    }
+}
+
+fn change_password_content(result: Option<PasswordChangeResult>) -> AnyView {
+    let notice = result.map(password_result_message);
+    view! {
+        <section class="form-card">
+            <p class="eyebrow">"Account security"</p>
+            <h1>"Change password"</h1>
+            {notice.map(|(message, success)| {
+                let class = if success {
+                    "form-message form-message--success"
+                } else {
+                    "form-message form-message--error"
+                };
+                let role = if success { "status" } else { "alert" };
+                view! { <p class=class role=role>{message}</p> }
+            })}
+            <form method="post" action="/auth">
+                <label class="form-field">
+                    <span>"Current password"</span>
+                    <input
+                        name="user[current_password]"
+                        type="password"
+                        autocomplete="current-password"
+                        required
+                        autofocus
+                    />
+                </label>
+                <label class="form-field">
+                    <span>"New password"</span>
+                    <input
+                        name="user[password]"
+                        type="password"
+                        autocomplete="new-password"
+                        minlength="8"
+                        required
+                    />
+                </label>
+                <label class="form-field">
+                    <span>"Confirm new password"</span>
+                    <input
+                        name="user[password_confirmation]"
+                        type="password"
+                        autocomplete="new-password"
+                        minlength="8"
+                        required
+                    />
+                </label>
+                <button type="submit">"Change password"</button>
+            </form>
+        </section>
+    }
+    .into_any()
+}
+
+fn login_error_message(error: LoginError) -> &'static str {
+    match error {
+        LoginError::InvalidCredentials => "Invalid username or password.",
+    }
+}
+
+fn password_result_message(result: PasswordChangeResult) -> (&'static str, bool) {
+    match result {
+        PasswordChangeResult::PasswordChanged => ("Password changed.", true),
+        PasswordChangeResult::ConfirmationMismatch => {
+            ("New password confirmation does not match.", false)
+        }
+        PasswordChangeResult::TooShort => ("New password must be at least 8 characters.", false),
+        PasswordChangeResult::CurrentPasswordIncorrect => ("Current password is incorrect.", false),
+        PasswordChangeResult::ChangeFailed => {
+            ("Unable to change password. Please try again.", false)
+        }
+        PasswordChangeResult::VerificationFailed => {
+            ("Unable to verify the current password.", false)
+        }
     }
 }
 

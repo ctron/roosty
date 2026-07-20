@@ -1,6 +1,5 @@
 use std::{fmt, path::Path};
 
-use askama::Template;
 use axum::{
     Form, Json, Router,
     body::to_bytes,
@@ -12,8 +11,14 @@ use axum::{
 use axum_params::{Params, UploadFile};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
+use percent_encoding::percent_decode_str;
 use roosty_core::{AccountId, RoostyError};
 use roosty_db::StatusVisibility;
+use roosty_web_ui::{
+    AuthorizationConsent, AuthorizationDecision, AuthorizationPageContext, AuthorizationPermission,
+    AuthorizationResult, LoginError, OutOfBandAuthorization, PasswordChangeResult,
+    render_authorization_consent, render_out_of_band_authorization,
+};
 use sea_orm::TransactionTrait;
 use serde::{
     Deserialize, Serialize,
@@ -23,7 +28,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use strum::{Display, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{http::AppState, password};
@@ -150,9 +155,8 @@ where
 /// Build browser login, OAuth, and account verification routes.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/login", get(login_form).post(login))
+        .route("/login", post(login))
         .route("/logout", post(logout))
-        .route("/auth/edit", get(edit_password_form))
         .route(
             "/auth",
             post(change_password)
@@ -176,11 +180,6 @@ pub fn router() -> Router<AppState> {
 }
 
 #[derive(Deserialize)]
-struct LoginQuery {
-    next: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct LoginForm {
     login: String,
     password: String,
@@ -198,67 +197,11 @@ struct ChangePasswordForm {
     password_confirmation: String,
 }
 
-#[derive(Template)]
-#[template(
-    source = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Sign in</title></head>
-<body>
-<main>
-<h1>Sign in</h1>
-{% if let Some(message) = error %}<p>{{ message }}</p>{% endif %}
-<form method="post" action="{{ action }}">
-<input type="hidden" name="_method" value="put">
-<input type="hidden" name="next" value="{{ next }}">
-<label>Username or email <input name="login" autocomplete="username" required></label>
-<label>Password <input name="password" type="password" autocomplete="current-password" required></label>
-<button type="submit">Sign in</button>
-</form>
-</main>
-</body>
-</html>"#,
-    ext = "html"
-)]
-struct LoginTemplate<'a> {
-    action: &'a str,
-    next: &'a str,
-    error: Option<&'a str>,
-}
-
-#[derive(Template)]
-#[template(
-    source = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Change password</title></head>
-<body>
-<main>
-<h1>Change password</h1>
-{% if let Some(message) = message %}<p>{{ message }}</p>{% endif %}
-<form method="post" action="{{ action }}">
-<label>Current password <input name="user[current_password]" type="password" autocomplete="current-password" required></label>
-<label>New password <input name="user[password]" type="password" autocomplete="new-password" required></label>
-<label>Confirm new password <input name="user[password_confirmation]" type="password" autocomplete="new-password" required></label>
-<button type="submit">Change password</button>
-</form>
-</main>
-</body>
-</html>"#,
-    ext = "html"
-)]
-struct ChangePasswordTemplate<'a> {
-    action: &'a str,
-    message: Option<&'a str>,
-}
-
-async fn login_form(State(state): State<AppState>, Query(query): Query<LoginQuery>) -> Response {
-    render_login(&state, query.next.as_deref().unwrap_or("/"), None)
-}
-
 async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     let next = sanitize_next(form.next.as_deref());
     let account = match roosty_db::find_local_account_by_login(&state.db, &form.login).await {
         Ok(Some(account)) => account,
-        Ok(None) => return render_login(&state, &next, Some("Invalid username or password.")),
+        Ok(None) => return redirect_login_error(&state, &next, LoginError::InvalidCredentials),
         Err(error) => return server_error(error),
     };
 
@@ -274,7 +217,7 @@ async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Re
             )
                 .into_response()
         }
-        Ok(false) => render_login(&state, &next, Some("Invalid username or password.")),
+        Ok(false) => redirect_login_error(&state, &next, LoginError::InvalidCredentials),
         Err(error) => server_error(error),
     }
 }
@@ -288,15 +231,6 @@ async fn logout(State(state): State<AppState>) -> Response {
         Redirect::to(&public_url(&state, "/login")),
     )
         .into_response()
-}
-
-/// Render Mastodon's account password settings page for the signed-in user.
-async fn edit_password_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match account_id_from_session(&state, &headers) {
-        Ok(Some(_)) => render_change_password(&state, None),
-        Ok(None) => Redirect::to(&public_url(&state, "/login?next=%2Fauth%2Fedit")).into_response(),
-        Err(error) => server_error(error),
-    }
 }
 
 /// Change the signed-in user's password after verifying their current password.
@@ -325,7 +259,7 @@ async fn change_password(
         &form.password_confirmation,
     ) {
         Ok(password_hash) => password_hash,
-        Err(message) => return render_change_password(&state, Some(message)),
+        Err(error) => return redirect_password_result(&state, error.into()),
     };
     if let Err(error) =
         roosty_db::update_local_account_password_hash_by_id(&state.db, account_id, &password_hash)
@@ -334,34 +268,18 @@ async fn change_password(
         return server_error(error);
     }
 
-    render_change_password(&state, Some("Password changed."))
+    redirect_password_result(&state, PasswordChangeResult::PasswordChanged)
 }
 
-fn render_login(state: &AppState, next: &str, error: Option<&str>) -> Response {
-    let action = public_url(state, "/login");
-    match (LoginTemplate {
-        action: &action,
-        next,
-        error,
-    })
-    .render()
-    {
-        Ok(html) => Html(html).into_response(),
-        Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
-    }
+fn redirect_login_error(state: &AppState, next: &str, error: LoginError) -> Response {
+    let error: &'static str = error.into();
+    let location = format!("/login?next={}&error={error}", url_encode(next),);
+    Redirect::to(&public_url(state, &location)).into_response()
 }
 
-fn render_change_password(state: &AppState, message: Option<&str>) -> Response {
-    let action = public_url(state, "/auth");
-    match (ChangePasswordTemplate {
-        action: &action,
-        message,
-    })
-    .render()
-    {
-        Ok(html) => Html(html).into_response(),
-        Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
-    }
+fn redirect_password_result(state: &AppState, result: PasswordChangeResult) -> Response {
+    let result: &'static str = result.into();
+    Redirect::to(&public_url(state, &format!("/auth/edit?result={result}"))).into_response()
 }
 
 /// Verify a password-change request and return the Argon2 hash to persist.
@@ -370,18 +288,40 @@ fn validated_password_hash(
     current_password: &str,
     password_value: &str,
     password_confirmation: &str,
-) -> Result<String, &'static str> {
+) -> Result<String, PasswordChangeError> {
     if password_value != password_confirmation {
-        return Err("New password confirmation does not match.");
+        return Err(PasswordChangeError::ConfirmationMismatch);
     }
     if password_value.chars().count() < 8 {
-        return Err("New password must be at least 8 characters.");
+        return Err(PasswordChangeError::TooShort);
     }
     match password::verify_password(current_password, current_password_hash) {
-        Ok(true) => password::hash_password(password_value)
-            .map_err(|_| "Unable to change password. Please try again."),
-        Ok(false) => Err("Current password is incorrect."),
-        Err(_) => Err("Unable to verify the current password."),
+        Ok(true) => {
+            password::hash_password(password_value).map_err(|_| PasswordChangeError::ChangeFailed)
+        }
+        Ok(false) => Err(PasswordChangeError::CurrentPasswordIncorrect),
+        Err(_) => Err(PasswordChangeError::VerificationFailed),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordChangeError {
+    ConfirmationMismatch,
+    TooShort,
+    CurrentPasswordIncorrect,
+    ChangeFailed,
+    VerificationFailed,
+}
+
+impl From<PasswordChangeError> for PasswordChangeResult {
+    fn from(error: PasswordChangeError) -> Self {
+        match error {
+            PasswordChangeError::ConfirmationMismatch => Self::ConfirmationMismatch,
+            PasswordChangeError::TooShort => Self::TooShort,
+            PasswordChangeError::CurrentPasswordIncorrect => Self::CurrentPasswordIncorrect,
+            PasswordChangeError::ChangeFailed => Self::ChangeFailed,
+            PasswordChangeError::VerificationFailed => Self::VerificationFailed,
+        }
     }
 }
 
@@ -452,6 +392,46 @@ struct AuthorizeParams {
     code_challenge_method: Option<PkceMethod>,
 }
 
+#[derive(Deserialize)]
+struct AuthorizeForm {
+    response_type: OAuthResponseType,
+    client_id: String,
+    redirect_uri: String,
+    scope: Option<String>,
+    state: Option<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<PkceMethod>,
+    #[serde(default)]
+    decision: AuthorizationDecision,
+}
+
+impl AuthorizeForm {
+    fn into_parts(self) -> (AuthorizeParams, AuthorizationDecision) {
+        (
+            AuthorizeParams {
+                response_type: self.response_type,
+                client_id: self.client_id,
+                redirect_uri: self.redirect_uri,
+                scope: self.scope,
+                state: self.state,
+                code_challenge: self.code_challenge,
+                code_challenge_method: self.code_challenge_method,
+            },
+            self.decision,
+        )
+    }
+}
+
+struct ValidatedAuthorizeRequest {
+    app: roosty_db::OAuthApplication,
+    redirect_uri: String,
+}
+
+enum AuthorizationCallback<'a> {
+    Approved { code: &'a str },
+    Denied,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Display, Eq, IntoStaticStr, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -491,59 +471,6 @@ impl PkceMethod {
     }
 }
 
-#[derive(Template)]
-#[template(
-    source = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Authorize</title></head>
-<body>
-<main>
-<h1>Authorize {{ client_name }}</h1>
-<p>This application is requesting access to your Roosty account.</p>
-<form method="post" action="{{ action }}">
-<input type="hidden" name="response_type" value="{{ params.response_type }}">
-<input type="hidden" name="client_id" value="{{ params.client_id }}">
-<input type="hidden" name="redirect_uri" value="{{ params.redirect_uri }}">
-<input type="hidden" name="scope" value="{{ scope }}">
-<input type="hidden" name="state" value="{{ state }}">
-<input type="hidden" name="code_challenge" value="{{ code_challenge }}">
-<input type="hidden" name="code_challenge_method" value="{{ code_challenge_method }}">
-<button type="submit">Authorize</button>
-</form>
-</main>
-</body>
-</html>"#,
-    ext = "html"
-)]
-struct AuthorizeTemplate<'a> {
-    action: &'a str,
-    client_name: &'a str,
-    params: &'a AuthorizeParams,
-    scope: &'a str,
-    state: &'a str,
-    code_challenge: &'a str,
-    code_challenge_method: &'a str,
-}
-
-#[derive(Template)]
-#[template(
-    source = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Authorization code</title></head>
-<body>
-<main>
-<h1>Authorization complete</h1>
-<p>Copy this authorization code into your application:</p>
-<code id="authorization-code">{{ code }}</code>
-</main>
-</body>
-</html>"#,
-    ext = "html"
-)]
-struct AuthorizationCodeTemplate<'a> {
-    code: &'a str,
-}
-
 async fn authorize_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -562,27 +489,17 @@ async fn authorize_form(
         Err(error) => return server_error(error),
     };
 
-    if let Err(response) = validate_authorize_request(&state, &params).await {
-        return response;
-    }
+    let validated = match validate_authorize_request(&state, &params).await {
+        Ok(validated) => validated,
+        Err(response) => return response,
+    };
+    let app = validated.app;
 
-    let app =
-        match roosty_db::find_oauth_application_by_client_id(&state.db, &params.client_id).await {
-            Ok(Some(app)) => app,
-            Ok(None) => {
-                return oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client");
-            }
-            Err(error) => return server_error(error),
-        };
-
-    if roosty_db::find_local_account_by_id(&state.db, account_id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return Redirect::to(&public_url(&state, "/login")).into_response();
-    }
+    let account = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
+        Err(error) => return server_error(error),
+    };
 
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let state_value = params.state.as_deref().unwrap_or_default();
@@ -591,38 +508,64 @@ async fn authorize_form(
         .code_challenge_method
         .map(PkceMethod::as_str)
         .unwrap_or_default();
-    let action = public_url(&state, "/oauth/authorize");
-    match (AuthorizeTemplate {
-        action: &action,
-        client_name: &app.name,
-        params: &params,
-        scope,
-        state: state_value,
-        code_challenge: challenge,
-        code_challenge_method: method,
-    })
-    .render()
-    {
-        Ok(html) => Html(html).into_response(),
-        Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
-    }
+    let permissions = scope
+        .split_whitespace()
+        .map(AuthorizationPermission::new)
+        .collect();
+    Html(render_authorization_consent(AuthorizationConsent {
+        context: authorization_page_context(&state, &account.username),
+        application_name: app.name,
+        response_type: params.response_type.as_str().to_owned(),
+        client_id: params.client_id,
+        redirect_uri: validated.redirect_uri,
+        scope: scope.to_owned(),
+        state: state_value.to_owned(),
+        code_challenge: challenge.to_owned(),
+        code_challenge_method: method.to_owned(),
+        permissions,
+    }))
+    .into_response()
 }
 
 async fn authorize(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(params): Form<AuthorizeParams>,
+    Form(form): Form<AuthorizeForm>,
 ) -> Response {
+    let (params, decision) = form.into_parts();
     let account_id = match account_id_from_session(&state, &headers) {
         Ok(Some(account_id)) => account_id,
         Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
         Err(error) => return server_error(error),
     };
 
-    let app = match validate_authorize_request(&state, &params).await {
-        Ok(app) => app,
+    let account = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
+        Err(error) => return server_error(error),
+    };
+
+    let validated = match validate_authorize_request(&state, &params).await {
+        Ok(validated) => validated,
         Err(response) => return response,
     };
+    let app = validated.app;
+
+    if decision == AuthorizationDecision::Deny {
+        if validated.redirect_uri == OOB_REDIRECT_URI {
+            return Html(render_out_of_band_authorization(OutOfBandAuthorization {
+                context: authorization_page_context(&state, &account.username),
+                application_name: app.name,
+                result: AuthorizationResult::Denied,
+            }))
+            .into_response();
+        }
+        return authorization_callback_redirect(
+            &validated.redirect_uri,
+            AuthorizationCallback::Denied,
+            params.state.as_deref(),
+        );
+    }
 
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let challenge = optional_non_empty(params.code_challenge.as_deref()).unwrap_or_default();
@@ -637,7 +580,7 @@ async fn authorize(
         roosty_db::NewAuthorizationCode {
             account_id,
             application_id: app.id,
-            redirect_uri: &params.redirect_uri,
+            redirect_uri: &validated.redirect_uri,
             scopes: scope,
             code_challenge: challenge,
             code_challenge_method: method,
@@ -649,36 +592,26 @@ async fn authorize(
         Err(error) => return server_error(error),
     };
 
-    if params.redirect_uri == OOB_REDIRECT_URI {
-        return match (AuthorizationCodeTemplate { code: &code }).render() {
-            Ok(html) => Html(html).into_response(),
-            Err(error) => server_error(RoostyError::InvalidInput(error.to_string())),
-        };
+    if validated.redirect_uri == OOB_REDIRECT_URI {
+        return Html(render_out_of_band_authorization(OutOfBandAuthorization {
+            context: authorization_page_context(&state, &account.username),
+            application_name: app.name,
+            result: AuthorizationResult::Approved { code },
+        }))
+        .into_response();
     }
 
-    let separator = if params.redirect_uri.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
-    let state_query = params
-        .state
-        .as_deref()
-        .map(|state| format!("&state={}", url_encode(state)))
-        .unwrap_or_default();
-    Redirect::to(&format!(
-        "{}{separator}code={}{}",
-        params.redirect_uri,
-        url_encode(&code),
-        state_query
-    ))
-    .into_response()
+    authorization_callback_redirect(
+        &validated.redirect_uri,
+        AuthorizationCallback::Approved { code: &code },
+        params.state.as_deref(),
+    )
 }
 
 async fn validate_authorize_request(
     state: &AppState,
     params: &AuthorizeParams,
-) -> Result<roosty_db::OAuthApplication, Response> {
+) -> Result<ValidatedAuthorizeRequest, Response> {
     if params.response_type != OAuthResponseType::Code {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
@@ -700,15 +633,58 @@ async fn validate_authorize_request(
         .await
         .map_err(server_error)?
         .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client"))?;
-    if !redirect_uri_matches(&app.redirect_uri, &params.redirect_uri) {
+    let Some(redirect_uri) =
+        matching_redirect_uri(&app.redirect_uri, &params.redirect_uri).map(str::to_owned)
+    else {
         return Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "redirect_uri mismatch",
         ));
-    }
+    };
 
-    Ok(app)
+    Ok(ValidatedAuthorizeRequest { app, redirect_uri })
+}
+
+fn authorization_callback_redirect(
+    redirect_uri: &str,
+    result: AuthorizationCallback<'_>,
+    state: Option<&str>,
+) -> Response {
+    let mut redirect = match Url::parse(redirect_uri) {
+        Ok(redirect) => redirect,
+        Err(error) => {
+            return server_error(RoostyError::InvalidInput(format!(
+                "registered OAuth redirect URI is invalid: {error}"
+            )));
+        }
+    };
+    {
+        let mut query = redirect.query_pairs_mut();
+        match result {
+            AuthorizationCallback::Approved { code } => {
+                query.append_pair("code", code);
+            }
+            AuthorizationCallback::Denied => {
+                query.append_pair("error", "access_denied");
+            }
+        }
+        if let Some(state) = state {
+            query.append_pair("state", state);
+        }
+    }
+    Redirect::to(redirect.as_str()).into_response()
+}
+
+fn authorization_page_context(
+    state: &AppState,
+    account_username: &str,
+) -> AuthorizationPageContext {
+    AuthorizationPageContext {
+        instance_name: state.config.instance_name.clone(),
+        server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        account_username: account_username.to_owned(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -746,13 +722,13 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         }
         Err(error) => return server_error(error),
     };
-    if !redirect_uri_matches(&app.redirect_uri, &form.redirect_uri) {
+    let Some(redirect_uri) = matching_redirect_uri(&app.redirect_uri, &form.redirect_uri) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "redirect_uri mismatch",
         );
-    }
+    };
     if let Some(secret) = form.client_secret.as_deref() {
         let supplied_hash = match roosty_db::secret_hash(&state.config.token_pepper, secret) {
             Ok(hash) => hash,
@@ -773,7 +749,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
             &state.config.token_pepper,
             &form.code,
             app.id,
-            &form.redirect_uri,
+            redirect_uri,
         )
         .await
         {
@@ -1568,11 +1544,19 @@ fn public_url(state: &AppState, path_and_query: &str) -> String {
         .unwrap_or_else(|_| format!("{}{}", state.config.public_base_url, path_and_query))
 }
 
-fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
-    registered
-        .lines()
-        .map(str::trim)
-        .any(|redirect_uri| redirect_uri == requested)
+/// Finds the exact registered redirect URI represented by a request parameter.
+///
+/// Elk embeds an already percent-encoded origin in its callback path, but its
+/// query serializer preserves those percent escapes. Query parsing consequently
+/// decodes that path segment once. Accept that representation while retaining
+/// the registered URI as the canonical redirect and authorization-code value.
+fn matching_redirect_uri<'a>(registered: &'a str, requested: &str) -> Option<&'a str> {
+    registered.lines().map(str::trim).find(|redirect_uri| {
+        *redirect_uri == requested
+            || percent_decode_str(redirect_uri)
+                .decode_utf8()
+                .is_ok_and(|decoded| decoded == requested)
+    })
 }
 
 fn sanitize_next(next: Option<&str>) -> String {
@@ -1679,6 +1663,8 @@ mod tests {
     use crate::{config::Config, http::AppState, password};
 
     const REDIRECT_URI: &str = "https://localhost:4001/oauth";
+    const ELK_REDIRECT_URI: &str =
+        "https://localhost:4001/api/roosty.localhost:4000/oauth/https%3A%2F%2Flocalhost%3A4001";
     const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
     const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -1718,15 +1704,13 @@ mod tests {
     #[test_context(EndpointContext)]
     #[tokio::test]
     async fn registers_elk_oauth_app_from_json(context: &mut EndpointContext) {
-        let redirect_uri =
-            "https://localhost:4001/api/roosty.localhost:4000/oauth/https%3A%2F%2Flocalhost%3A4001";
         let response = context
             .json(
                 "POST",
                 "/api/v1/apps",
                 serde_json::json!({
                     "client_name": "Elk",
-                    "redirect_uris": redirect_uri,
+                    "redirect_uris": ELK_REDIRECT_URI,
                     "scopes": "read write follow push",
                     "website": "https://localhost:4001",
                 }),
@@ -1736,7 +1720,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["name"], "Elk");
-        assert_eq!(body["redirect_uri"], redirect_uri);
+        assert_eq!(body["redirect_uri"], ELK_REDIRECT_URI);
         assert!(
             body["client_id"]
                 .as_str()
@@ -1747,6 +1731,105 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given Elk preserves percent escapes in its authorize query, the registered callback remains canonical throughout the flow.
+    async fn elk_nested_callback_completes_oauth_flow(context: &mut EndpointContext) {
+        let response = context
+            .json(
+                "POST",
+                "/api/v1/apps",
+                serde_json::json!({
+                    "client_name": "Elk",
+                    "redirect_uris": ELK_REDIRECT_URI,
+                    "scopes": "read write follow push",
+                    "website": "https://localhost:4001",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let app = RegisteredApp {
+            client_id: body["client_id"].as_str().unwrap().to_owned(),
+            client_secret: body["client_secret"].as_str().unwrap().to_owned(),
+        };
+        let cookie = context.login().await;
+
+        // Elk's query serializer uses encodeURI, which leaves the callback's
+        // existing percent escapes untouched instead of encoding `%` as `%25`.
+        let authorize_uri = format!(
+            "/oauth/authorize?response_type=code&client_id={}&redirect_uri={ELK_REDIRECT_URI}&scope=read+write+follow+push",
+            app.client_id
+        );
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri(authorize_uri)
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(&format!(
+            "name=\"redirect_uri\" value=\"{ELK_REDIRECT_URI}\""
+        )));
+
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("response_type", "code"),
+                ("client_id", app.client_id.as_str()),
+                ("redirect_uri", ELK_REDIRECT_URI),
+                ("scope", "read write follow push"),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let redirect = Url::parse(&header_value(&response, LOCATION)).unwrap();
+        assert_eq!(
+            redirect.as_str().split('?').next().unwrap(),
+            ELK_REDIRECT_URI
+        );
+        let code = redirect
+            .query_pairs()
+            .find_map(|(name, value)| (name == "code").then(|| value.into_owned()))
+            .unwrap();
+
+        let response = context
+            .json(
+                "POST",
+                "/oauth/token",
+                serde_json::json!({
+                    "grant_type": "authorization_code",
+                    "client_id": app.client_id,
+                    "client_secret": app.client_secret,
+                    "redirect_uri": ELK_REDIRECT_URI,
+                    "code": code,
+                    "scope": "read write follow push",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test_context(EndpointContext)]
@@ -1766,6 +1849,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = header_value(&response, LOCATION);
         assert!(location.starts_with("https://localhost:4000/login?next="));
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given an anonymous visitor, the protected Leptos password route redirects before SSR.
+    async fn password_form_redirects_anonymous_users_to_login(context: &mut EndpointContext) {
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/edit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            header_value(&response, LOCATION),
+            "https://localhost:4000/login?next=%2Fauth%2Fedit"
+        );
     }
 
     #[test_context(EndpointContext)]
@@ -1822,7 +1926,17 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(body_text(response).await.contains("Authorize toot"));
+        let html = body_text(response).await;
+        assert!(html.contains("Authorize toot"));
+        assert!(html.contains("href=\"/pkg/roosty-web.css\""));
+        assert!(html.contains("Roosty Test"));
+        assert!(html.contains("Powered by Roosty v"));
+        assert!(html.contains("Read account data"));
+        assert!(html.contains("Publish and modify content"));
+        assert!(html.contains("Manage follows"));
+        assert!(html.contains("name=\"decision\" value=\"approve\""));
+        assert!(html.contains("name=\"decision\" value=\"deny\""));
+        assert!(!html.contains("roosty-web.js"));
 
         let body = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
@@ -1848,7 +1962,8 @@ mod tests {
         assert!(response.headers().get(LOCATION).is_none());
         let html = body_text(response).await;
         let code = html
-            .split_once("<code id=\"authorization-code\">")
+            .split_once("id=\"authorization-code\"")
+            .and_then(|(_, html)| html.split_once('>'))
             .and_then(|(_, html)| html.split_once("</code>"))
             .map(|(code, _)| code)
             .unwrap();
@@ -1907,6 +2022,95 @@ mod tests {
 
     #[test_context(EndpointContext)]
     #[tokio::test]
+    /// Given a denied browser grant, the callback receives an OAuth error and state without a code.
+    async fn denied_authorization_redirects_without_a_code(context: &mut EndpointContext) {
+        let redirect_uri = "https://localhost:4001/oauth?existing=value#callback";
+        let response = context
+            .json(
+                "POST",
+                "/api/v1/apps",
+                serde_json::json!({
+                    "client_name": "Elk",
+                    "redirect_uris": redirect_uri,
+                    "scopes": "read write",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let app = json_body(response).await;
+        let client_id = app["client_id"].as_str().unwrap();
+        let cookie = context.login().await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("response_type", "code"),
+                ("client_id", client_id),
+                ("redirect_uri", redirect_uri),
+                ("scope", "read write"),
+                ("state", "return / safely"),
+                ("decision", "deny"),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let redirect = Url::parse(&header_value(&response, LOCATION)).unwrap();
+        assert_eq!(redirect.fragment(), Some("callback"));
+        let query = redirect.query_pairs().collect::<Vec<_>>();
+        assert!(query.contains(&("existing".into(), "value".into())));
+        assert!(query.contains(&("error".into(), "access_denied".into())));
+        assert!(query.contains(&("state".into(), "return / safely".into())));
+        assert!(!query.iter().any(|(name, _)| name == "code"));
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given an out-of-band client, denial renders a styled result without exposing a code.
+    async fn denied_oob_authorization_renders_result(context: &mut EndpointContext) {
+        let app = context.register_oob_app().await;
+        let cookie = context.login().await;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("response_type", "code"),
+                ("client_id", app.client_id.as_str()),
+                ("redirect_uri", OOB_REDIRECT_URI),
+                ("scope", "read write follow"),
+                ("decision", "deny"),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(LOCATION).is_none());
+        let html = body_text(response).await;
+        assert!(html.contains("Authorization denied"));
+        assert!(html.contains("Access was not granted"));
+        assert!(html.contains("href=\"/pkg/roosty-web.css\""));
+        assert!(!html.contains("authorization-code"));
+        assert!(!html.contains("roosty-web.js"));
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
     async fn login_sets_a_session_cookie(context: &mut EndpointContext) {
         let response = context
             .form(
@@ -1926,6 +2130,30 @@ mod tests {
             "https://localhost:4000/oauth/authorize"
         );
         assert!(session_cookie(&response).starts_with("roosty_session="));
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given invalid credentials, the POST redirects to the typed login error state without
+    /// reflecting credentials or an unsafe return target.
+    async fn login_failure_redirects_to_typed_error(context: &mut EndpointContext) {
+        let response = context
+            .form(
+                "POST",
+                "/login",
+                &[
+                    ("login", "admin"),
+                    ("password", "incorrect"),
+                    ("next", "https://malicious.example/"),
+                ],
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            header_value(&response, LOCATION),
+            "https://localhost:4000/login?next=%2F&error=invalid_credentials"
+        );
     }
 
     #[test_context(EndpointContext)]
@@ -1952,7 +2180,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            header_value(&response, LOCATION),
+            "https://localhost:4000/auth/edit?result=password_changed"
+        );
         let account = roosty_db::find_local_account_by_login(&context.db, "admin")
             .await
             .unwrap()
@@ -1985,7 +2217,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            header_value(&response, LOCATION),
+            "https://localhost:4000/auth/edit?result=current_password_incorrect"
+        );
         let account = roosty_db::find_local_account_by_login(&context.db, "admin")
             .await
             .unwrap()

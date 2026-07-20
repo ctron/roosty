@@ -21,9 +21,28 @@ a:focus-visible, button:focus-visible { outline: 3px solid #d18f00; outline-offs
 .site-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 1.25rem; border-bottom: 1px solid var(--border); }
 .site-header nav { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
 .brand { color: inherit; font-size: 1.25rem; font-weight: 800; text-decoration: none; }
-.hero, .prose { max-width: 48rem; margin: clamp(3rem, 9vw, 8rem) auto; padding: clamp(1.5rem, 5vw, 4rem); background: var(--surface); border: 1px solid var(--border); border-radius: 1.25rem; box-shadow: 0 1.25rem 4rem rgb(33 54 47 / 10%); }
-.hero h1, .prose h1 { margin: 0; font-size: clamp(2.25rem, 7vw, 4.75rem); line-height: 1.02; letter-spacing: -0.045em; }
+.hero, .prose, .form-card { max-width: 48rem; margin: clamp(3rem, 9vw, 8rem) auto; padding: clamp(1.5rem, 5vw, 4rem); background: var(--surface); border: 1px solid var(--border); border-radius: 1.25rem; box-shadow: 0 1.25rem 4rem rgb(33 54 47 / 10%); }
+.hero h1, .prose h1, .form-card h1 { margin: 0; font-size: clamp(2.25rem, 7vw, 4.75rem); line-height: 1.02; letter-spacing: -0.045em; }
 .prose h1 { font-size: clamp(2rem, 5vw, 3.5rem); }
+.form-card { max-width: 36rem; }
+.form-card h1 { font-size: clamp(2rem, 5vw, 3.5rem); }
+.form-card form { display: grid; gap: 1.25rem; margin-top: 2rem; }
+.authorization-card h2 { margin: 2rem 0 0.75rem; font-size: 1.2rem; }
+.permission-list { display: grid; gap: 0.75rem; margin: 0; padding: 0; list-style: none; }
+.permission-list li { display: grid; gap: 0.15rem; padding: 0.75rem 1rem; background: color-mix(in srgb, var(--accent) 8%, transparent); border: 1px solid var(--border); border-radius: 0.6rem; }
+.permission-list code { color: var(--muted); font-size: 0.9em; }
+.form-field { display: grid; gap: 0.4rem; font-weight: 700; }
+.form-field input { width: 100%; padding: 0.8rem 0.9rem; color: inherit; background: transparent; border: 1px solid var(--border); border-radius: 0.6rem; font: inherit; }
+.form-field input:focus { border-color: var(--accent); outline: 3px solid color-mix(in srgb, var(--accent) 35%, transparent); outline-offset: 1px; }
+.form-card button { justify-self: start; padding: 0.75rem 1rem; color: white; background: var(--accent); border: 0; border-radius: 0.65rem; font: inherit; font-weight: 700; cursor: pointer; }
+.form-card button:hover { background: var(--accent-strong); }
+.form-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.form-card .button--secondary { color: inherit; background: transparent; border: 1px solid var(--border); }
+.form-card .button--secondary:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.authorization-code { display: block; margin-block: 1.5rem; padding: 1rem; overflow-wrap: anywhere; color: inherit; background: color-mix(in srgb, var(--accent) 10%, transparent); border: 1px solid var(--border); border-radius: 0.6rem; font-size: 1.1rem; user-select: all; }
+.form-message { padding: 0.75rem 1rem; border: 1px solid currentColor; border-radius: 0.6rem; }
+.form-message--error { color: #9f2d25; background: #fff4f2; }
+.form-message--success { color: #17623e; background: #effbf3; }
 .eyebrow { margin-top: 0; color: var(--accent); font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; }
 .hero__lede { max-width: 38rem; color: var(--muted); font-size: 1.2rem; }
 .button { display: inline-block; margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 0.65rem; color: white; background: var(--accent); font-weight: 700; text-decoration: none; }
@@ -36,12 +55,15 @@ a:focus-visible, button:focus-visible { outline: 3px solid #d18f00; outline-offs
 
 @media (max-width: 38rem) {
   .site-header { align-items: flex-start; flex-direction: column; }
-  .hero, .prose { margin-block: 1.5rem; border-radius: 0.8rem; }
+  .hero, .prose, .form-card { margin-block: 1.5rem; border-radius: 0.8rem; }
 }
 
 @media (prefers-color-scheme: dark) {
   :root { color: #e8efeb; background: #111816; --surface: #18221f; --muted: #afbeb8; --border: #394a44; --accent: #71cfb1; --accent-strong: #9be0ca; }
   .button { color: #102019; background: #71cfb1; }
+  .form-card button { color: #102019; background: #71cfb1; }
+  .form-message--error { color: #ffc7c2; background: #371b19; }
+  .form-message--success { color: #a8e8c2; background: #153325; }
 }
 
 @media (prefers-reduced-motion: reduce) {
