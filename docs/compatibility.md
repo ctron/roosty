@@ -47,6 +47,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | --- | --- | --- |
 | 🟡 | `/api/v1/instance`, `/api/v2/instance` | Enough metadata for Elk startup; `version` reports the Roosty release version, while counts and capabilities are minimal. |
 | ✅ | `/api/v1/version` | Roosty extension exposing package and build-time Git identity. |
+| 🔴 | Explore and trends | Ranked Explore results are missing. The trends endpoints for statuses, tags, and links, along with profile-directory and account-suggestion APIs, are not implemented; public and hashtag timelines remain available without Explore ranking. |
 
 ### OAuth
 
@@ -88,6 +89,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟢 | `POST /api/v1/statuses` | Local text and consent-aware quote statuses; quote-plus-media is rejected to match Mastodon. |
+| 🔴 | Scheduled statuses | The `scheduled_at` creation parameter and `/api/v1/scheduled_statuses` listing, detail, update, and cancellation APIs are not implemented. |
 | 🟢 | `GET /api/v1/statuses/:id` | Visible local and locally cached remote statuses. |
 | 🟢 | `GET /api/v1/statuses/:id/source` | Authenticated plain-text source lookup for visible local statuses, including content warnings. |
 | 🟢 | `GET /api/v1/statuses/:id/history` | Visible local and cached-remote status revisions, oldest first, with immutable content, warning, sensitivity, emoji, and media projections. Legacy edits expose their known current state because pre-upgrade text cannot be reconstructed. |

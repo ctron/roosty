@@ -95,6 +95,8 @@
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
+- [ ] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, and multi-process-safe publication.
+- [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients.
 - [ ] Improve local account administration now that multiple local users can be operator-created.
 - [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [x] Add cursor pagination for local and cached-remote account status collections.
