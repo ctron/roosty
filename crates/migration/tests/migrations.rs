@@ -314,6 +314,67 @@ async fn followers_url_upgrade_and_rollback_preserve_legacy_actors(
     assert!(table_exists(database.connection(), "remote_actor").await);
 }
 
+/// Existing unresolved replies and reply collections are queued once during thread hydration.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn remote_thread_upgrade_queues_bounded_context_repairs(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(65)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '10000000-0000-0000-0000-000000000066',
+                'https://remote.test/users/alice', 'alice', 'remote.test',
+                'https://remote.test/inbox',
+                'https://remote.test/users/alice#main-key', 'key', now() + interval '1 day'
+            );
+            INSERT INTO remote_status (
+                id, activitypub_id, remote_actor_id, content, visibility,
+                published_at, updated_at, in_reply_to, object
+            ) VALUES (
+                '20000000-0000-0000-0000-000000000066',
+                'https://remote.test/statuses/66',
+                '10000000-0000-0000-0000-000000000066', '', 'public', now(), now(),
+                'https://parent.test/statuses/1',
+                '{"replies":"https://remote.test/statuses/66/replies"}'::jsonb
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    let rows = database
+        .connection()
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT kind, payload->>'status_id' AS status_id FROM job ORDER BY kind".to_owned(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].try_get::<String>("", "kind").unwrap(),
+        "federation_replies_fetch"
+    );
+    assert_eq!(
+        rows[1].try_get::<String>("", "kind").unwrap(),
+        "federation_thread_resolve"
+    );
+    assert!(rows.iter().all(|row| {
+        row.try_get::<String>("", "status_id").unwrap() == "20000000-0000-0000-0000-000000000066"
+    }));
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(table_exists(database.connection(), "remote_status").await);
+}
+
 #[test_context(EmbeddedDatabase)]
 #[tokio::test]
 async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {

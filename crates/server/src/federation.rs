@@ -39,6 +39,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use url::Url;
 use uuid::Uuid;
 
 use crate::http::AppState;
@@ -53,6 +54,11 @@ static INBOX_CONFLICT: AtomicU64 = AtomicU64::new(0);
 static INBOX_INVALID_ID: AtomicU64 = AtomicU64::new(0);
 static STATUS_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
 static ACTOR_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
+static THREAD_PARENT_RESOLVED: AtomicU64 = AtomicU64::new(0);
+static THREAD_REPLIES_DISCOVERED: AtomicU64 = AtomicU64::new(0);
+static THREAD_FETCH_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+const MAX_DISCOVERED_REPLIES: usize = 5;
 
 /// Mastodon visibility and explicit local recipients derived from a remote Note audience.
 #[derive(Debug, Eq, PartialEq)]
@@ -91,6 +97,11 @@ enum InboundAudienceError {
     #[error(transparent)]
     Database(#[from] RoostyError),
 }
+
+/// Non-retryable validation or policy failures from remote thread discovery.
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct PermanentThreadFetchError(Cow<'static, str>);
 
 impl From<InboundAudienceError> for RoostyError {
     fn from(error: InboundAudienceError) -> Self {
@@ -208,7 +219,7 @@ struct InboundQuoteResponse {
     result: Option<InboundQuoteAuthorization>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum InboundActivityReference {
     Id(String),
@@ -480,6 +491,8 @@ struct InboundNote {
     cc: Vec<String>,
     #[serde(default)]
     in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replies: Option<InboundReplies>,
     #[serde(default)]
     tag: Vec<InboundTag>,
     #[serde(default)]
@@ -500,6 +513,47 @@ struct InboundNote {
 #[derive(Deserialize, Serialize, PartialEq)]
 enum InboundNoteType {
     Note,
+}
+
+/// ActivityPub reply collection forms retained for bounded thread discovery.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum InboundReplies {
+    Id(String),
+    Object(Box<InboundRepliesObject>),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundRepliesObject {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    first: Option<InboundReplies>,
+    #[serde(default)]
+    items: Vec<InboundActivityReference>,
+    #[serde(default)]
+    ordered_items: Vec<InboundActivityReference>,
+}
+
+impl InboundRepliesObject {
+    fn item_urls(&self) -> impl Iterator<Item = &str> {
+        self.items
+            .iter()
+            .chain(&self.ordered_items)
+            .map(InboundActivityReference::id)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct ThreadStatusPayload {
+    status_id: Uuid,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReplyFetchPayload {
+    parent_status_id: Uuid,
+    reply_url: String,
 }
 
 struct ResolvedInboundQuote {
@@ -3021,14 +3075,17 @@ async fn process_remote_status_activity(
                 &attachments,
             )
             .await?;
-            let (status, edited) = match upsert {
-                roosty_db::RemoteStatusUpsertResult::Created(status) => (status, false),
-                roosty_db::RemoteStatusUpsertResult::Updated(status) => (status, true),
-                roosty_db::RemoteStatusUpsertResult::Unchanged(_) => {
-                    txn.commit().await?;
-                    return Ok(RemoteStatusChange::Ignored);
-                }
+            let (status, edited, unchanged) = match upsert {
+                roosty_db::RemoteStatusUpsertResult::Created(status) => (status, false, false),
+                roosty_db::RemoteStatusUpsertResult::Updated(status) => (status, true, false),
+                roosty_db::RemoteStatusUpsertResult::Unchanged(status) => (status, false, true),
             };
+            roosty_db::link_unresolved_remote_replies_to_parent(&txn, &status).await?;
+            enqueue_remote_thread_jobs(&txn, &status).await?;
+            if unchanged {
+                txn.commit().await?;
+                return Ok(RemoteStatusChange::Ignored);
+            }
             roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
             let direct_conversation_refresh = if audience.visibility() == StatusVisibility::Direct {
                 Some(
@@ -3209,6 +3266,363 @@ fn same_url_origin(left: &str, right: &str) -> bool {
     left.scheme() == "https" && left.origin() == right.origin()
 }
 
+/// Enqueue bounded thread discovery after the status transaction commits.
+async fn enqueue_remote_thread_jobs(
+    txn: &DatabaseTransaction,
+    status: &roosty_db::RemoteStatus,
+) -> Result<(), RoostyError> {
+    if status.in_reply_to.is_some()
+        && status.in_reply_to_local_status_id.is_none()
+        && status.in_reply_to_remote_status_id.is_none()
+    {
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationThreadResolve,
+                payload: serde_json::to_value(ThreadStatusPayload {
+                    status_id: status.id.0,
+                })
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
+                deduplication_key: Some(format!("thread-resolve:{}", status.id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    if status
+        .object
+        .get("replies")
+        .is_some_and(|replies| !replies.is_null())
+    {
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationRepliesFetch,
+                payload: serde_json::to_value(ThreadStatusPayload {
+                    status_id: status.id.0,
+                })
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
+                deduplication_key: Some(format!("replies-fetch:{}", status.id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn permanent_fetch_failure(reason: impl Into<Cow<'static, str>>) -> RoostyError {
+    let error = PermanentThreadFetchError(reason.into());
+    RoostyError::InvalidInput(format!("permanent federation fetch failure: {error}"))
+}
+
+fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, RoostyError> {
+    let url =
+        Url::parse(value).map_err(|_| permanent_fetch_failure("remote status URL is invalid"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| permanent_fetch_failure("remote status URL has no host"))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !state.config.federation_domain_is_allowed(host)
+    {
+        return Err(permanent_fetch_failure(
+            "remote status URL is rejected by federation policy",
+        ));
+    }
+    Ok(url)
+}
+
+/// Fetch, validate, and cache one public remote Note without user-facing side effects.
+async fn fetch_public_remote_status(
+    state: &AppState,
+    requested_url: &str,
+    expected_parent: Option<&str>,
+) -> Result<roosty_db::RemoteStatus, RoostyError> {
+    let url = parse_remote_fetch_url(state, requested_url)?;
+    let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+    let object = document
+        .get("object")
+        .filter(|_| document.get("type").and_then(JsonValue::as_str) == Some("Create"))
+        .cloned()
+        .unwrap_or(document);
+    let note: InboundNote = serde_json::from_value(object.clone())
+        .map_err(|_| permanent_fetch_failure("remote status is not a supported Note"))?;
+    if note.id != requested_url
+        || note.r#type != InboundNoteType::Note
+        || !same_url_origin(&note.id, &note.attributed_to)
+        || expected_parent.is_some_and(|parent| note.in_reply_to.as_deref() != Some(parent))
+    {
+        THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(permanent_fetch_failure(
+            "remote status identity or attribution is invalid",
+        ));
+    }
+    let actor = discovery::resolve_remote_actor_by_id(state, &note.attributed_to).await?;
+    if actor.deleted_at.is_some() {
+        THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(permanent_fetch_failure(
+            "remote status author is unavailable",
+        ));
+    }
+    let audience = match classify_remote_audience(state, &note, &actor).await {
+        Ok(audience) => audience,
+        Err(InboundAudienceError::Database(error)) => return Err(error),
+        Err(error) => {
+            THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+            return Err(permanent_fetch_failure(error.to_string()));
+        }
+    };
+    if !matches!(
+        audience,
+        InboundAudience::Public | InboundAudience::Unlisted
+    ) {
+        THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(permanent_fetch_failure(
+            "remote context Note is not public or unlisted",
+        ));
+    }
+    let published_at = OffsetDateTime::parse(&note.published, &Rfc3339)
+        .map_err(|_| permanent_fetch_failure("remote Note published timestamp is invalid"))?;
+    let updated_at = note
+        .updated
+        .as_deref()
+        .map(|updated| OffsetDateTime::parse(updated, &Rfc3339))
+        .transpose()
+        .map_err(|_| permanent_fetch_failure("remote Note updated timestamp is invalid"))?
+        .unwrap_or(published_at);
+    let attachments = note
+        .attachment
+        .iter()
+        .filter(|attachment| attachment.r#type == InboundAttachmentType::Document)
+        .filter_map(|attachment| {
+            attachment
+                .url()
+                .map(|remote_url| roosty_db::NewRemoteMediaAttachment {
+                    remote_url,
+                    content_type: attachment.media_type.clone(),
+                    description: attachment.name.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let emojis = remote_custom_emoji_definitions(&note.tag);
+    let tag_names = remote_hashtag_names(&note.tag);
+    let in_reply_to_local_status_id = match note.in_reply_to.as_deref() {
+        Some(url) => local_status_id_from_url(state, url).await?,
+        None => None,
+    };
+    let in_reply_to_remote_status_id = match note.in_reply_to.as_deref() {
+        Some(id) => roosty_db::find_remote_status_by_activitypub_id(&state.db, id)
+            .await?
+            .map(|status| status.id),
+        None => None,
+    };
+    let quote_automatic_policy = note
+        .interaction_policy
+        .as_ref()
+        .and_then(|policy| policy.can_quote.as_ref())
+        .map(|policy| policy.automatic_approval.values())
+        .unwrap_or_default();
+    let quote_manual_policy = note
+        .interaction_policy
+        .as_ref()
+        .and_then(|policy| policy.can_quote.as_ref())
+        .map(|policy| policy.manual_approval.values())
+        .unwrap_or_default();
+    let txn = state.db.begin().await?;
+    let upsert = roosty_db::process_remote_status_upsert(
+        &txn,
+        roosty_db::NewRemoteStatus {
+            activitypub_id: note.id,
+            remote_actor_id: actor.id,
+            content: note.content,
+            visibility: audience.visibility(),
+            published_at,
+            updated_at,
+            in_reply_to: note.in_reply_to,
+            in_reply_to_local_status_id,
+            in_reply_to_remote_status_id,
+            object,
+            tag_names,
+            quote_automatic_policy,
+            quote_manual_policy,
+        },
+        &attachments,
+    )
+    .await?;
+    let status = match upsert {
+        roosty_db::RemoteStatusUpsertResult::Created(status)
+        | roosty_db::RemoteStatusUpsertResult::Updated(status)
+        | roosty_db::RemoteStatusUpsertResult::Unchanged(status) => status,
+    };
+    roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
+    roosty_db::link_unresolved_remote_replies_to_parent(&txn, &status).await?;
+    enqueue_remote_thread_jobs(&txn, &status).await?;
+    txn.commit().await?;
+    Ok(status)
+}
+
+fn thread_status_payload(payload: JsonValue) -> Result<StatusId, RoostyError> {
+    serde_json::from_value::<ThreadStatusPayload>(payload)
+        .map(|payload| StatusId(payload.status_id))
+        .map_err(|_| permanent_fetch_failure("thread job payload is invalid"))
+}
+
+/// Fetch one missing parent and repair every child retaining its canonical URL.
+pub(crate) async fn resolve_remote_status_thread(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let status_id = thread_status_payload(payload)?;
+    let Some(child) = roosty_db::find_remote_status_by_id(&state.db, status_id).await? else {
+        return Ok(());
+    };
+    if child.in_reply_to_local_status_id.is_some()
+        || child.in_reply_to_remote_status_id.is_some()
+        || child.deleted_at.is_some()
+    {
+        return Ok(());
+    }
+    let Some(parent_url) = child.in_reply_to.as_deref() else {
+        return Ok(());
+    };
+    let parent = fetch_public_remote_status(state, parent_url, None).await?;
+    roosty_db::link_unresolved_remote_replies_to_parent(&state.db, &parent).await?;
+    THREAD_PARENT_RESOLVED.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn fetched_reply_collection(
+    state: &AppState,
+    mut replies: InboundReplies,
+    parent_url: &str,
+) -> Result<Vec<String>, RoostyError> {
+    let mut requests = 0_u8;
+    let mut seen_references = HashSet::new();
+    loop {
+        match replies {
+            InboundReplies::Id(id) => {
+                if requests >= 2 {
+                    return Ok(Vec::new());
+                }
+                if !seen_references.insert(id.clone()) {
+                    return Ok(Vec::new());
+                }
+                if !same_url_origin(parent_url, &id) {
+                    THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+                    return Err(permanent_fetch_failure(
+                        "remote replies collection is outside the status origin",
+                    ));
+                }
+                let url = parse_remote_fetch_url(state, &id)?;
+                let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+                replies = serde_json::from_value(document)
+                    .map_err(|_| permanent_fetch_failure("remote replies collection is invalid"))?;
+                requests += 1;
+            }
+            InboundReplies::Object(collection) => {
+                let items = collection
+                    .item_urls()
+                    .filter(|url| {
+                        let accepted = same_url_origin(parent_url, url);
+                        if !accepted {
+                            THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        accepted
+                    })
+                    .take(MAX_DISCOVERED_REPLIES)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if !items.is_empty() {
+                    return Ok(items);
+                }
+                if let Some(first) = collection.first {
+                    replies = first;
+                } else if let Some(id) = collection.id {
+                    replies = InboundReplies::Id(id);
+                } else {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
+}
+
+/// Read one replies collection page and enqueue at most five same-origin Notes.
+pub(crate) async fn fetch_remote_status_replies(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let status_id = thread_status_payload(payload)?;
+    let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, status_id).await? else {
+        return Ok(());
+    };
+    if parent.deleted_at.is_some()
+        || !matches!(
+            parent.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted
+        )
+    {
+        return Ok(());
+    }
+    let Some(replies) = parent.object.get("replies").cloned() else {
+        return Ok(());
+    };
+    let replies: InboundReplies = serde_json::from_value(replies)
+        .map_err(|_| permanent_fetch_failure("remote replies reference is invalid"))?;
+    let urls = fetched_reply_collection(state, replies, &parent.activitypub_id).await?;
+    let txn = state.db.begin().await?;
+    for reply_url in urls {
+        let digest = STANDARD.encode(Sha256::digest(reply_url.as_bytes()));
+        roosty_db::enqueue_job_in_transaction(
+            &txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationReplyFetch,
+                payload: serde_json::to_value(ReplyFetchPayload {
+                    parent_status_id: parent.id.0,
+                    reply_url,
+                })
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
+                deduplication_key: Some(format!("reply-fetch:{}:{digest}", parent.id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Fetch one collection-listed reply only when it names the expected parent.
+pub(crate) async fn fetch_remote_status_reply(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: ReplyFetchPayload = serde_json::from_value(payload)
+        .map_err(|_| permanent_fetch_failure("reply fetch job payload is invalid"))?;
+    let Some(parent) =
+        roosty_db::find_remote_status_by_id(&state.db, StatusId(payload.parent_status_id)).await?
+    else {
+        return Ok(());
+    };
+    if !same_url_origin(&parent.activitypub_id, &payload.reply_url) {
+        THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(permanent_fetch_failure(
+            "remote reply URL is outside the parent origin",
+        ));
+    }
+    fetch_public_remote_status(
+        state,
+        &payload.reply_url,
+        Some(parent.activitypub_id.as_str()),
+    )
+    .await?;
+    roosty_db::link_unresolved_remote_replies_to_parent(&state.db, &parent).await?;
+    THREAD_REPLIES_DISCOVERED.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Publish a cached remote Note lifecycle event only to local accounts following its author.
 async fn publish_remote_status_change(
     state: &AppState,
@@ -3386,7 +3800,12 @@ pub(crate) fn metrics_text() -> String {
             "# HELP roosty_federation_delete_repair_total Signed federation deletion repairs.\n",
             "# TYPE roosty_federation_delete_repair_total counter\n",
             "roosty_federation_delete_repair_total{{kind=\"status\"}} {}\n",
-            "roosty_federation_delete_repair_total{{kind=\"actor\"}} {}\n"
+            "roosty_federation_delete_repair_total{{kind=\"actor\"}} {}\n",
+            "# HELP roosty_federation_thread_fetch_total Bounded remote thread discovery outcomes.\n",
+            "# TYPE roosty_federation_thread_fetch_total counter\n",
+            "roosty_federation_thread_fetch_total{{outcome=\"parent_resolved\"}} {}\n",
+            "roosty_federation_thread_fetch_total{{outcome=\"reply_discovered\"}} {}\n",
+            "roosty_federation_thread_fetch_total{{outcome=\"rejected\"}} {}\n"
         ),
         INBOX_ACCEPTED.load(Ordering::Relaxed),
         INBOX_DUPLICATE.load(Ordering::Relaxed),
@@ -3394,6 +3813,9 @@ pub(crate) fn metrics_text() -> String {
         INBOX_INVALID_ID.load(Ordering::Relaxed),
         STATUS_DELETE_REPAIR.load(Ordering::Relaxed),
         ACTOR_DELETE_REPAIR.load(Ordering::Relaxed),
+        THREAD_PARENT_RESOLVED.load(Ordering::Relaxed),
+        THREAD_REPLIES_DISCOVERED.load(Ordering::Relaxed),
+        THREAD_FETCH_REJECTED.load(Ordering::Relaxed),
     );
     metrics.push_str(&discovery::metrics_text());
     metrics
@@ -5786,11 +6208,12 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundInteractionPolicy, InboundTag, InboundUndoAnnounceActivity,
-        InboundUndoBlockActivity, InboundUndoFollowActivity, MentionTag, MentionType, Note,
-        NoteContext, NoteExtensionsContext, NoteType, OrderedCollection, PublicKey, actor_context,
-        actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
-        local_actor_type, parse_acct, remote_hashtag_names, same_url_origin,
+        InboundFollowActivity, InboundInteractionPolicy, InboundReplies, InboundTag,
+        InboundUndoAnnounceActivity, InboundUndoBlockActivity, InboundUndoFollowActivity,
+        MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note, NoteContext, NoteExtensionsContext,
+        NoteType, OrderedCollection, PublicKey, actor_context, actor_profile_fields,
+        canonical_activity_digest, is_remote_actor_lifecycle_activity, local_actor_type,
+        parse_acct, remote_hashtag_names, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -6043,6 +6466,214 @@ mod tests {
         assert_eq!(
             notifications.items[0].remote_status_id,
             Some(cached_reply.id)
+        );
+
+        test_transport::clear_inboxes();
+        context.teardown().await;
+    }
+
+    /// Given a followed remote reply whose public parent was not delivered, the background
+    /// resolver fetches the parent and repairs the cached thread without notifications.
+    #[tokio::test]
+    async fn remote_reply_resolver_fetches_and_links_an_unknown_parent() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        test_transport::register_inbox("alpha.test", context.alpha.clone());
+        test_transport::register_inbox("beta.test", context.beta.clone());
+
+        let parent_author = create_test_account(&context.alpha, "parent").await;
+        let reply_author = create_test_account(&context.alpha, "replier").await;
+        let follower = create_test_account(&context.beta, "follower").await;
+        let reply_key = super::ensure_actor_key(&context.alpha, reply_author.id)
+            .await
+            .unwrap();
+        let follower_key = super::ensure_actor_key(&context.beta, follower.id)
+            .await
+            .unwrap();
+        let remote_reply_author =
+            cache_test_actor(&context.beta, "replier", "alpha.test", reply_key).await;
+        let remote_follower =
+            cache_test_actor(&context.alpha, "follower", "beta.test", follower_key).await;
+
+        let follow_id =
+            super::enqueue_remote_follow(&context.beta, follower.id, remote_reply_author.id)
+                .await
+                .unwrap();
+        roosty_db::create_remote_following(
+            &context.beta.db,
+            follower.id,
+            remote_reply_author.id,
+            &follow_id,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
+        assert!(
+            roosty_db::remote_actor_follows_local_account(
+                &context.alpha.db,
+                remote_follower.id,
+                reply_author.id,
+            )
+            .await
+            .unwrap()
+        );
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationFollowResponse).await;
+
+        let parent =
+            create_public_test_status(&context.alpha, parent_author.id, "missing parent").await;
+        let reply = roosty_db::create_local_status(
+            &context.alpha.db,
+            roosty_db::NewLocalStatus {
+                account_id: reply_author.id,
+                content: "delivered reply".to_owned(),
+                visibility: StatusVisibility::Public,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: Some(parent.id),
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+        super::enqueue_status_activity(&context.alpha, &reply, super::StatusActivityKind::Create)
+            .await
+            .unwrap();
+        deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
+
+        let reply_url = super::status_url(&context.alpha, "replier", reply.id);
+        let cached_reply =
+            roosty_db::find_remote_status_by_activitypub_id(&context.beta.db, &reply_url)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(cached_reply.in_reply_to_remote_status_id.is_none());
+
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationThreadResolve).await;
+        let parent_url = super::status_url(&context.alpha, "parent", parent.id);
+        let cached_parent =
+            roosty_db::find_remote_status_by_activitypub_id(&context.beta.db, &parent_url)
+                .await
+                .unwrap()
+                .unwrap();
+        let repaired_reply = roosty_db::find_remote_status_by_id(&context.beta.db, cached_reply.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired_reply.in_reply_to_remote_status_id,
+            Some(cached_parent.id)
+        );
+
+        test_transport::clear_inboxes();
+        context.teardown().await;
+    }
+
+    /// A bounded embedded replies page queues and caches only Notes that actually reply to the
+    /// expected same-origin parent.
+    #[tokio::test]
+    async fn remote_replies_fetch_caches_a_valid_same_origin_descendant() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        test_transport::register_inbox("alpha.test", context.alpha.clone());
+        test_transport::register_inbox("beta.test", context.beta.clone());
+
+        let author = create_test_account(&context.alpha, "author").await;
+        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+            .await
+            .unwrap();
+        let remote_author =
+            cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
+        let parent = create_public_test_status(&context.alpha, author.id, "parent").await;
+        let child = roosty_db::create_local_status(
+            &context.alpha.db,
+            roosty_db::NewLocalStatus {
+                account_id: author.id,
+                content: "child".to_owned(),
+                visibility: StatusVisibility::Public,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: Some(parent.id),
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+        let parent_url = super::status_url(&context.alpha, "author", parent.id);
+        let child_url = super::status_url(&context.alpha, "author", child.id);
+        let now = time::OffsetDateTime::now_utc();
+        let cached_parent = roosty_db::upsert_remote_status(
+            &context.beta.db,
+            roosty_db::NewRemoteStatus {
+                activitypub_id: parent_url,
+                remote_actor_id: remote_author.id,
+                content: "parent".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: now,
+                updated_at: now,
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({
+                    "replies": {
+                        "type": "CollectionPage",
+                        "items": [
+                            child_url,
+                            "https://attacker.test/statuses/unrelated"
+                        ]
+                    }
+                }),
+                tag_names: Vec::new(),
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        super::fetch_remote_status_replies(
+            &context.beta,
+            serde_json::to_value(super::ThreadStatusPayload {
+                status_id: cached_parent.id.0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        deliver_test_job(&context.beta, roosty_db::JobKind::FederationReplyFetch).await;
+
+        let cached_child =
+            roosty_db::find_remote_status_by_activitypub_id(&context.beta.db, &child_url)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            cached_child.in_reply_to_remote_status_id,
+            Some(cached_parent.id)
+        );
+
+        let unrelated = create_public_test_status(&context.alpha, author.id, "not a reply").await;
+        let unrelated_url = super::status_url(&context.alpha, "author", unrelated.id);
+        let rejected = super::fetch_remote_status_reply(
+            &context.beta,
+            serde_json::to_value(super::ReplyFetchPayload {
+                parent_status_id: cached_parent.id.0,
+                reply_url: unrelated_url.clone(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert!(rejected.is_err());
+        assert!(
+            roosty_db::find_remote_status_by_activitypub_id(&context.beta.db, &unrelated_url)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         test_transport::clear_inboxes();
@@ -6649,6 +7280,34 @@ mod tests {
         assert!(!same_url_origin("not-a-url", actor));
     }
 
+    /// A collection page accepts string and link items while enforcing Mastodon's five-item cap.
+    #[test]
+    fn reply_collection_items_are_typed_and_bounded() {
+        let replies: InboundReplies = serde_json::from_value(json!({
+            "id": "https://remote.example/statuses/1/replies?page=true",
+            "type": "CollectionPage",
+            "items": [
+                "https://remote.example/statuses/2",
+                {"id":"https://remote.example/statuses/3"},
+                "https://remote.example/statuses/4",
+                "https://remote.example/statuses/5",
+                "https://remote.example/statuses/6",
+                "https://remote.example/statuses/7"
+            ]
+        }))
+        .unwrap();
+        let InboundReplies::Object(collection) = replies else {
+            panic!("collection object parsed as an ID");
+        };
+        let urls = collection
+            .item_urls()
+            .take(MAX_DISCOVERED_REPLIES)
+            .collect::<Vec<_>>();
+        assert_eq!(urls.len(), 5);
+        assert_eq!(urls[0], "https://remote.example/statuses/2");
+        assert_eq!(urls[1], "https://remote.example/statuses/3");
+    }
+
     /// Given public ActivityStreams payloads, when serialized, then their property names use the
     /// ActivityStreams camelCase spelling required by Mastodon.
     #[test]
@@ -7091,6 +7750,21 @@ mod tests {
             // Featured-tag refresh tests invoke the worker directly; keeping its large future out
             // of this shared two-instance delivery helper avoids inflating every scenario future.
             roosty_db::JobKind::FederationFeaturedTagsRefresh => {}
+            roosty_db::JobKind::FederationThreadResolve => {
+                super::resolve_remote_status_thread(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationRepliesFetch => {
+                super::fetch_remote_status_replies(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
+            roosty_db::JobKind::FederationReplyFetch => {
+                super::fetch_remote_status_reply(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
             roosty_db::JobKind::WebPushDelivery
             | roosty_db::JobKind::NotificationRequestMerge
             | roosty_db::JobKind::NotificationRequestCleanup => {}

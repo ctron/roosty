@@ -599,6 +599,11 @@ pub(crate) async fn fetch_json<T: for<'de> Deserialize<'de>>(
     if let Some((value, name)) = query {
         url.query_pairs_mut().append_pair(name, value);
     }
+    #[cfg(test)]
+    if let Some(result) = super::test_transport::fetch_if_registered(&url).await {
+        return serde_json::from_value(result?)
+            .map_err(|_| invalid("remote response is invalid JSON"));
+    }
     let address = validate_remote_url(state, &url).await?;
     let host = url
         .host_str()

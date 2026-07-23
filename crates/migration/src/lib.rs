@@ -67,6 +67,7 @@ mod m20260701_000062_create_lists;
 mod m20260701_000063_constrain_inbox_activity_type;
 mod m20260701_000064_add_notification_groups;
 mod m20260701_000065_add_notification_policies;
+mod m20260701_000066_hydrate_remote_threads;
 
 pub struct Migrator;
 
@@ -139,6 +140,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000063_constrain_inbox_activity_type::Migration),
             Box::new(m20260701_000064_add_notification_groups::Migration),
             Box::new(m20260701_000065_add_notification_policies::Migration),
+            Box::new(m20260701_000066_hydrate_remote_threads::Migration),
         ]
     }
 }

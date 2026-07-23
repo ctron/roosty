@@ -2121,6 +2121,31 @@ pub async fn process_remote_status_upsert(
     Ok(RemoteStatusUpsertResult::Updated(status))
 }
 
+/// Link unresolved cached replies after their remote parent becomes available.
+///
+/// Matching the retained canonical URL makes this repair safe when the parent
+/// and child are fetched by different workers or Roosty processes.
+pub async fn link_unresolved_remote_replies_to_parent(
+    db: &impl ConnectionTrait,
+    parent: &RemoteStatus,
+) -> Result<u64> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            UPDATE remote_status
+            SET in_reply_to_remote_status_id = $1
+            WHERE in_reply_to = $2
+              AND in_reply_to_local_status_id IS NULL
+              AND in_reply_to_remote_status_id IS NULL
+              AND deleted_at IS NULL
+            "#,
+            vec![parent.id.0.into(), parent.activitypub_id.clone().into()],
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Replace the indexed hashtags for a cached Note inside its caller-owned transaction.
 async fn replace_remote_status_tags(
     txn: &DatabaseTransaction,
@@ -3443,6 +3468,9 @@ pub enum JobKind {
     FederationRemoteMediaFetch,
     FederationFeaturedRefresh,
     FederationFeaturedTagsRefresh,
+    FederationThreadResolve,
+    FederationRepliesFetch,
+    FederationReplyFetch,
     WebPushDelivery,
     NotificationRequestMerge,
     NotificationRequestCleanup,
@@ -14515,7 +14543,8 @@ pub async fn claim_due_job(
                     'federation_favourite_delivery', 'federation_reblog_delivery',
                     'federation_actor_update_delivery', 'federation_moderation_delivery',
                     'federation_remote_media_fetch', 'federation_featured_refresh',
-                    'federation_featured_tags_refresh', 'web_push_delivery',
+                    'federation_featured_tags_refresh', 'federation_thread_resolve',
+                    'federation_replies_fetch', 'federation_reply_fetch', 'web_push_delivery',
                     'notification_request_merge', 'notification_request_cleanup'
                   )
                 ORDER BY run_after, created_at
@@ -14706,6 +14735,18 @@ mod tests {
         assert_eq!(
             JobKind::FederationFeaturedTagsRefresh.as_str(),
             "federation_featured_tags_refresh"
+        );
+        assert_eq!(
+            JobKind::FederationThreadResolve.as_str(),
+            "federation_thread_resolve"
+        );
+        assert_eq!(
+            JobKind::FederationRepliesFetch.as_str(),
+            "federation_replies_fetch"
+        );
+        assert_eq!(
+            JobKind::FederationReplyFetch.as_str(),
+            "federation_reply_fetch"
         );
         assert_eq!(JobKind::WebPushDelivery.as_str(), "web_push_delivery");
     }

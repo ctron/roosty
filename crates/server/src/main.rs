@@ -485,6 +485,15 @@ async fn worker_iteration(
         roosty_db::JobKind::FederationFeaturedTagsRefresh => {
             federation::refresh_remote_featured_tags(&state, job.payload.clone()).await
         }
+        roosty_db::JobKind::FederationThreadResolve => {
+            federation::resolve_remote_status_thread(&state, job.payload.clone()).await
+        }
+        roosty_db::JobKind::FederationRepliesFetch => {
+            federation::fetch_remote_status_replies(&state, job.payload.clone()).await
+        }
+        roosty_db::JobKind::FederationReplyFetch => {
+            federation::fetch_remote_status_reply(&state, job.payload.clone()).await
+        }
         roosty_db::JobKind::WebPushDelivery => state
             .push
             .deliver(job.payload.clone())
@@ -555,7 +564,10 @@ async fn worker_iteration(
                     config.federation_delivery_max_age,
                 ) || error
                     .to_string()
-                    .starts_with("permanent federation delivery failure:"));
+                    .starts_with("permanent federation delivery failure:")
+                    || error
+                        .to_string()
+                        .starts_with("permanent federation fetch failure:"));
             if permanent {
                 if roosty_db::mark_job_permanently_failed(db, &job, &error.to_string()).await? {
                     warn!(job_id = %job.id.0, %error, "federation delivery failed permanently");

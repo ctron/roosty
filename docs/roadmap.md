@@ -39,7 +39,7 @@
 - [x] Implement remote follower-only Notes and replies using validated actor collection URLs, current follow relationships, explicit mentions, and cache-only traversal.
 - [x] Expose paginated, locally known follower/following relationships for cached remote accounts through the Mastodon API, without crawling remote ActivityPub collections.
 - [x] Deliver and process public/unlisted replies and mentions, including recipient addressing, remote-object resolution, and local notification visibility.
-- [x] Build cache-only remote reply contexts and conversation/thread traversal across local and cached remote parents, with Mastodon-compatible access limits and no outbox backfill.
+- [x] Build remote reply contexts and conversation/thread traversal across local and cached remote parents, with Mastodon-compatible access limits, durable public ancestor resolution, and bounded same-origin reply discovery.
 - [x] Support remote reply delivery and addressing for follower-only visibility.
 - [x] Deliver and process public/unlisted favourites (`Like`/`Undo`), including remote counters, local notifications, and mixed favourites collections.
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
