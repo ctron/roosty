@@ -390,6 +390,8 @@ struct AuthorizeParams {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<PkceMethod>,
+    #[serde(default)]
+    force_login: bool,
 }
 
 #[derive(Deserialize)]
@@ -416,6 +418,7 @@ impl AuthorizeForm {
                 state: self.state,
                 code_challenge: self.code_challenge,
                 code_challenge_method: self.code_challenge_method,
+                force_login: false,
             },
             self.decision,
         )
@@ -477,8 +480,11 @@ async fn authorize_form(
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     let account_id = match account_id_from_session(&state, &headers) {
-        Ok(Some(account_id)) => account_id,
-        Ok(None) => {
+        Ok(Some(account_id)) if !params.force_login => account_id,
+        Ok(Some(_)) | Ok(None) => {
+            // `force_login` is a one-shot account-selection hint. Excluding it
+            // from the return URL prevents another login redirect after the
+            // user successfully authenticates.
             let next = format!("/oauth/authorize?{}", authorize_query_string(&params));
             return Redirect::to(&public_url(
                 &state,
@@ -1760,7 +1766,7 @@ mod tests {
         // Elk's query serializer uses encodeURI, which leaves the callback's
         // existing percent escapes untouched instead of encoding `%` as `%25`.
         let authorize_uri = format!(
-            "/oauth/authorize?response_type=code&client_id={}&redirect_uri={ELK_REDIRECT_URI}&scope=read+write+follow+push",
+            "/oauth/authorize?response_type=code&client_id={}&redirect_uri={ELK_REDIRECT_URI}&scope=read+write+follow+push&force_login=false",
             app.client_id
         );
         let response = context
@@ -1830,6 +1836,109 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given Elk requests a second account, forced login replaces the session only after successful authentication and grants that account.
+    async fn elk_force_login_authorizes_a_different_account(context: &mut EndpointContext) {
+        let password_hash = password::hash_password("second-password").unwrap();
+        roosty_db::create_local_account(
+            &context.db,
+            "second",
+            "second@example.com",
+            &password_hash,
+        )
+        .await
+        .unwrap();
+        let app = context.register_app().await;
+        let current_cookie = context.login().await;
+        let force_login_uri = format!("{}&force_login=true", authorize_uri(&app.client_id));
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri(force_login_uri)
+                    .header(COOKIE, &current_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+        let login_url = Url::parse(&header_value(&response, LOCATION)).unwrap();
+        assert_eq!(login_url.path(), "/login");
+        let next = login_url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "next").then(|| value.into_owned()))
+            .unwrap();
+        let resumed_authorize_url = Url::parse(&format!("https://localhost:4000{next}")).unwrap();
+        let resumed_query = resumed_authorize_url.query_pairs().collect::<Vec<_>>();
+        assert!(resumed_query.contains(&("client_id".into(), app.client_id.as_str().into())));
+        assert!(resumed_query.contains(&("redirect_uri".into(), REDIRECT_URI.into())));
+        assert!(resumed_query.contains(&("scope".into(), "read write".into())));
+        assert!(resumed_query.contains(&("state".into(), "test-state".into())));
+        assert!(resumed_query.contains(&("code_challenge".into(), CODE_CHALLENGE.into())));
+        assert!(resumed_query.contains(&("code_challenge_method".into(), "S256".into())));
+        assert!(!resumed_query.iter().any(|(name, _)| name == "force_login"));
+
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("login", "second"),
+                ("password", "second-password"),
+                ("next", next.as_str()),
+            ])
+            .finish();
+        let response = context
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(COOKIE, current_cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            header_value(&response, LOCATION),
+            format!("https://localhost:4000{next}")
+        );
+        let second_cookie = session_cookie(&response);
+
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri(next)
+                    .header(COOKIE, &second_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(html.contains("second"));
+        assert!(!html.contains("Welcome, admin"));
+
+        let code = context.authorize(&app.client_id, &second_cookie).await;
+        let token = context.token(&app, &code).await;
+        let response = context
+            .request(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["username"], "second");
     }
 
     #[test_context(EndpointContext)]

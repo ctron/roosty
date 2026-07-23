@@ -54,7 +54,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 | Support | Area | Details |
 | --- | --- | --- |
 | 🟢 | `POST /api/v1/apps` | OAuth app registration. |
-| 🟢 | `GET/POST /oauth/authorize` | SSR consent lists requested scopes and supports approve or standards-compatible `access_denied` decisions. The flow includes Elk callbacks with nested percent-encoded origins, the trailing-slash form, and styled out-of-band results used by CLI clients such as toot. Redirects always use the exact registered callback. |
+| 🟢 | `GET/POST /oauth/authorize` | SSR consent lists requested scopes and supports approve or standards-compatible `access_denied` decisions. The flow includes Elk `force_login` account switching and callbacks with nested percent-encoded origins, the trailing-slash form, and styled out-of-band results used by CLI clients such as toot. Redirects always use the exact registered callback. |
 | 🟢 | `POST /oauth/token` | Authorization code and Elk-compatible token flow. |
 | 🟢 | `POST /oauth/revoke` | Bearer token revocation. |
 
