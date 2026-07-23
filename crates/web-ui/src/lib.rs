@@ -1,5 +1,7 @@
 //! Server-rendered and hydrated browser UI for Roosty.
 
+#![recursion_limit = "256"]
+
 mod app;
 #[cfg(feature = "ssr")]
 mod authorization;
