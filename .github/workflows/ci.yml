@@ -30,6 +30,8 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install Cargo Binstall
         shell: bash
         run: |
