@@ -99,7 +99,9 @@
 - [ ] Add SEO-friendly first-party profile and status pages. Welcome, about, login, password settings, OAuth consent, and out-of-band authorization results now use Leptos; no Askama views remain.
 - [ ] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, and multi-process-safe publication.
 - [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients.
-- [ ] Improve local account administration now that multiple local users can be operator-created.
+- [x] Add an operations-first administrator interface with durable queue diagnostics, account
+  creation/password reset/limits, compatible account APIs, OAuth scope enforcement, CSRF
+  protection, and transactional audit records.
 - [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [x] Add cursor pagination for local and cached-remote account status collections.
 - [x] Add cached-remote hashtag discovery, timelines, history, and followed-tag fan-out.

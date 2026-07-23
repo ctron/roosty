@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod accounts;
+mod admin;
 mod auth;
 mod compat;
 mod config;
@@ -188,25 +189,17 @@ async fn bootstrap_admin(username: &str, email: &str) -> Result<()> {
 
 /// Create an additional local account from an operator command.
 async fn create_user(username: &str, email: &str, admin: bool) -> Result<()> {
-    validate_username(username)?;
-    validate_email(email)?;
-
     let database_url = database_url_from_env()?;
     let db = roosty_db::connect(&database_url).await?;
-    let temporary_password = password::generate_temporary_password();
-    let password_hash = password::hash_password(&temporary_password)?;
-
-    let account_id = if admin {
-        roosty_db::create_admin_account(&db, username, email, &password_hash).await?
-    } else {
-        roosty_db::create_local_account(&db, username, email, &password_hash).await?
-    };
+    let result =
+        admin::create_local_account(&db, None, admin::AdminSource::Cli, username, email, admin)
+            .await?;
     let role = if admin { "administrator" } else { "user" };
 
-    println!("Created local {role} account {account_id}");
+    println!("Created local {role} account {}", result.account.id.0);
     println!("Username: {username}");
     println!("Email: {email}");
-    println!("Temporary password: {temporary_password}");
+    println!("Temporary password: {}", result.temporary_password);
 
     Ok(())
 }
@@ -217,16 +210,15 @@ async fn reset_password(username: &str) -> Result<()> {
 
     let database_url = database_url_from_env()?;
     let db = roosty_db::connect(&database_url).await?;
-    let temporary_password = password::generate_temporary_password();
-    let password_hash = password::hash_password(&temporary_password)?;
-
-    let account = roosty_db::update_local_account_password_hash(&db, username, &password_hash)
+    let account = roosty_db::find_local_account_by_username(&db, username)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local account does not exist".to_owned()))?;
+    let result =
+        admin::reset_local_password(&db, None, admin::AdminSource::Cli, account.id).await?;
 
-    println!("Reset password for local account {}", account.id.0);
-    println!("Username: {}", account.username);
-    println!("Temporary password: {temporary_password}");
+    println!("Reset password for local account {}", result.account.id.0);
+    println!("Username: {}", result.account.username);
+    println!("Temporary password: {}", result.temporary_password);
 
     Ok(())
 }
@@ -237,17 +229,18 @@ async fn set_account_limited(account: &str, limited: bool) -> Result<()> {
     let database_url = database_url_from_env()?;
     let db = roosty_db::connect(&database_url).await?;
     let found = if let Some((username, domain)) = account.split_once('@') {
-        roosty_db::set_remote_actor_limited(&db, username, domain, limited)
+        roosty_db::find_remote_actor_by_handle(&db, username, domain)
             .await?
-            .map(|actor| actor.activitypub_id)
+            .map(|actor| (actor.id, actor.activitypub_id))
     } else {
-        roosty_db::set_local_account_limited(&db, account, limited)
+        roosty_db::find_local_account_by_username(&db, account)
             .await?
-            .map(|account| account.username)
+            .map(|account| (account.id, account.username))
     };
-    let target = found.ok_or_else(|| {
+    let (account_id, target) = found.ok_or_else(|| {
         RoostyError::InvalidInput("local or cached remote account does not exist".to_owned())
     })?;
+    admin::set_account_limited(&db, None, admin::AdminSource::Cli, account_id, limited).await?;
     let action = if limited { "Limited" } else { "Unlimited" };
     println!("{action} account {target}");
     Ok(())

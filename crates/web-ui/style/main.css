@@ -52,10 +52,33 @@ a:focus-visible, button:focus-visible { outline: 3px solid #d18f00; outline-offs
 .session-account { font-weight: 650; }
 .not-found, .panic-page { max-width: 42rem; margin: 10vh auto; padding: 2rem; }
 .panic-page__actions { display: flex; flex-wrap: wrap; gap: 1rem; }
+.admin-page { display: grid; gap: 1.5rem; margin-block: 2rem 4rem; }
+.admin-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
+.admin-heading h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.5rem); }
+.admin-refresh-note { margin: -1rem 0 0; color: var(--muted); }
+.admin-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
+.admin-summary article, .admin-panel { padding: 1.25rem; background: var(--surface); border: 1px solid var(--border); border-radius: 0.8rem; }
+.admin-summary article { display: grid; gap: 0.2rem; }
+.admin-summary strong { font-size: 2rem; line-height: 1; }
+.admin-summary span { color: var(--muted); }
+.admin-panel h2 { margin-top: 0; }
+.admin-panel form { display: grid; gap: 1rem; max-width: 36rem; }
+.checkbox-field { display: flex; align-items: center; gap: 0.5rem; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 0.7rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+th { color: var(--muted); font-size: 0.85rem; text-transform: uppercase; }
+.admin-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.admin-actions form { display: inline; }
+.admin-panel button { padding: 0.55rem 0.75rem; color: white; background: var(--accent); border: 0; border-radius: 0.5rem; font: inherit; font-weight: 700; cursor: pointer; }
+.admin-panel .button--secondary { color: inherit; background: transparent; border: 1px solid var(--border); }
+.audit-list { display: grid; gap: 0.65rem; padding-left: 1.25rem; }
+.audit-list time, .audit-list span { color: var(--muted); }
 
 @media (max-width: 38rem) {
   .site-header { align-items: flex-start; flex-direction: column; }
   .hero, .prose, .form-card { margin-block: 1.5rem; border-radius: 0.8rem; }
+  .admin-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (prefers-color-scheme: dark) {

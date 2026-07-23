@@ -13,7 +13,10 @@ pub use authorization::{
     AuthorizationPermissionKind, AuthorizationResult, OutOfBandAuthorization,
     render_authorization_consent, render_out_of_band_authorization,
 };
-pub use bootstrap::{UiAccount, UiBackend, UiBootstrap, UiServerContext};
+pub use bootstrap::{
+    UiAccount, UiAdminAccount, UiAdminAuditEntry, UiAdminDashboard, UiAdminJob, UiAdminJobSummary,
+    UiBackend, UiBootstrap, UiServerContext,
+};
 pub use forms::{LoginError, PasswordChangeResult};
 
 #[cfg(feature = "hydrate")]

@@ -6,7 +6,7 @@ use leptos_router::{
     path,
 };
 
-use crate::bootstrap::{UiBootstrap, load_bootstrap};
+use crate::bootstrap::{UiAdminDashboard, UiBootstrap, load_admin_dashboard, load_bootstrap};
 use crate::forms::{LoginError, PasswordChangeResult};
 
 type BootstrapResource = Resource<Result<UiBootstrap, ServerFnError>>;
@@ -46,9 +46,169 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("about") view=AboutPage/>
                 <Route path=path!("login") view=LoginPage/>
                 <Route path=path!("auth/edit") view=ChangePasswordPage/>
+                <Route path=path!("admin") view=AdminPage/>
+                <Route path=path!("admin/accounts") view=AdminPage/>
+                <Route path=path!("admin/audit-log") view=AdminPage/>
             </Routes>
         </Router>
     }
+}
+
+#[component]
+fn AdminPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let query = use_query_map().get().get("q").unwrap_or_default();
+    let search_value = query.clone();
+    let dashboard = Resource::new_blocking(move || query.clone(), load_admin_dashboard);
+    #[cfg(feature = "hydrate")]
+    {
+        let dashboard = dashboard.clone();
+        set_interval(
+            move || {
+                if !document().hidden() {
+                    dashboard.refetch();
+                }
+            },
+            std::time::Duration::from_secs(15),
+        );
+    }
+    view! {
+        <PageMetadata bootstrap page_title="Administration" path="/admin"/>
+        <PageFrame bootstrap login_next="/admin">
+            <Suspense fallback=|| view! { <p>"Loading administrator dashboard…"</p> }>
+                {Suspend::new(async move {
+                    match dashboard.await {
+                        Ok(dashboard) => admin_dashboard_content(dashboard, search_value),
+                        Err(_) => view! {
+                            <section class="form-card">
+                                <h1>"Administrator access required"</h1>
+                                <p>"This page is available only to instance administrators."</p>
+                            </section>
+                        }.into_any(),
+                    }
+                })}
+            </Suspense>
+        </PageFrame>
+    }
+}
+
+fn admin_dashboard_content(dashboard: UiAdminDashboard, search_value: String) -> AnyView {
+    let csrf_create = dashboard.csrf_token.clone();
+    let csrf_actions = dashboard.csrf_token;
+    let summary = dashboard.summary;
+    let jobs = dashboard.jobs;
+    let accounts = dashboard.accounts;
+    let audit_entries = dashboard.audit_entries;
+    view! {
+        <section class="admin-page">
+            <div class="admin-heading">
+                <div>
+                    <p class="eyebrow">"Instance operations"</p>
+                    <h1>"Administration"</h1>
+                </div>
+                <a class="button button--secondary" href="/admin">"Refresh"</a>
+            </div>
+            <p class="admin-refresh-note">"Operational data refreshes every 15 seconds while this page is visible."</p>
+            <div class="admin-summary" aria-label="Durable queue summary">
+                <article><strong>{summary.due}</strong><span>"Due"</span></article>
+                <article><strong>{summary.in_progress}</strong><span>"In progress"</span></article>
+                <article><strong>{summary.scheduled_retries}</strong><span>"Scheduled retries"</span></article>
+                <article><strong>{summary.permanently_failed}</strong><span>"Permanent failures"</span></article>
+            </div>
+            {summary.oldest_due_at.map(|timestamp| view! {
+                <p class="form-message form-message--error">
+                    "Oldest due job: " {timestamp}
+                </p>
+            })}
+            <section class="admin-panel">
+                <h2>"Durable work"</h2>
+                <div class="table-scroll">
+                    <table>
+                        <thead><tr><th>"Kind"</th><th>"State"</th><th>"Attempts"</th><th>"Run after"</th><th>"Last error"</th></tr></thead>
+                        <tbody>
+                            {jobs.into_iter().map(|job| view! {
+                                <tr>
+                                    <td><code>{job.kind}</code></td>
+                                    <td>{job.state}</td>
+                                    <td>{job.attempts}</td>
+                                    <td>{job.run_after}</td>
+                                    <td>{job.last_error.unwrap_or_default()}</td>
+                                </tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            <section class="admin-panel">
+                <h2>"Create local account"</h2>
+                <form method="post" action="/admin/accounts">
+                    <input type="hidden" name="csrf_token" value=csrf_create/>
+                    <label class="form-field"><span>"Username"</span><input name="username" required minlength="2" maxlength="30"/></label>
+                    <label class="form-field"><span>"Email"</span><input name="email" type="email" required/></label>
+                    <label class="checkbox-field"><input name="admin" type="checkbox" value="true"/><span>"Grant full administrator privileges"</span></label>
+                    <label class="checkbox-field"><input type="checkbox" required/><span>"I confirm this account creation and understand that administrator access is unrestricted."</span></label>
+                    <button type="submit">"Create account"</button>
+                </form>
+            </section>
+            <section class="admin-panel">
+                <h2>"Accounts"</h2>
+                <form class="admin-search" method="get" action="/admin">
+                    <label class="form-field"><span>"Search accounts"</span><input name="q" value=search_value placeholder="Username, display name, email, or domain"/></label>
+                    <button type="submit">"Search"</button>
+                    <a href="/admin">"Clear"</a>
+                </form>
+                <div class="table-scroll">
+                    <table>
+                        <thead><tr><th>"Account"</th><th>"Origin"</th><th>"Role"</th><th>"State"</th><th>"Actions"</th></tr></thead>
+                        <tbody>
+                            {accounts.into_iter().map(|account| {
+                                let account_id = account.id.to_string();
+                                let reset_id = account_id.clone();
+                                let csrf_limit = csrf_actions.clone();
+                                let csrf_reset = csrf_actions.clone();
+                                let action = if account.limited { "unlimit" } else { "limit" };
+                                let handle = account.domain.as_ref().map_or_else(
+                                    || account.username.clone(),
+                                    |domain| format!("{}@{domain}", account.username),
+                                );
+                                view! {
+                                    <tr>
+                                        <td><strong>{handle}</strong><br/><small>{account.display_name}</small></td>
+                                        <td>{if account.domain.is_some() { "Remote" } else { "Local" }}</td>
+                                        <td>{if account.is_admin { "Admin" } else { "User" }}</td>
+                                        <td>{if account.limited { "Limited" } else { "Active" }}</td>
+                                        <td class="admin-actions">
+                                            <form method="post" action=format!("/admin/accounts/{account_id}/limit")>
+                                                <input type="hidden" name="csrf_token" value=csrf_limit/>
+                                                <input type="hidden" name="limited" value=(!account.limited).to_string()/>
+                                                <label class="checkbox-field"><input type="checkbox" required/><span>"Confirm"</span></label>
+                                                <button class="button--secondary" type="submit">{action}</button>
+                                            </form>
+                                            {account.domain.is_none().then(|| view! {
+                                                <form method="post" action=format!("/admin/accounts/{reset_id}/reset-password")>
+                                                    <input type="hidden" name="csrf_token" value=csrf_reset/>
+                                                    <label class="checkbox-field"><input type="checkbox" required/><span>"Confirm"</span></label>
+                                                    <button class="button--secondary" type="submit">"Reset password"</button>
+                                                </form>
+                                            })}
+                                        </td>
+                                    </tr>
+                                }
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            <section class="admin-panel">
+                <h2>"Recent administrator activity"</h2>
+                <ul class="audit-list">
+                    {audit_entries.into_iter().map(|entry| view! {
+                        <li><time>{entry.created_at}</time> <strong>{entry.action}</strong> <code>{entry.target_id}</code> <span>{entry.source}</span></li>
+                    }).collect_view()}
+                </ul>
+            </section>
+        </section>
+    }.into_any()
 }
 
 #[component]
@@ -332,6 +492,7 @@ fn session_navigation(
         Ok(bootstrap) => match bootstrap.account {
             Some(account) => view! {
                 <span class="session-account">"Welcome, " {account.username}</span>
+                {account.is_admin.then(|| view! { <A href="/admin">"Admin"</A> })}
                 <a href="/auth/edit" rel="external">"Account"</a>
             }
             .into_any(),

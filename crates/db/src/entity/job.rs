@@ -19,6 +19,7 @@ pub struct Model {
     pub last_error: Option<String>,
     pub created_at: OffsetDateTime,
     pub completed_at: Option<OffsetDateTime>,
+    pub permanently_failed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

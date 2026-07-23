@@ -1,5 +1,6 @@
 //! SeaORM entity modules for Roosty database tables.
 
+pub mod admin_audit_log;
 pub mod job;
 pub mod local_account;
 pub mod local_account_block;

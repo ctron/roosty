@@ -50,6 +50,24 @@ Links to server-owned account routes use `rel="external"` so Leptos performs a f
 navigation instead of resolving them as client-side UI routes. Future state-changing UI server
 functions must validate both the session and a CSRF token.
 
+## Administration
+
+Administrators have an SSR and hydrated operations interface at `/admin`, with account and audit
+deep links at `/admin/accounts` and `/admin/audit-log`. The navigation link is projected only for
+accounts whose persisted `is_admin` flag is set, and the server independently protects every admin
+route. Anonymous requests return through login; authenticated non-administrators receive a
+forbidden response.
+
+The dashboard reads durable queue health from PostgreSQL so multiple server and worker processes
+share the same view. It polls every 15 seconds while the document is visible and exposes only job
+kind, lifecycle state, attempts, scheduling timestamps, and bounded error text. Raw job payloads
+are never sent to the UI. Process-local Prometheus metrics remain infrastructure endpoints.
+
+Account creation, password reset, and local or cached-remote account limits use native forms with
+a session-bound HMAC CSRF token. Mutations and their audit records commit in one transaction.
+Generated temporary passwords are returned only by the successful response and are not stored in
+audit metadata.
+
 ## OAuth views
 
 OAuth consent and out-of-band code results use SSR-only Leptos documents with the shared instance

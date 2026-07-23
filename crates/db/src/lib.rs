@@ -687,7 +687,7 @@ pub async fn create_bootstrap_admin(
 
 /// Create a non-admin local account.
 pub async fn create_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     username: &str,
     email: &str,
     password_hash: &str,
@@ -697,7 +697,7 @@ pub async fn create_local_account(
 
 /// Create an administrator local account after bootstrap.
 pub async fn create_admin_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     username: &str,
     email: &str,
     password_hash: &str,
@@ -707,7 +707,7 @@ pub async fn create_admin_account(
 
 /// Insert a local account after checking user-facing unique account fields.
 async fn insert_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     username: &str,
     email: &str,
     password_hash: &str,
@@ -732,7 +732,7 @@ async fn insert_local_account(
 
 /// Reject account creation when the requested username or email is already in use.
 async fn ensure_local_account_available(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     username: &str,
     email: &str,
 ) -> Result<()> {
@@ -867,6 +867,131 @@ pub enum AccountSearchResult {
     Local(LocalAccount),
     /// An active actor held in the federation cache.
     Remote(RemoteActor),
+}
+
+/// Administrative projection shared by compatible and first-party account views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAccount {
+    pub id: AccountId,
+    pub username: String,
+    pub domain: Option<String>,
+    pub email: Option<String>,
+    pub display_name: String,
+    pub is_admin: bool,
+    pub limited: bool,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(FromQueryResult)]
+struct AdminAccountRow {
+    id: Uuid,
+    username: String,
+    domain: Option<String>,
+    email: Option<String>,
+    display_name: String,
+    is_admin: bool,
+    limited: bool,
+    created_at: OffsetDateTime,
+}
+
+/// List local and cached-remote accounts for administrator tooling.
+pub async fn list_admin_accounts(
+    db: &DbConnection,
+    query: &str,
+    origin: Option<&str>,
+    limited: Option<bool>,
+    limit: u64,
+    max_id: Option<Uuid>,
+) -> Result<Vec<AdminAccount>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let rows = AdminAccountRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+        SELECT id, username, domain, email, display_name, is_admin, limited, created_at
+        FROM (
+            SELECT id, username, NULL::text AS domain, email,
+                   display_name, is_admin, limited_at IS NOT NULL AS limited, created_at
+            FROM local_account
+            UNION ALL
+            SELECT id, username, domain, NULL::text AS email,
+                   display_name, false AS is_admin, limited_at IS NOT NULL AS limited,
+                   coalesce(profile_created_at, first_seen_at) AS created_at
+            FROM remote_actor
+            WHERE deleted_at IS NULL
+        ) account
+        WHERE ($1 = '' OR username ILIKE '%' || $1 || '%'
+                         OR display_name ILIKE '%' || $1 || '%'
+                         OR coalesce(domain, '') ILIKE '%' || $1 || '%'
+                         OR coalesce(email, '') ILIKE '%' || $1 || '%')
+          AND ($2::text IS NULL
+               OR ($2 = 'local' AND domain IS NULL)
+               OR ($2 = 'remote' AND domain IS NOT NULL))
+          AND ($3::boolean IS NULL OR limited = $3)
+          AND ($4::uuid IS NULL OR id < $4)
+        ORDER BY id DESC
+        LIMIT $5
+        "#,
+        vec![
+            query.trim().to_owned().into(),
+            origin.map(str::to_owned).into(),
+            limited.into(),
+            max_id.into(),
+            i64::try_from(limit.min(101))
+                .map_err(|_| RoostyError::InvalidInput("invalid account limit".to_owned()))?
+                .into(),
+        ],
+    ))
+    .all(&txn)
+    .await?;
+    let accounts = rows
+        .into_iter()
+        .map(|row| AdminAccount {
+            id: AccountId(row.id),
+            username: row.username,
+            domain: row.domain,
+            email: row.email,
+            display_name: row.display_name,
+            is_admin: row.is_admin,
+            limited: row.limited,
+            created_at: row.created_at,
+        })
+        .collect();
+    txn.commit().await?;
+    Ok(accounts)
+}
+
+/// Look up either kind of account for administrator detail and actions.
+pub async fn find_admin_account_by_id(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<Option<AdminAccount>> {
+    if let Some(account) = find_local_account_by_id(db, account_id).await? {
+        return Ok(Some(AdminAccount {
+            id: account.id,
+            username: account.username,
+            domain: None,
+            email: Some(account.email),
+            display_name: account.display_name,
+            is_admin: account.is_admin,
+            limited: account.limited_at.is_some(),
+            created_at: account.created_at,
+        }));
+    }
+    Ok(find_remote_actor_by_id(db, account_id)
+        .await?
+        .filter(|actor| actor.deleted_at.is_none())
+        .map(|actor| AdminAccount {
+            id: actor.id,
+            username: actor.username,
+            domain: Some(actor.domain),
+            email: None,
+            display_name: actor.display_name,
+            is_admin: false,
+            limited: actor.limited_at.is_some(),
+            created_at: actor.profile_created_at.unwrap_or(actor.first_seen_at),
+        }))
 }
 
 #[derive(Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, PartialEq)]
@@ -3623,6 +3748,7 @@ async fn insert_response_job(
         last_error: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         completed_at: Set(None),
+        permanently_failed_at: Set(None),
     })
     .on_conflict_do_nothing()
     .exec(txn)
@@ -4612,6 +4738,42 @@ pub async fn set_remote_actor_limited(
     let actor = remote_actor_from_model(active.update(&txn).await?);
     txn.commit().await?;
     Ok(Some(actor))
+}
+
+/// Set a local account's limit state inside a caller-owned transaction.
+pub async fn set_local_account_limited_by_id(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    limited: bool,
+) -> Result<Option<LocalAccount>> {
+    let Some(account) = local_account::Entity::find_by_id(account_id.0)
+        .lock_exclusive()
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active = account.into_active_model();
+    active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
+    Ok(Some(local_account_from_model(active.update(db).await?)?))
+}
+
+/// Set a cached remote actor's limit state inside a caller-owned transaction.
+pub async fn set_remote_actor_limited_by_id(
+    db: &impl ConnectionTrait,
+    actor_id: AccountId,
+    limited: bool,
+) -> Result<Option<RemoteActor>> {
+    let Some(actor) = remote_actor::Entity::find_by_id(actor_id.0)
+        .lock_exclusive()
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active = actor.into_active_model();
+    active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
+    Ok(Some(remote_actor_from_model(active.update(db).await?)))
 }
 
 /// Search local accounts by username or display name for Mastodon autocomplete.
@@ -7336,7 +7498,7 @@ pub async fn update_local_account_password_hash(
 
 /// Replace a local account password hash by its stable account identifier.
 pub async fn update_local_account_password_hash_by_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     password_hash: &str,
 ) -> Result<LocalAccount> {
@@ -14441,6 +14603,256 @@ pub struct ClaimedJob {
     pub created_at: OffsetDateTime,
 }
 
+/// Cross-process durable queue health shown to administrators.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminJobSummary {
+    pub due: u64,
+    pub in_progress: u64,
+    pub scheduled_retries: u64,
+    pub permanently_failed: u64,
+    pub oldest_due_at: Option<OffsetDateTime>,
+}
+
+/// Sanitized durable-job diagnostics; the stored payload is deliberately omitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminJobDiagnostic {
+    pub id: JobId,
+    pub kind: JobKind,
+    pub attempts: u32,
+    pub run_after: OffsetDateTime,
+    pub locked_at: Option<OffsetDateTime>,
+    pub last_error: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
+    pub permanently_failed_at: Option<OffsetDateTime>,
+}
+
+/// Origin of an administrator mutation.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum AdminAuditSource {
+    Web,
+    Api,
+    Cli,
+}
+
+/// Closed administrator mutations currently supported by Roosty.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+pub enum AdminAuditAction {
+    #[strum(serialize = "account.create")]
+    AccountCreate,
+    #[strum(serialize = "account.reset_password")]
+    AccountResetPassword,
+    #[strum(serialize = "account.limit")]
+    AccountLimit,
+    #[strum(serialize = "account.unlimit")]
+    AccountUnlimit,
+}
+
+/// Kind of record affected by an administrator mutation.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum AdminAuditTargetKind {
+    LocalAccount,
+    RemoteActor,
+}
+
+/// Immutable administrator action suitable for an audit-log UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAuditEntry {
+    pub id: Uuid,
+    pub actor_account_id: Option<AccountId>,
+    pub source: AdminAuditSource,
+    pub action: AdminAuditAction,
+    pub target_kind: AdminAuditTargetKind,
+    pub target_id: String,
+    pub metadata: JsonValue,
+    pub created_at: OffsetDateTime,
+}
+
+/// Append an administrator audit event through a caller-owned transaction.
+pub async fn insert_admin_audit_entry(
+    txn: &DatabaseTransaction,
+    actor_account_id: Option<AccountId>,
+    source: AdminAuditSource,
+    action: AdminAuditAction,
+    target_kind: AdminAuditTargetKind,
+    target_id: &str,
+    metadata: JsonValue,
+) -> Result<AdminAuditEntry> {
+    let model = entity::admin_audit_log::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        actor_account_id: Set(actor_account_id.map(|id| id.0)),
+        source: Set(source),
+        action: Set(action),
+        target_kind: Set(target_kind),
+        target_id: Set(target_id.to_owned()),
+        metadata: Set(metadata),
+        ..Default::default()
+    }
+    .insert(txn)
+    .await?;
+    Ok(admin_audit_entry_from_model(model))
+}
+
+/// Return recent audit events in stable UUIDv7 cursor order.
+pub async fn list_admin_audit_entries(
+    db: &DbConnection,
+    limit: u64,
+    max_id: Option<Uuid>,
+) -> Result<Vec<AdminAuditEntry>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let mut query = entity::admin_audit_log::Entity::find()
+        .order_by_desc(entity::admin_audit_log::Column::Id)
+        .limit(limit.min(100));
+    if let Some(max_id) = max_id {
+        query = query.filter(entity::admin_audit_log::Column::Id.lt(max_id));
+    }
+    let entries = query
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(admin_audit_entry_from_model)
+        .collect();
+    txn.commit().await?;
+    Ok(entries)
+}
+
+fn admin_audit_entry_from_model(model: entity::admin_audit_log::Model) -> AdminAuditEntry {
+    AdminAuditEntry {
+        id: model.id,
+        actor_account_id: model.actor_account_id.map(AccountId),
+        source: model.source,
+        action: model.action,
+        target_kind: model.target_kind,
+        target_id: model.target_id,
+        metadata: model.metadata,
+        created_at: model.created_at,
+    }
+}
+
+/// Summarize durable work from shared database state.
+pub async fn admin_job_summary(db: &DbConnection) -> Result<AdminJobSummary> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let row = txn
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT
+                count(*) FILTER (
+                    WHERE completed_at IS NULL AND locked_at IS NULL AND run_after <= now()
+                ) AS due,
+                count(*) FILTER (
+                    WHERE completed_at IS NULL AND locked_at IS NOT NULL
+                ) AS in_progress,
+                count(*) FILTER (
+                    WHERE completed_at IS NULL AND locked_at IS NULL
+                      AND attempts > 0 AND run_after > now()
+                ) AS scheduled_retries,
+                count(*) FILTER (
+                    WHERE permanently_failed_at IS NOT NULL
+                ) AS permanently_failed,
+                min(run_after) FILTER (
+                    WHERE completed_at IS NULL AND locked_at IS NULL AND run_after <= now()
+                ) AS oldest_due_at
+            FROM job
+            "#,
+        ))
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound("job summary returned no row".to_owned()))?;
+    let summary = AdminJobSummary {
+        due: u64::try_from(row.try_get::<i64>("", "due")?)
+            .map_err(|_| DbErr::Type("negative due job count".to_owned()))?,
+        in_progress: u64::try_from(row.try_get::<i64>("", "in_progress")?)
+            .map_err(|_| DbErr::Type("negative claimed job count".to_owned()))?,
+        scheduled_retries: u64::try_from(row.try_get::<i64>("", "scheduled_retries")?)
+            .map_err(|_| DbErr::Type("negative retry job count".to_owned()))?,
+        permanently_failed: u64::try_from(row.try_get::<i64>("", "permanently_failed")?)
+            .map_err(|_| DbErr::Type("negative permanent failure count".to_owned()))?,
+        oldest_due_at: row.try_get("", "oldest_due_at")?,
+    };
+    txn.commit().await?;
+    Ok(summary)
+}
+
+/// List current and recently permanently failed jobs without exposing payloads.
+pub async fn admin_job_diagnostics(
+    db: &DbConnection,
+    limit: u64,
+    max_id: Option<Uuid>,
+) -> Result<Vec<AdminJobDiagnostic>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let mut query = entity::job::Entity::find()
+        .filter(
+            Condition::any()
+                .add(entity::job::Column::CompletedAt.is_null())
+                .add(entity::job::Column::PermanentlyFailedAt.is_not_null()),
+        )
+        .order_by_desc(entity::job::Column::Id)
+        .limit(limit.min(100));
+    if let Some(max_id) = max_id {
+        query = query.filter(entity::job::Column::Id.lt(max_id));
+    }
+    let diagnostics = query
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|model| {
+            let attempts = u32::try_from(model.attempts).map_err(|_| {
+                RoostyError::InvalidInput("stored job attempts must not be negative".to_owned())
+            })?;
+            Ok(AdminJobDiagnostic {
+                id: JobId(model.id),
+                kind: model.kind,
+                attempts,
+                run_after: model.run_after,
+                locked_at: model.locked_at,
+                last_error: model
+                    .last_error
+                    .map(|error| sanitize_admin_job_error(&error)),
+                created_at: model.created_at,
+                completed_at: model.completed_at,
+                permanently_failed_at: model.permanently_failed_at,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    txn.commit().await?;
+    Ok(diagnostics)
+}
+
+fn sanitize_admin_job_error(error: &str) -> String {
+    error
+        .split_inclusive(char::is_whitespace)
+        .map(|part| {
+            part.find("https://")
+                .or_else(|| part.find("http://"))
+                .map_or_else(
+                    || part.to_owned(),
+                    |start| format!("{}[redacted-url] ", &part[..start]),
+                )
+        })
+        .collect::<String>()
+        .trim_end()
+        .chars()
+        .take(500)
+        .collect()
+}
+
 /// Enqueue a durable job, reusing an active deduplicated job when present.
 pub async fn enqueue_job(
     db: &DbConnection,
@@ -14641,7 +15053,7 @@ pub async fn mark_job_permanently_failed(
 ) -> Result<bool> {
     let result = db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "UPDATE job SET last_error = $2, completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE id = $1 AND claim_id = $3",
+        "UPDATE job SET last_error = $2, completed_at = now(), permanently_failed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE id = $1 AND claim_id = $3",
         vec![job.id.0.into(), error.to_owned().into(), job.claim_id.0.into()],
     )).await?;
     Ok(result.rows_affected() == 1)
@@ -14715,6 +15127,16 @@ mod tests {
 
         assert!(early > now);
         assert!(late - now <= Duration::hours(1) + Duration::seconds(1));
+    }
+
+    /// Given a delivery error containing a private endpoint, when it is projected to an
+    /// administrator, then diagnostic context remains without exposing the complete URL.
+    #[test]
+    fn administrator_job_errors_redact_urls() {
+        assert_eq!(
+            sanitize_admin_job_error("request to https://remote.example/inbox?token=secret failed"),
+            "request to [redacted-url] failed"
+        );
     }
 
     /// Worker job identifiers retain stable persisted spellings through the typed API.

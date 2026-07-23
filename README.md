@@ -14,9 +14,9 @@ notifications, moderation, OAuth, streaming, and Web Push are available across a
 surface.
 
 Compatibility is not complete. Explore and trends, scheduled posts, public registration, and parts of the
-administration API are still missing. The first-party frontend currently covers instance information and account
-flows; public profile and status views are planned. APIs and deployment expectations may still change between
-releases.
+administration API are still missing. The first-party frontend covers instance information, account flows, and an
+operations-first administrator dashboard; public profile and status views are planned. APIs and deployment
+expectations may still change between releases.
 
 See the [compatibility matrix](docs/compatibility.md) for detailed client and federation coverage, and the
 [roadmap](docs/roadmap.md) for planned work.

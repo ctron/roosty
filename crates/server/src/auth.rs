@@ -1490,6 +1490,43 @@ pub(crate) fn account_id_from_session(
     parse_session_cookie(&state.config.session_secret, cookie_value)
 }
 
+/// Derive a CSRF token tied to the signed browser session.
+pub(crate) fn csrf_token_from_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, RoostyError> {
+    let Some(cookie_value) = session_cookie_value(headers) else {
+        return Ok(None);
+    };
+    if parse_session_cookie(&state.config.session_secret, cookie_value)?.is_none() {
+        return Ok(None);
+    }
+    sign(
+        &state.config.session_secret,
+        &format!("admin-csrf.{cookie_value}"),
+    )
+    .map(Some)
+}
+
+/// Validate a submitted administrator CSRF token against the current session.
+pub(crate) fn validate_csrf_token(
+    state: &AppState,
+    headers: &HeaderMap,
+    submitted: &str,
+) -> Result<bool, RoostyError> {
+    Ok(csrf_token_from_session(state, headers)?.is_some_and(|expected| expected == submitted))
+}
+
+fn session_cookie_value(headers: &HeaderMap) -> Option<&str> {
+    let cookie_header = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())?;
+    cookie_header
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| (name == SESSION_COOKIE).then_some(value))
+}
+
 fn session_cookie(state: &AppState, account_id: AccountId) -> Result<String, RoostyError> {
     let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
     let payload = format!("{}.{}", account_id.0, expires_at.unix_timestamp());

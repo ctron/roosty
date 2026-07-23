@@ -61,6 +61,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_notification_policy").await);
     assert!(table_exists(database.connection(), "local_notification_permission").await);
     assert!(table_exists(database.connection(), "local_notification_request").await);
+    assert!(table_exists(database.connection(), "admin_audit_log").await);
+    assert!(column_exists(database.connection(), "job", "permanently_failed_at").await);
     assert!(column_exists(database.connection(), "local_notification", "filtered").await);
     assert!(
         column_exists(
