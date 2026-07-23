@@ -30,11 +30,22 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
-      - name: Install Cargo Leptos
-        run: cargo install cargo-leptos --version 0.3.7 --locked
+      - name: Install Cargo Binstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+            | bash
 
-      - name: Install wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Install frontend build tools
+        run: |
+          cargo binstall \
+            --no-confirm \
+            --locked \
+            --disable-telemetry \
+            cargo-leptos \
+            wasm-bindgen-cli
 
       - name: Check formatting
         run: cargo fmt --all -- --check
