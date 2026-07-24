@@ -1,0 +1,19 @@
+= Roosty documentation
+
+Roosty is a federated social server written in Rust.
+It implements ActivityPub federation and Mastodon-compatible client APIs, uses PostgreSQL for durable multi-process operation, and includes a server-rendered Rust/WebAssembly frontend.
+
+Roosty is early-stage software under active development.
+APIs and deployment expectations may change between releases.
+
+== Read the manual
+
+* xref:development.adoc[Development] explains how to run and operate a local Roosty stack.
+* xref:frontend.adoc[First-party frontend] describes the frontend architecture, rendering, authentication, and packaging.
+* xref:compatibility.adoc[Compatibility] tracks ActivityPub, Mastodon API, federation, and first-party UI coverage.
+
+== Project resources
+
+* https://github.com/ctron/roosty[Source repository]
+* https://github.com/ctron/roosty/blob/main/CONTRIBUTING.md[Contributing and deployment guide]
+* https://github.com/ctron/roosty/blob/main/docs/roadmap.md[Roadmap]

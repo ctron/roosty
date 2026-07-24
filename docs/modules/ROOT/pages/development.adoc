@@ -1,10 +1,11 @@
-# Development
+= Development
 
 Run the local stack:
 
-```sh
+[source,shell]
+----
 podman compose -f deploy/compose.yaml up --build
-```
+----
 
 The local stack starts Roosty with `serve --with-migrations --with-worker`, so migrations run before the server begins listening. It starts four durable worker loops; set `ROOSTY_WORKER_CONCURRENCY=0` to size the worker pool from the process's available logical CPUs.
 
@@ -12,9 +13,10 @@ The local stack uses Caddy with an internal development certificate so Roosty an
 
 The local deployment also starts Elk, an external Mastodon-compatible web client:
 
-```text
+[source,text]
+----
 https://localhost:4001
-```
+----
 
 Elk is configured for Roosty as a single-instance client using `roosty.localhost:4000`.
 
@@ -22,52 +24,78 @@ If Elk keeps trying an old saved instance, open `https://localhost:4001/reset` o
 
 To smoke-test Elk's server-side login handoff to Roosty:
 
-```sh
+[source,shell]
+----
 deploy/test-elk-login.sh
-```
+----
 
 To run migrations manually instead:
 
-```sh
+[source,shell]
+----
 podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty migrate
-```
+----
 
 Bootstrap the first administrator:
 
-```sh
+[source,shell]
+----
 podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin bootstrap --username admin --email admin@example.com
-```
+----
 
 Reset a local user's password and print a temporary replacement:
 
-```sh
+[source,shell]
+----
 podman compose -f deploy/compose.yaml exec roosty /usr/local/bin/roosty admin reset-password --username admin
-```
+----
 
 The local application listener is exposed through Caddy on `https://roosty.localhost:4000`. When `ROOSTY_INFRA_LISTEN_ADDR` is set, infrastructure endpoints are served only from that listener:
 
-```text
+[source,text]
+----
 http://localhost:3001/healthz
 http://localhost:3001/readyz
 http://localhost:3001/metrics
-```
+----
 
 Roosty stores uploaded media in the `roosty-media` compose volume. Elk stores local client settings in the `elk-data` compose volume. The backend does not serve, package, or embed Elk.
 
-## Streaming controls
+== Streaming controls
 
 Streaming uses PostgreSQL for ordered, best-effort fan-out between server
 processes. The local bounded channel remains the immediate delivery path, so a
 database publication failure does not delay the publishing request. Retained
 events are recovery metadata rather than a permanent message queue.
 
-| Environment variable | Default | Validation |
-| --- | ---: | --- |
-| `ROOSTY_STREAMING_MAX_CONNECTIONS` | `1000` | Positive integer, per process. |
-| `ROOSTY_STREAMING_SEND_TIMEOUT` | `10s` | Non-zero `humantime` duration. |
-| `ROOSTY_STREAMING_PING_INTERVAL` | `30s` | Non-zero `humantime` duration. |
-| `ROOSTY_STREAMING_IDLE_TIMEOUT` | `90s` | Non-zero duration greater than the ping interval. |
-| `ROOSTY_STREAMING_EVENT_RETENTION` | `1h` | Non-zero `humantime` duration. |
+[%header]
+|===
+|Environment variable
+|Default
+|Validation
+
+|`ROOSTY_STREAMING_MAX_CONNECTIONS`
+|`1000`
+|Positive integer, per process.
+
+|`ROOSTY_STREAMING_SEND_TIMEOUT`
+|`10s`
+|Non-zero `humantime` duration.
+
+|`ROOSTY_STREAMING_PING_INTERVAL`
+|`30s`
+|Non-zero `humantime` duration.
+
+|`ROOSTY_STREAMING_IDLE_TIMEOUT`
+|`90s`
+|Non-zero duration greater than the ping interval.
+
+|`ROOSTY_STREAMING_EVENT_RETENTION`
+|`1h`
+|Non-zero `humantime` duration.
+
+|===
+
 
 Configuration is read at startup. Stalled sends and clients that do not send
 any frames (including pong frames) before the idle deadline are disconnected.
@@ -76,14 +104,29 @@ The `/metrics` output includes active/rejected sockets, send timeouts, idle
 disconnects, lagged receivers, listener reconnects, and failed cross-process
 publications.
 
-## Scheduled status controls
+== Scheduled status controls
 
 Scheduled statuses are published by the durable worker pool. Limits are enforced
 transactionally per account so they remain consistent when multiple Roosty
 processes share a database.
 
-| Environment variable | Default | Validation |
-| --- | ---: | --- |
-| `ROOSTY_SCHEDULED_STATUS_MINIMUM_OFFSET` | `5m` | Non-zero `humantime` duration. |
-| `ROOSTY_SCHEDULED_STATUS_TOTAL_LIMIT` | `300` | Positive integer per account. |
-| `ROOSTY_SCHEDULED_STATUS_DAILY_LIMIT` | `25` | Positive integer per account and UTC day. |
+[%header]
+|===
+|Environment variable
+|Default
+|Validation
+
+|`ROOSTY_SCHEDULED_STATUS_MINIMUM_OFFSET`
+|`5m`
+|Non-zero `humantime` duration.
+
+|`ROOSTY_SCHEDULED_STATUS_TOTAL_LIMIT`
+|`300`
+|Positive integer per account.
+
+|`ROOSTY_SCHEDULED_STATUS_DAILY_LIMIT`
+|`25`
+|Positive integer per account and UTC day.
+
+|===
+

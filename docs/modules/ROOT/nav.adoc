@@ -1,0 +1,4 @@
+* xref:index.adoc[Overview]
+* xref:development.adoc[Development]
+* xref:frontend.adoc[First-party frontend]
+* xref:compatibility.adoc[Compatibility]

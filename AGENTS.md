@@ -65,7 +65,7 @@ Keep this as the default verification command for changes in this repository.
 - For larger or non-obvious function bodies, add concise internal comments explaining the major steps or invariants.
 - Add concise rustdoc to non-obvious tests describing the behavior or invariant protected, preferably in give, when,
   then style. Document `rstest` cases in their `#[case]` lines.
-- Update `docs/roadmap.md` and `docs/compatibility.md` when adding, removing, or materially changing ActivityPub or
+- Update `docs/roadmap.md` and `docs/modules/ROOT/pages/compatibility.adoc` when adding, removing, or materially changing ActivityPub or
   Mastodon-compatible behavior.
 - When adding Mastodon-compatible endpoints that accept `limit`, check the official API shape and implement the
   required cursor or offset pagination parameters and `Link` headers at the same time.

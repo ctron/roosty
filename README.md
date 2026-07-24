@@ -18,7 +18,9 @@ administration API are still missing. The first-party frontend covers instance i
 operations-first administrator dashboard; public profile and status views are planned. APIs and deployment
 expectations may still change between releases.
 
-See the [compatibility matrix](docs/compatibility.md) for detailed client and federation coverage, and the
+See the [documentation](https://ctron.github.io/roosty/) and
+[compatibility matrix](https://ctron.github.io/roosty/development/compatibility.html) for detailed client and
+federation coverage, and the
 [roadmap](docs/roadmap.md) for planned work.
 
 Development, verification, deployment, and release instructions are in [CONTRIBUTING.md](CONTRIBUTING.md).

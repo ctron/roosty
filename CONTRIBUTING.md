@@ -3,6 +3,26 @@
 This document covers release behavior, local development, deployment, verification, and operational configuration.
 For the project overview and current status, see the [README](README.md).
 
+## Documentation
+
+The published documentation is written in AsciiDoc and built with Antora. Install an active Node.js LTS release,
+then install the locked dependencies and build the site:
+
+```sh
+npm ci
+npm run docs:build
+```
+
+The generated site is written to `build/site`. To preview it with search enabled, serve that directory over HTTP:
+
+```sh
+python3 -m http.server 8000 --directory build/site
+```
+
+Open `http://localhost:8000`. Documentation content lives under `docs/modules/ROOT`, and its sidebar is defined in
+`docs/modules/ROOT/nav.adoc`. Pushes to `main` publish the site to
+[`https://ctron.github.io/roosty/`](https://ctron.github.io/roosty/) through GitHub Pages.
+
 ## Builds and Releases
 
 Every commit pushed to `main` that passes CI publishes a multi-architecture (`linux/amd64`, `linux/arm64`) container
