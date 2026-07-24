@@ -1,0 +1,60 @@
+= Administration
+
+Roosty provides an operations-focused web interface and command-line tools for instance administrators.
+For initial deployment, DNS, environment variables, and Ansible parameters, see xref:installation.adoc[Installation].
+
+== Open the administrator interface
+
+Sign in with an administrator account and open `/admin`.
+Roosty only shows the administration navigation to administrators, and the server independently protects every administrator route.
+
+The interface includes:
+
+* Queue health and sanitized job diagnostics.
+* Local and cached-remote account management.
+* Account creation and password resets.
+* Account limits.
+* An audit log of administrator actions.
+
+Account and audit details are available at `/admin/accounts` and `/admin/audit-log`.
+The dashboard reads durable state from PostgreSQL, so it represents work across all Roosty server and worker processes using the database.
+
+== Create accounts
+
+Public registration is not currently available.
+Create local user and administrator accounts from the administrator interface.
+Roosty generates a temporary password that must be passed to the account owner securely.
+The temporary password is not retained in the audit log.
+
+For the first administrator, use the bootstrap command documented in xref:installation.adoc#create-the-first-account[Create the first account].
+
+== Reset a password
+
+Use the account action in `/admin/accounts` to generate a new temporary password.
+Give it to the account owner through a secure channel and ask them to replace it at `/auth/edit`.
+
+When the web interface is unavailable, run the password-reset command inside the deployed Roosty container:
+
+[source,shell]
+----
+/usr/local/bin/roosty admin reset-password --username alice
+----
+
+== Limit an account
+
+Administrators can limit a local or cached-remote account without discarding its ActivityPub data.
+A limited account is suppressed from discovery and public timelines and participates in notification filtering.
+Removing the limit restores normal presentation.
+
+Account suspension, deletion, reports, and custom administrator roles are not yet implemented.
+See the xref:compatibility.adoc[compatibility matrix] for the current Mastodon administration API coverage.
+
+== Inspect background work
+
+The dashboard summarizes durable queue health and provides sanitized job diagnostics.
+Use it to identify delayed or repeatedly failing federation, media, notification, and scheduled-status work.
+
+Diagnostics omit raw job payloads and secrets.
+Administrator mutations are recorded in the audit log, including whether the action came from the web interface, API, or command line.
+
+For deployment logs, container operations, upgrades, and configuration changes, follow the procedures in xref:installation.adoc[Installation].

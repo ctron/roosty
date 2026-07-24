@@ -1,7 +1,7 @@
-= User guide
+= Using Roosty
 
 Roosty exposes Mastodon-compatible APIs, so you use it through a compatible client.
-The first-party web interface currently provides instance information, sign-in, account settings, OAuth authorization, and administrator operations; it is not yet a complete social timeline client.
+The first-party web interface currently provides instance information, sign-in, account settings, and OAuth authorization; it is not yet a complete social timeline client.
 
 == Get an account
 

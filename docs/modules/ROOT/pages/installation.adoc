@@ -448,5 +448,6 @@ sudo docker compose -f /opt/roosty/compose.yaml exec -T roosty \
 
 The production Compose stack does not publish the infrastructure listener on the host.
 
-For client options and first sign-in, continue with the xref:user-guide.adoc[User guide].
+For client options and first sign-in, continue with xref:user-guide.adoc[Using Roosty].
+For account provisioning and day-to-day operations, see xref:administration.adoc[Administration].
 For federation policy, operational configuration, upgrades, and release behavior, see the https://github.com/ctron/roosty/blob/main/CONTRIBUTING.md[contributor and deployment guide].
