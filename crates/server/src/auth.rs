@@ -734,6 +734,7 @@ fn authorization_page_context(
         instance_name: state.config.instance_name.clone(),
         build_identifier: crate::version::build_identifier(),
         account_username: account_username.to_owned(),
+        stylesheet_href: roosty_web_ui::stylesheet_href(&state.leptos_options),
     }
 }
 

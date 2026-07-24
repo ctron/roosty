@@ -8,6 +8,8 @@ mod authorization;
 mod bootstrap;
 mod forms;
 
+#[cfg(feature = "ssr")]
+pub use app::stylesheet_href;
 pub use app::{App, shell};
 #[cfg(feature = "ssr")]
 pub use authorization::{

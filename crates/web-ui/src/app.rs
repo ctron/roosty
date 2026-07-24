@@ -32,6 +32,29 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
     }
 }
 
+/// Resolve the CSS asset name produced by Cargo Leptos for standalone SSR documents.
+#[cfg(feature = "ssr")]
+pub fn stylesheet_href(options: &LeptosOptions) -> String {
+    let mut filename = options.output_name.to_string();
+    if options.hash_files {
+        let hash_path = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_default()
+            .join(options.hash_file.as_ref());
+        if let Ok(hashes) = std::fs::read_to_string(hash_path)
+            && let Some(hash) = hashes.lines().find_map(|line| {
+                let (file, hash) = line.trim().split_once(':')?;
+                (file == "css").then_some(hash.trim())
+            })
+        {
+            filename.push('.');
+            filename.push_str(hash);
+        }
+    }
+    format!("/pkg/{filename}.css")
+}
+
 /// Root component shared by the native renderer and browser hydration target.
 #[component]
 pub fn App() -> impl IntoView {

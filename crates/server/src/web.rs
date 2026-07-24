@@ -332,6 +332,7 @@ async fn create_admin_account(
     .await
     {
         Ok(result) => temporary_password_page(
+            &state,
             "Account created",
             &result.account.username,
             &result.temporary_password,
@@ -383,6 +384,7 @@ async fn reset_admin_password(
     .await
     {
         Ok(result) => temporary_password_page(
+            &state,
             "Password reset",
             &result.account.username,
             &result.temporary_password,
@@ -391,9 +393,15 @@ async fn reset_admin_password(
     }
 }
 
-fn temporary_password_page(title: &str, username: &str, temporary_password: &str) -> Response {
+fn temporary_password_page(
+    state: &AppState,
+    title: &str,
+    username: &str,
+    temporary_password: &str,
+) -> Response {
+    let stylesheet_href = roosty_web_ui::stylesheet_href(&state.leptos_options);
     Html(format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><link rel=\"stylesheet\" href=\"/pkg/roosty-web.css\"><title>{title}</title><main class=\"form-card\"><h1>{title}</h1><p>Temporary password for <strong>{username}</strong>:</p><code class=\"authorization-code\">{temporary_password}</code><p>This password is shown only once. Transfer it securely.</p><p><a href=\"/admin\">Return to administration</a></p></main></html>"
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><link rel=\"stylesheet\" href=\"{stylesheet_href}\"><title>{title}</title><main class=\"form-card\"><h1>{title}</h1><p>Temporary password for <strong>{username}</strong>:</p><code class=\"authorization-code\">{temporary_password}</code><p>This password is shown only once. Transfer it securely.</p><p><a href=\"/admin\">Return to administration</a></p></main></html>"
     ))
     .into_response()
 }

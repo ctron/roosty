@@ -18,6 +18,7 @@ pub struct AuthorizationPageContext {
     pub instance_name: String,
     pub build_identifier: String,
     pub account_username: String,
+    pub stylesheet_href: String,
 }
 
 /// A requested OAuth scope prepared for human-readable display.
@@ -189,6 +190,7 @@ fn render_document(title: String, context: AuthorizationPageContext, content: An
     let instance_name = context.instance_name;
     let account_username = context.account_username;
     let build_identifier = context.build_identifier;
+    let stylesheet_href = context.stylesheet_href;
     view! {
             <!DOCTYPE html>
             <html lang="en">
@@ -196,7 +198,7 @@ fn render_document(title: String, context: AuthorizationPageContext, content: An
                     <meta charset="utf-8"/>
                     <meta name="viewport" content="width=device-width, initial-scale=1"/>
                     <title>{title}</title>
-                    <link rel="stylesheet" href="/pkg/roosty-web.css"/>
+                    <link rel="stylesheet" href=stylesheet_href/>
                 </head>
                 <body>
                     <div class="site-shell">
@@ -249,6 +251,7 @@ mod tests {
                 instance_name: "Test instance".to_owned(),
                 build_identifier: "v1.2.3".to_owned(),
                 account_username: "alice".to_owned(),
+                stylesheet_href: "/pkg/roosty-web.css".to_owned(),
             },
             application_name: "<script>alert('x')</script>".to_owned(),
             response_type: "code".to_owned(),

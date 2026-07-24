@@ -3,7 +3,8 @@
 FROM docker.io/library/rust:bookworm AS builder
 
 ARG TARGETPLATFORM
-ENV LEPTOS_WASM_OPT_VERSION=version_131
+ENV LEPTOS_WASM_OPT_VERSION=version_131 \
+    LEPTOS_TAILWIND_VERSION=v4.3.3
 
 WORKDIR /src
 RUN rustup target add wasm32-unknown-unknown \
@@ -16,6 +17,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=cargo-target-${TARGETPLATFORM},target=/cargo-target,sharing=locked \
     CARGO_TARGET_DIR=/cargo-target cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked \
     && cp /cargo-target/release/roosty /usr/local/bin/roosty \
+    && cp /cargo-target/release/hash.txt /usr/local/bin/hash.txt \
     && cp -R target/site /usr/local/share/roosty-site
 
 FROM docker.io/library/debian:bookworm-slim
@@ -26,6 +28,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/roosty /usr/local/bin/roosty
+COPY --from=builder /usr/local/bin/hash.txt /usr/local/bin/hash.txt
 COPY --from=builder /usr/local/share/roosty-site /usr/local/share/roosty/site
 
 USER 65532:65532

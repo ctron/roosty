@@ -11,6 +11,7 @@ permissions:
 
 env:
   LEPTOS_WASM_OPT_VERSION: version_131
+  LEPTOS_TAILWIND_VERSION: v4.3.3
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

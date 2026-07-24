@@ -11,6 +11,7 @@ permissions:
 
 env:
   LEPTOS_WASM_OPT_VERSION: version_131
+  LEPTOS_TAILWIND_VERSION: v4.3.3
 
 concurrency:
   group: release-${{ github.ref }}
@@ -114,8 +115,9 @@ jobs:
           asset="roosty-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
           mkdir -p dist/package
           cp target/release/roosty dist/package/roosty
+          cp target/release/hash.txt dist/package/hash.txt
           cp -R target/site dist/package/site
-          tar -C dist/package -czf "dist/$asset" roosty site
+          tar -C dist/package -czf "dist/$asset" hash.txt roosty site
           sha256sum "dist/$asset" > "dist/$asset.sha256"
           printf 'asset=%s\n' "$asset" >> "$GITHUB_OUTPUT"
 

@@ -70,6 +70,7 @@ rustup target add wasm32-unknown-unknown
 cargo install cargo-leptos --version 0.3.7 --locked
 cargo install wasm-bindgen-cli --version 0.2.126 --locked
 export LEPTOS_WASM_OPT_VERSION=version_131
+export LEPTOS_TAILWIND_VERSION=v4.3.3
 cargo leptos build
 ```
 
