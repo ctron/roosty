@@ -2,7 +2,8 @@
   "name": "roosty-documentation",
   "private": true,
   "scripts": {
-    "docs:build": "antora --cache-dir build/cache --log-failure-level=warn antora-playbook.yml"
+    "docs:build": "antora --cache-dir build/cache --log-failure-level=warn antora-playbook.yml",
+    "docs:check": "npm run docs:build && node scripts/check-doc-tables.mjs"
   },
   "devDependencies": {
     "@antora/cli": "3.1.15",

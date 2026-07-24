@@ -44,7 +44,7 @@ jobs:
         run: npm ci
 
       - name: Build documentation
-        run: npm run docs:build
+        run: npm run docs:check
 
       - name: Configure GitHub Pages
         if: github.event_name != 'pull_request'

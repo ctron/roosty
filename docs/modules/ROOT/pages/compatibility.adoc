@@ -6,7 +6,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Discovery
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -29,7 +29,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Actors and Objects
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -60,7 +60,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Inbox and Delivery
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -87,7 +87,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Moderation and Safety
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -112,7 +112,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Instance and Discovery
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -135,7 +135,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === OAuth
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -162,7 +162,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Accounts and Preferences
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -237,7 +237,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Search
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -256,7 +256,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Statuses
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -351,7 +351,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Timelines
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -382,7 +382,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Notifications and Markers
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -417,7 +417,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Tags, Push, and Media
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -460,7 +460,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 === Streaming
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -507,7 +507,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 == First-party Web UI
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area
@@ -534,7 +534,7 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 == Federation
 
-[%header]
+[cols="1,2,7", options="header"]
 |===
 |Support
 |Area

@@ -68,7 +68,7 @@ processes. The local bounded channel remains the immediate delivery path, so a
 database publication failure does not delay the publishing request. Retained
 events are recovery metadata rather than a permanent message queue.
 
-[%header]
+[cols="3,1,4", options="header"]
 |===
 |Environment variable
 |Default
@@ -110,7 +110,7 @@ Scheduled statuses are published by the durable worker pool. Limits are enforced
 transactionally per account so they remain consistent when multiple Roosty
 processes share a database.
 
-[%header]
+[cols="3,1,4", options="header"]
 |===
 |Environment variable
 |Default
