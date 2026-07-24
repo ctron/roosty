@@ -507,20 +507,24 @@ fn session_navigation(
                     .map(|character| character.to_uppercase().to_string())
                     .unwrap_or_else(|| "?".to_owned());
                 view! {
-                <span class="session-account" title=account.display_name>
-                    {account.avatar_url.map_or_else(
-                        || view! { <span class="profile-icon" aria-hidden="true">{initial}</span> }.into_any(),
-                        |avatar_url| view! {
-                            <img class="profile-icon" src=avatar_url alt=""/>
-                        }.into_any(),
-                    )}
-                    <span>{account.username}</span>
-                </span>
                 {account.is_admin.then(|| view! { <A href="/admin">"Admin"</A> })}
-                <a href="/auth/edit" rel="external">"Account"</a>
-                <form class="logout-form" method="post" action="/logout">
-                    <button type="submit">"Log out"</button>
-                </form>
+                <details class="profile-menu">
+                    <summary class="session-account" title=account.display_name>
+                        {account.avatar_url.map_or_else(
+                            || view! { <span class="profile-icon" aria-hidden="true">{initial}</span> }.into_any(),
+                            |avatar_url| view! {
+                                <img class="profile-icon" src=avatar_url alt=""/>
+                            }.into_any(),
+                        )}
+                        <span>{account.username}</span>
+                    </summary>
+                    <div class="profile-menu__items">
+                        <a href="/auth/edit" rel="external">"Account"</a>
+                        <form class="logout-form" method="post" action="/logout">
+                            <button type="submit">"Log out"</button>
+                        </form>
+                    </div>
+                </details>
                 }
                 .into_any()
             }

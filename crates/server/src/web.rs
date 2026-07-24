@@ -570,7 +570,9 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("alice"));
+        assert!(html.contains("<details class=\"profile-menu\">"));
         assert!(html.contains("class=\"profile-icon\""));
+        assert!(html.contains("<div class=\"profile-menu__items\">"));
         assert!(html.contains("href=\"/auth/edit\" rel=\"external\""));
         assert!(html.contains("method=\"post\" action=\"/logout\""));
         assert!(!html.contains("/login?next="));

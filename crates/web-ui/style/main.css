@@ -14,7 +14,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; }
 a { color: var(--accent-strong); text-underline-offset: 0.18em; }
-a:focus-visible, button:focus-visible { outline: 3px solid #d18f00; outline-offset: 3px; }
+a:focus-visible, button:focus-visible, summary:focus-visible { outline: 3px solid #d18f00; outline-offset: 3px; }
 
 .site-shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
 .site-header, .site-footer, main { width: min(68rem, calc(100% - 2rem)); margin-inline: auto; }
@@ -49,11 +49,20 @@ a:focus-visible, button:focus-visible { outline: 3px solid #d18f00; outline-offs
 .button:hover { background: var(--accent-strong); }
 .site-footer { padding-block: 1.5rem; color: var(--muted); border-top: 1px solid var(--border); }
 .session-placeholder, .session-error { color: var(--muted); }
-.session-account { display: inline-flex; align-items: center; gap: 0.45rem; font-weight: 650; }
+.profile-menu { position: relative; margin-inline-start: auto; }
+.session-account { display: inline-flex; align-items: center; gap: 0.45rem; font-weight: 650; cursor: pointer; list-style: none; }
+.session-account::-webkit-details-marker { display: none; }
+.session-account::after { content: "▾"; color: var(--muted); font-size: 0.75em; }
+.profile-menu[open] .session-account::after { content: "▴"; }
+.profile-menu__items { position: absolute; z-index: 10; inset-block-start: calc(100% + 0.6rem); inset-inline-end: 0; display: grid; min-width: 10rem; padding: 0.4rem; background: var(--surface); border: 1px solid var(--border); border-radius: 0.65rem; box-shadow: 0 0.75rem 2rem rgb(33 54 47 / 16%); }
+.profile-menu__items a, .profile-menu__items button { display: block; width: 100%; padding: 0.55rem 0.7rem; border-radius: 0.4rem; text-align: start; text-decoration: none; }
+.profile-menu__items a:hover, .profile-menu__items button:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .profile-icon { width: 2rem; height: 2rem; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 50%; color: white; background: var(--accent); object-fit: cover; font-size: 0.85rem; font-weight: 800; }
 .logout-form { display: inline; margin: 0; }
 .logout-form button { padding: 0; color: var(--accent-strong); background: transparent; border: 0; font: inherit; text-decoration: underline; text-underline-offset: 0.18em; cursor: pointer; }
 .logout-form button:hover { text-decoration-thickness: 2px; }
+.profile-menu__items .logout-form { display: block; }
+.profile-menu__items .logout-form button { text-decoration: none; }
 .not-found, .panic-page { max-width: 42rem; margin: 10vh auto; padding: 2rem; }
 .panic-page__actions { display: flex; flex-wrap: wrap; gap: 1rem; }
 .admin-page { display: grid; gap: 1.5rem; margin-block: 2rem 4rem; }
@@ -81,6 +90,7 @@ th { color: var(--muted); font-size: 0.85rem; text-transform: uppercase; }
 
 @media (max-width: 38rem) {
   .site-header { align-items: flex-start; flex-direction: column; }
+  .site-header nav { width: 100%; }
   .hero, .prose, .form-card { margin-block: 1.5rem; border-radius: 0.8rem; }
   .admin-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
