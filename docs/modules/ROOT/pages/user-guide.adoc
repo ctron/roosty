@@ -8,6 +8,8 @@ The first-party web interface currently provides instance information, sign-in, 
 Public registration is not currently available.
 Ask the instance operator to create an account and provide its username, temporary password, and instance domain.
 
+== Sign in
+
 Open `https://your-domain.example/login` to sign in through Roosty's first-party interface.
 After signing in, open `https://your-domain.example/auth/edit` to replace the temporary password.
 
