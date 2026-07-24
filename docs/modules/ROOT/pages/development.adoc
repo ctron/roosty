@@ -1,5 +1,7 @@
 = Development
 
+For the first-party web architecture, rendering model, authentication boundaries, and packaging behavior, see xref:frontend.adoc[First-party frontend].
+
 Run the local stack:
 
 [source,shell]
@@ -129,4 +131,3 @@ processes share a database.
 |Positive integer per account and UTC day.
 
 |===
-

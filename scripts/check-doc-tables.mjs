@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 const pages = [
   'build/site/development/compatibility.html',
   'build/site/development/development.html',
+  'build/site/development/installation.html',
 ]
 
 for (const page of pages) {

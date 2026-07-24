@@ -5,18 +5,19 @@ For the project overview and current status, see the [README](README.md).
 
 ## Documentation
 
-The published documentation is written in AsciiDoc and built with Antora. Install an active Node.js LTS release,
-then install the locked dependencies and build the site:
+The published documentation is written in AsciiDoc and built with Antora. Install an active Node.js LTS release and
+Miniserve 0.35.0, then install the locked dependencies and build the site:
 
 ```sh
+cargo install --locked miniserve --version 0.35.0
 npm ci
 npm run docs:build
 ```
 
-The generated site is written to `build/site`. To preview it with search enabled, serve that directory over HTTP:
+The generated site is written to `build/site`. To rebuild and preview it with search enabled:
 
 ```sh
-python3 -m http.server 8000 --directory build/site
+npm run docs:serve
 ```
 
 Open `http://localhost:8000`. Documentation content lives under `docs/modules/ROOT`, and its sidebar is defined in

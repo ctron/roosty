@@ -1,0 +1,54 @@
+= User guide
+
+Roosty exposes Mastodon-compatible APIs, so you use it through a compatible client.
+The first-party web interface currently provides instance information, sign-in, account settings, OAuth authorization, and administrator operations; it is not yet a complete social timeline client.
+
+== Get an account
+
+Public registration is not currently available.
+Ask the instance operator to create an account and provide its username, temporary password, and instance domain.
+
+Open `https://your-domain.example/login` to sign in through Roosty's first-party interface.
+After signing in, open `https://your-domain.example/auth/edit` to replace the temporary password.
+
+== Choose a client
+
+An instance may provide one or both bundled browser clients:
+
+* Elk is normally available at `https://elk.your-domain.example`.
+* Phanpy, when enabled by the operator, is normally available at `https://phanpy.your-domain.example`.
+
+You can also use another Mastodon-compatible web, desktop, or mobile client.
+When prompted for an instance, enter the Roosty instance domain, such as `your-domain.example`.
+The client redirects to Roosty for sign-in and authorization, then returns to the client without sharing your password with it.
+
+Client compatibility is still growing.
+Consult the xref:compatibility.adoc[compatibility matrix] when a client depends on a feature that appears unavailable.
+
+== Account settings
+
+Roosty's first-party account settings page is available at `/auth/edit`.
+Use it to change your password.
+
+Compatible clients can update supported profile fields, avatar and header images, and posting preferences through the Mastodon API.
+The exact controls depend on the client.
+
+== Everyday use
+
+Supported clients can work with Roosty's implemented social features, including:
+
+* Home, public, hashtag, and list timelines.
+* Posts, replies, edits, favourites, boosts, bookmarks, quotes, and scheduled posts.
+* Local and remote follows, follow requests, mutes, blocks, and private lists.
+* Notifications, conversations, media attachments, followed hashtags, and push notifications.
+
+Some features have documented limits, and some Mastodon features remain unavailable.
+The xref:compatibility.adoc[compatibility matrix] is the source of truth for current behavior.
+
+== Sign-in help
+
+If a temporary password no longer works or you forget your password, contact the instance operator.
+Roosty does not currently provide public email-based password recovery.
+
+If a browser client keeps selecting an old instance, clear that client's saved instance or site data and start the sign-in flow again.
+For a bundled client, the instance operator can provide its reset URL or deployment-specific troubleshooting steps.

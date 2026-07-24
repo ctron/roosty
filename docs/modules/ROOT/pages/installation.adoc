@@ -1,0 +1,452 @@
+= Installation
+
+Roosty provides an Ansible deployment for a single Debian or Ubuntu host.
+It installs a Docker Compose stack containing Roosty, PostgreSQL, and Caddy, with persistent database and media storage.
+Caddy obtains and renews the public TLS certificate.
+
+Roosty is early-stage software.
+Review the xref:compatibility.adoc[compatibility matrix] before operating a public instance.
+
+== Prerequisites
+
+Prepare:
+
+* A Debian or Ubuntu host reachable through SSH.
+* A public domain with A and/or AAAA records pointing to the host.
+* Inbound TCP ports 80 and 443.
+* Ansible on the machine from which you will deploy.
+* An SSH deployment account with passwordless or interactive `sudo` access.
+
+If you enable the bundled Elk or Phanpy client, create DNS records for its subdomain as well.
+
+== Configure DNS
+
+Choose the instance domain before creating accounts or enabling federation.
+The domain becomes part of account handles, actor URLs, status URLs, and other federated identifiers.
+Changing it later is a migration rather than a routine configuration update.
+
+Create an `A` record for IPv4 and, only when the host has working public IPv6 connectivity, an `AAAA` record for IPv6.
+Both record types must point to the host running Caddy.
+Do not publish a stale or unreachable `AAAA` record: certificate validation, clients, and remote servers may prefer IPv6 even when IPv4 works.
+
+For example, an installation at `social.example.com` with both bundled clients could use:
+
+[cols="2,2,5", options="header"]
+|===
+|Name
+|Type
+|Value
+
+|`social.example.com`
+|`A`
+|The server's public IPv4 address.
+
+|`social.example.com`
+|`AAAA`
+|The server's public IPv6 address, when IPv6 is fully configured.
+
+|`elk.social.example.com`
+|`A`, `AAAA`, or `CNAME`
+|The same server addresses, or a CNAME to `social.example.com`, when Elk is enabled.
+
+|`phanpy.social.example.com`
+|`A`, `AAAA`, or `CNAME`
+|The same server addresses, or a CNAME to `social.example.com`, when Phanpy is enabled.
+|===
+
+Replace these names and addresses with your real values.
+The `elk.` and `phanpy.` names are not required when their corresponding clients are disabled.
+A wildcard record is also unnecessary.
+
+Roosty does not require special SRV or TXT records for ActivityPub discovery.
+WebFinger and ActivityPub are served over HTTPS from `roosty_domain`.
+Existing mail-related MX and TXT records can remain unchanged.
+
+If the domain uses CAA records, ensure they permit the certificate authority used by Caddy.
+If a DNS proxy or CDN is enabled, it must forward ports 80 and 443 to this host and support WebSockets and normal API request bodies.
+Using direct DNS records is the simplest initial setup.
+
+Create the records before running the playbook so Caddy can complete ACME validation.
+DNS changes can remain cached until their previous TTL expires.
+Check the authoritative result from a machine outside the server's network:
+
+[source,shell]
+----
+dig +short A social.example.com
+dig +short AAAA social.example.com
+dig +short A elk.social.example.com
+dig +short A phanpy.social.example.com
+----
+
+Every returned address must be public, belong to the intended server or proxy, and accept inbound HTTP and HTTPS traffic.
+An empty result for an optional client or for unused IPv6 is valid.
+
+== Configure the inventory
+
+The example production inventory is under `deploy/ansible/inventories/production`.
+Replace the example host and user in `hosts.yml`, then configure the instance in `group_vars/roosty.yml`.
+At minimum, set:
+
+* `roosty_domain` to the public instance domain.
+* `roosty_acme_email` to the certificate contact address.
+* `roosty_image_tag` to the Roosty release to deploy.
+* `roosty_instance_name` and `roosty_instance_description` for users and clients.
+
+Registration is closed by default.
+Federation is also disabled until its domain policy and encryption secret are configured.
+Keep those defaults for the first deployment.
+
+=== Ansible parameters
+
+Set deployment parameters in `deploy/ansible/inventories/production/group_vars/roosty.yml`.
+Parameters marked _Required_ have no role default and must be supplied by the inventory.
+
+==== Instance and deployment
+
+[cols="3,2,6", options="header"]
+|===
+|Parameter
+|Default
+|Purpose
+
+|`roosty_domain`
+|Required
+|Public instance domain, without a scheme or path.
+
+|`roosty_acme_email`
+|Required
+|Contact address used by Caddy for ACME certificates.
+
+|`roosty_image_tag`
+|Required
+|Roosty container tag from `ghcr.io/ctron/roosty`.
+
+|`roosty_instance_name`
+|Required
+|Instance name exposed to users and clients.
+
+|`roosty_instance_description`
+|Required
+|Instance description exposed to users and clients.
+
+|`roosty_registration_mode`
+|Required
+|Advertised registration mode: `closed`, `open`, or `approval`. Public account registration is not yet implemented, so use `closed`.
+
+|`roosty_deploy_dir`
+|`/opt/roosty`
+|Host directory containing generated Compose, Caddy, environment, and secret files.
+
+|`roosty_docker_packages`
+|`docker.io`, `docker-compose-v2`, `openssl`
+|APT packages installed on the target host.
+|===
+
+==== Bundled clients
+
+[cols="3,2,6", options="header"]
+|===
+|Parameter
+|Default
+|Purpose
+
+|`roosty_elk_enabled`
+|`true`
+|Deploy Elk at `elk.<roosty_domain>`.
+
+|`roosty_elk_storage_uid`
+|`911`
+|Container UID that owns Elk's persistent application storage.
+
+|`roosty_phanpy_enabled`
+|`false`
+|Serve Phanpy at `phanpy.<roosty_domain>`.
+
+|`roosty_phanpy_version`
+|Role-pinned build
+|Phanpy release embedded in the Caddy image.
+|===
+
+==== Federation and workers
+
+[cols="3,2,6", options="header"]
+|===
+|Parameter
+|Default
+|Purpose
+
+|`roosty_federation_enabled`
+|Required
+|Enable ActivityPub discovery and delivery.
+
+|`roosty_federation_allowed_domains`
+|Required
+|YAML list of exact domains allowed for federation. The single entry `"*"` permits all public domains.
+
+|`roosty_federation_blocked_domains`
+|Required
+|YAML list of exact domains to block. Blocks include subdomains and take precedence over the allow-list.
+
+|`roosty_federation_delivery_max_age`
+|Required
+|Maximum age for retrying failed federation deliveries, as a non-zero human-readable duration.
+
+|`roosty_worker_concurrency`
+|`4`
+|Durable worker loops per Roosty process. `0` selects the available logical CPU count.
+|===
+
+==== Scheduled statuses and streaming
+
+[cols="3,2,6", options="header"]
+|===
+|Parameter
+|Default
+|Purpose
+
+|`roosty_scheduled_status_minimum_offset`
+|`5m`
+|Minimum time between scheduling and publication.
+
+|`roosty_scheduled_status_total_limit`
+|`300`
+|Maximum pending scheduled statuses per account.
+
+|`roosty_scheduled_status_daily_limit`
+|`25`
+|Maximum scheduled publications per account and UTC day.
+
+|`roosty_streaming_max_connections`
+|`1000`
+|Maximum simultaneous streaming sockets per process.
+
+|`roosty_streaming_send_timeout`
+|`10s`
+|Maximum time allowed to send one WebSocket frame.
+
+|`roosty_streaming_ping_interval`
+|`30s`
+|Interval between server WebSocket pings.
+
+|`roosty_streaming_idle_timeout`
+|`90s`
+|Maximum time without an inbound frame; must exceed the ping interval.
+
+|`roosty_streaming_event_retention`
+|`1h`
+|Retention period for the PostgreSQL streaming recovery log.
+|===
+
+== Environment variables
+
+The Ansible deployment writes ordinary settings to `<roosty_deploy_dir>/.env` and generated secrets to `<roosty_deploy_dir>/secrets.env`.
+Do not edit those generated files directly; set the corresponding Ansible parameter and rerun the playbook.
+Secrets are generated once and retained across deployments.
+
+The following variables are the complete server configuration interface for manual deployments.
+Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
+
+=== Core server
+
+[cols="4,2,6", options="header"]
+|===
+|Variable
+|Default
+|Purpose
+
+|`ROOSTY_DATABASE_URL`
+|Required
+|PostgreSQL connection URL.
+
+|`ROOSTY_PUBLIC_BASE_URL`
+|Required
+|Externally visible base URL. Federation requires an absolute HTTPS URL.
+
+|`ROOSTY_LISTEN_ADDR`
+|`0.0.0.0:4000`
+|Application HTTP listener.
+
+|`ROOSTY_INFRA_LISTEN_ADDR`
+|Unset
+|Optional listener for `/healthz`, `/readyz`, and `/metrics`.
+
+|`ROOSTY_SESSION_SECRET`
+|Required
+|At least 32 bytes; signs browser sessions and protects stored Web Push credentials. Use the same value for every process sharing the database.
+
+|`ROOSTY_TOKEN_PEPPER`
+|Required
+|At least 32 bytes; hashes OAuth tokens and client secrets. Use the same value for every process sharing the database.
+
+|`ROOSTY_INSTANCE_NAME`
+|Required
+|Instance name exposed to users and clients.
+
+|`ROOSTY_INSTANCE_DESCRIPTION`
+|Unset
+|Optional instance description.
+
+|`ROOSTY_REGISTRATION_MODE`
+|`closed`
+|Advertised mode: `closed`, `open`, or `approval`. Public registration is not yet implemented.
+
+|`ROOSTY_WEB_ROOT`
+|Build-dependent
+|Directory containing the packaged first-party web assets.
+|===
+
+=== Media and Web Push
+
+[cols="4,2,6", options="header"]
+|===
+|Variable
+|Default
+|Purpose
+
+|`ROOSTY_OBJECT_STORAGE_BACKEND`
+|`local`
+|Media storage backend. `local` is currently the only supported value.
+
+|`ROOSTY_MEDIA_ROOT`
+|`./media`
+|Directory for locally managed media.
+
+|`ROOSTY_REMOTE_MEDIA_CACHE_TTL`
+|`30d`
+|Retention period for successfully fetched remote media.
+
+|`ROOSTY_REMOTE_MEDIA_MAX_BYTES`
+|`40MiB`
+|Maximum accepted size of one remote media response.
+
+|`ROOSTY_REMOTE_MEDIA_FETCH_CONCURRENCY`
+|`5`
+|Maximum concurrent remote media downloads per worker process; must be positive.
+
+|`ROOSTY_VAPID_PRIVATE_KEY`
+|Unset
+|Base64-encoded PKCS#8 P-256 private key for Web Push. All processes sharing the database must use the same key.
+|===
+
+=== Federation and workers
+
+[cols="4,2,6", options="header"]
+|===
+|Variable
+|Default
+|Purpose
+
+|`ROOSTY_FEDERATION_ENABLED`
+|`false`
+|Enable ActivityPub federation.
+
+|`ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET`
+|Required when enabled
+|At least 32 bytes; encrypts local actor private keys. It must remain identical across processes and restarts.
+
+|`ROOSTY_FEDERATION_ALLOWED_DOMAINS`
+|Required when enabled
+|Comma-separated exact domains. `*` permits all public domains.
+
+|`ROOSTY_FEDERATION_BLOCKED_DOMAINS`
+|Empty
+|Comma-separated exact domains to block, including their subdomains.
+
+|`ROOSTY_FEDERATION_DELIVERY_MAX_AGE`
+|`7d`
+|Maximum age for retrying a failed delivery.
+
+|`ROOSTY_WORKER_CONCURRENCY`
+|`4`
+|Durable worker loops per process. `0` selects the available logical CPU count.
+|===
+
+=== Scheduled statuses and streaming
+
+[cols="4,2,6", options="header"]
+|===
+|Variable
+|Default
+|Purpose
+
+|`ROOSTY_SCHEDULED_STATUS_MINIMUM_OFFSET`
+|`5m`
+|Minimum time between scheduling and publication.
+
+|`ROOSTY_SCHEDULED_STATUS_TOTAL_LIMIT`
+|`300`
+|Maximum pending scheduled statuses per account; must be positive.
+
+|`ROOSTY_SCHEDULED_STATUS_DAILY_LIMIT`
+|`25`
+|Maximum scheduled publications per account and UTC day; must be positive.
+
+|`ROOSTY_STREAMING_MAX_CONNECTIONS`
+|`1000`
+|Maximum simultaneous streaming sockets per process; must be positive.
+
+|`ROOSTY_STREAMING_SEND_TIMEOUT`
+|`10s`
+|Maximum duration of one outbound WebSocket send.
+
+|`ROOSTY_STREAMING_PING_INTERVAL`
+|`30s`
+|Interval between server WebSocket pings.
+
+|`ROOSTY_STREAMING_IDLE_TIMEOUT`
+|`90s`
+|Maximum time without an inbound frame; must exceed the ping interval.
+
+|`ROOSTY_STREAMING_EVENT_RETENTION`
+|`1h`
+|Retention period for the PostgreSQL streaming recovery log.
+|===
+
+The production Compose definition also consumes deployment-only variables such as `ROOSTY_IMAGE_TAG`, `ROOSTY_PHANPY_VERSION`, `ROOSTY_DOMAIN`, and `ROOSTY_ACME_EMAIL`.
+These select container and proxy behavior and are not read by the Roosty server itself.
+
+== Deploy
+
+From the repository:
+
+[source,shell]
+----
+cd deploy/ansible
+ansible-playbook site.yml
+----
+
+The playbook installs the required host packages, writes the Compose and Caddy configuration, creates persistent secrets, starts the services, and waits for Roosty to become ready.
+Re-run the same command to apply configuration or image-version changes.
+
+== Create the first account
+
+Bootstrap an administrator on the deployed host:
+
+[source,shell]
+----
+sudo docker compose -f /opt/roosty/compose.yaml exec roosty \
+  /usr/local/bin/roosty admin bootstrap \
+  --username admin \
+  --email admin@example.com
+----
+
+The command prints the initial password.
+Store it securely and change it after signing in.
+
+== Verify the instance
+
+Check the public instance and its infrastructure endpoints:
+
+[source,shell]
+----
+curl --fail https://your-domain.example/api/v2/instance
+sudo docker compose -f /opt/roosty/compose.yaml exec -T roosty \
+  curl --fail http://127.0.0.1:3001/healthz
+sudo docker compose -f /opt/roosty/compose.yaml exec -T roosty \
+  curl --fail http://127.0.0.1:3001/readyz
+----
+
+The production Compose stack does not publish the infrastructure listener on the host.
+
+For client options and first sign-in, continue with the xref:user-guide.adoc[User guide].
+For federation policy, operational configuration, upgrades, and release behavior, see the https://github.com/ctron/roosty/blob/main/CONTRIBUTING.md[contributor and deployment guide].

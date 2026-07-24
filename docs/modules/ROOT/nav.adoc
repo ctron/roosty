@@ -1,4 +1,6 @@
 * xref:index.adoc[Overview]
+* xref:installation.adoc[Installation]
+* xref:user-guide.adoc[User guide]
 * xref:development.adoc[Development]
-* xref:frontend.adoc[First-party frontend]
+** xref:frontend.adoc[First-party frontend]
 * xref:compatibility.adoc[Compatibility]
