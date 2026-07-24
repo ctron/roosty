@@ -45,6 +45,7 @@ jobs:
           cargo binstall \
             --no-confirm \
             --locked \
+            --force \
             --disable-telemetry \
             cargo-leptos \
             wasm-bindgen-cli

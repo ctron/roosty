@@ -98,7 +98,7 @@ jobs:
 
       - name: Install release build tools
         run: >-
-          cargo binstall --no-confirm --locked --disable-telemetry
+          cargo binstall --no-confirm --locked --force --disable-telemetry
           cargo-leptos@0.3.7 wasm-bindgen-cli@0.2.126
 
       - name: Build release archive
