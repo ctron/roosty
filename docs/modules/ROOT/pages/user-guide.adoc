@@ -47,6 +47,8 @@ Supported clients can work with Roosty's implemented social features, including:
 Some features have documented limits, and some Mastodon features remain unavailable.
 The xref:compatibility.adoc[compatibility matrix] is the source of truth for current behavior.
 
+To try following an account hosted by Roosty, https://openfollow.social/@rita@roosty.de[follow Rita at `@rita@roosty.de`].
+
 == Sign-in help
 
 If a temporary password no longer works or you forget your password, contact the instance operator.

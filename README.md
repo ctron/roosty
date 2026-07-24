@@ -7,6 +7,8 @@ Roosty is a federated social server written in Rust. It implements ActivityPub f
 client APIs, uses PostgreSQL for durable multi-process operation, and includes a server-rendered Rust/WebAssembly
 frontend alongside support for existing Mastodon clients.
 
+To see Roosty on the fediverse, [follow Rita at `@rita@roosty.de`](https://openfollow.social/@rita@roosty.de).
+
 ## Project state
 
 Roosty is early-stage and under active development. Federation, timelines, follows, posts, interactions,
