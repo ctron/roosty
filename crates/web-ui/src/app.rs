@@ -81,8 +81,8 @@ fn AdminPage() -> impl IntoView {
                         Ok(dashboard) => admin_dashboard_content(dashboard, search_value),
                         Err(_) => view! {
                             <section class="form-card">
-                                <h1>"Administrator access required"</h1>
-                                <p>"This page is available only to instance administrators."</p>
+                                <h1>"Could not load administration"</h1>
+                                <p>"The administrator dashboard could not load its operational data. Try again or check the server logs."</p>
                             </section>
                         }.into_any(),
                     }

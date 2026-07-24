@@ -11,7 +11,7 @@ use sea_orm::{
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
     FromQueryResult, IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
-    sea_query::{Expr, OnConflict, Query},
+    sea_query::{Expr, Func, OnConflict, Query},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -885,18 +885,6 @@ pub struct AdminAccount {
     pub created_at: OffsetDateTime,
 }
 
-#[derive(FromQueryResult)]
-struct AdminAccountRow {
-    id: Uuid,
-    username: String,
-    domain: Option<String>,
-    email: Option<String>,
-    display_name: String,
-    is_admin: bool,
-    limited: bool,
-    created_at: OffsetDateTime,
-}
-
 /// List local and cached-remote accounts for administrator tooling.
 pub async fn list_admin_accounts(
     db: &DbConnection,
@@ -909,60 +897,106 @@ pub async fn list_admin_accounts(
     let txn = db
         .begin_with_config(None, Some(AccessMode::ReadOnly))
         .await?;
-    let rows = AdminAccountRow::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        r#"
-        SELECT id, username, domain, email, display_name, is_admin, limited, created_at
-        FROM (
-            SELECT id, username, NULL::text AS domain, email,
-                   display_name, is_admin, limited_at IS NOT NULL AS limited, created_at
-            FROM local_account
-            UNION ALL
-            SELECT id, username, domain, NULL::text AS email,
-                   display_name, false AS is_admin, limited_at IS NOT NULL AS limited,
-                   coalesce(profile_created_at, first_seen_at) AS created_at
-            FROM remote_actor
-            WHERE deleted_at IS NULL
-        ) account
-        WHERE ($1 = '' OR username ILIKE '%' || $1 || '%'
-                         OR display_name ILIKE '%' || $1 || '%'
-                         OR coalesce(domain, '') ILIKE '%' || $1 || '%'
-                         OR coalesce(email, '') ILIKE '%' || $1 || '%')
-          AND ($2::text IS NULL
-               OR ($2 = 'local' AND domain IS NULL)
-               OR ($2 = 'remote' AND domain IS NOT NULL))
-          AND ($3::boolean IS NULL OR limited = $3)
-          AND ($4::uuid IS NULL OR id < $4)
-        ORDER BY id DESC
-        LIMIT $5
-        "#,
-        vec![
-            query.trim().to_owned().into(),
-            origin.map(str::to_owned).into(),
-            limited.into(),
-            max_id.into(),
-            i64::try_from(limit.min(101))
-                .map_err(|_| RoostyError::InvalidInput("invalid account limit".to_owned()))?
-                .into(),
-        ],
-    ))
-    .all(&txn)
-    .await?;
-    let accounts = rows
-        .into_iter()
-        .map(|row| AdminAccount {
-            id: AccountId(row.id),
-            username: row.username,
-            domain: row.domain,
-            email: row.email,
-            display_name: row.display_name,
-            is_admin: row.is_admin,
-            limited: row.limited,
-            created_at: row.created_at,
-        })
-        .collect();
+    let query = query.trim().to_lowercase();
+    let fetch_limit = limit.min(101);
+    let include_local = origin.is_none_or(|origin| origin == "local");
+    let include_remote = origin.is_none_or(|origin| origin == "remote");
+
+    // Fetch at most one page from each entity, then merge by the shared UUIDv7 cursor.
+    // This keeps pagination typed and bounded to twice the requested page size.
+    let mut accounts = Vec::new();
+    if include_local {
+        let mut select = local_account::Entity::find();
+        if !query.is_empty() {
+            let pattern = format!("%{query}%");
+            select = select.filter(
+                Condition::any()
+                    .add(lower_contains(local_account::Column::Username, &pattern))
+                    .add(lower_contains(local_account::Column::DisplayName, &pattern))
+                    .add(lower_contains(local_account::Column::Email, &pattern)),
+            );
+        }
+        if let Some(limited) = limited {
+            select = select.filter(if limited {
+                local_account::Column::LimitedAt.is_not_null()
+            } else {
+                local_account::Column::LimitedAt.is_null()
+            });
+        }
+        if let Some(max_id) = max_id {
+            select = select.filter(local_account::Column::Id.lt(max_id));
+        }
+        accounts.extend(
+            select
+                .order_by_desc(local_account::Column::Id)
+                .limit(fetch_limit)
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|account| AdminAccount {
+                    id: AccountId(account.id),
+                    username: account.username,
+                    domain: None,
+                    email: Some(account.email),
+                    display_name: account.display_name,
+                    is_admin: account.is_admin,
+                    limited: account.limited_at.is_some(),
+                    created_at: account.created_at,
+                }),
+        );
+    }
+    if include_remote {
+        let mut select =
+            remote_actor::Entity::find().filter(remote_actor::Column::DeletedAt.is_null());
+        if !query.is_empty() {
+            let pattern = format!("%{query}%");
+            select = select.filter(
+                Condition::any()
+                    .add(lower_contains(remote_actor::Column::Username, &pattern))
+                    .add(lower_contains(remote_actor::Column::DisplayName, &pattern))
+                    .add(lower_contains(remote_actor::Column::Domain, &pattern)),
+            );
+        }
+        if let Some(limited) = limited {
+            select = select.filter(if limited {
+                remote_actor::Column::LimitedAt.is_not_null()
+            } else {
+                remote_actor::Column::LimitedAt.is_null()
+            });
+        }
+        if let Some(max_id) = max_id {
+            select = select.filter(remote_actor::Column::Id.lt(max_id));
+        }
+        accounts.extend(
+            select
+                .order_by_desc(remote_actor::Column::Id)
+                .limit(fetch_limit)
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|actor| AdminAccount {
+                    id: AccountId(actor.id),
+                    username: actor.username,
+                    domain: Some(actor.domain),
+                    email: None,
+                    display_name: actor.display_name,
+                    is_admin: false,
+                    limited: actor.limited_at.is_some(),
+                    created_at: actor.profile_created_at.unwrap_or(actor.created_at),
+                }),
+        );
+    }
+    accounts.sort_unstable_by_key(|account| Reverse(account.id.0));
+    accounts.truncate(fetch_limit as usize);
     txn.commit().await?;
     Ok(accounts)
+}
+
+fn lower_contains<C>(column: C, pattern: &str) -> sea_orm::sea_query::SimpleExpr
+where
+    C: ColumnTrait,
+{
+    Expr::expr(Func::lower(Expr::col(column))).like(pattern)
 }
 
 /// Look up either kind of account for administrator detail and actions.
