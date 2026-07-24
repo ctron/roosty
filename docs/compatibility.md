@@ -90,8 +90,8 @@ Legend: 🟢 implemented, 🟡 usable with limits, 🔴 missing.
 
 | Support | Area | Details |
 | --- | --- | --- |
-| 🟢 | `POST /api/v1/statuses` | Local text and consent-aware quote statuses; quote-plus-media is rejected to match Mastodon. |
-| 🔴 | Scheduled statuses | The `scheduled_at` creation parameter and `/api/v1/scheduled_statuses` listing, detail, update, and cancellation APIs are not implemented. |
+| 🟢 | `POST /api/v1/statuses` | Local text and consent-aware quote statuses; quote-plus-media is rejected to match Mastodon. Status creation honors account-scoped `Idempotency-Key` values for one hour. |
+| 🟢 | Scheduled statuses | `scheduled_at` creation plus cursor-paginated listing, detail, date-only update, and cancellation APIs are available with `read:statuses`/`write:statuses` scope enforcement. Durable jobs publish text, media, replies, and quotes safely across multiple processes. |
 | 🟢 | `GET /api/v1/statuses/:id` | Visible local and locally cached remote statuses. |
 | 🟢 | `GET /api/v1/statuses/:id/source` | Authenticated plain-text source lookup for visible local statuses, including content warnings. |
 | 🟢 | `GET /api/v1/statuses/:id/history` | Visible local and cached-remote status revisions, oldest first, with immutable content, warning, sensitivity, emoji, and media projections. Legacy edits expose their known current state because pre-upgrade text cannot be reconstructed. |

@@ -97,7 +97,7 @@
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [ ] Add SEO-friendly first-party profile and status pages. Welcome, about, login, password settings, OAuth consent, and out-of-band authorization results now use Leptos; no Askama views remain.
-- [ ] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, and multi-process-safe publication.
+- [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
 - [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account
   creation/password reset/limits, compatible account APIs, OAuth scope enforcement, CSRF

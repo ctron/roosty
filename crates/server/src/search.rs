@@ -410,6 +410,7 @@ mod tests {
         let status = roosty_db::create_local_status(
             &context.db,
             roosty_db::NewLocalStatus {
+                id: None,
                 account_id: context.account_id,
                 content: "searchable #RoostTag".to_owned(),
                 visibility: StatusVisibility::Public,
@@ -548,6 +549,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),

@@ -10,6 +10,48 @@ const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
 const DEFAULT_WORKER_CONCURRENCY: &str = "4";
 
+/// Operator-configurable policy limits for future publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledStatusConfig {
+    pub minimum_offset: time::Duration,
+    pub total_limit: u64,
+    pub daily_limit: u64,
+}
+
+impl Default for ScheduledStatusConfig {
+    fn default() -> Self {
+        Self {
+            minimum_offset: time::Duration::minutes(5),
+            total_limit: 300,
+            daily_limit: 25,
+        }
+    }
+}
+
+impl ScheduledStatusConfig {
+    fn from_env() -> Result<Self> {
+        let minimum_offset =
+            optional_humantime_duration_env("ROOSTY_SCHEDULED_STATUS_MINIMUM_OFFSET", "5m")?;
+        let total_limit = parse_env("ROOSTY_SCHEDULED_STATUS_TOTAL_LIMIT", "300")?;
+        let daily_limit = parse_env("ROOSTY_SCHEDULED_STATUS_DAILY_LIMIT", "25")?;
+        if total_limit == 0 {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_SCHEDULED_STATUS_TOTAL_LIMIT must be positive".to_owned(),
+            ));
+        }
+        if daily_limit == 0 {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_SCHEDULED_STATUS_DAILY_LIMIT must be positive".to_owned(),
+            ));
+        }
+        Ok(Self {
+            minimum_offset,
+            total_limit,
+            daily_limit,
+        })
+    }
+}
+
 /// Configured storage implementation for locally managed media.
 #[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq)]
 #[strum(serialize_all = "snake_case")]
@@ -136,6 +178,7 @@ pub struct Config {
     pub remote_media_fetch_concurrency: usize,
     /// Number of durable job loops to run in this process; zero in configuration uses available CPUs.
     pub worker_concurrency: usize,
+    pub scheduled_statuses: ScheduledStatusConfig,
     pub streaming: StreamingConfig,
     pub instance_name: String,
     pub instance_description: Option<String>,
@@ -233,6 +276,7 @@ impl Config {
             remote_media_max_bytes,
             remote_media_fetch_concurrency,
             worker_concurrency,
+            scheduled_statuses: ScheduledStatusConfig::from_env()?,
             streaming: StreamingConfig::from_env()?,
             instance_name: required_env("ROOSTY_INSTANCE_NAME")?,
             instance_description: optional_env("ROOSTY_INSTANCE_DESCRIPTION"),
@@ -442,6 +486,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            scheduled_statuses: ScheduledStatusConfig::default(),
             streaming: StreamingConfig::default(),
             instance_name: "Roosty Test".to_owned(),
             instance_description: None,
@@ -495,6 +540,18 @@ mod tests {
                 ping_interval: Duration::from_secs(30),
                 idle_timeout: Duration::from_secs(90),
                 event_retention: Duration::from_secs(3_600),
+            }
+        );
+    }
+
+    #[test]
+    fn scheduled_status_defaults_match_mastodon() {
+        assert_eq!(
+            ScheduledStatusConfig::default(),
+            ScheduledStatusConfig {
+                minimum_offset: time::Duration::minutes(5),
+                total_limit: 300,
+                daily_limit: 25,
             }
         );
     }

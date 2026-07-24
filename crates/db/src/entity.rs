@@ -60,5 +60,7 @@ pub mod remote_status_pin;
 pub mod remote_status_reblog;
 pub mod remote_status_remote_recipient;
 pub mod remote_status_tag;
+pub mod scheduled_status;
+pub mod status_creation_idempotency;
 pub mod status_quote;
 pub mod streaming_event;

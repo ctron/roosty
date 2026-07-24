@@ -6404,6 +6404,7 @@ mod tests {
         let reply = roosty_db::create_local_status(
             &context.beta.db,
             NewLocalStatus {
+                id: None,
                 account_id: reply_author.id,
                 content: "reply without an explicit mention".to_owned(),
                 visibility: StatusVisibility::Public,
@@ -6526,6 +6527,7 @@ mod tests {
         let reply = roosty_db::create_local_status(
             &context.alpha.db,
             roosty_db::NewLocalStatus {
+                id: None,
                 account_id: reply_author.id,
                 content: "delivered reply".to_owned(),
                 visibility: StatusVisibility::Public,
@@ -6591,6 +6593,7 @@ mod tests {
         let child = roosty_db::create_local_status(
             &context.alpha.db,
             roosty_db::NewLocalStatus {
+                id: None,
                 account_id: author.id,
                 content: "child".to_owned(),
                 visibility: StatusVisibility::Public,
@@ -6786,6 +6789,7 @@ mod tests {
             None,
             &[],
             roosty_db::LocalStatusMetadata {
+                scheduled_status_id: None,
                 tag_names: Vec::new(),
                 remote_actor_ids: Vec::new(),
                 local_recipient_ids: Vec::new(),
@@ -7543,6 +7547,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
             streaming: crate::config::StreamingConfig::default(),
             instance_name: "Federation test".to_owned(),
             instance_description: None,
@@ -7647,6 +7652,7 @@ mod tests {
         roosty_db::create_local_status(
             &state.db,
             roosty_db::NewLocalStatus {
+                id: None,
                 account_id,
                 content: content.to_owned(),
                 visibility,
@@ -7767,7 +7773,8 @@ mod tests {
             }
             roosty_db::JobKind::WebPushDelivery
             | roosty_db::JobKind::NotificationRequestMerge
-            | roosty_db::JobKind::NotificationRequestCleanup => {}
+            | roosty_db::JobKind::NotificationRequestCleanup
+            | roosty_db::JobKind::ScheduledStatusPublish => {}
         }
         assert!(
             roosty_db::mark_job_completed(&state.db, &job)

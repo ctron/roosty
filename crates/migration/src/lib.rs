@@ -69,6 +69,7 @@ mod m20260701_000064_add_notification_groups;
 mod m20260701_000065_add_notification_policies;
 mod m20260701_000066_hydrate_remote_threads;
 mod m20260701_000067_add_admin_operations;
+mod m20260701_000068_create_scheduled_status;
 
 pub struct Migrator;
 
@@ -143,6 +144,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000065_add_notification_policies::Migration),
             Box::new(m20260701_000066_hydrate_remote_threads::Migration),
             Box::new(m20260701_000067_add_admin_operations::Migration),
+            Box::new(m20260701_000068_create_scheduled_status::Migration),
         ]
     }
 }

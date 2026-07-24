@@ -11,8 +11,10 @@ use axum::{
 use linkify::{LinkFinder, LinkKind};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    LocalNotificationType, RemoteConversationParticipant, RemoteStatus, StatusContextItem,
-    StatusContextParent, StatusVisibility,
+    ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus,
+    QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus, ScheduleStatusResult,
+    ScheduledStatus, StatusContextItem, StatusContextParent, StatusCreationReservation,
+    StatusVisibility,
 };
 use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
@@ -23,7 +25,10 @@ use uuid::Uuid;
 
 use crate::{
     accounts::{RemoteAccountResponse, remote_account_response, remote_custom_emojis},
-    auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    auth::{
+        AccountResponse, AuthenticatedAccessToken, AuthenticatedAccount, OAuthScope,
+        OAuthScopeResource, OptionalAuthenticatedAccount, account_response,
+    },
     conversations::{publish_conversation_update, publish_conversation_updates},
     federation::{
         StatusActivityKind, enqueue_quote_request_in_transaction,
@@ -53,6 +58,13 @@ pub(crate) const MAX_PINNED_STATUSES: u64 = 5;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/statuses", post(create_status))
+        .route("/api/v1/scheduled_statuses", get(list_scheduled_statuses))
+        .route(
+            "/api/v1/scheduled_statuses/{status_id}",
+            get(show_scheduled_status)
+                .put(update_scheduled_status)
+                .delete(delete_scheduled_status),
+        )
         .route(
             "/api/v1/statuses/{status_id}",
             get(show_status).put(update_status).delete(delete_status),
@@ -199,7 +211,7 @@ struct CollectionParams {
     min_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct StatusInput {
     status: Option<String>,
     visibility: Option<StatusVisibility>,
@@ -216,10 +228,43 @@ struct StatusInput {
     #[serde(alias = "quotedStatusId")]
     quoted_status_id: Option<String>,
     #[serde(alias = "quoteApprovalPolicy")]
-    quote_approval_policy: Option<roosty_db::QuoteApprovalPolicy>,
+    quote_approval_policy: Option<QuoteApprovalPolicy>,
+    #[serde(alias = "scheduledAt")]
+    scheduled_at: Option<String>,
 }
 
 #[derive(Deserialize)]
+struct ScheduledStatusUpdate {
+    scheduled_at: String,
+}
+
+#[derive(Serialize)]
+struct ScheduledStatusResponse {
+    id: String,
+    scheduled_at: String,
+    params: ScheduledStatusParamsResponse,
+    media_attachments: Vec<MediaAttachmentResponse>,
+}
+
+#[derive(Serialize)]
+struct ScheduledStatusParamsResponse {
+    text: String,
+    media_ids: Option<Vec<String>>,
+    sensitive: Option<bool>,
+    spoiler_text: String,
+    visibility: StatusVisibility,
+    language: Option<String>,
+    scheduled_at: Option<String>,
+    poll: Option<Value>,
+    idempotency: Option<String>,
+    with_rate_limit: bool,
+    in_reply_to_id: Option<String>,
+    quoted_status_id: Option<String>,
+    quote_approval_policy: QuoteApprovalPolicy,
+    application_id: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
 struct MediaAttributeInput {
     id: String,
     description: Option<String>,
@@ -404,7 +449,7 @@ struct MentionResponse {
 
 impl MentionResponse {
     /// Build the Mastodon mention shape for a local account referenced by a reply.
-    fn new(state: &AppState, account: &roosty_db::LocalAccount) -> Self {
+    fn new(state: &AppState, account: &LocalAccount) -> Self {
         Self {
             id: account.id.0.to_string(),
             username: account.username.clone(),
@@ -448,7 +493,7 @@ enum StatusCollectionList {
 
 struct ReplyTarget {
     account_id: AccountId,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
 }
 
 struct ResolvedQuoteTarget {
@@ -462,7 +507,7 @@ struct ResolvedQuoteTarget {
 
 async fn resolve_quote_target(
     state: &AppState,
-    quoting_account: &roosty_db::LocalAccount,
+    quoting_account: &LocalAccount,
     raw_id: &str,
     requested_visibility: StatusVisibility,
     content: &str,
@@ -493,15 +538,15 @@ async fn resolve_quote_target(
             true
         } else {
             match target.quote_approval_policy {
-                roosty_db::QuoteApprovalPolicy::Public => true,
-                roosty_db::QuoteApprovalPolicy::Followers => roosty_db::local_follow_relationship(
+                QuoteApprovalPolicy::Public => true,
+                QuoteApprovalPolicy::Followers => roosty_db::local_follow_relationship(
                     &state.db,
                     quoting_account.id,
                     target.account_id,
                 )
                 .await?
                 .is_some(),
-                roosty_db::QuoteApprovalPolicy::Nobody => false,
+                QuoteApprovalPolicy::Nobody => false,
             }
         };
         if !allowed {
@@ -628,13 +673,127 @@ async fn resolve_quote_target(
 
 async fn create_status(
     State(state): State<AppState>,
-    AuthenticatedAccount(account): AuthenticatedAccount,
+    token: AuthenticatedAccessToken,
     request: axum::extract::Request,
 ) -> Response {
+    if !has_status_scope(&token.grant.scopes, StatusPermission::Write) {
+        return forbidden("This action is outside the authorized scopes");
+    }
+    let account = token.grant.account;
+    let idempotency_key = request
+        .headers()
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let input = match parse_status_input(request).await {
         Ok(input) => input,
         Err(error) => return bad_request(&error.to_string()),
     };
+    let reservation = match idempotency_key.as_deref() {
+        Some(key) if key.is_empty() || key.len() > 1024 => {
+            return bad_request("Idempotency-Key must contain between 1 and 1024 bytes");
+        }
+        Some(key) => match roosty_db::begin_status_creation(&state.db, account.id, key).await {
+            Ok(reservation) => Some(reservation),
+            Err(error) => return server_error(error),
+        },
+        None => None,
+    };
+    if let Some(StatusCreationReservation::Existing(existing)) = reservation {
+        return existing_status_creation_response(&state, &account, existing).await;
+    }
+    let result_id = Uuid::now_v7();
+    let is_scheduled = input.scheduled_at.is_some();
+    let response = if is_scheduled {
+        create_scheduled_status(&state, &account, input, Some(result_id)).await
+    } else {
+        create_status_from_input(
+            &state,
+            account.clone(),
+            input,
+            None,
+            Some(StatusId(result_id)),
+        )
+        .await
+    };
+    if response.status().is_success()
+        && let Some(StatusCreationReservation::New(guard)) = reservation
+    {
+        let result = if is_scheduled {
+            ExistingStatusCreation::ScheduledStatus(result_id)
+        } else {
+            ExistingStatusCreation::Status(StatusId(result_id))
+        };
+        if let Err(error) = guard.complete(result).await {
+            return server_error(error);
+        }
+    }
+    response
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusPermission {
+    Read,
+    Write,
+}
+
+impl StatusPermission {
+    fn allows_scope(self, scope: OAuthScope<'_>) -> bool {
+        matches!(
+            (self, scope),
+            (
+                Self::Read,
+                OAuthScope::Read(OAuthScopeResource::All | OAuthScopeResource::Statuses)
+            ) | (
+                Self::Write,
+                OAuthScope::Write(OAuthScopeResource::All | OAuthScopeResource::Statuses)
+            )
+        )
+    }
+}
+
+fn has_status_scope(scopes: &str, permission: StatusPermission) -> bool {
+    scopes
+        .split_ascii_whitespace()
+        .map(OAuthScope::parse)
+        .any(|scope| permission.allows_scope(scope))
+}
+
+async fn existing_status_creation_response(
+    state: &AppState,
+    account: &LocalAccount,
+    existing: ExistingStatusCreation,
+) -> Response {
+    match existing {
+        ExistingStatusCreation::Status(id) => {
+            match roosty_db::find_local_status_by_id(&state.db, id).await {
+                Ok(Some(status)) if status.account_id == account.id => {
+                    match status_response(state, status, account.clone()).await {
+                        Ok(response) => Json(response).into_response(),
+                        Err(error) => server_error(error),
+                    }
+                }
+                Ok(_) => not_found(),
+                Err(error) => server_error(error),
+            }
+        }
+        ExistingStatusCreation::ScheduledStatus(id) => {
+            match roosty_db::find_scheduled_status(&state.db, account.id, id).await {
+                Ok(Some(status)) => scheduled_status_response(state, status).await,
+                Ok(None) => not_found(),
+                Err(error) => server_error(error),
+            }
+        }
+    }
+}
+
+async fn create_status_from_input(
+    state: &AppState,
+    account: LocalAccount,
+    input: StatusInput,
+    scheduled_status_id: Option<Uuid>,
+    publication_status_id: Option<StatusId>,
+) -> Response {
     let media_ids = match parse_media_ids(input.media_ids.as_deref().unwrap_or_default()) {
         Ok(media_ids) => media_ids,
         Err(error) => return bad_request(&error.to_string()),
@@ -652,7 +811,7 @@ async fn create_status(
     let mut visibility = input.visibility.unwrap_or(account.default_visibility);
     let quote_target = match input.quoted_status_id.as_deref() {
         Some(id) => match resolve_quote_target(
-            &state,
+            state,
             &account,
             id,
             visibility,
@@ -673,7 +832,7 @@ async fn create_status(
         visibility,
         StatusVisibility::Private | StatusVisibility::Direct
     ) {
-        roosty_db::QuoteApprovalPolicy::Nobody
+        QuoteApprovalPolicy::Nobody
     } else {
         input
             .quote_approval_policy
@@ -689,7 +848,7 @@ async fn create_status(
         match roosty_db::find_local_status_by_id(&state.db, parent_id).await {
             Ok(Some(parent)) => {
                 notifiable_reply = parent.account_id == account.id;
-                match status_visible_to_viewer(&state, &parent, Some(account.id)).await {
+                match status_visible_to_viewer(state, &parent, Some(account.id)).await {
                     Ok(true) => {}
                     Ok(false) => return bad_request("reply target status does not exist"),
                     Err(error) => return server_error(error),
@@ -724,6 +883,7 @@ async fn create_status(
     }
 
     let new_status = roosty_db::NewLocalStatus {
+        id: publication_status_id,
         account_id: account.id,
         content: input.status.unwrap_or_default().trim().to_owned(),
         visibility,
@@ -749,7 +909,7 @@ async fn create_status(
                 | StatusVisibility::Private
                 | StatusVisibility::Direct
         ) {
-        resolve_remote_mentions(&state, &new_status.content).await
+        resolve_remote_mentions(state, &new_status.content).await
     } else {
         Vec::new()
     };
@@ -758,7 +918,7 @@ async fn create_status(
         .iter()
         .map(|actor| actor.id)
         .collect::<Vec<_>>();
-    let notification_recipients = match local_text_mentions(&state, &new_status.content).await {
+    let notification_recipients = match local_text_mentions(state, &new_status.content).await {
         Ok(accounts) => accounts,
         Err(error) => return server_error(error),
     };
@@ -771,6 +931,7 @@ async fn create_status(
         new_status,
         &media_ids,
         roosty_db::LocalStatusMetadata {
+            scheduled_status_id,
             tag_names,
             remote_actor_ids: remote_mention_ids,
             local_recipient_ids: if has_explicit_audience {
@@ -839,12 +1000,12 @@ async fn create_status(
                 }
             }
             if let Err(error) =
-                attach_direct_conversation(&state, &txn, &mut status, author_id).await
+                attach_direct_conversation(state, &txn, &mut status, author_id).await
             {
                 return server_error(error);
             }
             if let Err(error) = enqueue_status_activity_in_transaction(
-                &state,
+                state,
                 &txn,
                 &status,
                 StatusActivityKind::Create,
@@ -870,7 +1031,7 @@ async fn create_status(
                     Err(error) => return server_error(error),
                 };
                 if let Err(error) =
-                    enqueue_quote_request_in_transaction(&state, &txn, &status, &quote).await
+                    enqueue_quote_request_in_transaction(state, &txn, &status, &quote).await
                 {
                     return server_error(error);
                 }
@@ -889,20 +1050,27 @@ async fn create_status(
                     }
                 }
             }
+            if let Some(scheduled_status_id) = scheduled_status_id
+                && let Err(error) =
+                    roosty_db::delete_scheduled_status_in_transaction(&txn, scheduled_status_id)
+                        .await
+            {
+                return server_error(error);
+            }
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
             if let Some(conversation_id) = status.conversation_id
-                && let Err(error) = publish_conversation_update(&state, conversation_id).await
+                && let Err(error) = publish_conversation_update(state, conversation_id).await
             {
                 warn!(%error, "failed to publish conversation update");
             }
 
-            match status_response(&state, status.clone(), account).await {
+            match status_response(state, status.clone(), account).await {
                 Ok(response) => {
                     for notification in notifications {
                         if let Err(error) = publish_committed_notification(
-                            &state,
+                            state,
                             notification.account_id,
                             notification,
                         )
@@ -911,7 +1079,7 @@ async fn create_status(
                             warn!(%error, "failed to publish status notification");
                         }
                     }
-                    let recipients = status_stream_recipients(&state, &status).await;
+                    let recipients = status_stream_recipients(state, &status).await;
                     let stream_visibility = if status.in_reply_to_id.is_some()
                         || status.in_reply_to_remote_status_id.is_some()
                     {
@@ -931,6 +1099,384 @@ async fn create_status(
             }
         }
         Err(error) => server_error(error),
+    }
+}
+
+async fn create_scheduled_status(
+    state: &AppState,
+    account: &LocalAccount,
+    input: StatusInput,
+    id: Option<Uuid>,
+) -> Response {
+    let scheduled_at = match parse_scheduled_at(input.scheduled_at.as_deref()) {
+        Ok(value) => value,
+        Err(error) => return unprocessable(error),
+    };
+    if scheduled_at <= OffsetDateTime::now_utc() + state.config.scheduled_statuses.minimum_offset {
+        return unprocessable("scheduled_at is too soon");
+    }
+    let media_ids = match parse_media_ids(input.media_ids.as_deref().unwrap_or_default()) {
+        Ok(ids) => ids,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    if input.quoted_status_id.is_some() && !media_ids.is_empty() {
+        return bad_request("quote posts cannot include media attachments");
+    }
+    if let Err(error) = validate_status_text(
+        input.status.as_deref().unwrap_or_default(),
+        !media_ids.is_empty(),
+    ) {
+        return bad_request(&error.to_string());
+    }
+    let mut visibility = input.visibility.unwrap_or(account.default_visibility);
+    let quoted_status_id = match input.quoted_status_id.as_deref() {
+        Some(id) => match resolve_quote_target(
+            state,
+            account,
+            id,
+            visibility,
+            input.status.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            Ok((_, effective_visibility)) => {
+                visibility = effective_visibility;
+                match parse_optional_status_id(Some(id)) {
+                    Ok(id) => id,
+                    Err(error) => return bad_request(&error.to_string()),
+                }
+            }
+            Err(RoostyError::InvalidInput(error)) => return bad_request(&error),
+            Err(error) => return server_error(error),
+        },
+        None => None,
+    };
+    let reply_id = match parse_optional_status_id(input.in_reply_to_id.as_deref()) {
+        Ok(id) => id,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let (in_reply_to_id, in_reply_to_remote_status_id) = match reply_id {
+        Some(id) => match roosty_db::find_local_status_by_id(&state.db, id).await {
+            Ok(Some(status)) => {
+                match status_visible_to_viewer(state, &status, Some(account.id)).await {
+                    Ok(true) => (Some(id), None),
+                    Ok(false) => return bad_request("reply target status does not exist"),
+                    Err(error) => return server_error(error),
+                }
+            }
+            Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, id).await {
+                Ok(Some(status)) => {
+                    match roosty_db::remote_status_visible_to_account(
+                        &state.db, &status, account.id,
+                    )
+                    .await
+                    {
+                        Ok(true) => (None, Some(id)),
+                        Ok(false) => return bad_request("reply target status does not exist"),
+                        Err(error) => return server_error(error),
+                    }
+                }
+                Ok(None) => return bad_request("reply target status does not exist"),
+                Err(error) => return server_error(error),
+            },
+            Err(error) => return server_error(error),
+        },
+        None => (None, None),
+    };
+    let quote_approval_policy = if matches!(
+        visibility,
+        StatusVisibility::Private | StatusVisibility::Direct
+    ) {
+        QuoteApprovalPolicy::Nobody
+    } else {
+        input
+            .quote_approval_policy
+            .unwrap_or(account.default_quote_policy)
+    };
+    let result = roosty_db::create_scheduled_status(
+        &state.db,
+        NewScheduledStatus {
+            id,
+            account_id: account.id,
+            content: input.status.unwrap_or_default().trim().to_owned(),
+            visibility,
+            sensitive: input.sensitive.unwrap_or(account.default_sensitive),
+            spoiler_text: input.spoiler_text.unwrap_or_default(),
+            language: input.language.or(account.default_language.clone()),
+            in_reply_to_id,
+            in_reply_to_remote_status_id,
+            quoted_status_id,
+            quote_approval_policy,
+            scheduled_at,
+            media_ids,
+        },
+        state.config.scheduled_statuses.total_limit,
+        state.config.scheduled_statuses.daily_limit,
+    )
+    .await;
+    match result {
+        Ok((ScheduleStatusResult::Created, Some(status))) => {
+            scheduled_status_response(state, status).await
+        }
+        Ok((ScheduleStatusResult::TotalLimitReached, _)) => {
+            unprocessable("total scheduled status limit reached")
+        }
+        Ok((ScheduleStatusResult::DailyLimitReached, _)) => {
+            unprocessable("daily scheduled status limit reached")
+        }
+        Ok((ScheduleStatusResult::Created, None)) => server_error(RoostyError::InvalidInput(
+            "scheduled status was not returned".to_owned(),
+        )),
+        Err(RoostyError::InvalidInput(error)) => bad_request(&error),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn list_scheduled_statuses(
+    State(state): State<AppState>,
+    token: AuthenticatedAccessToken,
+    Query(params): Query<CollectionParams>,
+) -> Response {
+    if !has_status_scope(&token.grant.scopes, StatusPermission::Read) {
+        return forbidden("This action is outside the authorized scopes");
+    }
+    let account = token.grant.account;
+    let limit = timeline_limit(params.limit);
+    let cursor = match collection_cursor(&params) {
+        Ok(cursor) => roosty_db::TimelineCursor {
+            max_id: cursor.max_id.map(StatusId),
+            since_id: cursor.since_id.map(StatusId),
+            min_id: cursor.min_id.map(StatusId),
+        },
+        Err(()) => return bad_request("invalid pagination cursor"),
+    };
+    match roosty_db::scheduled_statuses(&state.db, account.id, limit, cursor).await {
+        Ok(page) => {
+            let link = timeline_link_header(&page, limit, "/api/v1/scheduled_statuses");
+            let mut responses = Vec::with_capacity(page.items.len());
+            for status in page.items {
+                match scheduled_status_response_value(&state, status).await {
+                    Ok(response) => responses.push(response),
+                    Err(error) => return server_error(error),
+                }
+            }
+            let mut response = Json(responses).into_response();
+            if let Some(link) = link {
+                response.headers_mut().insert(header::LINK, link);
+            }
+            response
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn show_scheduled_status(
+    State(state): State<AppState>,
+    token: AuthenticatedAccessToken,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    if !has_status_scope(&token.grant.scopes, StatusPermission::Read) {
+        return forbidden("This action is outside the authorized scopes");
+    }
+    let account = token.grant.account;
+    match roosty_db::find_scheduled_status(&state.db, account.id, path.status_id).await {
+        Ok(Some(status)) => scheduled_status_response(&state, status).await,
+        Ok(None) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn update_scheduled_status(
+    State(state): State<AppState>,
+    token: AuthenticatedAccessToken,
+    Path(path): Path<StatusPath>,
+    request: axum::extract::Request,
+) -> Response {
+    if !has_status_scope(&token.grant.scopes, StatusPermission::Write) {
+        return forbidden("This action is outside the authorized scopes");
+    }
+    let account = token.grant.account;
+    let update: ScheduledStatusUpdate = match parse_request_body(request).await {
+        Ok(update) => update,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let scheduled_at = match parse_scheduled_at(Some(&update.scheduled_at)) {
+        Ok(value) => value,
+        Err(error) => return unprocessable(error),
+    };
+    if scheduled_at <= OffsetDateTime::now_utc() + state.config.scheduled_statuses.minimum_offset {
+        return unprocessable("scheduled_at is too soon");
+    }
+    match roosty_db::reschedule_status(
+        &state.db,
+        account.id,
+        path.status_id,
+        scheduled_at,
+        state.config.scheduled_statuses.daily_limit,
+    )
+    .await
+    {
+        Ok(Some(status)) => scheduled_status_response(&state, status).await,
+        Ok(None) => not_found(),
+        Err(RoostyError::InvalidInput(error)) => unprocessable(&error),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn delete_scheduled_status(
+    State(state): State<AppState>,
+    token: AuthenticatedAccessToken,
+    Path(path): Path<StatusPath>,
+) -> Response {
+    if !has_status_scope(&token.grant.scopes, StatusPermission::Write) {
+        return forbidden("This action is outside the authorized scopes");
+    }
+    let account = token.grant.account;
+    match roosty_db::cancel_scheduled_status(&state.db, account.id, path.status_id).await {
+        Ok(true) => Json(serde_json::json!({})).into_response(),
+        Ok(false) => not_found(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn scheduled_status_response(state: &AppState, status: ScheduledStatus) -> Response {
+    match scheduled_status_response_value(state, status).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn scheduled_status_response_value(
+    state: &AppState,
+    status: ScheduledStatus,
+) -> Result<ScheduledStatusResponse, RoostyError> {
+    let media = roosty_db::media_attachments_for_scheduled_status(&state.db, status.id).await?;
+    Ok(ScheduledStatusResponse {
+        id: status.id.to_string(),
+        scheduled_at: format_timestamp(status.scheduled_at),
+        params: ScheduledStatusParamsResponse {
+            text: status.content,
+            media_ids: (!media.is_empty())
+                .then(|| media.iter().map(|item| item.id.to_string()).collect()),
+            sensitive: Some(status.sensitive),
+            spoiler_text: status.spoiler_text,
+            visibility: status.visibility,
+            language: status.language,
+            scheduled_at: None,
+            poll: None,
+            idempotency: None,
+            with_rate_limit: false,
+            in_reply_to_id: status
+                .in_reply_to_id
+                .or(status.in_reply_to_remote_status_id)
+                .map(|id| id.0.to_string()),
+            quoted_status_id: status.quoted_status_id.map(|id| id.0.to_string()),
+            quote_approval_policy: status.quote_approval_policy,
+            application_id: None,
+        },
+        media_attachments: media
+            .iter()
+            .map(|item| media_response(state, item))
+            .collect(),
+    })
+}
+
+fn parse_scheduled_at(value: Option<&str>) -> Result<OffsetDateTime, &'static str> {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("scheduled_at is required")?;
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| "scheduled_at must be an RFC 3339 timestamp")
+}
+
+async fn parse_request_body<T: for<'de> Deserialize<'de>>(
+    request: axum::extract::Request,
+) -> Result<T, StatusInputError> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| StatusInputError::Empty)?;
+    if content_type.contains("application/json") {
+        serde_json::from_slice(&body).map_err(StatusInputError::Json)
+    } else {
+        serde_qs::Config::new()
+            .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+            .use_form_encoding(true)
+            .deserialize_str(&String::from_utf8_lossy(&body))
+            .map_err(|error| StatusInputError::Form(error.to_string()))
+    }
+}
+
+/// Publish one durable schedule, treating permanent validation failures like Mastodon cancellation.
+pub(crate) async fn publish_scheduled_status(
+    state: &AppState,
+    payload: Value,
+) -> Result<(), RoostyError> {
+    let id = payload
+        .get("scheduled_status_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RoostyError::InvalidInput("scheduled status id is missing".to_owned()))?
+        .parse::<Uuid>()
+        .map_err(|_| RoostyError::InvalidInput("scheduled status id is invalid".to_owned()))?;
+    let Some(status) = roosty_db::find_scheduled_status_by_id(&state.db, id).await? else {
+        return Ok(());
+    };
+    if status.scheduled_at > OffsetDateTime::now_utc() {
+        return Err(RoostyError::InvalidInput(
+            "scheduled status is not due yet".to_owned(),
+        ));
+    }
+    if roosty_db::find_local_status_by_id(&state.db, status.publication_status_id)
+        .await?
+        .is_some()
+    {
+        roosty_db::cancel_scheduled_status(&state.db, status.account_id, status.id).await?;
+        return Ok(());
+    }
+    let Some(account) = roosty_db::find_local_account_by_id(&state.db, status.account_id).await?
+    else {
+        return Ok(());
+    };
+    let media = roosty_db::media_attachments_for_scheduled_status(&state.db, status.id).await?;
+    let input = StatusInput {
+        status: Some(status.content),
+        visibility: Some(status.visibility),
+        sensitive: Some(status.sensitive),
+        spoiler_text: Some(status.spoiler_text),
+        language: status.language,
+        in_reply_to_id: status
+            .in_reply_to_id
+            .or(status.in_reply_to_remote_status_id)
+            .map(|id| id.0.to_string()),
+        media_ids: Some(media.into_iter().map(|item| item.id.to_string()).collect()),
+        media_attributes: Vec::new(),
+        quoted_status_id: status.quoted_status_id.map(|id| id.0.to_string()),
+        quote_approval_policy: Some(status.quote_approval_policy),
+        scheduled_at: None,
+    };
+    let response = create_status_from_input(
+        state,
+        account,
+        input,
+        Some(status.id),
+        Some(status.publication_status_id),
+    )
+    .await;
+    match response.status() {
+        StatusCode::OK => Ok(()),
+        status_code if status_code.is_client_error() => {
+            roosty_db::cancel_scheduled_status(&state.db, status.account_id, status.id).await?;
+            Ok(())
+        }
+        _ => Err(RoostyError::InvalidInput(
+            "scheduled status publication failed transiently".to_owned(),
+        )),
     }
 }
 
@@ -999,7 +1545,7 @@ async fn unpin_status(
 
 async fn mutate_status_pin(
     state: &AppState,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
     status_id: StatusId,
     pin: bool,
 ) -> Response {
@@ -1391,6 +1937,7 @@ async fn update_status(
         media_ids.as_deref(),
         &media_attributes,
         roosty_db::LocalStatusMetadata {
+            scheduled_status_id: None,
             tag_names: hashtag_names(&final_content),
             remote_actor_ids: remote_mention_ids,
             local_recipient_ids,
@@ -3374,7 +3921,7 @@ async fn status_with_author_and_pin(
 async fn status_response(
     state: &AppState,
     status: roosty_db::LocalStatus,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
 ) -> Result<StatusResponse, RoostyError> {
     status_response_for_viewer(state, status, account.clone(), Some(account.id)).await
 }
@@ -3842,7 +4389,7 @@ async fn local_remote_reblog_response(
 async fn status_response_for_viewer(
     state: &AppState,
     status: roosty_db::LocalStatus,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
     let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
@@ -3852,7 +4399,7 @@ async fn status_response_for_viewer(
 async fn status_response_for_viewer_with_pin(
     state: &AppState,
     status: roosty_db::LocalStatus,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
@@ -3875,7 +4422,7 @@ async fn status_response_for_viewer_with_pin(
 async fn status_response_base(
     state: &AppState,
     status: roosty_db::LocalStatus,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
@@ -4130,9 +4677,9 @@ async fn local_quote_approval(
     viewer: Option<AccountId>,
 ) -> Result<QuoteApprovalResponse, RoostyError> {
     let automatic = match status.quote_approval_policy {
-        roosty_db::QuoteApprovalPolicy::Public => vec![QuoteApprovalAudience::Public],
-        roosty_db::QuoteApprovalPolicy::Followers => vec![QuoteApprovalAudience::Followers],
-        roosty_db::QuoteApprovalPolicy::Nobody => Vec::new(),
+        QuoteApprovalPolicy::Public => vec![QuoteApprovalAudience::Public],
+        QuoteApprovalPolicy::Followers => vec![QuoteApprovalAudience::Followers],
+        QuoteApprovalPolicy::Nobody => Vec::new(),
     };
     let current_user = match viewer {
         Some(viewer) if viewer == status.account_id => QuoteApprovalDecision::Automatic,
@@ -4142,11 +4689,11 @@ async fn local_quote_approval(
         {
             QuoteApprovalDecision::Denied
         }
-        Some(_) if status.quote_approval_policy == roosty_db::QuoteApprovalPolicy::Public => {
+        Some(_) if status.quote_approval_policy == QuoteApprovalPolicy::Public => {
             QuoteApprovalDecision::Automatic
         }
         Some(viewer)
-            if status.quote_approval_policy == roosty_db::QuoteApprovalPolicy::Followers
+            if status.quote_approval_policy == QuoteApprovalPolicy::Followers
                 && roosty_db::local_follow_relationship(&state.db, viewer, status.account_id)
                     .await?
                     .is_some() =>
@@ -4243,7 +4790,7 @@ pub(crate) fn local_status_content_tag_links(state: &AppState, content: &str) ->
 async fn local_text_mentions(
     state: &AppState,
     content: &str,
-) -> Result<Vec<roosty_db::LocalAccount>, RoostyError> {
+) -> Result<Vec<LocalAccount>, RoostyError> {
     let mut accounts = Vec::new();
     let mut seen = HashSet::new();
 
@@ -4265,7 +4812,7 @@ async fn local_text_mentions(
 fn status_mentions(
     state: &AppState,
     reply_target: Option<&ReplyTarget>,
-    text_mentions: &[roosty_db::LocalAccount],
+    text_mentions: &[LocalAccount],
     remote_mentions: &[roosty_db::RemoteActor],
 ) -> Vec<MentionResponse> {
     let mut mentions = Vec::new();
@@ -4741,7 +5288,7 @@ fn status_content_html(content: &str) -> String {
 pub(crate) fn status_content_html_with_mentions_and_tags(
     state: &AppState,
     content: &str,
-    mentions: &[roosty_db::LocalAccount],
+    mentions: &[LocalAccount],
     remote_mentions: &[roosty_db::RemoteActor],
     tags: &[TagResponse],
 ) -> String {
@@ -5271,8 +5818,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        StatusContextLimits, escape_html, hashtag_names, mention_usernames, push_url_html,
-        remote_mention_matches, status_content_html, timeline_limit, url_matches,
+        StatusContextLimits, StatusPermission, escape_html, has_status_scope, hashtag_names,
+        mention_usernames, push_url_html, remote_mention_matches, status_content_html,
+        timeline_limit, url_matches,
     };
     use crate::{config::Config, http::AppState, password};
 
@@ -5288,6 +5836,17 @@ mod tests {
         assert_eq!(authenticated.ancestors, 4_096);
         assert_eq!(authenticated.descendants, 4_096);
         assert_eq!(authenticated.descendants_depth, None);
+    }
+
+    #[test]
+    fn status_scope_permissions_accept_umbrella_and_granular_scopes() {
+        assert!(has_status_scope("read", StatusPermission::Read));
+        assert!(has_status_scope("read:statuses", StatusPermission::Read));
+        assert!(has_status_scope("write", StatusPermission::Write));
+        assert!(has_status_scope("write:statuses", StatusPermission::Write));
+        assert!(!has_status_scope("read:accounts", StatusPermission::Read));
+        assert!(!has_status_scope("write:media", StatusPermission::Write));
+        assert!(!has_status_scope("push follow", StatusPermission::Read));
     }
 
     #[test_context(StatusContext)]
@@ -5323,6 +5882,68 @@ mod tests {
         let public = context.get("/api/v1/timelines/public?limit=30").await;
         assert_eq!(public.status(), StatusCode::OK);
         assert_eq!(json_body(public).await.as_array().unwrap().len(), 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a future post, scheduling is idempotent and the owner can list, move, and cancel it.
+    async fn scheduled_status_lifecycle_is_mastodon_compatible(context: &mut StatusContext) {
+        let token = context.access_token().await;
+        let first_time = (OffsetDateTime::now_utc() + TimeDuration::minutes(10))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let request = |scheduled_at: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/statuses")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "scheduled-lifecycle")
+                .body(Body::from(
+                    json!({"status": "later", "scheduled_at": scheduled_at}).to_string(),
+                ))
+                .unwrap()
+        };
+        let first = context.request(request(&first_time)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let scheduled = json_body(first).await;
+        let scheduled_id = scheduled["id"].as_str().unwrap();
+
+        let duplicate = context.request(request(&first_time)).await;
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        assert_eq!(json_body(duplicate).await["id"], scheduled_id);
+
+        let list = context
+            .authenticated_get("/api/v1/scheduled_statuses", &token)
+            .await;
+        assert_eq!(list.status(), StatusCode::OK);
+        assert_eq!(json_body(list).await.as_array().unwrap().len(), 1);
+
+        let second_time = (OffsetDateTime::now_utc() + TimeDuration::minutes(20))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let update = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/scheduled_statuses/{scheduled_id}"),
+                &token,
+                json!({"scheduled_at": second_time}),
+            )
+            .await;
+        assert_eq!(update.status(), StatusCode::OK);
+
+        let delete = context
+            .authenticated_empty(
+                "DELETE",
+                &format!("/api/v1/scheduled_statuses/{scheduled_id}"),
+                &token,
+            )
+            .await;
+        assert_eq!(delete.status(), StatusCode::OK);
+        let list = context
+            .authenticated_get("/api/v1/scheduled_statuses", &token)
+            .await;
+        assert!(json_body(list).await.as_array().unwrap().is_empty());
     }
 
     #[test_context(StatusContext)]
@@ -9140,6 +9761,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),

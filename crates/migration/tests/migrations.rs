@@ -27,6 +27,16 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_status_bookmark").await);
     assert!(table_exists(database.connection(), "local_follow").await);
     assert!(table_exists(database.connection(), "local_media_attachment").await);
+    assert!(table_exists(database.connection(), "scheduled_status").await);
+    assert!(table_exists(database.connection(), "status_creation_idempotency").await);
+    assert!(
+        column_exists(
+            database.connection(),
+            "local_media_attachment",
+            "scheduled_status_id"
+        )
+        .await
+    );
     assert!(table_exists(database.connection(), "local_notification").await);
     assert!(table_exists(database.connection(), "local_status_reblog").await);
     assert!(table_exists(database.connection(), "local_conversation").await);
@@ -391,6 +401,8 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_status_bookmark").await);
     assert!(table_exists(database.connection(), "local_follow").await);
     assert!(table_exists(database.connection(), "local_media_attachment").await);
+    assert!(table_exists(database.connection(), "scheduled_status").await);
+    assert!(table_exists(database.connection(), "status_creation_idempotency").await);
     assert!(table_exists(database.connection(), "local_notification").await);
     assert!(table_exists(database.connection(), "local_status_reblog").await);
     assert!(table_exists(database.connection(), "local_conversation").await);
@@ -413,6 +425,8 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "local_status_bookmark").await);
     assert!(!table_exists(database.connection(), "local_follow").await);
     assert!(!table_exists(database.connection(), "local_media_attachment").await);
+    assert!(!table_exists(database.connection(), "scheduled_status").await);
+    assert!(!table_exists(database.connection(), "status_creation_idempotency").await);
     assert!(!table_exists(database.connection(), "local_notification").await);
     assert!(!table_exists(database.connection(), "local_status_reblog").await);
     assert!(!table_exists(database.connection(), "local_conversation").await);

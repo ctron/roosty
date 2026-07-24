@@ -9,6 +9,9 @@ roosty_docker_packages:
   - docker-compose-v2
   - openssl
 roosty_worker_concurrency: 4
+roosty_scheduled_status_minimum_offset: 5m
+roosty_scheduled_status_total_limit: 300
+roosty_scheduled_status_daily_limit: 25
 roosty_streaming_max_connections: 1000
 roosty_streaming_send_timeout: 10s
 roosty_streaming_ping_interval: 30s

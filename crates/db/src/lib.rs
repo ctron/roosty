@@ -171,7 +171,8 @@ use entity::{
     remote_media_attachment, remote_profile_media, remote_status, remote_status_edit,
     remote_status_edit_media, remote_status_favourite, remote_status_local_mention,
     remote_status_local_recipient, remote_status_pin, remote_status_reblog,
-    remote_status_remote_recipient, remote_status_tag, status_quote, streaming_event,
+    remote_status_remote_recipient, remote_status_tag, scheduled_status,
+    status_creation_idempotency, status_quote, streaming_event,
 };
 
 /// Quote policy values authored by Mastodon-compatible clients.
@@ -366,6 +367,8 @@ pub struct NewJob {
 /// Derived status links persisted with a local status mutation.
 #[derive(Clone, Debug, Default)]
 pub struct LocalStatusMetadata {
+    /// Schedule allowed to transfer its reserved media into this status.
+    pub scheduled_status_id: Option<Uuid>,
     /// Normalized hashtag names linked to the status.
     pub tag_names: Vec<String>,
     /// Resolved remote actors explicitly mentioned by the status.
@@ -2959,6 +2962,8 @@ pub struct RemoteFeaturedTagInput {
 /// Data accepted when creating a local status.
 #[derive(Clone, Debug)]
 pub struct NewLocalStatus {
+    /// Stable identifier, supplied for retry-safe scheduled publication.
+    pub id: Option<StatusId>,
     /// Authoring local account identifier.
     pub account_id: AccountId,
     /// Plain text status content.
@@ -2977,6 +2982,148 @@ pub struct NewLocalStatus {
     pub in_reply_to_remote_status_id: Option<StatusId>,
     /// Per-status quote consent policy.
     pub quote_approval_policy: QuoteApprovalPolicy,
+}
+
+/// Stored posting intent waiting for durable publication.
+#[derive(Clone, Debug)]
+pub struct ScheduledStatus {
+    pub id: Uuid,
+    pub account_id: AccountId,
+    pub publication_status_id: StatusId,
+    pub content: String,
+    pub visibility: StatusVisibility,
+    pub sensitive: bool,
+    pub spoiler_text: String,
+    pub language: Option<String>,
+    pub in_reply_to_id: Option<StatusId>,
+    pub in_reply_to_remote_status_id: Option<StatusId>,
+    pub quoted_status_id: Option<StatusId>,
+    pub quote_approval_policy: QuoteApprovalPolicy,
+    pub scheduled_at: OffsetDateTime,
+}
+
+/// Validated scheduled posting intent and reserved attachment order.
+#[derive(Clone, Debug)]
+pub struct NewScheduledStatus {
+    pub id: Option<Uuid>,
+    pub account_id: AccountId,
+    pub content: String,
+    pub visibility: StatusVisibility,
+    pub sensitive: bool,
+    pub spoiler_text: String,
+    pub language: Option<String>,
+    pub in_reply_to_id: Option<StatusId>,
+    pub in_reply_to_remote_status_id: Option<StatusId>,
+    pub quoted_status_id: Option<StatusId>,
+    pub quote_approval_policy: QuoteApprovalPolicy,
+    pub scheduled_at: OffsetDateTime,
+    pub media_ids: Vec<Uuid>,
+}
+
+/// Existing result protected by an account-scoped status idempotency key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingStatusCreation {
+    Status(StatusId),
+    ScheduledStatus(Uuid),
+}
+
+/// Persisted result variants for status-creation idempotency.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum StatusCreationResultKind {
+    Status,
+    ScheduledStatus,
+}
+
+/// PostgreSQL transaction retaining an advisory lock until a creation result is recorded.
+pub struct StatusCreationGuard {
+    txn: DatabaseTransaction,
+    account_id: AccountId,
+    key_hash: String,
+}
+
+/// Result of acquiring a status-creation idempotency key.
+pub enum StatusCreationReservation {
+    New(StatusCreationGuard),
+    Existing(ExistingStatusCreation),
+}
+
+impl StatusCreationGuard {
+    /// Record the successful result and release the cross-process advisory lock.
+    pub async fn complete(self, result: ExistingStatusCreation) -> Result<()> {
+        let (kind, id) = match result {
+            ExistingStatusCreation::Status(id) => (StatusCreationResultKind::Status, id.0),
+            ExistingStatusCreation::ScheduledStatus(id) => {
+                (StatusCreationResultKind::ScheduledStatus, id)
+            }
+        };
+        status_creation_idempotency::ActiveModel {
+            account_id: Set(self.account_id.0),
+            key_hash: Set(self.key_hash),
+            result_kind: Set(kind),
+            result_id: Set(id),
+            expires_at: Set(OffsetDateTime::now_utc() + Duration::hours(1)),
+            created_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(&self.txn)
+        .await?;
+        self.txn.commit().await?;
+        Ok(())
+    }
+}
+
+/// Serialize status creation for an account/key pair across all server processes.
+pub async fn begin_status_creation(
+    db: &DbConnection,
+    account_id: AccountId,
+    key: &str,
+) -> Result<StatusCreationReservation> {
+    let key_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(key.as_bytes()));
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("{}:{key_hash}", account_id.0).into()],
+    ))
+    .await?;
+    status_creation_idempotency::Entity::delete_many()
+        .filter(status_creation_idempotency::Column::AccountId.eq(account_id.0))
+        .filter(status_creation_idempotency::Column::KeyHash.eq(&key_hash))
+        .filter(status_creation_idempotency::Column::ExpiresAt.lt(OffsetDateTime::now_utc()))
+        .exec(&txn)
+        .await?;
+    let existing =
+        status_creation_idempotency::Entity::find_by_id((account_id.0, key_hash.clone()))
+            .one(&txn)
+            .await?;
+    if let Some(existing) = existing {
+        let result = match existing.result_kind {
+            StatusCreationResultKind::Status => {
+                ExistingStatusCreation::Status(StatusId(existing.result_id))
+            }
+            StatusCreationResultKind::ScheduledStatus => {
+                ExistingStatusCreation::ScheduledStatus(existing.result_id)
+            }
+        };
+        txn.rollback().await?;
+        return Ok(StatusCreationReservation::Existing(result));
+    }
+    Ok(StatusCreationReservation::New(StatusCreationGuard {
+        txn,
+        account_id,
+        key_hash,
+    }))
+}
+
+/// Outcome when an account's configurable scheduling capacity is checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleStatusResult {
+    Created,
+    TotalLimitReached,
+    DailyLimitReached,
 }
 
 /// Stored local direct-message conversation.
@@ -3099,6 +3246,8 @@ pub struct LocalMediaAttachment {
     pub account_id: AccountId,
     /// Local status this media is attached to, when already posted.
     pub status_id: Option<StatusId>,
+    /// Scheduled status reserving this media before publication.
+    pub scheduled_status_id: Option<Uuid>,
     /// Position of this attachment on the status.
     pub status_order: i32,
     /// Original uploaded MIME type.
@@ -3599,6 +3748,7 @@ pub enum JobKind {
     WebPushDelivery,
     NotificationRequestMerge,
     NotificationRequestCleanup,
+    ScheduledStatusPublish,
 }
 
 impl JobKind {
@@ -7518,7 +7668,7 @@ pub async fn create_local_status(
     db: &DbConnection,
     new_status: NewLocalStatus,
 ) -> Result<LocalStatus> {
-    let status_id = Uuid::now_v7();
+    let status_id = new_status.id.map_or_else(Uuid::now_v7, |id| id.0);
     let created_at = OffsetDateTime::now_utc();
 
     let status = local_status::ActiveModel {
@@ -7551,12 +7701,13 @@ pub async fn create_local_status_with_media(
     metadata: LocalStatusMetadata,
 ) -> Result<LocalStatus> {
     let LocalStatusMetadata {
+        scheduled_status_id,
         mut tag_names,
         remote_actor_ids,
         local_recipient_ids,
         local_mention_ids,
     } = metadata;
-    let status_id = Uuid::now_v7();
+    let status_id = new_status.id.map_or_else(Uuid::now_v7, |id| id.0);
     let created_at = OffsetDateTime::now_utc();
     let account_id = new_status.account_id;
 
@@ -7569,7 +7720,11 @@ pub async fn create_local_status_with_media(
                 "media attachment not found".to_owned(),
             ));
         };
-        if media.account_id != account_id.0 || media.status_id.is_some() {
+        if media.account_id != account_id.0
+            || media.status_id.is_some()
+            || (media.scheduled_status_id.is_some()
+                && media.scheduled_status_id != scheduled_status_id)
+        {
             return Err(RoostyError::InvalidInput(
                 "media attachment is not available".to_owned(),
             ));
@@ -7606,6 +7761,7 @@ pub async fn create_local_status_with_media(
         };
         let mut active = media.into_active_model();
         active.status_id = Set(Some(status_id));
+        active.scheduled_status_id = Set(None);
         active.status_order = Set(index as i32);
         active.updated_at = Set(OffsetDateTime::now_utc());
         active.update(txn).await?;
@@ -8875,6 +9031,7 @@ pub async fn update_owned_local_status(
         .exec(txn)
         .await?;
     let LocalStatusMetadata {
+        scheduled_status_id: _,
         mut tag_names,
         remote_actor_ids,
         local_recipient_ids,
@@ -9063,6 +9220,7 @@ pub async fn create_local_media_attachment(
         id: Set(Uuid::now_v7()),
         account_id: Set(media.account_id.0),
         status_id: Set(None),
+        scheduled_status_id: Set(None),
         status_order: Set(0),
         content_type: Set(media.content_type),
         original_filename: Set(media.original_filename),
@@ -9084,6 +9242,279 @@ pub async fn create_local_media_attachment(
     .await?;
 
     Ok(local_media_attachment_from_model(model))
+}
+
+/// Store a schedule, reserve its media, and enqueue publication atomically.
+pub async fn create_scheduled_status(
+    db: &DbConnection,
+    input: NewScheduledStatus,
+    total_limit: u64,
+    daily_limit: u64,
+) -> Result<(ScheduleStatusResult, Option<ScheduledStatus>)> {
+    let txn = db.begin().await?;
+    local_account::Entity::find_by_id(input.account_id.0)
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
+
+    let total = scheduled_status::Entity::find()
+        .filter(scheduled_status::Column::AccountId.eq(input.account_id.0))
+        .count(&txn)
+        .await?;
+    if total >= total_limit {
+        txn.rollback().await?;
+        return Ok((ScheduleStatusResult::TotalLimitReached, None));
+    }
+    let day = input.scheduled_at.date();
+    let day_start = day.midnight().assume_utc();
+    let day_end = day_start + Duration::days(1);
+    let daily = scheduled_status::Entity::find()
+        .filter(scheduled_status::Column::AccountId.eq(input.account_id.0))
+        .filter(scheduled_status::Column::ScheduledAt.gte(day_start))
+        .filter(scheduled_status::Column::ScheduledAt.lt(day_end))
+        .count(&txn)
+        .await?;
+    if daily >= daily_limit {
+        txn.rollback().await?;
+        return Ok((ScheduleStatusResult::DailyLimitReached, None));
+    }
+
+    for media_id in &input.media_ids {
+        let available = local_media_attachment::Entity::find_by_id(*media_id)
+            .filter(local_media_attachment::Column::AccountId.eq(input.account_id.0))
+            .filter(local_media_attachment::Column::StatusId.is_null())
+            .filter(local_media_attachment::Column::ScheduledStatusId.is_null())
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        if available.is_none() {
+            return Err(RoostyError::InvalidInput(
+                "media attachment is not available".to_owned(),
+            ));
+        }
+    }
+
+    let id = input.id.unwrap_or_else(Uuid::now_v7);
+    let publication_status_id = Uuid::now_v7();
+    let now = OffsetDateTime::now_utc();
+    let model = scheduled_status::ActiveModel {
+        id: Set(id),
+        account_id: Set(input.account_id.0),
+        publication_status_id: Set(publication_status_id),
+        content: Set(input.content),
+        visibility: Set(input.visibility),
+        sensitive: Set(input.sensitive),
+        spoiler_text: Set(input.spoiler_text),
+        language: Set(input.language),
+        in_reply_to_id: Set(input.in_reply_to_id.map(|id| id.0)),
+        in_reply_to_remote_status_id: Set(input.in_reply_to_remote_status_id.map(|id| id.0)),
+        quoted_status_id: Set(input.quoted_status_id.map(|id| id.0)),
+        quote_approval_policy: Set(input.quote_approval_policy),
+        scheduled_at: Set(input.scheduled_at),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&txn)
+    .await?;
+    for (position, media_id) in input.media_ids.iter().enumerate() {
+        let media = local_media_attachment::Entity::find_by_id(*media_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| RoostyError::InvalidInput("media attachment disappeared".to_owned()))?;
+        let mut active = media.into_active_model();
+        active.scheduled_status_id = Set(Some(id));
+        active.status_order = Set(position as i32);
+        active.updated_at = Set(now);
+        active.update(&txn).await?;
+    }
+    enqueue_job_in_transaction(
+        &txn,
+        NewJob {
+            kind: JobKind::ScheduledStatusPublish,
+            payload: serde_json::json!({ "scheduled_status_id": id }),
+            deduplication_key: Some(id.to_string()),
+            run_after: input.scheduled_at,
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok((
+        ScheduleStatusResult::Created,
+        Some(scheduled_status_from_model(model)),
+    ))
+}
+
+/// Find one schedule when it belongs to the requesting account.
+pub async fn find_scheduled_status(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    id: Uuid,
+) -> Result<Option<ScheduledStatus>> {
+    Ok(scheduled_status::Entity::find_by_id(id)
+        .filter(scheduled_status::Column::AccountId.eq(account_id.0))
+        .one(db)
+        .await?
+        .map(scheduled_status_from_model))
+}
+
+/// Find a schedule by identifier for worker publication.
+pub async fn find_scheduled_status_by_id(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+) -> Result<Option<ScheduledStatus>> {
+    Ok(scheduled_status::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .map(scheduled_status_from_model))
+}
+
+/// List one account's schedules in opaque UUIDv7 cursor order.
+pub async fn scheduled_statuses(
+    db: &DbConnection,
+    account_id: AccountId,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<TimelinePage<ScheduledStatus>> {
+    let mut query = scheduled_status::Entity::find()
+        .filter(scheduled_status::Column::AccountId.eq(account_id.0));
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(scheduled_status::Column::Id.lt(max_id.0));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(scheduled_status::Column::Id.gt(since_id.0));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(scheduled_status::Column::Id.gt(min_id.0));
+    }
+    let mut items = query
+        .order_by_desc(scheduled_status::Column::Id)
+        .limit(page_query_limit(limit))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(scheduled_status_from_model)
+        .collect::<Vec<_>>();
+    if cursor.min_id.is_some() {
+        items.sort_by_key(|status| Reverse(status.id));
+    }
+    let (items, has_more) = trim_to_page(items, limit);
+    Ok(TimelinePage {
+        first_cursor: items.first().map(|status| status.id),
+        last_cursor: items.last().map(|status| status.id),
+        items,
+        has_more,
+    })
+}
+
+/// Move a schedule and its active durable job under an account lock.
+pub async fn reschedule_status(
+    db: &DbConnection,
+    account_id: AccountId,
+    id: Uuid,
+    scheduled_at: OffsetDateTime,
+    daily_limit: u64,
+) -> Result<Option<ScheduledStatus>> {
+    let txn = db.begin().await?;
+    local_account::Entity::find_by_id(account_id.0)
+        .lock_exclusive()
+        .one(&txn)
+        .await?;
+    let Some(model) = scheduled_status::Entity::find_by_id(id)
+        .filter(scheduled_status::Column::AccountId.eq(account_id.0))
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    let day = scheduled_at.date();
+    let day_start = day.midnight().assume_utc();
+    let day_end = day_start + Duration::days(1);
+    let daily = scheduled_status::Entity::find()
+        .filter(scheduled_status::Column::AccountId.eq(account_id.0))
+        .filter(scheduled_status::Column::Id.ne(id))
+        .filter(scheduled_status::Column::ScheduledAt.gte(day_start))
+        .filter(scheduled_status::Column::ScheduledAt.lt(day_end))
+        .count(&txn)
+        .await?;
+    if daily >= daily_limit {
+        return Err(RoostyError::InvalidInput(
+            "daily scheduled status limit reached".to_owned(),
+        ));
+    }
+    let mut active = model.into_active_model();
+    active.scheduled_at = Set(scheduled_at);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    let updated = active.update(&txn).await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE job SET run_after = $1 WHERE kind = $2 AND deduplication_key = $3 AND completed_at IS NULL",
+        vec![
+            scheduled_at.into(),
+            JobKind::ScheduledStatusPublish.as_str().to_owned().into(),
+            id.to_string().into(),
+        ],
+    ))
+    .await?;
+    txn.commit().await?;
+    Ok(Some(scheduled_status_from_model(updated)))
+}
+
+/// Cancel an owned schedule, release media, and retire its active job.
+pub async fn cancel_scheduled_status(
+    db: &DbConnection,
+    account_id: AccountId,
+    id: Uuid,
+) -> Result<bool> {
+    let txn = db.begin().await?;
+    let Some(model) = scheduled_status::Entity::find_by_id(id)
+        .filter(scheduled_status::Column::AccountId.eq(account_id.0))
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(false);
+    };
+    model.into_active_model().delete(&txn).await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE job SET completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE kind = $1 AND deduplication_key = $2 AND completed_at IS NULL",
+        vec![
+            JobKind::ScheduledStatusPublish.as_str().to_owned().into(),
+            id.to_string().into(),
+        ],
+    ))
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// Remove a schedule as part of the transaction that published its status.
+pub async fn delete_scheduled_status_in_transaction(
+    txn: &DatabaseTransaction,
+    id: Uuid,
+) -> Result<()> {
+    scheduled_status::Entity::delete_by_id(id).exec(txn).await?;
+    Ok(())
+}
+
+/// Return reserved media in client order.
+pub async fn media_attachments_for_scheduled_status(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+) -> Result<Vec<LocalMediaAttachment>> {
+    Ok(local_media_attachment::Entity::find()
+        .filter(local_media_attachment::Column::ScheduledStatusId.eq(id))
+        .order_by_asc(local_media_attachment::Column::StatusOrder)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(local_media_attachment_from_model)
+        .collect())
 }
 
 /// Find a media attachment owned by a local account.
@@ -9109,6 +9540,7 @@ pub async fn find_owned_unattached_media_attachment(
     let media = local_media_attachment::Entity::find_by_id(media_id)
         .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
         .filter(local_media_attachment::Column::StatusId.is_null())
+        .filter(local_media_attachment::Column::ScheduledStatusId.is_null())
         .one(db)
         .await?;
 
@@ -9125,6 +9557,7 @@ pub async fn update_owned_unattached_media_attachment(
     let Some(media) = local_media_attachment::Entity::find_by_id(media_id)
         .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
         .filter(local_media_attachment::Column::StatusId.is_null())
+        .filter(local_media_attachment::Column::ScheduledStatusId.is_null())
         .one(db)
         .await?
     else {
@@ -9160,6 +9593,7 @@ pub async fn delete_owned_unattached_media_attachment(
     let Some(media) = local_media_attachment::Entity::find_by_id(media_id)
         .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
         .filter(local_media_attachment::Column::StatusId.is_null())
+        .filter(local_media_attachment::Column::ScheduledStatusId.is_null())
         .filter(
             local_media_attachment::Column::Id.not_in_subquery(
                 Query::select()
@@ -14557,6 +14991,7 @@ fn local_media_attachment_from_model(media: local_media_attachment::Model) -> Lo
         id: media.id,
         account_id: AccountId(media.account_id),
         status_id: media.status_id.map(StatusId),
+        scheduled_status_id: media.scheduled_status_id,
         status_order: media.status_order,
         content_type: media.content_type,
         original_filename: media.original_filename,
@@ -14571,6 +15006,24 @@ fn local_media_attachment_from_model(media: local_media_attachment::Model) -> Lo
         preview_width: media.preview_width,
         preview_height: media.preview_height,
         blurhash: media.blurhash,
+    }
+}
+
+fn scheduled_status_from_model(status: scheduled_status::Model) -> ScheduledStatus {
+    ScheduledStatus {
+        id: status.id,
+        account_id: AccountId(status.account_id),
+        publication_status_id: StatusId(status.publication_status_id),
+        content: status.content,
+        visibility: status.visibility,
+        sensitive: status.sensitive,
+        spoiler_text: status.spoiler_text,
+        language: status.language,
+        in_reply_to_id: status.in_reply_to_id.map(StatusId),
+        in_reply_to_remote_status_id: status.in_reply_to_remote_status_id.map(StatusId),
+        quoted_status_id: status.quoted_status_id.map(StatusId),
+        quote_approval_policy: status.quote_approval_policy,
+        scheduled_at: status.scheduled_at,
     }
 }
 

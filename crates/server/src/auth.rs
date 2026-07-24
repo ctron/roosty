@@ -47,6 +47,50 @@ pub(crate) struct AuthenticatedAccessToken {
     pub raw_token: String,
 }
 
+/// Parsed OAuth scope family at the wire boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OAuthScope<'a> {
+    Read(OAuthScopeResource<'a>),
+    Write(OAuthScopeResource<'a>),
+    Follow,
+    Push,
+    Other(&'a str),
+}
+
+/// Resource selected by a read or write OAuth scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OAuthScopeResource<'a> {
+    All,
+    Statuses,
+    Other(&'a str),
+}
+
+impl<'a> OAuthScope<'a> {
+    pub(crate) fn parse(value: &'a str) -> Self {
+        match value.split_once(':') {
+            None => match value {
+                "read" => Self::Read(OAuthScopeResource::All),
+                "write" => Self::Write(OAuthScopeResource::All),
+                "follow" => Self::Follow,
+                "push" => Self::Push,
+                other => Self::Other(other),
+            },
+            Some(("read", resource)) => Self::Read(OAuthScopeResource::parse(resource)),
+            Some(("write", resource)) => Self::Write(OAuthScopeResource::parse(resource)),
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl<'a> OAuthScopeResource<'a> {
+    fn parse(value: &'a str) -> Self {
+        match value {
+            "statuses" => Self::Statuses,
+            other => Self::Other(other),
+        }
+    }
+}
+
 /// Optional local account extracted from an OAuth bearer token when present.
 pub(crate) struct OptionalAuthenticatedAccount(pub Option<roosty_db::LocalAccount>);
 
@@ -3182,6 +3226,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),

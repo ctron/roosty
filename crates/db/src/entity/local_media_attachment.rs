@@ -9,6 +9,7 @@ pub struct Model {
     pub id: Uuid,
     pub account_id: Uuid,
     pub status_id: Option<Uuid>,
+    pub scheduled_status_id: Option<Uuid>,
     pub status_order: i32,
     pub content_type: String,
     pub original_filename: String,

@@ -75,3 +75,15 @@ any frames (including pong frames) before the idle deadline are disconnected.
 The `/metrics` output includes active/rejected sockets, send timeouts, idle
 disconnects, lagged receivers, listener reconnects, and failed cross-process
 publications.
+
+## Scheduled status controls
+
+Scheduled statuses are published by the durable worker pool. Limits are enforced
+transactionally per account so they remain consistent when multiple Roosty
+processes share a database.
+
+| Environment variable | Default | Validation |
+| --- | ---: | --- |
+| `ROOSTY_SCHEDULED_STATUS_MINIMUM_OFFSET` | `5m` | Non-zero `humantime` duration. |
+| `ROOSTY_SCHEDULED_STATUS_TOTAL_LIMIT` | `300` | Positive integer per account. |
+| `ROOSTY_SCHEDULED_STATUS_DAILY_LIMIT` | `25` | Positive integer per account and UTC day. |
