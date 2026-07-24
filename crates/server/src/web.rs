@@ -535,7 +535,7 @@ mod tests {
             assert!(html.contains(&format!(
                 "href=\"/login?next={login_next}\" rel=\"external\""
             )));
-            assert!(html.contains("/pkg/roosty-web.js"));
+            assert!(html.contains("/pkg/roosty-web.") && html.contains(".js"));
             if path == "/" {
                 assert!(html.contains(">About this instance</a>"));
             }
@@ -546,26 +546,29 @@ mod tests {
     /// then the asset is served successfully as JavaScript rather than an HTML fallback.
     #[tokio::test]
     async fn serves_hydration_bundle_as_javascript() {
-        let package_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/site/pkg");
-        let bundle = std::fs::read_dir(package_dir)
-            .unwrap_or_else(|error| panic!("failed to read generated frontend assets: {error}"))
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("roosty-web.") && name.ends_with(".js"))
-            })
-            .unwrap_or_else(|| panic!("generated frontend JavaScript bundle not found"));
-        let bundle_name = bundle.file_name().unwrap().to_str().unwrap();
+        let html_response = test_router()
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = String::from_utf8(
+            to_bytes(html_response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let bundle_start = html
+            .find("/pkg/roosty-web.")
+            .expect("SSR HTML did not reference a hashed JavaScript bundle");
+        let bundle_end = html[bundle_start..]
+            .find('"')
+            .map(|offset| bundle_start + offset)
+            .expect("JavaScript bundle reference was not quoted");
+        let bundle_path = &html[bundle_start..bundle_end];
 
         let response = test_router()
-            .oneshot(
-                Request::get(format!("/pkg/{bundle_name}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get(bundle_path).body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -681,6 +684,8 @@ mod tests {
             .output_name("roosty-web")
             .site_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/site"))
             .site_pkg_dir("pkg")
+            .hash_file(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/hash.txt").into())
+            .hash_files(true)
             .build();
         let state = TestState {
             options: options.clone(),
