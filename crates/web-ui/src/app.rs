@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use leptos_meta::{Link, Meta, MetaTags, Stylesheet, Title, provide_meta_context};
+use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, Title, provide_meta_context};
 use leptos_router::{
     components::{A, Route, Router, Routes},
     hooks::use_query_map,
@@ -21,7 +21,8 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
                 <AutoReload options=options.clone()/>
-                <HydrationScripts options/>
+                <HydrationScripts options=options.clone()/>
+                <HashedStylesheet id="leptos" options/>
                 <MetaTags/>
             </head>
             <body>
@@ -39,7 +40,6 @@ pub fn App() -> impl IntoView {
     provide_context(bootstrap);
 
     view! {
-        <Stylesheet id="leptos" href="/pkg/roosty-web.css"/>
         <Router>
             <Routes fallback=|| view! { <NotFoundPage/> }>
                 <Route path=path!("") view=WelcomePage/>
