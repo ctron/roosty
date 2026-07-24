@@ -477,10 +477,18 @@ fn instance_brand(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
 
 fn version_attribution(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
     match result {
-        Ok(bootstrap) => {
-            view! { <p>"Powered by Roosty v" {bootstrap.server_version}</p> }.into_any()
+        Ok(bootstrap) => view! {
+            <p>
+                "Powered by "
+                <a href="https://github.com/ctron/roosty">"Roosty"</a>
+                " " {bootstrap.build_identifier}
+            </p>
         }
-        Err(_) => view! { <p>"Powered by Roosty"</p> }.into_any(),
+        .into_any(),
+        Err(_) => view! {
+            <p>"Powered by " <a href="https://github.com/ctron/roosty">"Roosty"</a></p>
+        }
+        .into_any(),
     }
 }
 
@@ -490,12 +498,32 @@ fn session_navigation(
 ) -> AnyView {
     match result {
         Ok(bootstrap) => match bootstrap.account {
-            Some(account) => view! {
-                <span class="session-account">"Welcome, " {account.username}</span>
+            Some(account) => {
+                let initial = account
+                    .display_name
+                    .chars()
+                    .find(|character| !character.is_whitespace())
+                    .or_else(|| account.username.chars().next())
+                    .map(|character| character.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                view! {
+                <span class="session-account" title=account.display_name>
+                    {account.avatar_url.map_or_else(
+                        || view! { <span class="profile-icon" aria-hidden="true">{initial}</span> }.into_any(),
+                        |avatar_url| view! {
+                            <img class="profile-icon" src=avatar_url alt=""/>
+                        }.into_any(),
+                    )}
+                    <span>{account.username}</span>
+                </span>
                 {account.is_admin.then(|| view! { <A href="/admin">"Admin"</A> })}
                 <a href="/auth/edit" rel="external">"Account"</a>
+                <form class="logout-form" method="post" action="/logout">
+                    <button type="submit">"Log out"</button>
+                </form>
+                }
+                .into_any()
             }
-            .into_any(),
             None => {
                 let href = format!("/login?next={login_next}");
                 view! { <a href=href rel="external">"Sign in"</a> }.into_any()

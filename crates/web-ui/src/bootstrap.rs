@@ -10,7 +10,7 @@ pub struct UiBootstrap {
     pub instance_name: String,
     pub instance_description: Option<String>,
     pub public_base_url: String,
-    pub server_version: String,
+    pub build_identifier: String,
     pub account: Option<UiAccount>,
     pub csrf_token: Option<String>,
 }
@@ -21,6 +21,7 @@ pub struct UiAccount {
     pub id: Uuid,
     pub username: String,
     pub display_name: String,
+    pub avatar_url: Option<String>,
     pub is_admin: bool,
 }
 

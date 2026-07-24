@@ -16,7 +16,7 @@ pub enum AuthorizationDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationPageContext {
     pub instance_name: String,
-    pub server_version: String,
+    pub build_identifier: String,
     pub account_username: String,
 }
 
@@ -188,7 +188,7 @@ fn permission_view(permission: AuthorizationPermission) -> impl IntoView {
 fn render_document(title: String, context: AuthorizationPageContext, content: AnyView) -> String {
     let instance_name = context.instance_name;
     let account_username = context.account_username;
-    let server_version = context.server_version;
+    let build_identifier = context.build_identifier;
     view! {
             <!DOCTYPE html>
             <html lang="en">
@@ -206,11 +206,18 @@ fn render_document(title: String, context: AuthorizationPageContext, content: An
                                 <a href="/about">"About"</a>
                                 <span class="session-account">"Welcome, " {account_username}</span>
                                 <a href="/auth/edit">"Account"</a>
+                                <form class="logout-form" method="post" action="/logout">
+                                    <button type="submit">"Log out"</button>
+                                </form>
                             </nav>
                         </header>
                         <main>{content}</main>
                         <footer class="site-footer">
-                            <p>"Powered by Roosty v" {server_version}</p>
+                            <p>
+                                "Powered by "
+                                <a href="https://github.com/ctron/roosty">"Roosty"</a>
+                                " " {build_identifier}
+                            </p>
                         </footer>
                     </div>
                 </body>
@@ -240,7 +247,7 @@ mod tests {
         let html = render_authorization_consent(AuthorizationConsent {
             context: AuthorizationPageContext {
                 instance_name: "Test instance".to_owned(),
-                server_version: "1.2.3".to_owned(),
+                build_identifier: "v1.2.3".to_owned(),
                 account_username: "alice".to_owned(),
             },
             application_name: "<script>alert('x')</script>".to_owned(),
@@ -261,6 +268,8 @@ mod tests {
         assert!(!html.contains("<script>alert('x')</script>"));
         assert!(html.contains("Read account data"));
         assert!(html.contains("Use this application-specific permission"));
+        assert!(html.contains("method=\"post\" action=\"/logout\""));
+        assert!(html.contains("href=\"https://github.com/ctron/roosty\""));
         assert!(!html.contains("roosty-web.js"));
     }
 }

@@ -49,7 +49,11 @@ a:focus-visible, button:focus-visible { outline: 3px solid #d18f00; outline-offs
 .button:hover { background: var(--accent-strong); }
 .site-footer { padding-block: 1.5rem; color: var(--muted); border-top: 1px solid var(--border); }
 .session-placeholder, .session-error { color: var(--muted); }
-.session-account { font-weight: 650; }
+.session-account { display: inline-flex; align-items: center; gap: 0.45rem; font-weight: 650; }
+.profile-icon { width: 2rem; height: 2rem; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 50%; color: white; background: var(--accent); object-fit: cover; font-size: 0.85rem; font-weight: 800; }
+.logout-form { display: inline; margin: 0; }
+.logout-form button { padding: 0; color: var(--accent-strong); background: transparent; border: 0; font: inherit; text-decoration: underline; text-underline-offset: 0.18em; cursor: pointer; }
+.logout-form button:hover { text-decoration-thickness: 2px; }
 .not-found, .panic-page { max-width: 42rem; margin: 10vh auto; padding: 2rem; }
 .panic-page__actions { display: flex; flex-wrap: wrap; gap: 1rem; }
 .admin-page { display: grid; gap: 1.5rem; margin-block: 2rem 4rem; }

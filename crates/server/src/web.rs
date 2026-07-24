@@ -144,6 +144,10 @@ impl UiBackend for RoostyUiBackend {
                         id: account.id.0,
                         username: account.username,
                         display_name: account.display_name,
+                        avatar_url: account
+                            .avatar_file_path
+                            .as_deref()
+                            .map(|path| crate::media::media_url(&state, path)),
                         is_admin: account.is_admin,
                     }),
                 None => None,
@@ -154,7 +158,7 @@ impl UiBackend for RoostyUiBackend {
                 instance_name: state.config.instance_name.clone(),
                 instance_description: state.config.instance_description.clone(),
                 public_base_url: state.config.public_base_url.to_string(),
-                server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                build_identifier: crate::version::build_identifier(),
                 account,
                 csrf_token,
             })
@@ -512,8 +516,8 @@ mod tests {
             assert!(html.contains("<h1>Test Roosty</h1>"));
             assert!(html.contains("class=\"brand\">Test Roosty</a>"));
             assert!(html.contains("A test social server"));
-            assert!(html.contains("Powered by Roosty v"));
-            assert!(html.contains("1.2.3"));
+            assert!(html.contains("href=\"https://github.com/ctron/roosty\">Roosty</a>"));
+            assert!(html.contains("v1.2.3"));
             assert!(html.contains(&format!("<title>{title}</title>")));
             assert!(html.contains(&format!(
                 "href=\"https://roosty.test{path}\" rel=\"canonical\""
@@ -565,9 +569,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Welcome, "));
         assert!(html.contains("alice"));
+        assert!(html.contains("class=\"profile-icon\""));
         assert!(html.contains("href=\"/auth/edit\" rel=\"external\""));
+        assert!(html.contains("method=\"post\" action=\"/logout\""));
         assert!(!html.contains("/login?next="));
     }
 
@@ -600,13 +605,14 @@ mod tests {
                         id: Uuid::nil(),
                         username: "alice".to_owned(),
                         display_name: "Alice".to_owned(),
+                        avatar_url: None,
                         is_admin: false,
                     });
                 Ok(UiBootstrap {
                     instance_name: "Test Roosty".to_owned(),
                     instance_description,
                     public_base_url: "https://roosty.test".to_owned(),
-                    server_version: "1.2.3".to_owned(),
+                    build_identifier: "v1.2.3".to_owned(),
                     account,
                     csrf_token: None,
                 })

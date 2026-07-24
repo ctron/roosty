@@ -688,7 +688,7 @@ fn authorization_page_context(
 ) -> AuthorizationPageContext {
     AuthorizationPageContext {
         instance_name: state.config.instance_name.clone(),
-        server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        build_identifier: crate::version::build_identifier(),
         account_username: account_username.to_owned(),
     }
 }
@@ -2076,7 +2076,7 @@ mod tests {
         assert!(html.contains("Authorize toot"));
         assert!(html.contains("href=\"/pkg/roosty-web.css\""));
         assert!(html.contains("Roosty Test"));
-        assert!(html.contains("Powered by Roosty v"));
+        assert!(html.contains("href=\"https://github.com/ctron/roosty\">Roosty</a>"));
         assert!(html.contains("Read account data"));
         assert!(html.contains("Publish and modify content"));
         assert!(html.contains("Manage follows"));
