@@ -57,10 +57,10 @@ jobs:
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --locked
 
+      - name: Build server-rendered and hydrated frontend
+        run: cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked
+
       - name: Test Rust workspace
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo test --workspace --locked -- --test-threads=8
-
-      - name: Build server-rendered and hydrated frontend
-        run: cargo leptos build --release --lib-cargo-args=--locked --bin-cargo-args=--locked

@@ -31,5 +31,7 @@ COPY --from=builder /usr/local/bin/roosty /usr/local/bin/roosty
 COPY --from=builder /usr/local/bin/hash.txt /usr/local/bin/hash.txt
 COPY --from=builder /usr/local/share/roosty-site /usr/local/share/roosty/site
 
+ENV LEPTOS_HASH_FILES=true
+
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/roosty"]

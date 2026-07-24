@@ -430,6 +430,7 @@ mod tests {
     use leptos_axum::LeptosRoutes;
     use roosty_web_ui::{UiAccount, UiBackend, UiBootstrap, UiServerContext, shell};
     use tower::ServiceExt;
+    use tower_http::services::ServeDir;
     use uuid::Uuid;
 
     /// Given the first UI slice, when Leptos enumerates routes, then both direct entry points are
@@ -541,6 +542,47 @@ mod tests {
         }
     }
 
+    /// Given the hydrated frontend bundle, when it is requested through the application router,
+    /// then the asset is served successfully as JavaScript rather than an HTML fallback.
+    #[tokio::test]
+    async fn serves_hydration_bundle_as_javascript() {
+        let package_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/site/pkg");
+        let bundle = std::fs::read_dir(package_dir)
+            .unwrap_or_else(|error| panic!("failed to read generated frontend assets: {error}"))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("roosty-web.") && name.ends_with(".js"))
+            })
+            .unwrap_or_else(|| panic!("generated frontend JavaScript bundle not found"));
+        let bundle_name = bundle.file_name().unwrap().to_str().unwrap();
+
+        let response = test_router()
+            .oneshot(
+                Request::get(format!("/pkg/{bundle_name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/javascript")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let javascript = String::from_utf8(body.to_vec()).unwrap();
+        assert!(javascript.len() > 100);
+        assert!(!javascript.contains("<html"));
+    }
+
     /// Given an instance without an operator description, when its welcome page is rendered, then
     /// visitors see neutral instance copy rather than project marketing or an empty lead.
     #[tokio::test]
@@ -637,7 +679,7 @@ mod tests {
     fn test_router_with_description(instance_description: Option<String>) -> Router {
         let options = LeptosOptions::builder()
             .output_name("roosty-web")
-            .site_root("target/site")
+            .site_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/site"))
             .site_pkg_dir("pkg")
             .build();
         let state = TestState {
@@ -653,6 +695,13 @@ mod tests {
                 super::ui_routes(),
                 move || provide_context(context.clone()),
                 move || shell(options.clone()),
+            )
+            .nest_service(
+                "/pkg",
+                ServeDir::new(
+                    std::path::Path::new(&*state.options.site_root)
+                        .join(&*state.options.site_pkg_dir),
+                ),
             )
             .with_state(state)
     }
