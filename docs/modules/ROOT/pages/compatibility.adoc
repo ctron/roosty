@@ -331,12 +331,20 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 |
 
 |🟢
+|`GET /api/v1/statuses/:id/favourited_by`
+|Cached-remote statuses expose interactions known to this instance.
+
+|🟢
 |`GET /api/v1/bookmarks`
 |
 
 |🟢
 |Boosts
 |
+
+|🟢
+|`GET /api/v1/statuses/:id/reblogged_by`
+|Cached-remote statuses expose interactions known to this instance.
 
 |🟢
 |Quote posts

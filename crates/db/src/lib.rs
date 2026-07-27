@@ -3608,12 +3608,21 @@ pub struct PublicTimelineOptions {
     pub blocked_remote_domains: Vec<String>,
 }
 
-/// Local or remote actor that boosted a local status.
+/// Local or cached-remote status whose interaction actors are being listed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusInteractionTarget {
+    /// Status authored by a local account.
+    Local(StatusId),
+    /// Status cached from a remote actor.
+    Remote(StatusId),
+}
+
+/// Local or remote actor that interacted with a status.
 #[derive(Clone, Debug)]
-pub enum RebloggedByAccount {
-    /// Local boost actor.
+pub enum StatusInteractionAccount {
+    /// Local interaction actor.
     Local(LocalAccount),
-    /// Remote boost actor.
+    /// Remote interaction actor.
     Remote(RemoteActor),
 }
 
@@ -12464,46 +12473,191 @@ pub async fn local_reblogged_by_for_status(
     })
 }
 
-/// List local and remote accounts that boosted a local status, newest first.
-pub async fn reblogged_by_for_status(
+/// List locally known accounts that favourited a local or cached-remote status, newest first.
+pub async fn favourited_by_for_status(
     db: &DbConnection,
-    status_id: StatusId,
+    target: StatusInteractionTarget,
     limit: u64,
     cursor: CollectionCursor,
-) -> Result<CollectionPage<RebloggedByAccount>> {
-    let local = local_status_reblog::Entity::find()
-        .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
-        .apply_collection_cursor(cursor)
-        .order_by_desc(local_status_reblog::Column::Id)
-        .limit(page_query_limit(limit))
-        .all(db)
-        .await?;
-    let remote = remote_status_reblog::Entity::find()
-        .filter(remote_status_reblog::Column::LocalStatusId.eq(Some(status_id.0)))
-        .apply_collection_cursor(cursor)
-        .order_by_desc(remote_status_reblog::Column::Id)
-        .limit(page_query_limit(limit))
-        .all(db)
+) -> Result<CollectionPage<StatusInteractionAccount>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
         .await?;
     let mut entries = Vec::new();
-    for reblog in local {
-        if let Some(account) = find_local_account_by_id(db, AccountId(reblog.account_id)).await? {
-            entries.push((reblog.id, RebloggedByAccount::Local(account)));
+    match target {
+        StatusInteractionTarget::Local(status_id) => {
+            let local = local_status_favourite::Entity::find()
+                .filter(local_status_favourite::Column::StatusId.eq(status_id.0))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(local_status_favourite::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            let remote = remote_status_favourite::Entity::find()
+                .filter(remote_status_favourite::Column::LocalStatusId.eq(status_id.0))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(remote_status_favourite::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            entries.extend(local.into_iter().map(|favourite| {
+                (
+                    favourite.id,
+                    InteractionActorId::Local(AccountId(favourite.account_id)),
+                )
+            }));
+            entries.extend(remote.into_iter().map(|favourite| {
+                (
+                    favourite.id,
+                    InteractionActorId::Remote(AccountId(favourite.remote_actor_id)),
+                )
+            }));
+        }
+        StatusInteractionTarget::Remote(status_id) => {
+            let local = local_remote_status_favourite::Entity::find()
+                .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(status_id.0))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(local_remote_status_favourite::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            entries.extend(local.into_iter().map(|favourite| {
+                (
+                    favourite.id,
+                    InteractionActorId::Local(AccountId(favourite.local_account_id)),
+                )
+            }));
         }
     }
-    for reblog in remote {
-        if let Some(account) =
-            find_remote_actor_by_id(db, AccountId(reblog.remote_actor_id)).await?
-        {
-            entries.push((reblog.id, RebloggedByAccount::Remote(account)));
+    let page = interaction_accounts_page(&txn, entries, limit).await?;
+    txn.commit().await?;
+    Ok(page)
+}
+
+/// List locally known accounts that boosted a local or cached-remote status, newest first.
+pub async fn reblogged_by_for_status(
+    db: &DbConnection,
+    target: StatusInteractionTarget,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<CollectionPage<StatusInteractionAccount>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let mut entries = Vec::new();
+    match target {
+        StatusInteractionTarget::Local(status_id) => {
+            let local = local_status_reblog::Entity::find()
+                .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(local_status_reblog::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            let remote = remote_status_reblog::Entity::find()
+                .filter(remote_status_reblog::Column::LocalStatusId.eq(Some(status_id.0)))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(remote_status_reblog::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            entries.extend(local.into_iter().map(|reblog| {
+                (
+                    reblog.id,
+                    InteractionActorId::Local(AccountId(reblog.account_id)),
+                )
+            }));
+            entries.extend(remote.into_iter().map(|reblog| {
+                (
+                    reblog.id,
+                    InteractionActorId::Remote(AccountId(reblog.remote_actor_id)),
+                )
+            }));
+        }
+        StatusInteractionTarget::Remote(status_id) => {
+            let local = local_remote_status_reblog::Entity::find()
+                .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status_id.0))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(local_remote_status_reblog::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            let remote = remote_status_reblog::Entity::find()
+                .filter(remote_status_reblog::Column::RemoteStatusId.eq(Some(status_id.0)))
+                .apply_collection_cursor(cursor)
+                .order_by_desc(remote_status_reblog::Column::Id)
+                .limit(page_query_limit(limit))
+                .all(&txn)
+                .await?;
+            entries.extend(local.into_iter().map(|reblog| {
+                (
+                    reblog.id,
+                    InteractionActorId::Local(AccountId(reblog.local_account_id)),
+                )
+            }));
+            entries.extend(remote.into_iter().map(|reblog| {
+                (
+                    reblog.id,
+                    InteractionActorId::Remote(AccountId(reblog.remote_actor_id)),
+                )
+            }));
         }
     }
+    let page = interaction_accounts_page(&txn, entries, limit).await?;
+    txn.commit().await?;
+    Ok(page)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InteractionActorId {
+    Local(AccountId),
+    Remote(AccountId),
+}
+
+async fn interaction_accounts_page(
+    db: &impl ConnectionTrait,
+    mut entries: Vec<(Uuid, InteractionActorId)>,
+    limit: u64,
+) -> Result<CollectionPage<StatusInteractionAccount>> {
     entries.sort_by_key(|(id, _)| Reverse(*id));
     let (entries, has_more) = trim_to_page(entries, limit);
     let first_cursor = entries.first().map(|(id, _)| *id);
     let last_cursor = entries.last().map(|(id, _)| *id);
+    let local_ids = entries
+        .iter()
+        .filter_map(|(_, actor)| match actor {
+            InteractionActorId::Local(id) => Some(*id),
+            InteractionActorId::Remote(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_ids = entries
+        .iter()
+        .filter_map(|(_, actor)| match actor {
+            InteractionActorId::Local(_) => None,
+            InteractionActorId::Remote(id) => Some(*id),
+        })
+        .collect::<Vec<_>>();
+    let local = local_accounts_by_id(db, local_ids).await?;
+    let remote = remote_actors_by_id(db, remote_ids).await?;
+    let mut local = local
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect::<HashMap<_, _>>();
+    let mut remote = remote
+        .into_iter()
+        .map(|actor| (actor.id, actor))
+        .collect::<HashMap<_, _>>();
+    let items = entries
+        .into_iter()
+        .filter_map(|(_, actor)| match actor {
+            InteractionActorId::Local(id) => local.remove(&id).map(StatusInteractionAccount::Local),
+            InteractionActorId::Remote(id) => {
+                remote.remove(&id).map(StatusInteractionAccount::Remote)
+            }
+        })
+        .collect();
     Ok(CollectionPage {
-        items: entries.into_iter().map(|(_, account)| account).collect(),
+        items,
         first_cursor,
         last_cursor,
         has_more,
@@ -12579,6 +12733,33 @@ async fn local_accounts_by_id(
     }
 
     Ok(accounts)
+}
+
+/// Return remote actors in the same order as the provided ids.
+async fn remote_actors_by_id(
+    db: &impl ConnectionTrait,
+    actor_ids: Vec<AccountId>,
+) -> Result<Vec<RemoteActor>> {
+    if actor_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let models = remote_actor::Entity::find()
+        .filter(remote_actor::Column::Id.is_in(actor_ids.iter().map(|id| id.0)))
+        .all(db)
+        .await?;
+    let mut actors_by_id = models
+        .into_iter()
+        .map(|model| (model.id, model))
+        .collect::<HashMap<_, _>>();
+    let mut actors = Vec::with_capacity(actor_ids.len());
+    for actor_id in actor_ids {
+        if let Some(model) = actors_by_id.remove(&actor_id.0) {
+            actors.push(remote_actor_from_model(model));
+        }
+    }
+
+    Ok(actors)
 }
 
 /// Soft-delete a local status when the authenticated account owns it.
@@ -14161,6 +14342,36 @@ impl ApplyCollectionCursor for Select<local_remote_status_favourite::Entity> {
         }
         if let Some(min_id) = cursor.min_id {
             self = self.filter(local_remote_status_favourite::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<remote_status_favourite::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(remote_status_favourite::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(remote_status_favourite::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(remote_status_favourite::Column::Id.gt(min_id));
+        }
+        self
+    }
+}
+
+impl ApplyCollectionCursor for Select<local_remote_status_reblog::Entity> {
+    fn apply_collection_cursor(mut self, cursor: CollectionCursor) -> Self {
+        if let Some(max_id) = cursor.max_id {
+            self = self.filter(local_remote_status_reblog::Column::Id.lt(max_id));
+        }
+        if let Some(since_id) = cursor.since_id {
+            self = self.filter(local_remote_status_reblog::Column::Id.gt(since_id));
+        }
+        if let Some(min_id) = cursor.min_id {
+            self = self.filter(local_remote_status_reblog::Column::Id.gt(min_id));
         }
         self
     }

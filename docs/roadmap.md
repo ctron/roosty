@@ -9,6 +9,7 @@
 - Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
 - Mastodon-compatible private lists with local/remote membership, reply policies, exclusive home-feed filtering, and cursor-paginated list timelines.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
+- Mastodon-compatible favourite and boost actor lists for local and cached-remote statuses, with visibility enforcement and cursor pagination over locally known interactions.
 - Mastodon-compatible safe linkification of explicit web URLs across local API, history, streaming, and outbound ActivityPub projections.
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
 - Mastodon-compatible consent-aware quote posts with transactional policy, authorization, listing, revocation, notifications, and FEP-044f delivery.

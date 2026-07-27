@@ -46,6 +46,8 @@ use crate::{
 
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 40;
+const INTERACTION_ACCOUNTS_DEFAULT_LIMIT: u64 = 40;
+const INTERACTION_ACCOUNTS_MAX_LIMIT: u64 = 80;
 const PUBLIC_CONTEXT_ANCESTORS_LIMIT: usize = 40;
 const PUBLIC_CONTEXT_DESCENDANTS_LIMIT: usize = 60;
 const PUBLIC_CONTEXT_DESCENDANTS_DEPTH: usize = 20;
@@ -107,6 +109,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/statuses/{status_id}/reblogged_by",
             get(reblogged_by),
+        )
+        .route(
+            "/api/v1/statuses/{status_id}/favourited_by",
+            get(favourited_by),
         )
         .route("/api/v1/favourites", get(favourites))
         .route("/api/v1/bookmarks", get(bookmarks))
@@ -2577,30 +2583,79 @@ async fn reblogged_by(
     Path(path): Path<StatusPath>,
     Query(params): Query<CollectionParams>,
 ) -> Response {
+    status_interaction_accounts(state, viewer, path, params, StatusInteractionKind::Reblog).await
+}
+
+async fn favourited_by(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+    Query(params): Query<CollectionParams>,
+) -> Response {
+    status_interaction_accounts(
+        state,
+        viewer,
+        path,
+        params,
+        StatusInteractionKind::Favourite,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum StatusInteractionKind {
+    Favourite,
+    Reblog,
+}
+
+async fn status_interaction_accounts(
+    state: AppState,
+    viewer: Option<roosty_db::LocalAccount>,
+    path: StatusPath,
+    params: CollectionParams,
+    interaction: StatusInteractionKind,
+) -> Response {
     let viewer_id = viewer.as_ref().map(|account| account.id);
     let status_id = StatusId(path.status_id);
-    match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, viewer_id).await {
-            Ok(true) => {}
+    let target = match find_status_context_item(&state.db, status_id).await {
+        Ok(Some(item)) => match status_context_item_visible(&state.db, &item, viewer_id).await {
+            Ok(true) => match item {
+                StatusContextItem::Local(_) => roosty_db::StatusInteractionTarget::Local(status_id),
+                StatusContextItem::Remote(_) => {
+                    roosty_db::StatusInteractionTarget::Remote(status_id)
+                }
+            },
             Ok(false) => return not_found(),
             Err(error) => return server_error(error),
         },
         Ok(None) => return not_found(),
         Err(error) => return server_error(error),
-    }
+    };
 
-    let limit = timeline_limit(params.limit);
+    let limit = interaction_accounts_limit(params.limit);
     let cursor = match collection_cursor(&params) {
         Ok(cursor) => cursor,
         Err(()) => return bad_request("collection cursor is invalid"),
     };
-    match roosty_db::reblogged_by_for_status(&state.db, status_id, limit, cursor).await {
+    let result = match interaction {
+        StatusInteractionKind::Favourite => {
+            roosty_db::favourited_by_for_status(&state.db, target, limit, cursor).await
+        }
+        StatusInteractionKind::Reblog => {
+            roosty_db::reblogged_by_for_status(&state.db, target, limit, cursor).await
+        }
+    };
+    match result {
         Ok(page) => {
-            reblogged_by_response(
+            let suffix = match interaction {
+                StatusInteractionKind::Favourite => "favourited_by",
+                StatusInteractionKind::Reblog => "reblogged_by",
+            };
+            interaction_accounts_response(
                 &state,
                 page,
                 limit,
-                &format!("/api/v1/statuses/{}/reblogged_by", path.status_id),
+                &format!("/api/v1/statuses/{}/{suffix}", path.status_id),
             )
             .await
         }
@@ -3478,31 +3533,24 @@ async fn filter_remote_stream_recipients(
     visible
 }
 
-/// Return mixed local and remote boost actors with Mastodon cursor pagination.
-async fn reblogged_by_response(
+/// Return mixed local and remote interaction actors with Mastodon cursor pagination.
+async fn interaction_accounts_response(
     state: &AppState,
-    page: roosty_db::CollectionPage<roosty_db::RebloggedByAccount>,
+    page: roosty_db::CollectionPage<roosty_db::StatusInteractionAccount>,
     limit: u64,
     path: &str,
 ) -> Response {
-    let link_header = CollectionLink::new(
-        limit,
-        page.first_cursor,
-        page.last_cursor,
-        page.has_more,
-        path,
-    )
-    .header_value();
+    let link_header = interaction_accounts_link_header(&page, limit, path);
     let mut accounts = Vec::with_capacity(page.items.len());
     for account in page.items {
         match account {
-            roosty_db::RebloggedByAccount::Local(account) => {
+            roosty_db::StatusInteractionAccount::Local(account) => {
                 match account_response(state, account).await {
                     Ok(account) => accounts.push(StatusAccountResponse::Local(Box::new(account))),
                     Err(error) => return server_error(error),
                 }
             }
-            roosty_db::RebloggedByAccount::Remote(actor) => {
+            roosty_db::StatusInteractionAccount::Remote(actor) => {
                 match remote_account_response(state, actor).await {
                     Ok(account) => accounts.push(StatusAccountResponse::Remote(Box::new(account))),
                     Err(error) => return server_error(error),
@@ -5067,6 +5115,12 @@ pub(crate) fn timeline_limit(limit: Option<u64>) -> u64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
+fn interaction_accounts_limit(limit: Option<u64>) -> u64 {
+    limit
+        .unwrap_or(INTERACTION_ACCOUNTS_DEFAULT_LIMIT)
+        .clamp(1, INTERACTION_ACCOUNTS_MAX_LIMIT)
+}
+
 fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputError> {
     Ok(TimelineQuery {
         limit: timeline_limit(params.limit),
@@ -5235,6 +5289,22 @@ impl<'a> CollectionLink<'a> {
         );
         HeaderValue::from_str(&value).ok()
     }
+}
+
+fn interaction_accounts_link_header(
+    page: &roosty_db::CollectionPage<roosty_db::StatusInteractionAccount>,
+    limit: u64,
+    path: &str,
+) -> Option<HeaderValue> {
+    if !page.has_more {
+        return None;
+    }
+    let first = page.first_cursor?;
+    let last = page.last_cursor?;
+    HeaderValue::from_str(&format!(
+        r#"<{path}?limit={limit}&since_id={first}>; rel="prev", <{path}?limit={limit}&max_id={last}>; rel="next""#
+    ))
+    .ok()
 }
 
 /// Parse an optional UUID cursor from Mastodon collection query parameters.
@@ -5803,8 +5873,8 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::{AccountId, StatusId};
     use roosty_db::{
-        NewRemoteMediaAttachment, NewRemoteStatus, RemoteActor, RemoteStatus, StatusContextParent,
-        StatusVisibility,
+        NewRemoteMediaAttachment, NewRemoteStatus, RemoteActor, RemoteStatus,
+        RemoteStatusReblogTarget, StatusContextParent, StatusVisibility,
     };
     use roosty_migration::Migrator;
     use sea_orm::TransactionTrait;
@@ -5819,8 +5889,8 @@ mod tests {
 
     use super::{
         StatusContextLimits, StatusPermission, escape_html, has_status_scope, hashtag_names,
-        mention_usernames, push_url_html, remote_mention_matches, status_content_html,
-        timeline_limit, url_matches,
+        interaction_accounts_limit, mention_usernames, push_url_html, remote_mention_matches,
+        status_content_html, timeline_limit, url_matches,
     };
     use crate::{config::Config, http::AppState, password};
 
@@ -5836,6 +5906,14 @@ mod tests {
         assert_eq!(authenticated.ancestors, 4_096);
         assert_eq!(authenticated.descendants, 4_096);
         assert_eq!(authenticated.descendants_depth, None);
+    }
+
+    #[test]
+    fn interaction_account_limits_match_mastodon_defaults() {
+        assert_eq!(interaction_accounts_limit(None), 40);
+        assert_eq!(interaction_accounts_limit(Some(0)), 1);
+        assert_eq!(interaction_accounts_limit(Some(80)), 80);
+        assert_eq!(interaction_accounts_limit(Some(100)), 80);
     }
 
     #[test]
@@ -8329,6 +8407,243 @@ mod tests {
             account_usernames(&json_body(next_page).await),
             serde_json::json!(["alice"])
         );
+
+        let remote = context.cache_remote_actor("remote-reblogger").await;
+        roosty_db::reblog_status_by_remote_actor(
+            &context.db,
+            remote.id,
+            RemoteStatusReblogTarget::Local(StatusId(status_id.parse().unwrap())),
+            "https://remote.test/announces/local-status",
+        )
+        .await
+        .unwrap();
+        let mixed = context
+            .get(&format!("/api/v1/statuses/{status_id}/reblogged_by"))
+            .await;
+        assert_eq!(
+            account_usernames(&json_body(mixed).await),
+            json!(["remote-reblogger", "carol", "bob", "alice"])
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given several favourites, when Elk pages `favourited_by`, then Account arrays and opaque
+    /// Mastodon cursors are returned.
+    async fn favourited_by_uses_cursor_pagination(context: &mut StatusContext) {
+        let owner_token = context.access_token().await;
+        let alice_token = context
+            .access_token_for("alice", "alice-favourited-by@example.com")
+            .await;
+        let bob_token = context
+            .access_token_for("bob", "bob-favourited-by@example.com")
+            .await;
+        let carol_token = context
+            .access_token_for("carol", "carol-favourited-by@example.com")
+            .await;
+        let status = context
+            .create_status(&owner_token, "favourite target", None, None)
+            .await;
+        let status_id = status["id"].as_str().unwrap();
+
+        for token in [&alice_token, &bob_token, &carol_token] {
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/favourite"),
+                    token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let page = context
+            .authenticated_get(
+                &format!("/api/v1/statuses/{status_id}/favourited_by?limit=2"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let next_cursor = link_cursor(&page, "next", "max_id");
+        let _previous_cursor = link_cursor(&page, "prev", "since_id");
+        assert_eq!(
+            account_usernames(&json_body(page).await),
+            serde_json::json!(["carol", "bob"])
+        );
+
+        let next_page = context
+            .authenticated_get(
+                &format!("/api/v1/statuses/{status_id}/favourited_by?limit=2&max_id={next_cursor}"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(
+            account_usernames(&json_body(next_page).await),
+            serde_json::json!(["alice"])
+        );
+
+        for cursor in ["since_id", "min_id"] {
+            let newer = context
+                .authenticated_get(
+                    &format!(
+                        "/api/v1/statuses/{status_id}/favourited_by?limit=2&{cursor}={next_cursor}"
+                    ),
+                    &owner_token,
+                )
+                .await;
+            assert_eq!(
+                account_usernames(&json_body(newer).await),
+                serde_json::json!(["carol"])
+            );
+        }
+
+        let remote = context.cache_remote_actor("remote-favouriter").await;
+        roosty_db::favourite_local_status_by_remote_actor(
+            &context.db,
+            remote.id,
+            StatusId(status_id.parse().unwrap()),
+            "https://remote.test/likes/local-status",
+        )
+        .await
+        .unwrap();
+        let mixed = context
+            .get(&format!("/api/v1/statuses/{status_id}/favourited_by"))
+            .await;
+        assert_eq!(
+            account_usernames(&json_body(mixed).await),
+            json!(["remote-favouriter", "carol", "bob", "alice"])
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a cached remote status, when Elk requests interaction actors, then locally known
+    /// favourites and boosts are returned without treating the status as missing.
+    async fn remote_status_interaction_accounts_are_available_to_elk(context: &mut StatusContext) {
+        let viewer_token = context.access_token().await;
+        let local_token = context
+            .access_token_for("local-interactor", "local-interactor@example.com")
+            .await;
+        let local = roosty_db::find_local_account_by_username(&context.db, "local-interactor")
+            .await
+            .unwrap()
+            .unwrap();
+        let author = context.cache_remote_actor("remote-author").await;
+        let remote_booster = context.cache_remote_actor("remote-booster").await;
+        let status = context
+            .cache_remote_status(&author, "remote interaction target", None)
+            .await;
+
+        roosty_db::favourite_remote_status(
+            &context.db,
+            local.id,
+            status.id,
+            "https://localhost.test/likes/local",
+        )
+        .await
+        .unwrap();
+        roosty_db::reblog_remote_status(
+            &context.db,
+            local.id,
+            status.id,
+            "https://localhost.test/announces/local",
+        )
+        .await
+        .unwrap();
+        roosty_db::reblog_status_by_remote_actor(
+            &context.db,
+            remote_booster.id,
+            RemoteStatusReblogTarget::Remote(status.id),
+            "https://remote.test/announces/remote",
+        )
+        .await
+        .unwrap();
+
+        let favourited_by = context
+            .authenticated_get(
+                &format!("/api/v1/statuses/{}/favourited_by", status.id.0),
+                &viewer_token,
+            )
+            .await;
+        assert_eq!(favourited_by.status(), StatusCode::OK);
+        assert_eq!(
+            account_usernames(&json_body(favourited_by).await),
+            json!(["local-interactor"])
+        );
+
+        let reblogged_by = context
+            .authenticated_get(
+                &format!("/api/v1/statuses/{}/reblogged_by", status.id.0),
+                &local_token,
+            )
+            .await;
+        assert_eq!(reblogged_by.status(), StatusCode::OK);
+        assert_eq!(
+            account_usernames(&json_body(reblogged_by).await),
+            json!(["remote-booster", "local-interactor"])
+        );
+
+        let empty = context
+            .cache_remote_status(&author, "remote empty target", None)
+            .await;
+        for suffix in ["favourited_by", "reblogged_by"] {
+            let response = context
+                .get(&format!("/api/v1/statuses/{}/{suffix}", empty.id.0))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(json_body(response).await.as_array().unwrap().is_empty());
+        }
+
+        let invalid_cursor = context
+            .get(&format!(
+                "/api/v1/statuses/{}/favourited_by?max_id=invalid",
+                status.id.0
+            ))
+            .await;
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a private cached Note, interaction lists remain hidden anonymously and available to
+    /// an explicit local recipient.
+    async fn remote_interaction_accounts_follow_status_visibility(context: &mut StatusContext) {
+        let viewer_token = context.access_token().await;
+        let author = context.cache_remote_actor("private-author").await;
+        let now = OffsetDateTime::now_utc();
+        let status = roosty_db::upsert_remote_status(
+            &context.db,
+            NewRemoteStatus {
+                activitypub_id: format!("https://remote.test/statuses/{}", Uuid::now_v7()),
+                remote_actor_id: author.id,
+                content: "private remote interaction target".to_owned(),
+                visibility: StatusVisibility::Private,
+                published_at: now,
+                updated_at: now,
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({}),
+                tag_names: Vec::new(),
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let txn = context.db.begin().await.unwrap();
+        roosty_db::replace_remote_status_local_recipients(&txn, status.id, &[context.account_id])
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        for suffix in ["favourited_by", "reblogged_by"] {
+            let path = format!("/api/v1/statuses/{}/{suffix}", status.id.0);
+            assert_eq!(context.get(&path).await.status(), StatusCode::NOT_FOUND);
+            let authorized = context.authenticated_get(&path, &viewer_token).await;
+            assert_eq!(authorized.status(), StatusCode::OK);
+            assert!(json_body(authorized).await.as_array().unwrap().is_empty());
+        }
     }
 
     #[test_context(StatusContext)]
@@ -9160,6 +9475,9 @@ mod tests {
         let anonymous_reblogged_by = context
             .get(&format!("/api/v1/statuses/{status_id}/reblogged_by"))
             .await;
+        let anonymous_favourited_by = context
+            .get(&format!("/api/v1/statuses/{status_id}/favourited_by"))
+            .await;
         let owner = context
             .authenticated_empty(
                 "POST",
@@ -9170,8 +9488,29 @@ mod tests {
 
         assert_eq!(forbidden.status(), StatusCode::BAD_REQUEST);
         assert_eq!(anonymous_reblogged_by.status(), StatusCode::NOT_FOUND);
+        assert_eq!(anonymous_favourited_by.status(), StatusCode::NOT_FOUND);
         assert_eq!(owner.status(), StatusCode::OK);
         assert_eq!(json_body(owner).await["reblogged"], true);
+
+        let owner_favourite = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/statuses/{status_id}/favourite"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(owner_favourite.status(), StatusCode::OK);
+        let owner_favourited_by = context
+            .authenticated_get(
+                &format!("/api/v1/statuses/{status_id}/favourited_by"),
+                &owner_token,
+            )
+            .await;
+        assert_eq!(owner_favourited_by.status(), StatusCode::OK);
+        assert_eq!(
+            account_usernames(&json_body(owner_favourited_by).await),
+            json!(["admin"])
+        );
     }
 
     #[test_context(StatusContext)]
