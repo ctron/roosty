@@ -7,6 +7,7 @@ mod app;
 mod authorization;
 mod bootstrap;
 mod forms;
+mod ui;
 
 #[cfg(feature = "ssr")]
 pub use app::stylesheet_href;
@@ -18,17 +19,19 @@ pub use authorization::{
     render_authorization_consent, render_out_of_band_authorization,
 };
 pub use bootstrap::{
-    UiAccount, UiAdminAccount, UiAdminAuditEntry, UiAdminDashboard, UiAdminJob, UiAdminJobSummary,
-    UiBackend, UiBootstrap, UiServerContext,
+    UiAccount, UiAdminAccount, UiAdminAccounts, UiAdminAuditEntry, UiAdminAuditLog, UiAdminJob,
+    UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext,
 };
 pub use forms::{LoginError, PasswordChangeResult};
 
 #[cfg(feature = "hydrate")]
 fn panic_body(_: browser_panic_hook::PanicDetails<'_>) -> String {
-    r#"<main class="panic-page">
-<h1>Roosty needs a fresh start</h1>
+    r#"<main class="card border-base-300 bg-base-100 mx-auto my-12 w-full max-w-2xl border shadow-xl">
+<div class="card-body">
+<h1 class="card-title text-3xl">Roosty needs a fresh start</h1>
 <p>The browser application stopped unexpectedly. Details were written to the browser console.</p>
-<p class="panic-page__actions"><a href="">Reload this page</a><a href="/">Return home</a></p>
+<div class="card-actions"><a class="btn btn-primary" href="">Reload this page</a><a class="btn btn-ghost" href="/">Return home</a></div>
+</div>
 </main>"#
         .to_owned()
 }

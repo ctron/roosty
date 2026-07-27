@@ -5,6 +5,21 @@ the server, serves the generated CSS, JavaScript, and WebAssembly assets, and ex
 scoped server functions for hydrated interactions. Caddy remains a reverse proxy and does not own
 frontend routing.
 
+== Component system
+
+The first-party UI uses daisyUI 5 components and standard Tailwind utilities. Roosty overrides only the colors of
+daisyUI's light and dark themes, retaining its green accent and neutral surfaces with automatic system color-scheme
+behavior. Typography, radii, sizing, borders, depth, motion, and component behavior use framework defaults. Reusable
+Leptos components own repeated navigation, account menus, cards, headings, administrator panels, fields, notices,
+and confirmation controls, while native links, buttons, inputs, forms, tables, and `details` elements retain their
+browser semantics.
+
+New controls and layouts should use daisyUI component classes and standard Tailwind utilities instead of authored CSS
+selectors. The stylesheet is reserved for loading Tailwind and daisyUI and declaring the two Roosty color palettes.
+The daisyUI standalone build plugins are pinned and vendored below `crates/web-ui/style/vendor` because Cargo Leptos
+uses Tailwind's standalone executable. Update both plugin files, their checksums, and the versioned license link
+together when upgrading daisyUI.
+
 == Route ownership
 
 UI routes are registered explicitly from the Leptos route list. The initial routes are `/` and
@@ -52,16 +67,18 @@ functions must validate both the session and a CSRF token.
 
 == Administration
 
-Administrators have an SSR and hydrated operations interface at `/admin`, with account and audit
-deep links at `/admin/accounts` and `/admin/audit-log`. The navigation link is projected only for
-accounts whose persisted `is_admin` flag is set, and the server independently protects every admin
-route. Anonymous requests return through login; authenticated non-administrators receive a
-forbidden response.
+Administrators have an SSR and hydrated operations interface with a responsive category menu:
+work queue at `/admin`, accounts at `/admin/accounts`, and audit log at `/admin/audit-log`. The
+navigation link is projected only for accounts whose persisted `is_admin` flag is set, and the
+server independently protects every admin route. Anonymous requests return through login;
+authenticated non-administrators receive a forbidden response.
 
-The dashboard reads durable queue health from PostgreSQL so multiple server and worker processes
-share the same view. It polls every 15 seconds while the document is visible and exposes only job
-kind, lifecycle state, attempts, scheduling timestamps, and bounded error text. Raw job payloads
-are never sent to the UI. Process-local Prometheus metrics remain infrastructure endpoints.
+Each category has a separate JSON GET loader and queries only the data it presents. The active
+category refetches every 15 seconds while the document is visible, and its Refresh button triggers
+the same in-place request without a page reload. These responses are marked `Cache-Control:
+no-store`. Queue data exposes only job kind, lifecycle state, attempts, scheduling timestamps, and
+bounded error text. Raw job payloads are never sent to the UI. Process-local Prometheus metrics
+remain infrastructure endpoints.
 
 Account creation, password reset, and local or cached-remote account limits use native forms with
 a session-bound HMAC CSRF token. Mutations and their audit records commit in one transaction.
@@ -81,7 +98,8 @@ render a local result. Elk and Phanpy remain independent full Mastodon clients.
 
 Install Cargo Leptos 0.3.7 and the wasm-bindgen CLI matching the workspace's wasm-bindgen
 dependency (currently 0.2.126). Cargo Leptos downloads the pinned Tailwind CSS 4.3.3 standalone
-CLI when `LEPTOS_TAILWIND_VERSION=v4.3.3` is set. Set that variable alongside
+CLI when `LEPTOS_TAILWIND_VERSION=v4.3.3` is set. The vendored daisyUI plugins are loaded by that
+standalone executable, so frontend builds do not require Node.js dependencies. Set that variable alongside
 `LEPTOS_WASM_OPT_VERSION=version_131` when invoking Cargo Leptos; CI, release, and container builds
 set both automatically. Because Cargo Leptos prefers an
 existing executable, any `wasm-opt` already on `PATH` must also be version 131. `cargo leptos build`

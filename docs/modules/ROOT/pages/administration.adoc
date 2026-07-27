@@ -8,16 +8,15 @@ For initial deployment, DNS, environment variables, and Ansible parameters, see 
 Sign in with an administrator account and open `/admin`.
 Roosty only shows the administration navigation to administrators, and the server independently protects every administrator route.
 
-The interface includes:
+The responsive administration menu separates the interface into:
 
-* Queue health and sanitized job diagnostics.
-* Local and cached-remote account management.
-* Account creation and password resets.
-* Account limits.
-* An audit log of administrator actions.
+* Work queue at `/admin`, with durable queue health and sanitized job diagnostics.
+* Accounts at `/admin/accounts`, with local and cached-remote account management, account creation, password resets, and account limits.
+* Audit log at `/admin/audit-log`, with recent administrator actions.
 
-Account and audit details are available at `/admin/accounts` and `/admin/audit-log`.
-The dashboard reads durable state from PostgreSQL, so it represents work across all Roosty server and worker processes using the database.
+Each active category refreshes its own JSON data every 15 seconds while the page is visible.
+The Refresh button performs the same in-place fetch; neither refresh mechanism reloads the document.
+The interface reads durable state from PostgreSQL, so it represents work across all Roosty server and worker processes using the database.
 
 == Create accounts
 
@@ -51,7 +50,7 @@ See the xref:compatibility.adoc[compatibility matrix] for the current Mastodon a
 
 == Inspect background work
 
-The dashboard summarizes durable queue health and provides sanitized job diagnostics.
+The work queue summarizes durable queue health and provides sanitized job diagnostics.
 Use it to identify delayed or repeatedly failing federation, media, notification, and scheduled-status work.
 
 Diagnostics omit raw job payloads and secrets.

@@ -5,9 +5,20 @@ use leptos_router::{
     hooks::use_query_map,
     path,
 };
+use serde::{Serialize, de::DeserializeOwned};
 
-use crate::bootstrap::{UiAdminDashboard, UiBootstrap, load_admin_dashboard, load_bootstrap};
-use crate::forms::{LoginError, PasswordChangeResult};
+use crate::{
+    bootstrap::{
+        UiAdminAccounts, UiAdminAuditLog, UiAdminWorkQueue, UiBootstrap, load_admin_accounts,
+        load_admin_audit_log, load_admin_work_queue, load_bootstrap,
+    },
+    forms::{LoginError, PasswordChangeResult},
+    ui::{
+        AccountMenu, AdminLayout, AdminPanel, AdminSection, ConfirmationCheckbox, FormField, Hero,
+        Notice, NoticeKind, Page, PageCard, PageCardKind, PageCardTitle, PageTitle, SiteFooter,
+        SiteHeader,
+    },
+};
 
 type BootstrapResource = Resource<Result<UiBootstrap, ServerFnError>>;
 const DEFAULT_INSTANCE_DESCRIPTION: &str = "A place to connect on the social web.";
@@ -69,87 +80,201 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("about") view=AboutPage/>
                 <Route path=path!("login") view=LoginPage/>
                 <Route path=path!("auth/edit") view=ChangePasswordPage/>
-                <Route path=path!("admin") view=AdminPage/>
-                <Route path=path!("admin/accounts") view=AdminPage/>
-                <Route path=path!("admin/audit-log") view=AdminPage/>
+                <Route path=path!("admin") view=AdminWorkQueuePage/>
+                <Route path=path!("admin/jobs") view=AdminWorkQueuePage/>
+                <Route path=path!("admin/accounts") view=AdminAccountsPage/>
+                <Route path=path!("admin/audit-log") view=AdminAuditLogPage/>
             </Routes>
         </Router>
     }
 }
 
 #[component]
-fn AdminPage() -> impl IntoView {
+fn AdminWorkQueuePage() -> impl IntoView {
     let bootstrap = expect_context::<BootstrapResource>();
-    let query = use_query_map().get().get("q").unwrap_or_default();
-    let search_value = query.clone();
-    let dashboard = Resource::new_blocking(move || query.clone(), load_admin_dashboard);
-    #[cfg(feature = "hydrate")]
-    {
-        let dashboard = dashboard.clone();
-        set_interval(
-            move || {
-                if !document().hidden() {
-                    dashboard.refetch();
-                }
-            },
-            std::time::Duration::from_secs(15),
-        );
-    }
+    let work_queue = Resource::new_blocking(|| (), |_| load_admin_work_queue());
+    install_periodic_refresh(work_queue);
+
     view! {
-        <PageMetadata bootstrap page_title="Administration" path="/admin"/>
-        <PageFrame bootstrap login_next="/admin">
-            <Suspense fallback=|| view! { <p>"Loading administrator dashboard…"</p> }>
-                {Suspend::new(async move {
-                    match dashboard.await {
-                        Ok(dashboard) => admin_dashboard_content(dashboard, search_value),
-                        Err(_) => view! {
-                            <section class="form-card">
-                                <h1>"Could not load administration"</h1>
-                                <p>"The administrator dashboard could not load its operational data. Try again or check the server logs."</p>
-                            </section>
-                        }.into_any(),
-                    }
-                })}
-            </Suspense>
+        <PageMetadata bootstrap page_title="Work queue" path="/admin"/>
+        <PageFrame bootstrap login_next="/admin" wide=true>
+            <AdminLayout active=AdminSection::WorkQueue>
+                <AdminPageHeading title="Work queue" resource=work_queue/>
+                <Transition fallback=|| admin_loading("Loading durable work…")>
+                    {Suspend::new(async move {
+                        match work_queue.await {
+                            Ok(work_queue) => admin_work_queue_content(work_queue),
+                            Err(_) => admin_load_error("work queue"),
+                        }
+                    })}
+                </Transition>
+            </AdminLayout>
         </PageFrame>
     }
 }
 
-fn admin_dashboard_content(dashboard: UiAdminDashboard, search_value: String) -> AnyView {
-    let csrf_create = dashboard.csrf_token.clone();
-    let csrf_actions = dashboard.csrf_token;
-    let summary = dashboard.summary;
-    let jobs = dashboard.jobs;
-    let accounts = dashboard.accounts;
-    let audit_entries = dashboard.audit_entries;
+#[component]
+fn AdminAccountsPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let query = use_query_map().get().get("q").unwrap_or_default();
+    let search_value = query.clone();
+    let accounts = Resource::new_blocking(move || query.clone(), load_admin_accounts);
+    install_periodic_refresh(accounts);
+
     view! {
-        <section class="admin-page">
-            <div class="admin-heading">
-                <div>
-                    <p class="eyebrow">"Instance operations"</p>
-                    <h1>"Administration"</h1>
-                </div>
-                <a class="button button--secondary" href="/admin">"Refresh"</a>
+        <PageMetadata bootstrap page_title="Accounts" path="/admin/accounts"/>
+        <PageFrame bootstrap login_next="/admin/accounts" wide=true>
+            <AdminLayout active=AdminSection::Accounts>
+                <AdminPageHeading title="Accounts" resource=accounts/>
+                <Transition fallback=|| admin_loading("Loading accounts…")>
+                    {Suspend::new(async move {
+                        match accounts.await {
+                            Ok(accounts) => admin_accounts_content(accounts, search_value),
+                            Err(_) => admin_load_error("accounts"),
+                        }
+                    })}
+                </Transition>
+            </AdminLayout>
+        </PageFrame>
+    }
+}
+
+#[component]
+fn AdminAuditLogPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let audit_log = Resource::new_blocking(|| (), |_| load_admin_audit_log());
+    install_periodic_refresh(audit_log);
+
+    view! {
+        <PageMetadata bootstrap page_title="Audit log" path="/admin/audit-log"/>
+        <PageFrame bootstrap login_next="/admin/audit-log" wide=true>
+            <AdminLayout active=AdminSection::AuditLog>
+                <AdminPageHeading title="Audit log" resource=audit_log/>
+                <Transition fallback=|| admin_loading("Loading administrator activity…")>
+                    {Suspend::new(async move {
+                        match audit_log.await {
+                            Ok(audit_log) => admin_audit_log_content(audit_log),
+                            Err(_) => admin_load_error("audit log"),
+                        }
+                    })}
+                </Transition>
+            </AdminLayout>
+        </PageFrame>
+    }
+}
+
+#[component]
+fn AdminPageHeading<T>(title: &'static str, resource: Resource<T>) -> impl IntoView
+where
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+{
+    let refresh = resource;
+    view! {
+        <section class="grid gap-4 py-8">
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+                <PageTitle>{title}</PageTitle>
+                <button
+                    class="btn btn-outline"
+                    type="button"
+                    on:click=move |_| {
+                        refresh.refetch();
+                    }
+                >
+                    "Refresh"
+                </button>
             </div>
-            <p class="admin-refresh-note">"Operational data refreshes every 15 seconds while this page is visible."</p>
-            <div class="admin-summary" aria-label="Durable queue summary">
-                <article><strong>{summary.due}</strong><span>"Due"</span></article>
-                <article><strong>{summary.in_progress}</strong><span>"In progress"</span></article>
-                <article><strong>{summary.scheduled_retries}</strong><span>"Scheduled retries"</span></article>
-                <article><strong>{summary.permanently_failed}</strong><span>"Permanent failures"</span></article>
+            <p class="text-base-content/70">
+                "Data refreshes every 15 seconds while this page is visible."
+            </p>
+        </section>
+    }
+}
+
+#[cfg(feature = "hydrate")]
+fn install_periodic_refresh<T>(resource: Resource<T>)
+where
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+{
+    if let Ok(handle) = set_interval_with_handle(
+        move || {
+            if !document().hidden() {
+                resource.refetch();
+            }
+        },
+        std::time::Duration::from_secs(15),
+    ) {
+        on_cleanup(move || handle.clear());
+    }
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn install_periodic_refresh<T>(_resource: Resource<T>)
+where
+    T: Send + Sync + 'static,
+{
+}
+
+fn admin_loading(message: &'static str) -> AnyView {
+    view! {
+        <div class="py-8">
+            <span class="loading loading-spinner" aria-hidden="true"></span>
+            <span class="ml-3">{message}</span>
+        </div>
+    }
+    .into_any()
+}
+
+fn admin_load_error(category: &'static str) -> AnyView {
+    view! {
+        <Notice kind=NoticeKind::Error>
+            "Could not load the administrator " {category} ". Try again or check the server logs."
+        </Notice>
+    }
+    .into_any()
+}
+
+fn admin_work_queue_content(work_queue: UiAdminWorkQueue) -> AnyView {
+    let summary = work_queue.summary;
+    view! {
+        <section class="grid gap-6 pb-8">
+            <div
+                class="stats stats-vertical bg-base-100 w-full shadow lg:stats-horizontal"
+                aria-label="Durable queue summary"
+            >
+                <article class="stat">
+                    <strong class="stat-value">{summary.due}</strong>
+                    <span class="stat-title">"Due"</span>
+                </article>
+                <article class="stat">
+                    <strong class="stat-value">{summary.in_progress}</strong>
+                    <span class="stat-title">"In progress"</span>
+                </article>
+                <article class="stat">
+                    <strong class="stat-value">{summary.scheduled_retries}</strong>
+                    <span class="stat-title">"Scheduled retries"</span>
+                </article>
+                <article class="stat">
+                    <strong class="stat-value">{summary.permanently_failed}</strong>
+                    <span class="stat-title">"Permanent failures"</span>
+                </article>
             </div>
             {summary.oldest_due_at.map(|timestamp| view! {
-                <p class="form-message form-message--error">
-                    "Oldest due job: " {timestamp}
-                </p>
+                <Notice kind=NoticeKind::Error>"Oldest due job: " {timestamp}</Notice>
             })}
-            <section class="admin-panel">
-                <h2>"Durable work"</h2>
-                <div class="table-scroll">
-                    <table>
-                        <thead><tr><th>"Kind"</th><th>"State"</th><th>"Attempts"</th><th>"Run after"</th><th>"Last error"</th></tr></thead>
+            <AdminPanel title="Durable work">
+                <div class="overflow-x-auto">
+                    <table class="table table-zebra">
+                        <thead>
+                            <tr>
+                                <th>"Kind"</th>
+                                <th>"State"</th>
+                                <th>"Attempts"</th>
+                                <th>"Run after"</th>
+                                <th>"Last error"</th>
+                            </tr>
+                        </thead>
                         <tbody>
-                            {jobs.into_iter().map(|job| view! {
+                            {work_queue.jobs.into_iter().map(|job| view! {
                                 <tr>
                                     <td><code>{job.kind}</code></td>
                                     <td>{job.state}</td>
@@ -161,30 +286,67 @@ fn admin_dashboard_content(dashboard: UiAdminDashboard, search_value: String) ->
                         </tbody>
                     </table>
                 </div>
-            </section>
-            <section class="admin-panel">
-                <h2>"Create local account"</h2>
-                <form method="post" action="/admin/accounts">
+            </AdminPanel>
+        </section>
+    }
+    .into_any()
+}
+
+fn admin_accounts_content(accounts: UiAdminAccounts, search_value: String) -> AnyView {
+    let csrf_create = accounts.csrf_token.clone();
+    let csrf_actions = accounts.csrf_token;
+    view! {
+        <section class="grid gap-6 pb-8">
+            <AdminPanel title="Create local account">
+                <form class="fieldset max-w-xl gap-4" method="post" action="/admin/accounts">
                     <input type="hidden" name="csrf_token" value=csrf_create/>
-                    <label class="form-field"><span>"Username"</span><input name="username" required minlength="2" maxlength="30"/></label>
-                    <label class="form-field"><span>"Email"</span><input name="email" type="email" required/></label>
-                    <label class="checkbox-field"><input name="admin" type="checkbox" value="true"/><span>"Grant full administrator privileges"</span></label>
-                    <label class="checkbox-field"><input type="checkbox" required/><span>"I confirm this account creation and understand that administrator access is unrestricted."</span></label>
-                    <button type="submit">"Create account"</button>
+                    <FormField label="Username">
+                        <input class="input w-full" name="username" required minlength="2" maxlength="30"/>
+                    </FormField>
+                    <FormField label="Email">
+                        <input class="input w-full" name="email" type="email" required/>
+                    </FormField>
+                    <label class="label justify-start gap-3">
+                        <input class="checkbox" name="admin" type="checkbox" value="true"/>
+                        <span>"Grant full administrator privileges"</span>
+                    </label>
+                    <label class="label items-start justify-start gap-3">
+                        <input class="checkbox" type="checkbox" required/>
+                        <span>
+                            "I confirm this account creation and understand that administrator access is unrestricted."
+                        </span>
+                    </label>
+                    <button class="btn btn-primary" type="submit">"Create account"</button>
                 </form>
-            </section>
-            <section class="admin-panel">
-                <h2>"Accounts"</h2>
-                <form class="admin-search" method="get" action="/admin">
-                    <label class="form-field"><span>"Search accounts"</span><input name="q" value=search_value placeholder="Username, display name, email, or domain"/></label>
-                    <button type="submit">"Search"</button>
-                    <a href="/admin">"Clear"</a>
+            </AdminPanel>
+            <AdminPanel title="Accounts">
+                <form class="fieldset max-w-xl gap-4" method="get" action="/admin/accounts">
+                    <FormField label="Search accounts">
+                        <input
+                            class="input w-full"
+                            name="q"
+                            value=search_value
+                            placeholder="Username, display name, email, or domain"
+                        />
+                    </FormField>
+                    <div class="card-actions">
+                        <button class="btn btn-primary" type="submit">"Search"</button>
+                        <A attr:class="btn btn-ghost" href="/admin/accounts">"Clear"</A>
+                    </div>
                 </form>
-                <div class="table-scroll">
-                    <table>
-                        <thead><tr><th>"Account"</th><th>"Origin"</th><th>"Role"</th><th>"State"</th><th>"Actions"</th></tr></thead>
+                <div class="overflow-x-auto">
+                    <table class="table table-zebra">
+                        <thead>
+                            <tr>
+                                <th>"Account"</th>
+                                <th>"Origin"</th>
+                                <th>"Role"</th>
+                                <th>"State"</th>
+                                <th>"Actions"</th>
+                            </tr>
+                        </thead>
                         <tbody>
-                            {accounts.into_iter().map(|account| {
+                            {accounts.accounts.into_iter().map(|account| {
                                 let account_id = account.id.to_string();
                                 let reset_id = account_id.clone();
                                 let csrf_limit = csrf_actions.clone();
@@ -196,22 +358,46 @@ fn admin_dashboard_content(dashboard: UiAdminDashboard, search_value: String) ->
                                 );
                                 view! {
                                     <tr>
-                                        <td><strong>{handle}</strong><br/><small>{account.display_name}</small></td>
+                                        <td>
+                                            <strong>{handle}</strong>
+                                            <br/>
+                                            <small>{account.display_name}</small>
+                                        </td>
                                         <td>{if account.domain.is_some() { "Remote" } else { "Local" }}</td>
                                         <td>{if account.is_admin { "Admin" } else { "User" }}</td>
                                         <td>{if account.limited { "Limited" } else { "Active" }}</td>
-                                        <td class="admin-actions">
-                                            <form method="post" action=format!("/admin/accounts/{account_id}/limit")>
+                                        <td class="flex flex-wrap gap-2">
+                                            <form
+                                                class="flex items-center gap-2"
+                                                method="post"
+                                                action=format!("/admin/accounts/{account_id}/limit")
+                                            >
                                                 <input type="hidden" name="csrf_token" value=csrf_limit/>
-                                                <input type="hidden" name="limited" value=(!account.limited).to_string()/>
-                                                <label class="checkbox-field"><input type="checkbox" required/><span>"Confirm"</span></label>
-                                                <button class="button--secondary" type="submit">{action}</button>
+                                                <input
+                                                    type="hidden"
+                                                    name="limited"
+                                                    value=(!account.limited).to_string()
+                                                />
+                                                <ConfirmationCheckbox/>
+                                                <button class="btn btn-sm btn-outline" type="submit">
+                                                    {action}
+                                                </button>
                                             </form>
                                             {account.domain.is_none().then(|| view! {
-                                                <form method="post" action=format!("/admin/accounts/{reset_id}/reset-password")>
-                                                    <input type="hidden" name="csrf_token" value=csrf_reset/>
-                                                    <label class="checkbox-field"><input type="checkbox" required/><span>"Confirm"</span></label>
-                                                    <button class="button--secondary" type="submit">"Reset password"</button>
+                                                <form
+                                                    class="flex items-center gap-2"
+                                                    method="post"
+                                                    action=format!("/admin/accounts/{reset_id}/reset-password")
+                                                >
+                                                    <input
+                                                        type="hidden"
+                                                        name="csrf_token"
+                                                        value=csrf_reset
+                                                    />
+                                                    <ConfirmationCheckbox/>
+                                                    <button class="btn btn-sm btn-outline" type="submit">
+                                                        "Reset password"
+                                                    </button>
                                                 </form>
                                             })}
                                         </td>
@@ -221,17 +407,30 @@ fn admin_dashboard_content(dashboard: UiAdminDashboard, search_value: String) ->
                         </tbody>
                     </table>
                 </div>
-            </section>
-            <section class="admin-panel">
-                <h2>"Recent administrator activity"</h2>
-                <ul class="audit-list">
-                    {audit_entries.into_iter().map(|entry| view! {
-                        <li><time>{entry.created_at}</time> <strong>{entry.action}</strong> <code>{entry.target_id}</code> <span>{entry.source}</span></li>
+            </AdminPanel>
+        </section>
+    }
+    .into_any()
+}
+
+fn admin_audit_log_content(audit_log: UiAdminAuditLog) -> AnyView {
+    view! {
+        <section class="pb-8">
+            <AdminPanel title="Recent administrator activity">
+                <ul class="list">
+                    {audit_log.audit_entries.into_iter().map(|entry| view! {
+                        <li class="list-row">
+                            <time class="text-base-content/70">{entry.created_at}</time>
+                            <strong>{entry.action}</strong>
+                            <code>{entry.target_id}</code>
+                            <span class="text-base-content/70">{entry.source}</span>
+                        </li>
                     }).collect_view()}
                 </ul>
-            </section>
+            </AdminPanel>
         </section>
-    }.into_any()
+    }
+    .into_any()
 }
 
 #[component]
@@ -278,32 +477,30 @@ fn LoginPage() -> impl IntoView {
     view! {
         <PageMetadata bootstrap page_title="Sign in" path="/login"/>
         <PageFrame bootstrap login_next="/login">
-            <section class="form-card">
-                <p class="eyebrow">"Account access"</p>
-                <h1>"Sign in"</h1>
+            <PageCard kind=PageCardKind::Form>
+                <PageCardTitle context="Account access">"Sign in"</PageCardTitle>
                 {error.map(|error| view! {
-                    <p class="form-message form-message--error" role="alert">
-                        {login_error_message(error)}
-                    </p>
+                    <Notice kind=NoticeKind::Error>{login_error_message(error)}</Notice>
                 })}
-                <form method="post" action="/login">
+                <form class="fieldset gap-4" method="post" action="/login">
                     <input type="hidden" name="next" value=next/>
-                    <label class="form-field">
-                        <span>"Username or email"</span>
-                        <input name="login" autocomplete="username" required autofocus/>
-                    </label>
-                    <label class="form-field">
-                        <span>"Password"</span>
+                    <FormField label="Username or email">
+                        <input class="input w-full" name="login" autocomplete="username" required autofocus/>
+                    </FormField>
+                    <FormField label="Password">
                         <input
+                            class="input w-full"
                             name="password"
                             type="password"
                             autocomplete="current-password"
                             required
                         />
-                    </label>
-                    <button type="submit">"Sign in"</button>
+                    </FormField>
+                    <div class="card-actions">
+                        <button class="btn btn-primary" type="submit">"Sign in"</button>
+                    </div>
                 </form>
-            </section>
+            </PageCard>
         </PageFrame>
     }
 }
@@ -327,11 +524,13 @@ fn ChangePasswordPage() -> impl IntoView {
                         }
                         _ => {
                             view! {
-                                <section class="form-card">
-                                    <h1>"Sign in required"</h1>
+                                <PageCard kind=PageCardKind::Form>
+                                    <PageCardTitle>"Sign in required"</PageCardTitle>
                                     <p>"Sign in before changing your password."</p>
-                                    <p><a href="/login?next=%2Fauth%2Fedit" rel="external">"Sign in"</a></p>
-                                </section>
+                                    <div class="card-actions">
+                                        <a class="btn btn-primary" href="/login?next=%2Fauth%2Fedit" rel="external">"Sign in"</a>
+                                    </div>
+                                </PageCard>
                             }
                             .into_any()
                         }
@@ -345,52 +544,48 @@ fn ChangePasswordPage() -> impl IntoView {
 fn change_password_content(result: Option<PasswordChangeResult>) -> AnyView {
     let notice = result.map(password_result_message);
     view! {
-        <section class="form-card">
-            <p class="eyebrow">"Account security"</p>
-            <h1>"Change password"</h1>
+        <PageCard kind=PageCardKind::Form>
+            <PageCardTitle context="Account security">"Change password"</PageCardTitle>
             {notice.map(|(message, success)| {
-                let class = if success {
-                    "form-message form-message--success"
-                } else {
-                    "form-message form-message--error"
-                };
-                let role = if success { "status" } else { "alert" };
-                view! { <p class=class role=role>{message}</p> }
+                let kind = if success { NoticeKind::Success } else { NoticeKind::Error };
+                view! { <Notice kind>{message}</Notice> }
             })}
-            <form method="post" action="/auth">
-                <label class="form-field">
-                    <span>"Current password"</span>
+            <form class="fieldset gap-4" method="post" action="/auth">
+                <FormField label="Current password">
                     <input
+                        class="input w-full"
                         name="user[current_password]"
                         type="password"
                         autocomplete="current-password"
                         required
                         autofocus
                     />
-                </label>
-                <label class="form-field">
-                    <span>"New password"</span>
+                </FormField>
+                <FormField label="New password">
                     <input
+                        class="input w-full"
                         name="user[password]"
                         type="password"
                         autocomplete="new-password"
                         minlength="8"
                         required
                     />
-                </label>
-                <label class="form-field">
-                    <span>"Confirm new password"</span>
+                </FormField>
+                <FormField label="Confirm new password">
                     <input
+                        class="input w-full"
                         name="user[password_confirmation]"
                         type="password"
                         autocomplete="new-password"
                         minlength="8"
                         required
                     />
-                </label>
-                <button type="submit">"Change password"</button>
+                </FormField>
+                <div class="card-actions">
+                    <button class="btn btn-primary" type="submit">"Change password"</button>
+                </div>
             </form>
-        </section>
+        </PageCard>
     }
     .into_any()
 }
@@ -420,27 +615,32 @@ fn password_result_message(result: PasswordChangeResult) -> (&'static str, bool)
 
 fn welcome_content(name: String, description: String) -> AnyView {
     view! {
-        <section class="hero">
-            <p class="eyebrow">"Welcome to"</p>
-            <h1>{name}</h1>
-            <p class="hero__lede">{description}</p>
-            <p><A attr:class="button" href="/about">"About this instance"</A></p>
-        </section>
+        <Page>
+            <Hero>
+                <PageTitle eyebrow="Welcome to">{name}</PageTitle>
+                <p class="text-base-content/70 text-lg">{description}</p>
+                <div class="card-actions">
+                    <A attr:class="btn btn-primary" href="/about">"About this instance"</A>
+                </div>
+            </Hero>
+        </Page>
     }
     .into_any()
 }
 
 fn about_content(name: String, description: String) -> AnyView {
     view! {
-        <article class="prose">
-            <p class="eyebrow">"About this instance"</p>
-            <h1>{name}</h1>
-            <p>{description}</p>
-            <p>
-                "This instance is part of the decentralized social web. People can connect across compatible servers without needing an account on the same site."
-            </p>
-            <p><A href="/">"Return to the welcome page"</A></p>
-        </article>
+        <Page>
+            <article>
+                <PageTitle>"About " {name}</PageTitle>
+                <div class="mt-8 flex max-w-3xl flex-col gap-6">
+                    <p>{description}</p>
+                    <p>
+                        "This instance is part of the decentralized social web. People can connect across compatible servers without needing an account on the same site."
+                    </p>
+                </div>
+            </article>
+        </Page>
     }
     .into_any()
 }
@@ -449,31 +649,38 @@ fn about_content(name: String, description: String) -> AnyView {
 fn PageFrame(
     bootstrap: BootstrapResource,
     login_next: &'static str,
+    #[prop(default = false)] wide: bool,
     children: Children,
 ) -> impl IntoView {
+    let brand = view! {
+        <Suspense fallback=|| view! { <A attr:class="btn btn-ghost text-xl" href="/">"Roosty"</A> }>
+            {move || bootstrap.get().map(instance_brand)}
+        </Suspense>
+    }
+    .into_any();
+
+    let main_class = if wide {
+        "w-full grow"
+    } else {
+        "mx-auto w-full max-w-6xl grow px-4"
+    };
+
     view! {
-        <div class="site-shell">
-            <header class="site-header">
-                <Suspense fallback=|| view! { <A attr:class="brand" href="/">"Roosty"</A> }>
-                    {move || bootstrap.get().map(instance_brand)}
+        <div class="bg-base-200 flex min-h-screen flex-col">
+            <SiteHeader brand>
+                <A attr:class="btn btn-ghost" href="/about">"About"</A>
+                <Suspense fallback=move || view! { <span class="loading loading-dots loading-sm" aria-label="Checking session"></span> }>
+                    {move || {
+                        bootstrap
+                            .get()
+                            .map(|result| session_navigation(result, login_next))
+                    }}
                 </Suspense>
-                <nav aria-label="Primary navigation">
-                    <A href="/about">"About"</A>
-                    <Suspense fallback=move || view! { <span class="session-placeholder">"Checking session…"</span> }>
-                        {move || {
-                            bootstrap
-                                .get()
-                                .map(|result| session_navigation(result, login_next))
-                        }}
-                    </Suspense>
-                </nav>
-            </header>
-            <main>{children()}</main>
-            <footer class="site-footer">
-                <Suspense fallback=|| view! { <p>"Powered by Roosty"</p> }>
-                    {move || bootstrap.get().map(version_attribution)}
-                </Suspense>
-            </footer>
+            </SiteHeader>
+            <main class=main_class>{children()}</main>
+            <Suspense fallback=|| view! { <SiteFooter/> }>
+                {move || bootstrap.get().map(version_footer)}
+            </Suspense>
         </div>
     }
 }
@@ -495,23 +702,15 @@ fn instance_brand(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
     let name = result
         .map(|bootstrap| bootstrap.instance_name)
         .unwrap_or_else(|_| "Roosty".to_owned());
-    view! { <A attr:class="brand" href="/">{name}</A> }.into_any()
+    view! { <A attr:class="btn btn-ghost text-xl" href="/">{name}</A> }.into_any()
 }
 
-fn version_attribution(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
+fn version_footer(result: Result<UiBootstrap, ServerFnError>) -> AnyView {
     match result {
-        Ok(bootstrap) => view! {
-            <p>
-                "Powered by "
-                <a href="https://github.com/ctron/roosty">"Roosty"</a>
-                " " {bootstrap.build_identifier}
-            </p>
+        Ok(bootstrap) => {
+            view! { <SiteFooter build_identifier=bootstrap.build_identifier/> }.into_any()
         }
-        .into_any(),
-        Err(_) => view! {
-            <p>"Powered by " <a href="https://github.com/ctron/roosty">"Roosty"</a></p>
-        }
-        .into_any(),
+        Err(_) => view! { <SiteFooter/> }.into_any(),
     }
 }
 
@@ -522,41 +721,28 @@ fn session_navigation(
     match result {
         Ok(bootstrap) => match bootstrap.account {
             Some(account) => {
-                let initial = account
-                    .display_name
-                    .chars()
-                    .find(|character| !character.is_whitespace())
-                    .or_else(|| account.username.chars().next())
-                    .map(|character| character.to_uppercase().to_string())
-                    .unwrap_or_else(|| "?".to_owned());
+                let is_admin = account.is_admin;
                 view! {
-                {account.is_admin.then(|| view! { <A href="/admin">"Admin"</A> })}
-                <details class="profile-menu">
-                    <summary class="session-account" title=account.display_name>
-                        {account.avatar_url.map_or_else(
-                            || view! { <span class="profile-icon" aria-hidden="true">{initial}</span> }.into_any(),
-                            |avatar_url| view! {
-                                <img class="profile-icon" src=avatar_url alt=""/>
-                            }.into_any(),
-                        )}
-                        <span>{account.username}</span>
-                    </summary>
-                    <div class="profile-menu__items">
-                        <a href="/auth/edit" rel="external">"Account"</a>
-                        <form class="logout-form" method="post" action="/logout">
-                            <button type="submit">"Log out"</button>
-                        </form>
-                    </div>
-                </details>
+                    {is_admin.then(|| view! { <A attr:class="btn btn-ghost" href="/admin">"Admin"</A> })}
+                    <AccountMenu
+                        username=account.username
+                        display_name=account.display_name
+                        avatar_url=account.avatar_url
+                    />
                 }
                 .into_any()
             }
             None => {
                 let href = format!("/login?next={login_next}");
-                view! { <a href=href rel="external">"Sign in"</a> }.into_any()
+                view! {
+                    <a class="btn btn-ghost" href=href rel="external">"Sign in"</a>
+                }
+                .into_any()
             }
         },
-        Err(_) => view! { <span class="session-error">"Session unavailable"</span> }.into_any(),
+        Err(_) => {
+            view! { <span class="badge badge-warning">"Session unavailable"</span> }.into_any()
+        }
     }
 }
 
@@ -607,10 +793,14 @@ fn PageMetadata(
 #[component]
 fn NotFoundPage() -> impl IntoView {
     view! {
-        <main class="not-found">
-            <Title text="Page not found · Roosty"/>
-            <h1>"Page not found"</h1>
-            <p><A href="/">"Return home"</A></p>
+        <main class="card border-base-300 bg-base-100 mx-auto my-12 w-full max-w-2xl border shadow-xl">
+            <div class="card-body">
+                <Title text="Page not found · Roosty"/>
+                <PageCardTitle>"Page not found"</PageCardTitle>
+                <div class="card-actions">
+                    <A attr:class="btn btn-primary" href="/">"Return home"</A>
+                </div>
+            </div>
         </main>
     }
 }

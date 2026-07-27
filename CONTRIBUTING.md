@@ -81,6 +81,11 @@ with `wasm-opt --version` or remove it from `PATH` to use the pinned download.
 `cargo leptos watch` uses the exported version pin and provides the corresponding rebuild loop when
 running Roosty directly. The Compose build performs a release frontend build automatically.
 
+The frontend's daisyUI 5 standalone plugins are pinned in `crates/web-ui/style/vendor`; no separate
+Node.js installation is needed for the first-party UI build. When upgrading daisyUI, download both
+standalone `.mjs` assets from the same official release, update their versioned filenames and
+references in `main.css`, and record their new SHA-256 checksums in the vendor README.
+
 Start the local stack:
 
 ```sh

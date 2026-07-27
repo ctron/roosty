@@ -2,6 +2,10 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use strum::IntoStaticStr;
 
+use crate::ui::{
+    AccountMenu, Notice, NoticeKind, PageCard, PageCardKind, PageCardTitle, SiteFooter, SiteHeader,
+};
+
 /// User choice submitted from the OAuth consent form.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, IntoStaticStr, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -99,15 +103,16 @@ pub fn render_authorization_consent(consent: AuthorizationConsent) -> String {
     let application_name = consent.application_name;
     let permissions = consent.permissions;
     let content = view! {
-                <section class="form-card authorization-card">
-                    <p class="eyebrow">"Application access"</p>
-                    <h1>"Authorize " {application_name}</h1>
+                <PageCard kind=PageCardKind::Form>
+                    <PageCardTitle context="Application access">
+                        "Authorize " {application_name}
+                    </PageCardTitle>
                     <p>"This application is requesting permission to use your account."</p>
-                    <h2>"Requested permissions"</h2>
-                    <ul class="permission-list">
+                    <h2 class="card-title">"Requested permissions"</h2>
+                    <ul class="list rounded-box bg-base-200">
                         {permissions.into_iter().map(permission_view).collect_view()}
                     </ul>
-                    <form method="post" action="/oauth/authorize">
+                    <form class="fieldset gap-4" method="post" action="/oauth/authorize">
                         <input type="hidden" name="response_type" value=consent.response_type/>
                         <input type="hidden" name="client_id" value=consent.client_id/>
                         <input type="hidden" name="redirect_uri" value=consent.redirect_uri/>
@@ -119,21 +124,21 @@ pub fn render_authorization_consent(consent: AuthorizationConsent) -> String {
                             name="code_challenge_method"
                             value=consent.code_challenge_method
                         />
-                        <div class="form-actions">
-                            <button type="submit" name="decision" value=approve>
+                        <div class="card-actions">
+                            <button class="btn btn-primary" type="submit" name="decision" value=approve>
                                 "Authorize"
                             </button>
                             <button
+                                class="btn btn-ghost"
                                 type="submit"
                                 name="decision"
                                 value=deny
-                                class="button--secondary"
                             >
                                 "Deny"
                             </button>
                         </div>
                     </form>
-                </section>
+                </PageCard>
     }
     .into_any();
     render_document(title, context, content)
@@ -146,24 +151,26 @@ pub fn render_out_of_band_authorization(page: OutOfBandAuthorization) -> String 
     let application_name = page.application_name;
     let content = match page.result {
         AuthorizationResult::Approved { code } => view! {
-            <section class="form-card authorization-card">
-                <p class="eyebrow">"Authorization complete"</p>
-                <h1>"Copy your code"</h1>
+            <PageCard kind=PageCardKind::Form>
+                <PageCardTitle context="Authorization complete">"Copy your code"</PageCardTitle>
                 <p>
                     "Enter this one-time code in " <strong>{application_name}</strong> "."
                 </p>
-                <code id="authorization-code" class="authorization-code">{code}</code>
-                <p>"Keep this code private. It grants access to your account."</p>
-            </section>
+                <div class="mockup-code">
+                    <pre class="px-4"><code id="authorization-code" class="break-all select-all">{code}</code></pre>
+                </div>
+                <Notice kind=NoticeKind::Warning>
+                    "Keep this code private. It grants access to your account."
+                </Notice>
+            </PageCard>
         }
         .into_any(),
         AuthorizationResult::Denied => view! {
-            <section class="form-card authorization-card">
-                <p class="eyebrow">"Authorization denied"</p>
-                <h1>"Access was not granted"</h1>
+            <PageCard kind=PageCardKind::Form>
+                <PageCardTitle context="Authorization denied">"Access was not granted"</PageCardTitle>
                 <p>{application_name} " was not given access to your account."</p>
                 <p>"You can close this page and return to the application."</p>
-            </section>
+            </PageCard>
         }
         .into_any(),
     };
@@ -179,7 +186,7 @@ fn permission_view(permission: AuthorizationPermission) -> impl IntoView {
         AuthorizationPermissionKind::Other => "Use this application-specific permission",
     };
     view! {
-        <li>
+        <li class="list-row">
             <strong>{description}</strong>
             <code>{permission.scope}</code>
         </li>
@@ -201,26 +208,19 @@ fn render_document(title: String, context: AuthorizationPageContext, content: An
                     <link rel="stylesheet" href=stylesheet_href/>
                 </head>
                 <body>
-                    <div class="site-shell">
-                        <header class="site-header">
-                            <a class="brand" href="/">{instance_name}</a>
-                            <nav aria-label="Primary navigation">
-                                <a href="/about">"About"</a>
-                                <span class="session-account">"Welcome, " {account_username}</span>
-                                <a href="/auth/edit">"Account"</a>
-                                <form class="logout-form" method="post" action="/logout">
-                                    <button type="submit">"Log out"</button>
-                                </form>
-                            </nav>
-                        </header>
-                        <main>{content}</main>
-                        <footer class="site-footer">
-                            <p>
-                                "Powered by "
-                                <a href="https://github.com/ctron/roosty">"Roosty"</a>
-                                " " {build_identifier}
-                            </p>
-                        </footer>
+                    <div class="bg-base-200 flex min-h-screen flex-col">
+                        <SiteHeader brand=view! {
+                            <a class="btn btn-ghost text-xl" href="/">{instance_name}</a>
+                        }.into_any()>
+                            <a class="btn btn-ghost" href="/about">"About"</a>
+                            <AccountMenu
+                                username=account_username.clone()
+                                display_name=account_username
+                                avatar_url=None
+                            />
+                        </SiteHeader>
+                        <main class="mx-auto w-full max-w-6xl grow px-4">{content}</main>
+                        <SiteFooter build_identifier/>
                     </div>
                 </body>
             </html>
@@ -271,6 +271,13 @@ mod tests {
         assert!(!html.contains("<script>alert('x')</script>"));
         assert!(html.contains("Read account data"));
         assert!(html.contains("Use this application-specific permission"));
+        assert!(html.contains("<html lang=\"en\">"));
+        assert!(html.contains("class=\"btn btn-primary\""));
+        assert!(html.contains("class=\"card border-base-300 bg-base-100"));
+        assert!(html.contains("max-w-xl"));
+        assert!(html.contains("class=\"navbar mx-auto max-w-6xl"));
+        assert!(html.contains("<details class=\"dropdown dropdown-end\">"));
+        assert!(!html.contains("Welcome, alice"));
         assert!(html.contains("method=\"post\" action=\"/logout\""));
         assert!(html.contains("href=\"https://github.com/ctron/roosty\""));
         assert!(!html.contains("roosty-web.js"));

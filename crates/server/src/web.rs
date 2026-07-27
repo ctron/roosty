@@ -18,8 +18,9 @@ use axum::{
 use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
 use roosty_web_ui::{
-    App, UiAccount, UiAdminAccount, UiAdminAuditEntry, UiAdminDashboard, UiAdminJob,
-    UiAdminJobSummary, UiBackend, UiBootstrap, UiServerContext, shell,
+    App, UiAccount, UiAdminAccount, UiAdminAccounts, UiAdminAuditEntry, UiAdminAuditLog,
+    UiAdminJob, UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext,
+    shell,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -107,13 +108,19 @@ async fn protect_ui_route(
 fn redirect_login(state: &AppState, next: &str) -> Response {
     let mut location = state.config.public_base_url.clone();
     location.set_path("/login");
-    location.set_query(Some(if next.starts_with("/admin") {
-        "next=%2Fadmin"
-    } else {
-        "next=%2Fauth%2Fedit"
-    }));
+    location.set_query(Some(login_return_query(next)));
     location.set_fragment(None);
     Redirect::to(location.as_str()).into_response()
+}
+
+fn login_return_query(next: &str) -> &'static str {
+    match next {
+        "/admin/jobs" => "next=%2Fadmin%2Fjobs",
+        "/admin/accounts" => "next=%2Fadmin%2Faccounts",
+        "/admin/audit-log" => "next=%2Fadmin%2Faudit-log",
+        path if path.starts_with("/admin") => "next=%2Fadmin",
+        _ => "next=%2Fauth%2Fedit",
+    }
 }
 
 #[derive(Clone)]
@@ -165,87 +172,132 @@ impl UiBackend for RoostyUiBackend {
         })
     }
 
-    fn admin_dashboard(
+    fn admin_work_queue(
+        &self,
+        cookie_header: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminWorkQueue, String>> + Send + 'static>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            authenticated_admin_headers(&state, cookie_header).await?;
+            let (summary, jobs) = tokio::try_join!(
+                roosty_db::admin_job_summary(&state.db),
+                roosty_db::admin_job_diagnostics(&state.db, 40, None),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(UiAdminWorkQueue {
+                summary: ui_admin_job_summary(summary),
+                jobs: jobs.into_iter().map(ui_admin_job).collect(),
+            })
+        })
+    }
+
+    fn admin_accounts(
         &self,
         cookie_header: Option<String>,
         query: String,
-    ) -> Pin<Box<dyn Future<Output = Result<UiAdminDashboard, String>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminAccounts, String>> + Send + 'static>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let headers = cookie_headers(cookie_header)?;
-            let account_id = account_id_from_session(&state, &headers)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "administrator session required".to_owned())?;
-            let account = roosty_db::find_local_account_by_id(&state.db, account_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .filter(|account| account.is_admin)
-                .ok_or_else(|| "administrator session required".to_owned())?;
+            let headers = authenticated_admin_headers(&state, cookie_header).await?;
             let csrf_token = csrf_token_from_session(&state, &headers)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "administrator session required".to_owned())?;
-            let (summary, jobs, accounts, audit_entries) = tokio::try_join!(
-                roosty_db::admin_job_summary(&state.db),
-                roosty_db::admin_job_diagnostics(&state.db, 40, None),
-                roosty_db::list_admin_accounts(&state.db, &query, None, None, 100, None),
-                roosty_db::list_admin_audit_entries(&state.db, 20, None),
-            )
-            .map_err(|error| error.to_string())?;
-            let _ = account;
-            Ok(UiAdminDashboard {
+            let accounts = roosty_db::list_admin_accounts(&state.db, &query, None, None, 100, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(UiAdminAccounts {
                 csrf_token,
-                summary: UiAdminJobSummary {
-                    due: summary.due,
-                    in_progress: summary.in_progress,
-                    scheduled_retries: summary.scheduled_retries,
-                    permanently_failed: summary.permanently_failed,
-                    oldest_due_at: summary.oldest_due_at.map(format_timestamp),
-                },
-                jobs: jobs
-                    .into_iter()
-                    .map(|job| UiAdminJob {
-                        id: job.id.0,
-                        kind: job.kind.as_str().to_owned(),
-                        state: if job.permanently_failed_at.is_some() {
-                            "permanently_failed"
-                        } else if job.locked_at.is_some() {
-                            "in_progress"
-                        } else if job.attempts > 0 {
-                            "retry_scheduled"
-                        } else {
-                            "due"
-                        }
-                        .to_owned(),
-                        attempts: job.attempts,
-                        run_after: format_timestamp(job.run_after),
-                        last_error: job.last_error,
-                    })
-                    .collect(),
-                accounts: accounts
-                    .into_iter()
-                    .map(|account| UiAdminAccount {
-                        id: account.id.0,
-                        username: account.username,
-                        domain: account.domain,
-                        email: account.email,
-                        display_name: account.display_name,
-                        is_admin: account.is_admin,
-                        limited: account.limited,
-                    })
-                    .collect(),
+                accounts: accounts.into_iter().map(ui_admin_account).collect(),
+            })
+        })
+    }
+
+    fn admin_audit_log(
+        &self,
+        cookie_header: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminAuditLog, String>> + Send + 'static>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            authenticated_admin_headers(&state, cookie_header).await?;
+            let audit_entries = roosty_db::list_admin_audit_entries(&state.db, 20, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(UiAdminAuditLog {
                 audit_entries: audit_entries
                     .into_iter()
-                    .map(|entry| UiAdminAuditEntry {
-                        id: entry.id,
-                        action: entry.action.to_string(),
-                        source: entry.source.to_string(),
-                        target_kind: entry.target_kind.to_string(),
-                        target_id: entry.target_id,
-                        created_at: format_timestamp(entry.created_at),
-                    })
+                    .map(ui_admin_audit_entry)
                     .collect(),
             })
         })
+    }
+}
+
+async fn authenticated_admin_headers(
+    state: &AppState,
+    cookie_header: Option<String>,
+) -> Result<HeaderMap, String> {
+    let headers = cookie_headers(cookie_header)?;
+    let account_id = account_id_from_session(state, &headers)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "administrator session required".to_owned())?;
+    roosty_db::find_local_account_by_id(&state.db, account_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .filter(|account| account.is_admin)
+        .ok_or_else(|| "administrator session required".to_owned())?;
+    Ok(headers)
+}
+
+fn ui_admin_job_summary(summary: roosty_db::AdminJobSummary) -> UiAdminJobSummary {
+    UiAdminJobSummary {
+        due: summary.due,
+        in_progress: summary.in_progress,
+        scheduled_retries: summary.scheduled_retries,
+        permanently_failed: summary.permanently_failed,
+        oldest_due_at: summary.oldest_due_at.map(format_timestamp),
+    }
+}
+
+fn ui_admin_job(job: roosty_db::AdminJobDiagnostic) -> UiAdminJob {
+    UiAdminJob {
+        id: job.id.0,
+        kind: job.kind.as_str().to_owned(),
+        state: if job.permanently_failed_at.is_some() {
+            "permanently_failed"
+        } else if job.locked_at.is_some() {
+            "in_progress"
+        } else if job.attempts > 0 {
+            "retry_scheduled"
+        } else {
+            "due"
+        }
+        .to_owned(),
+        attempts: job.attempts,
+        run_after: format_timestamp(job.run_after),
+        last_error: job.last_error,
+    }
+}
+
+fn ui_admin_account(account: roosty_db::AdminAccount) -> UiAdminAccount {
+    UiAdminAccount {
+        id: account.id.0,
+        username: account.username,
+        domain: account.domain,
+        email: account.email,
+        display_name: account.display_name,
+        is_admin: account.is_admin,
+        limited: account.limited,
+    }
+}
+
+fn ui_admin_audit_entry(entry: roosty_db::AdminAuditEntry) -> UiAdminAuditEntry {
+    UiAdminAuditEntry {
+        id: entry.id,
+        action: entry.action.to_string(),
+        source: entry.source.to_string(),
+        target_kind: entry.target_kind.to_string(),
+        target_id: entry.target_id,
+        created_at: format_timestamp(entry.created_at),
     }
 }
 
@@ -360,7 +412,7 @@ async fn limit_admin_account(
     )
     .await
     {
-        Ok(_) => Redirect::to("/admin").into_response(),
+        Ok(_) => Redirect::to("/admin/accounts").into_response(),
         Err(error) => admin_form_error(error),
     }
 }
@@ -401,7 +453,7 @@ fn temporary_password_page(
 ) -> Response {
     let stylesheet_href = roosty_web_ui::stylesheet_href(&state.leptos_options);
     Html(format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><link rel=\"stylesheet\" href=\"{stylesheet_href}\"><title>{title}</title><main class=\"form-card\"><h1>{title}</h1><p>Temporary password for <strong>{username}</strong>:</p><code class=\"authorization-code\">{temporary_password}</code><p>This password is shown only once. Transfer it securely.</p><p><a href=\"/admin\">Return to administration</a></p></main></html>"
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><link rel=\"stylesheet\" href=\"{stylesheet_href}\"><title>{title}</title><main class=\"card border-base-300 bg-base-100 mx-auto my-12 w-full max-w-xl border shadow-xl\"><div class=\"card-body\"><h1 class=\"card-title text-3xl\">{title}</h1><p>Temporary password for <strong>{username}</strong>:</p><div class=\"mockup-code\"><pre class=\"px-4\"><code class=\"break-all select-all\">{temporary_password}</code></pre></div><div class=\"alert alert-warning\"><span>This password is shown only once. Transfer it securely.</span></div><div class=\"card-actions\"><a class=\"btn btn-primary\" href=\"/admin/accounts\">Return to accounts</a></div></div></main></html>"
     ))
     .into_response()
 }
@@ -433,7 +485,7 @@ mod tests {
     use tower_http::services::ServeDir;
     use uuid::Uuid;
 
-    /// Given the first UI slice, when Leptos enumerates routes, then both direct entry points are
+    /// Given the UI routes, when Leptos enumerates them, then every direct entry point is
     /// registered with Axum rather than relying on a catch-all fallback.
     #[tokio::test]
     async fn generated_routes_include_welcome_and_about() {
@@ -447,6 +499,30 @@ mod tests {
         assert!(paths.iter().any(|path| path == "/login"));
         assert!(paths.iter().any(|path| path == "/auth/edit"));
         assert!(paths.iter().any(|path| path == "/admin"));
+        assert!(paths.iter().any(|path| path == "/admin/jobs"));
+        assert!(paths.iter().any(|path| path == "/admin/accounts"));
+        assert!(paths.iter().any(|path| path == "/admin/audit-log"));
+    }
+
+    #[test]
+    fn login_returns_to_the_requested_administration_category() {
+        assert_eq!(
+            super::login_return_query("/admin/jobs"),
+            "next=%2Fadmin%2Fjobs"
+        );
+        assert_eq!(
+            super::login_return_query("/admin/accounts"),
+            "next=%2Fadmin%2Faccounts"
+        );
+        assert_eq!(
+            super::login_return_query("/admin/audit-log"),
+            "next=%2Fadmin%2Faudit-log"
+        );
+        assert_eq!(super::login_return_query("/admin"), "next=%2Fadmin");
+        assert_eq!(
+            super::login_return_query("/auth/edit"),
+            "next=%2Fauth%2Fedit"
+        );
     }
 
     /// Given a failed credential submission, when the redirected login page renders, then the new
@@ -465,10 +541,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("<h1>Sign in</h1>"));
+        assert!(html.contains(">Sign in</h1>"));
         assert!(html.contains("action=\"/login\""));
         assert!(html.contains("name=\"next\" value=\"/about\""));
         assert!(html.contains("Invalid username or password."));
+        assert!(html.contains("class=\"input w-full\""));
+        assert!(html.contains("class=\"btn btn-primary\""));
+        assert!(html.contains("class=\"alert alert-error\""));
         assert!(html.contains("role=\"alert\""));
     }
 
@@ -489,7 +568,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("<h1>Change password</h1>"));
+        assert!(html.contains(">Change password</h1>"));
         assert!(html.contains("action=\"/auth\""));
         assert!(html.contains("name=\"user[current_password]\""));
         assert!(html.contains("name=\"user[password]\""));
@@ -507,7 +586,7 @@ mod tests {
             ("/", "Welcome to", "Welcome · Test Roosty", "/"),
             (
                 "/about",
-                "About this instance",
+                "decentralized social web",
                 "About · Test Roosty",
                 "/about",
             ),
@@ -521,9 +600,15 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("<html lang=\"en\">"));
             assert!(html.contains(marker), "missing page marker in {path}");
-            assert!(html.contains("<h1>Test Roosty</h1>"));
-            assert!(html.contains("class=\"brand\">Test Roosty</a>"));
+            if path == "/about" {
+                assert!(html.contains(">About "));
+                assert!(html.contains("Test Roosty</h1>"));
+            } else {
+                assert!(html.contains(">Test Roosty</h1>"));
+            }
+            assert!(html.contains("class=\"btn btn-ghost text-xl\">Test Roosty</a>"));
             assert!(html.contains("A test social server"));
             assert!(html.contains("href=\"https://github.com/ctron/roosty\">Roosty</a>"));
             assert!(html.contains("v1.2.3"));
@@ -535,6 +620,17 @@ mod tests {
             assert!(html.contains(&format!(
                 "href=\"/login?next={login_next}\" rel=\"external\""
             )));
+            let login_href = format!("href=\"/login?next={login_next}\"");
+            let login_href_offset = html.find(&login_href).expect("missing login link");
+            let login_link_start = html[..login_href_offset]
+                .rfind("<a")
+                .expect("login href was not on a link");
+            let login_link_end = html[login_href_offset..]
+                .find("</a>")
+                .map(|offset| login_href_offset + offset)
+                .expect("login link was not closed");
+            let login_link = &html[login_link_start..login_link_end];
+            assert!(login_link.contains("class=\"btn btn-ghost\""));
             assert!(html.contains("/pkg/roosty-web.") && html.contains(".js"));
             if path == "/" {
                 assert!(html.contains(">About this instance</a>"));
@@ -623,9 +719,10 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("alice"));
-        assert!(html.contains("<details class=\"profile-menu\">"));
-        assert!(html.contains("class=\"profile-icon\""));
-        assert!(html.contains("<div class=\"profile-menu__items\">"));
+        assert!(html.contains("class=\"navbar mx-auto max-w-6xl"));
+        assert!(html.contains("<details class=\"dropdown dropdown-end\">"));
+        assert!(html.contains("class=\"avatar"));
+        assert!(html.contains("<ul class=\"menu dropdown-content rounded-box"));
         assert!(html.contains("href=\"/auth/edit\" rel=\"external\""));
         assert!(html.contains("method=\"post\" action=\"/logout\""));
         assert!(!html.contains("/login?next="));
