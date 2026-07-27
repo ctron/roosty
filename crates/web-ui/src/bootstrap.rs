@@ -45,6 +45,23 @@ pub struct UiAdminAccounts {
     pub accounts: Vec<UiAdminAccount>,
 }
 
+/// Account origin selected by an administrator account page.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiAdminAccountOrigin {
+    Local,
+    Remote,
+}
+
+impl UiAdminAccountOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+}
+
 /// Recent administrator actions shown on the audit-log page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UiAdminAuditLog {
@@ -109,6 +126,7 @@ pub trait UiBackend: Send + Sync {
         &self,
         _cookie_header: Option<String>,
         _query: String,
+        _origin: UiAdminAccountOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAccounts, String>> + Send + 'static>> {
         Box::pin(async { Err("administrator accounts are unavailable".to_owned()) })
     }
@@ -139,12 +157,15 @@ pub async fn load_admin_work_queue() -> Result<UiAdminWorkQueue, ServerFnError> 
 
 /// Load administrator-only account data as a JSON response.
 #[server(prefix = "/api/web", protocol = Http<GetUrl, Json>)]
-pub async fn load_admin_accounts(query: String) -> Result<UiAdminAccounts, ServerFnError> {
+pub async fn load_admin_accounts(
+    query: String,
+    origin: UiAdminAccountOrigin,
+) -> Result<UiAdminAccounts, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         expect_context::<UiServerContext>()
             .0
-            .admin_accounts(request_cookie().await?, query)
+            .admin_accounts(request_cookie().await?, query, origin)
             .await
             .map_err(ServerFnError::new)
     }

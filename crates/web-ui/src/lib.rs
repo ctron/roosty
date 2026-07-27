@@ -19,8 +19,9 @@ pub use authorization::{
     render_authorization_consent, render_out_of_band_authorization,
 };
 pub use bootstrap::{
-    UiAccount, UiAdminAccount, UiAdminAccounts, UiAdminAuditEntry, UiAdminAuditLog, UiAdminJob,
-    UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext,
+    UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
+    UiAdminAuditLog, UiAdminJob, UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap,
+    UiServerContext,
 };
 pub use forms::{LoginError, PasswordChangeResult};
 

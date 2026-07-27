@@ -4,7 +4,8 @@ use leptos::prelude::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminSection {
     WorkQueue,
-    Accounts,
+    LocalAccounts,
+    RemoteAccounts,
     AuditLog,
 }
 
@@ -46,13 +47,29 @@ pub(crate) fn AdminLayout(active: AdminSection, children: Children) -> impl Into
                             </a>
                         </li>
                         <li>
-                            <a
-                                href="/admin/accounts"
-                                class=selected(AdminSection::Accounts)
-                                aria-current=current(AdminSection::Accounts)
-                            >
-                                "Accounts"
-                            </a>
+                            <details open>
+                                <summary>"Accounts"</summary>
+                                <ul>
+                                    <li>
+                                        <a
+                                            href="/admin/accounts"
+                                            class=selected(AdminSection::LocalAccounts)
+                                            aria-current=current(AdminSection::LocalAccounts)
+                                        >
+                                            "Local"
+                                        </a>
+                                    </li>
+                                    <li>
+                                        <a
+                                            href="/admin/remote-accounts"
+                                            class=selected(AdminSection::RemoteAccounts)
+                                            aria-current=current(AdminSection::RemoteAccounts)
+                                        >
+                                            "Remote"
+                                        </a>
+                                    </li>
+                                </ul>
+                            </details>
                         </li>
                         <li>
                             <a
@@ -245,14 +262,45 @@ pub(crate) fn AdminPanel(title: &'static str, children: Children) -> impl IntoVi
     }
 }
 
-/// Render the required confirmation control used by sensitive administrator actions.
+/// Confirm a sensitive administrator action in a native daisyUI checkbox modal.
 #[component]
-pub(crate) fn ConfirmationCheckbox() -> impl IntoView {
+pub(crate) fn AdminActionModal(
+    id: String,
+    trigger_label: &'static str,
+    title: &'static str,
+    message: String,
+    form_action: String,
+    csrf_token: String,
+    #[prop(optional)] limited: Option<bool>,
+) -> impl IntoView {
+    let heading_id = format!("{id}-title");
+    let labelled_by = heading_id.clone();
+    let trigger_id = id.clone();
+    let cancel_id = id.clone();
+    let backdrop_id = id.clone();
+
     view! {
-        <label class="label gap-2">
-            <input class="checkbox checkbox-sm" type="checkbox" required/>
-            <span>"Confirm"</span>
+        <label for=trigger_id class="btn btn-sm btn-outline" role="button" tabindex="0">
+            {trigger_label}
         </label>
+        <input id=id type="checkbox" class="modal-toggle"/>
+        <div class="modal" role="dialog" aria-labelledby=labelled_by>
+            <div class="modal-box">
+                <h3 id=heading_id class="text-lg font-bold">{title}</h3>
+                <p class="py-4">{message}</p>
+                <div class="modal-action">
+                    <label for=cancel_id class="btn">"Cancel"</label>
+                    <form method="post" action=form_action>
+                        <input type="hidden" name="csrf_token" value=csrf_token/>
+                        {limited.map(|limited| view! {
+                            <input type="hidden" name="limited" value=limited.to_string()/>
+                        })}
+                        <button class="btn btn-primary" type="submit">{trigger_label}</button>
+                    </form>
+                </div>
+            </div>
+            <label class="modal-backdrop" for=backdrop_id>"Close"</label>
+        </div>
     }
 }
 
@@ -291,7 +339,7 @@ mod tests {
     #[test]
     fn admin_layout_exposes_all_categories_in_a_responsive_drawer() {
         let html = view! {
-            <AdminLayout active=AdminSection::Accounts>
+            <AdminLayout active=AdminSection::LocalAccounts>
                 <p>"Account content"</p>
             </AdminLayout>
         }
@@ -302,7 +350,10 @@ mod tests {
         assert!(html.contains("class=\"btn btn-outline drawer-button\""));
         assert!(html.contains("href=\"/admin\""));
         assert!(html.contains("href=\"/admin/accounts\""));
+        assert!(html.contains("href=\"/admin/remote-accounts\""));
         assert!(html.contains("href=\"/admin/audit-log\""));
+        assert!(html.contains("<details open>"));
+        assert!(html.contains("<summary>Accounts</summary>"));
         assert!(html.contains("class=\"menu bg-base-200 min-h-full w-64 p-4\""));
         assert!(html.contains("class=\"menu-title\""));
         assert!(html.contains("aria-label=\"Administration\""));
@@ -501,15 +552,31 @@ mod tests {
 
     #[cfg(feature = "ssr")]
     #[test]
-    fn confirmation_and_warning_components_preserve_accessibility_contracts() {
-        let checkbox = view! { <ConfirmationCheckbox/> }.to_html();
+    fn confirmation_modal_and_warning_preserve_accessibility_contracts() {
+        let modal = view! {
+            <AdminActionModal
+                id="limit-account".to_owned()
+                trigger_label="Limit"
+                title="Limit account?"
+                message="Confirm this action.".to_owned()
+                form_action="/admin/accounts/id/limit".to_owned()
+                csrf_token="token".to_owned()
+                limited=true
+            />
+        }
+        .to_html();
         let warning = view! {
             <Notice kind=NoticeKind::Warning>"Keep this private"</Notice>
         }
         .to_html();
 
-        assert!(checkbox.contains("class=\"checkbox checkbox-sm\""));
-        assert!(checkbox.contains("type=\"checkbox\" required"));
+        assert!(modal.contains("type=\"checkbox\" class=\"modal-toggle\""));
+        assert!(modal.contains("class=\"modal\""));
+        assert!(modal.contains("role=\"dialog\""));
+        assert!(modal.contains("class=\"modal-box\""));
+        assert!(modal.contains("class=\"modal-backdrop\""));
+        assert!(modal.contains("method=\"post\" action=\"/admin/accounts/id/limit\""));
+        assert!(modal.contains("name=\"limited\" value=\"true\""));
         assert!(warning.contains("class=\"alert alert-warning\""));
         assert!(warning.contains("role=\"status\""));
     }

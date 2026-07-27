@@ -9,12 +9,12 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     bootstrap::{
-        UiAdminAccounts, UiAdminAuditLog, UiAdminWorkQueue, UiBootstrap, load_admin_accounts,
-        load_admin_audit_log, load_admin_work_queue, load_bootstrap,
+        UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditLog, UiAdminWorkQueue, UiBootstrap,
+        load_admin_accounts, load_admin_audit_log, load_admin_work_queue, load_bootstrap,
     },
     forms::{LoginError, PasswordChangeResult},
     ui::{
-        AccountMenu, AdminLayout, AdminPanel, AdminSection, ConfirmationCheckbox, FormField, Hero,
+        AccountMenu, AdminActionModal, AdminLayout, AdminPanel, AdminSection, FormField, Hero,
         Notice, NoticeKind, Page, PageCard, PageCardKind, PageCardTitle, PageTitle, SiteFooter,
         SiteHeader,
     },
@@ -82,7 +82,8 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("auth/edit") view=ChangePasswordPage/>
                 <Route path=path!("admin") view=AdminWorkQueuePage/>
                 <Route path=path!("admin/jobs") view=AdminWorkQueuePage/>
-                <Route path=path!("admin/accounts") view=AdminAccountsPage/>
+                <Route path=path!("admin/accounts") view=AdminLocalAccountsPage/>
+                <Route path=path!("admin/remote-accounts") view=AdminRemoteAccountsPage/>
                 <Route path=path!("admin/audit-log") view=AdminAuditLogPage/>
             </Routes>
         </Router>
@@ -114,22 +115,49 @@ fn AdminWorkQueuePage() -> impl IntoView {
 }
 
 #[component]
-fn AdminAccountsPage() -> impl IntoView {
+fn AdminLocalAccountsPage() -> impl IntoView {
+    view! { <AdminAccountsPage origin=UiAdminAccountOrigin::Local/> }
+}
+
+#[component]
+fn AdminRemoteAccountsPage() -> impl IntoView {
+    view! { <AdminAccountsPage origin=UiAdminAccountOrigin::Remote/> }
+}
+
+#[component]
+fn AdminAccountsPage(origin: UiAdminAccountOrigin) -> impl IntoView {
     let bootstrap = expect_context::<BootstrapResource>();
     let query = use_query_map().get().get("q").unwrap_or_default();
     let search_value = query.clone();
-    let accounts = Resource::new_blocking(move || query.clone(), load_admin_accounts);
+    let accounts = Resource::new_blocking(
+        move || (query.clone(), origin),
+        |(query, origin)| load_admin_accounts(query, origin),
+    );
     install_periodic_refresh(accounts);
+    let (title, path, section) = match origin {
+        UiAdminAccountOrigin::Local => (
+            "Local accounts",
+            "/admin/accounts",
+            AdminSection::LocalAccounts,
+        ),
+        UiAdminAccountOrigin::Remote => (
+            "Remote accounts",
+            "/admin/remote-accounts",
+            AdminSection::RemoteAccounts,
+        ),
+    };
 
     view! {
-        <PageMetadata bootstrap page_title="Accounts" path="/admin/accounts"/>
-        <PageFrame bootstrap login_next="/admin/accounts" wide=true>
-            <AdminLayout active=AdminSection::Accounts>
-                <AdminPageHeading title="Accounts" resource=accounts/>
+        <PageMetadata bootstrap page_title=title path=path/>
+        <PageFrame bootstrap login_next=path wide=true>
+            <AdminLayout active=section>
+                <AdminPageHeading title=title resource=accounts/>
                 <Transition fallback=|| admin_loading("Loading accounts…")>
                     {Suspend::new(async move {
                         match accounts.await {
-                            Ok(accounts) => admin_accounts_content(accounts, search_value),
+                            Ok(accounts) => {
+                                admin_accounts_content(accounts, search_value, origin, path)
+                            }
                             Err(_) => admin_load_error("accounts"),
                         }
                     })}
@@ -292,7 +320,23 @@ fn admin_work_queue_content(work_queue: UiAdminWorkQueue) -> AnyView {
     .into_any()
 }
 
-fn admin_accounts_content(accounts: UiAdminAccounts, search_value: String) -> AnyView {
+fn admin_accounts_content(
+    accounts: UiAdminAccounts,
+    search_value: String,
+    origin: UiAdminAccountOrigin,
+    path: &'static str,
+) -> AnyView {
+    match origin {
+        UiAdminAccountOrigin::Local => local_accounts_content(accounts, search_value, path),
+        UiAdminAccountOrigin::Remote => remote_accounts_content(accounts, search_value, path),
+    }
+}
+
+fn local_accounts_content(
+    accounts: UiAdminAccounts,
+    search_value: String,
+    path: &'static str,
+) -> AnyView {
     let csrf_create = accounts.csrf_token.clone();
     let csrf_actions = accounts.csrf_token;
     view! {
@@ -319,19 +363,19 @@ fn admin_accounts_content(accounts: UiAdminAccounts, search_value: String) -> An
                     <button class="btn btn-primary" type="submit">"Create account"</button>
                 </form>
             </AdminPanel>
-            <AdminPanel title="Accounts">
-                <form class="fieldset max-w-xl gap-4" method="get" action="/admin/accounts">
-                    <FormField label="Search accounts">
+            <AdminPanel title="Local accounts">
+                <form class="fieldset max-w-xl gap-4" method="get" action=path>
+                    <FormField label="Search local accounts">
                         <input
                             class="input w-full"
                             name="q"
                             value=search_value
-                            placeholder="Username, display name, email, or domain"
+                            placeholder="Username, display name, or email"
                         />
                     </FormField>
                     <div class="card-actions">
                         <button class="btn btn-primary" type="submit">"Search"</button>
-                        <A attr:class="btn btn-ghost" href="/admin/accounts">"Clear"</A>
+                        <a class="btn btn-ghost" href=path>"Clear"</a>
                     </div>
                 </form>
                 <div class="overflow-x-auto">
@@ -339,7 +383,7 @@ fn admin_accounts_content(accounts: UiAdminAccounts, search_value: String) -> An
                         <thead>
                             <tr>
                                 <th>"Account"</th>
-                                <th>"Origin"</th>
+                                <th>"Email"</th>
                                 <th>"Role"</th>
                                 <th>"State"</th>
                                 <th>"Actions"</th>
@@ -351,7 +395,99 @@ fn admin_accounts_content(accounts: UiAdminAccounts, search_value: String) -> An
                                 let reset_id = account_id.clone();
                                 let csrf_limit = csrf_actions.clone();
                                 let csrf_reset = csrf_actions.clone();
-                                let action = if account.limited { "unlimit" } else { "limit" };
+                                let (action, title) = if account.limited {
+                                    ("Unlimit", "Unlimit local account?")
+                                } else {
+                                    ("Limit", "Limit local account?")
+                                };
+                                let username = account.username;
+                                view! {
+                                    <tr>
+                                        <td>
+                                            <strong>{username.clone()}</strong>
+                                            <br/>
+                                            <small>{account.display_name}</small>
+                                        </td>
+                                        <td>{account.email.unwrap_or_default()}</td>
+                                        <td>{if account.is_admin { "Admin" } else { "User" }}</td>
+                                        <td>{if account.limited { "Limited" } else { "Active" }}</td>
+                                        <td class="flex flex-wrap gap-2">
+                                            <AdminActionModal
+                                                id=format!("limit-{account_id}")
+                                                trigger_label=action
+                                                title
+                                                message=format!(
+                                                    "Are you sure you want to {} {username}?",
+                                                    action.to_lowercase(),
+                                                )
+                                                form_action=format!("/admin/accounts/{account_id}/limit")
+                                                csrf_token=csrf_limit
+                                                limited=!account.limited
+                                            />
+                                            <AdminActionModal
+                                                id=format!("reset-password-{reset_id}")
+                                                trigger_label="Reset password"
+                                                title="Reset local account password?"
+                                                message=format!(
+                                                    "Reset the password for {username}? The current password will stop working immediately."
+                                                )
+                                                form_action=format!("/admin/accounts/{reset_id}/reset-password")
+                                                csrf_token=csrf_reset
+                                            />
+                                        </td>
+                                    </tr>
+                                }
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            </AdminPanel>
+        </section>
+    }
+    .into_any()
+}
+
+fn remote_accounts_content(
+    accounts: UiAdminAccounts,
+    search_value: String,
+    path: &'static str,
+) -> AnyView {
+    let csrf_actions = accounts.csrf_token;
+    view! {
+        <section class="pb-8">
+            <AdminPanel title="Remote accounts">
+                <form class="fieldset max-w-xl gap-4" method="get" action=path>
+                    <FormField label="Search remote accounts">
+                        <input
+                            class="input w-full"
+                            name="q"
+                            value=search_value
+                            placeholder="Username, display name, or domain"
+                        />
+                    </FormField>
+                    <div class="card-actions">
+                        <button class="btn btn-primary" type="submit">"Search"</button>
+                        <a class="btn btn-ghost" href=path>"Clear"</a>
+                    </div>
+                </form>
+                <div class="overflow-x-auto">
+                    <table class="table table-zebra">
+                        <thead>
+                            <tr>
+                                <th>"Account"</th>
+                                <th>"State"</th>
+                                <th>"Actions"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {accounts.accounts.into_iter().map(|account| {
+                                let account_id = account.id.to_string();
+                                let csrf_limit = csrf_actions.clone();
+                                let (action, title) = if account.limited {
+                                    ("Unlimit", "Unlimit remote account?")
+                                } else {
+                                    ("Limit", "Limit remote account?")
+                                };
                                 let handle = account.domain.as_ref().map_or_else(
                                     || account.username.clone(),
                                     |domain| format!("{}@{domain}", account.username),
@@ -359,47 +495,24 @@ fn admin_accounts_content(accounts: UiAdminAccounts, search_value: String) -> An
                                 view! {
                                     <tr>
                                         <td>
-                                            <strong>{handle}</strong>
+                                            <strong>{handle.clone()}</strong>
                                             <br/>
                                             <small>{account.display_name}</small>
                                         </td>
-                                        <td>{if account.domain.is_some() { "Remote" } else { "Local" }}</td>
-                                        <td>{if account.is_admin { "Admin" } else { "User" }}</td>
                                         <td>{if account.limited { "Limited" } else { "Active" }}</td>
-                                        <td class="flex flex-wrap gap-2">
-                                            <form
-                                                class="flex items-center gap-2"
-                                                method="post"
-                                                action=format!("/admin/accounts/{account_id}/limit")
-                                            >
-                                                <input type="hidden" name="csrf_token" value=csrf_limit/>
-                                                <input
-                                                    type="hidden"
-                                                    name="limited"
-                                                    value=(!account.limited).to_string()
-                                                />
-                                                <ConfirmationCheckbox/>
-                                                <button class="btn btn-sm btn-outline" type="submit">
-                                                    {action}
-                                                </button>
-                                            </form>
-                                            {account.domain.is_none().then(|| view! {
-                                                <form
-                                                    class="flex items-center gap-2"
-                                                    method="post"
-                                                    action=format!("/admin/accounts/{reset_id}/reset-password")
-                                                >
-                                                    <input
-                                                        type="hidden"
-                                                        name="csrf_token"
-                                                        value=csrf_reset
-                                                    />
-                                                    <ConfirmationCheckbox/>
-                                                    <button class="btn btn-sm btn-outline" type="submit">
-                                                        "Reset password"
-                                                    </button>
-                                                </form>
-                                            })}
+                                        <td>
+                                            <AdminActionModal
+                                                id=format!("limit-{account_id}")
+                                                trigger_label=action
+                                                title
+                                                message=format!(
+                                                    "Are you sure you want to {} {handle}?",
+                                                    action.to_lowercase(),
+                                                )
+                                                form_action=format!("/admin/accounts/{account_id}/limit")
+                                                csrf_token=csrf_limit
+                                                limited=!account.limited
+                                            />
                                         </td>
                                     </tr>
                                 }

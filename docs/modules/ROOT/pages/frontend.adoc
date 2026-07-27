@@ -68,10 +68,11 @@ functions must validate both the session and a CSRF token.
 == Administration
 
 Administrators have an SSR and hydrated operations interface with a responsive category menu:
-work queue at `/admin`, accounts at `/admin/accounts`, and audit log at `/admin/audit-log`. The
-navigation link is projected only for accounts whose persisted `is_admin` flag is set, and the
-server independently protects every admin route. Anonymous requests return through login;
-authenticated non-administrators receive a forbidden response.
+work queue at `/admin`, local accounts at `/admin/accounts`, remote accounts at
+`/admin/remote-accounts`, and audit log at `/admin/audit-log`. The navigation link is projected
+only for accounts whose persisted `is_admin` flag is set, and the server independently protects
+every admin route. Anonymous requests return through login; authenticated non-administrators
+receive a forbidden response.
 
 Each category has a separate JSON GET loader and queries only the data it presents. The active
 category refetches every 15 seconds while the document is visible, and its Refresh button triggers
@@ -81,7 +82,8 @@ bounded error text. Raw job payloads are never sent to the UI. Process-local Pro
 remain infrastructure endpoints.
 
 Account creation, password reset, and local or cached-remote account limits use native forms with
-a session-bound HMAC CSRF token. Mutations and their audit records commit in one transaction.
+a session-bound HMAC CSRF token. Sensitive account actions open a daisyUI confirmation modal
+before the native form is submitted. Mutations and their audit records commit in one transaction.
 Generated temporary passwords are returned only by the successful response and are not stored in
 audit metadata.
 

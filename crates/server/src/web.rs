@@ -18,9 +18,9 @@ use axum::{
 use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
 use roosty_web_ui::{
-    App, UiAccount, UiAdminAccount, UiAdminAccounts, UiAdminAuditEntry, UiAdminAuditLog,
-    UiAdminJob, UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext,
-    shell,
+    App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
+    UiAdminAuditLog, UiAdminJob, UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap,
+    UiServerContext, shell,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -117,6 +117,7 @@ fn login_return_query(next: &str) -> &'static str {
     match next {
         "/admin/jobs" => "next=%2Fadmin%2Fjobs",
         "/admin/accounts" => "next=%2Fadmin%2Faccounts",
+        "/admin/remote-accounts" => "next=%2Fadmin%2Fremote-accounts",
         "/admin/audit-log" => "next=%2Fadmin%2Faudit-log",
         path if path.starts_with("/admin") => "next=%2Fadmin",
         _ => "next=%2Fauth%2Fedit",
@@ -195,6 +196,7 @@ impl UiBackend for RoostyUiBackend {
         &self,
         cookie_header: Option<String>,
         query: String,
+        origin: UiAdminAccountOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAccounts, String>> + Send + 'static>> {
         let state = self.state.clone();
         Box::pin(async move {
@@ -202,9 +204,16 @@ impl UiBackend for RoostyUiBackend {
             let csrf_token = csrf_token_from_session(&state, &headers)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "administrator session required".to_owned())?;
-            let accounts = roosty_db::list_admin_accounts(&state.db, &query, None, None, 100, None)
-                .await
-                .map_err(|error| error.to_string())?;
+            let accounts = roosty_db::list_admin_accounts(
+                &state.db,
+                &query,
+                Some(origin.as_str()),
+                None,
+                100,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             Ok(UiAdminAccounts {
                 csrf_token,
                 accounts: accounts.into_iter().map(ui_admin_account).collect(),
@@ -412,7 +421,12 @@ async fn limit_admin_account(
     )
     .await
     {
-        Ok(_) => Redirect::to("/admin/accounts").into_response(),
+        Ok(account) => Redirect::to(if account.domain.is_some() {
+            "/admin/remote-accounts"
+        } else {
+            "/admin/accounts"
+        })
+        .into_response(),
         Err(error) => admin_form_error(error),
     }
 }
@@ -501,6 +515,7 @@ mod tests {
         assert!(paths.iter().any(|path| path == "/admin"));
         assert!(paths.iter().any(|path| path == "/admin/jobs"));
         assert!(paths.iter().any(|path| path == "/admin/accounts"));
+        assert!(paths.iter().any(|path| path == "/admin/remote-accounts"));
         assert!(paths.iter().any(|path| path == "/admin/audit-log"));
     }
 
@@ -513,6 +528,10 @@ mod tests {
         assert_eq!(
             super::login_return_query("/admin/accounts"),
             "next=%2Fadmin%2Faccounts"
+        );
+        assert_eq!(
+            super::login_return_query("/admin/remote-accounts"),
+            "next=%2Fadmin%2Fremote-accounts"
         );
         assert_eq!(
             super::login_return_query("/admin/audit-log"),

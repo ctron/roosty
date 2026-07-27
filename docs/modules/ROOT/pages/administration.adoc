@@ -11,7 +11,8 @@ Roosty only shows the administration navigation to administrators, and the serve
 The responsive administration menu separates the interface into:
 
 * Work queue at `/admin`, with durable queue health and sanitized job diagnostics.
-* Accounts at `/admin/accounts`, with local and cached-remote account management, account creation, password resets, and account limits.
+* Local accounts at `/admin/accounts`, with account creation, password resets, and account limits.
+* Remote accounts at `/admin/remote-accounts`, with cached-remote account limits.
 * Audit log at `/admin/audit-log`, with recent administrator actions.
 
 Each active category refreshes its own JSON data every 15 seconds while the page is visible.
@@ -44,6 +45,7 @@ When the web interface is unavailable, run the password-reset command inside the
 Administrators can limit a local or cached-remote account without discarding its ActivityPub data.
 A limited account is suppressed from discovery and public timelines and participates in notification filtering.
 Removing the limit restores normal presentation.
+The interface confirms limit, unlimit, and password-reset actions in a modal before submitting them.
 
 Account suspension, deletion, reports, and custom administrator roles are not yet implemented.
 See the xref:compatibility.adoc[compatibility matrix] for the current Mastodon administration API coverage.
