@@ -126,9 +126,9 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 |`/api/v1/version`
 |Roosty-specific extension.
 
-|🔴
+|🟡
 |Explore and trends
-|Trends, profile-directory, and account-suggestion APIs are not implemented.
+|Trending hashtags are available. Trending statuses/links, the profile directory, and account suggestions are missing.
 
 |===
 

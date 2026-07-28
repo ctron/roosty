@@ -79,6 +79,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::auth::router())
         .merge(crate::compat::router())
         .merge(crate::conversations::router())
+        .merge(crate::explore::router())
         .merge(crate::federation::router())
         .merge(crate::instance::router())
         .merge(crate::lists::router())

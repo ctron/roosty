@@ -2945,10 +2945,30 @@ pub struct LocalTag {
 pub struct LocalTagHistory {
     /// Midnight UTC Unix timestamp for this history bucket.
     pub day: u64,
-    /// Number of local status uses on this day.
+    /// Number of locally known public status uses on this day.
     pub uses: u64,
-    /// Number of distinct local accounts using the tag on this day.
+    /// Number of distinct locally known accounts using the tag on this day.
     pub accounts: u64,
+}
+
+/// A locally known hashtag selected for Mastodon-compatible trend discovery.
+#[derive(Clone, Debug)]
+pub struct TrendingTag {
+    /// Shared hashtag metadata.
+    pub tag: LocalTag,
+    /// Public local and cached-remote usage during the latest seven UTC days.
+    pub history: Vec<LocalTagHistory>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct TrendingTagRow {
+    id: Uuid,
+    name: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    day: i64,
+    uses: i64,
+    accounts: i64,
 }
 
 /// A featured hashtag projected with account-scoped visible-status statistics.
@@ -8174,62 +8194,167 @@ pub async fn is_local_tag_followed(
         .is_some())
 }
 
-/// Return recent local usage history for a tag.
+/// Return public local and cached-remote usage during the latest seven UTC days.
 pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTagHistory>> {
-    let rows = local_status_tag::Entity::find()
-        .filter(local_status_tag::Column::TagId.eq(tag_id))
-        .all(db)
-        .await?;
-    let mut buckets =
-        std::collections::BTreeMap::<u64, (u64, std::collections::HashSet<(bool, Uuid)>)>::new();
-
-    for row in rows {
-        let Some(status) = local_status::Entity::find_by_id(row.status_id)
-            .filter(local_status::Column::DeletedAt.is_null())
-            .filter(local_status::Column::Visibility.eq(StatusVisibility::Public))
-            .one(db)
-            .await?
-        else {
-            continue;
-        };
-        let day = (status.created_at.unix_timestamp() / 86_400 * 86_400).max(0) as u64;
-        let (uses, accounts) = buckets.entry(day).or_default();
-        *uses += 1;
-        accounts.insert((false, status.account_id));
+    #[derive(Debug, FromQueryResult)]
+    struct HistoryRow {
+        day: i64,
+        uses: i64,
+        accounts: i64,
     }
 
-    let rows = remote_status_tag::Entity::find()
-        .filter(remote_status_tag::Column::TagId.eq(tag_id))
-        .all(db)
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
         .await?;
-    for row in rows {
-        let Some(status) = remote_status::Entity::find_by_id(row.remote_status_id)
-            .filter(remote_status::Column::DeletedAt.is_null())
-            .filter(remote_status::Column::Visibility.eq(StatusVisibility::Public))
-            .one(db)
-            .await?
-        else {
-            continue;
-        };
-        let day = (status.published_at.unix_timestamp() / 86_400 * 86_400).max(0) as u64;
-        let (uses, accounts) = buckets.entry(day).or_default();
-        *uses += 1;
-        accounts.insert((true, status.remote_actor_id));
-    }
+    let rows = HistoryRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"WITH bounds AS (
+               SELECT (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                           AT TIME ZONE 'UTC') - interval '6 days' AS starts_at,
+                      (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                           AT TIME ZONE 'UTC') + interval '1 day' AS ends_at
+           ),
+           usage AS (
+               SELECT s.created_at AS occurred_at,
+                      'local:' || s.account_id::text AS actor_key
+               FROM local_status_tag st
+               JOIN local_status s ON s.id = st.status_id
+               CROSS JOIN bounds b
+               WHERE st.tag_id = $1
+                 AND s.deleted_at IS NULL AND s.visibility = 'public'
+                 AND s.created_at >= b.starts_at AND s.created_at < b.ends_at
+               UNION ALL
+               SELECT s.published_at AS occurred_at,
+                      'remote:' || s.remote_actor_id::text AS actor_key
+               FROM remote_status_tag st
+               JOIN remote_status s ON s.id = st.remote_status_id
+               CROSS JOIN bounds b
+               WHERE st.tag_id = $1
+                 AND s.deleted_at IS NULL AND s.visibility = 'public'
+                 AND s.published_at >= b.starts_at AND s.published_at < b.ends_at
+           )
+           SELECT extract(epoch FROM date_trunc(
+                      'day', occurred_at AT TIME ZONE 'UTC'
+                  ))::bigint AS day,
+                  count(*)::bigint AS uses,
+                  count(DISTINCT actor_key)::bigint AS accounts
+           FROM usage
+           GROUP BY date_trunc('day', occurred_at AT TIME ZONE 'UTC')
+           ORDER BY day DESC"#,
+        vec![tag_id.into()],
+    ))
+    .all(&txn)
+    .await?;
+    txn.commit().await?;
 
-    let mut history = buckets
-        .into_iter()
-        .rev()
-        .take(7)
-        .map(|(day, (uses, accounts))| LocalTagHistory {
-            day,
-            uses,
-            accounts: accounts.len() as u64,
+    rows.into_iter()
+        .map(|row| {
+            Ok(LocalTagHistory {
+                day: u64::try_from(row.day)
+                    .map_err(|_| DbErr::Type("negative tag history day".to_owned()))?,
+                uses: u64::try_from(row.uses)
+                    .map_err(|_| DbErr::Type("negative tag usage count".to_owned()))?,
+                accounts: u64::try_from(row.accounts)
+                    .map_err(|_| DbErr::Type("negative tag account count".to_owned()))?,
+            })
         })
-        .collect::<Vec<_>>();
-    history.sort_by_key(|bucket| std::cmp::Reverse(bucket.day));
+        .collect()
+}
 
-    Ok(history)
+/// Rank hashtags from public local and cached-remote activity in one aggregate query.
+pub async fn trending_tags(db: &DbConnection, limit: u64, offset: u64) -> Result<Vec<TrendingTag>> {
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let rows = TrendingTagRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"WITH bounds AS (
+               SELECT (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                           AT TIME ZONE 'UTC') - interval '6 days' AS starts_at,
+                      (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                           AT TIME ZONE 'UTC') + interval '1 day' AS ends_at
+           ),
+           usage AS (
+               SELECT st.tag_id, s.created_at AS occurred_at,
+                      'local:' || s.account_id::text AS actor_key
+               FROM local_status_tag st
+               JOIN local_status s ON s.id = st.status_id
+               CROSS JOIN bounds b
+               WHERE s.deleted_at IS NULL AND s.visibility = 'public'
+                 AND s.created_at >= b.starts_at AND s.created_at < b.ends_at
+               UNION ALL
+               SELECT st.tag_id, s.published_at AS occurred_at,
+                      'remote:' || s.remote_actor_id::text AS actor_key
+               FROM remote_status_tag st
+               JOIN remote_status s ON s.id = st.remote_status_id
+               CROSS JOIN bounds b
+               WHERE s.deleted_at IS NULL AND s.visibility = 'public'
+                 AND s.published_at >= b.starts_at AND s.published_at < b.ends_at
+           ),
+           selected AS (
+               SELECT u.tag_id,
+                      count(DISTINCT actor_key)::bigint AS participating_accounts,
+                      count(*)::bigint AS total_uses,
+                      max(occurred_at) AS latest_use
+               FROM usage u
+               JOIN local_tag t ON t.id = u.tag_id
+               GROUP BY u.tag_id, t.name
+               ORDER BY participating_accounts DESC, total_uses DESC,
+                        latest_use DESC, t.name ASC
+               LIMIT $1 OFFSET $2
+           )
+           SELECT t.id, t.name, t.created_at, t.updated_at,
+                  extract(epoch FROM date_trunc(
+                      'day', u.occurred_at AT TIME ZONE 'UTC'
+                  ))::bigint AS day,
+                  count(*)::bigint AS uses,
+                  count(DISTINCT u.actor_key)::bigint AS accounts
+           FROM selected s
+           JOIN local_tag t ON t.id = s.tag_id
+           JOIN usage u ON u.tag_id = s.tag_id
+           GROUP BY t.id, t.name, t.created_at, t.updated_at,
+                    s.participating_accounts, s.total_uses, s.latest_use,
+                    date_trunc('day', u.occurred_at AT TIME ZONE 'UTC')
+           ORDER BY s.participating_accounts DESC, s.total_uses DESC,
+                    s.latest_use DESC, t.name ASC, day DESC"#,
+        vec![
+            i64::try_from(limit)
+                .map_err(|_| DbErr::Type("trend limit exceeds bigint".to_owned()))?
+                .into(),
+            i64::try_from(offset)
+                .map_err(|_| DbErr::Type("trend offset exceeds bigint".to_owned()))?
+                .into(),
+        ],
+    ))
+    .all(&txn)
+    .await?;
+    txn.commit().await?;
+
+    let mut trends = Vec::<TrendingTag>::new();
+    for row in rows {
+        if trends.last().is_none_or(|trend| trend.tag.id != row.id) {
+            trends.push(TrendingTag {
+                tag: LocalTag {
+                    id: row.id,
+                    name: row.name.clone(),
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                },
+                history: Vec::new(),
+            });
+        }
+        if let Some(trend) = trends.last_mut() {
+            trend.history.push(LocalTagHistory {
+                day: u64::try_from(row.day)
+                    .map_err(|_| DbErr::Type("negative tag history day".to_owned()))?,
+                uses: u64::try_from(row.uses)
+                    .map_err(|_| DbErr::Type("negative tag usage count".to_owned()))?,
+                accounts: u64::try_from(row.accounts)
+                    .map_err(|_| DbErr::Type("negative tag account count".to_owned()))?,
+            });
+        }
+    }
+    Ok(trends)
 }
 
 /// List public local and cached remote statuses containing a hashtag.

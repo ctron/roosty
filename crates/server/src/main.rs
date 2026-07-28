@@ -17,6 +17,7 @@ mod auth;
 mod compat;
 mod config;
 mod conversations;
+mod explore;
 mod featured_tags;
 mod federation;
 mod http;

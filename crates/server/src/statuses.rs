@@ -6344,6 +6344,116 @@ mod tests {
 
     #[test_context(StatusContext)]
     #[tokio::test]
+    /// Given recent public hashtag activity, when Explore is queried, then trends are ranked and bounded compatibly.
+    async fn trending_tags_rank_known_public_activity(context: &mut StatusContext) {
+        let admin_token = context.access_token().await;
+        let bob_token = context
+            .access_token_for("trend_bob", "trend-bob@example.com")
+            .await;
+        context
+            .create_status(&admin_token, "first #rust #quiet", Some("public"), None)
+            .await;
+        context
+            .create_status(&admin_token, "second #rust", Some("public"), None)
+            .await;
+        context
+            .create_status(&bob_token, "third #rust", Some("public"), None)
+            .await;
+        context
+            .create_status(&admin_token, "not public #hidden", Some("unlisted"), None)
+            .await;
+        let deleted = context
+            .create_status(&admin_token, "removed #deleted", Some("public"), None)
+            .await;
+        let delete_response = context
+            .authenticated_empty(
+                "DELETE",
+                &format!("/api/v1/statuses/{}", deleted["id"].as_str().unwrap()),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let actor = context.cache_remote_actor("trend_remote").await;
+        let now = OffsetDateTime::now_utc();
+        roosty_db::upsert_remote_status(
+            &context.db,
+            NewRemoteStatus {
+                activitypub_id: "https://remote.test/statuses/recent-trend".to_owned(),
+                remote_actor_id: actor.id,
+                content: "<p>#Fediverse</p>".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: now,
+                updated_at: now,
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({}),
+                tag_names: vec!["fediverse".to_owned()],
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        roosty_db::upsert_remote_status(
+            &context.db,
+            NewRemoteStatus {
+                activitypub_id: "https://remote.test/statuses/old-trend".to_owned(),
+                remote_actor_id: actor.id,
+                content: "<p>#Old</p>".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: now - TimeDuration::days(8),
+                updated_at: now - TimeDuration::days(8),
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: json!({}),
+                tag_names: vec!["old".to_owned()],
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let canonical = json_body(context.get("/api/v1/trends/tags?limit=20&offset=0").await).await;
+        let alias = json_body(context.get("/api/v1/trends?limit=20").await).await;
+        assert_eq!(alias, canonical);
+        assert_eq!(canonical[0]["name"], "rust");
+        assert_eq!(canonical[0]["history"][0]["uses"], "3");
+        assert_eq!(canonical[0]["history"][0]["accounts"], "2");
+        let names = canonical
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"fediverse"));
+        assert!(names.contains(&"quiet"));
+        assert!(!names.contains(&"hidden"));
+        assert!(!names.contains(&"deleted"));
+        assert!(!names.contains(&"old"));
+
+        let first = json_body(context.get("/api/v1/trends/tags?limit=1").await).await;
+        assert_eq!(first.as_array().unwrap().len(), 1);
+        assert_eq!(first[0]["name"], "rust");
+        let second = json_body(context.get("/api/v1/trends/tags?limit=1&offset=1").await).await;
+        assert_eq!(second.as_array().unwrap().len(), 1);
+        assert_ne!(second[0]["name"], "rust");
+        let clamped = json_body(context.get("/api/v1/trends/tags?limit=999").await).await;
+        assert_eq!(clamped.as_array().unwrap().len(), 3);
+        assert_eq!(
+            context
+                .get("/api/v1/trends/tags?offset=invalid")
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
     /// Given indexed cached hashtags, mixed APIs and followed-tag home delivery expose public remote Notes.
     async fn cached_remote_hashtags_integrate_with_timelines_search_and_follows(
         context: &mut StatusContext,
