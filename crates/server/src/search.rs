@@ -436,17 +436,22 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["accounts"], serde_json::json!([]));
         assert_eq!(body["statuses"], serde_json::json!([]));
+        let history = body["hashtags"][0]["history"].as_array().unwrap();
         assert_eq!(
             body["hashtags"],
             serde_json::json!([{
                 "id": body["hashtags"][0]["id"],
                 "name": "roosttag",
                 "url": "https://roosty.localhost:4000/tags/roosttag",
-                "history": [{
-                    "day": body["hashtags"][0]["history"][0]["day"],
-                    "uses": "1",
-                    "accounts": "1"
-                }]
+                "history": [
+                    {"day": history[0]["day"], "uses": "1", "accounts": "1"},
+                    {"day": history[1]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[2]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[3]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[4]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[5]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[6]["day"], "uses": "0", "accounts": "0"}
+                ]
             }])
         );
     }
@@ -549,6 +554,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                trends_refresh_interval: time::Duration::minutes(5),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),

@@ -276,6 +276,9 @@ jobs retry with exponential backoff until this age is exceeded.
 Roosty runs four durable worker loops by default for both `roosty worker` and
 `serve --with-worker`. Set `ROOSTY_WORKER_CONCURRENCY` to choose a different
 count; set it to `0` to use the logical CPU count available to the process.
+Trend scores refresh every five minutes by default. Set
+`ROOSTY_TRENDS_REFRESH_INTERVAL` to a humantime duration of at least one minute,
+using the same value for every process connected to the database.
 
 This surface provides WebFinger, local actor documents, public Notes, outboxes,
 follower/following collections, policy-controlled remote `resolve=true` lookup,

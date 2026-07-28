@@ -3866,6 +3866,25 @@ async fn public_timeline_models(
     Ok(items)
 }
 
+/// Project cached trend results through the normal status serializer.
+pub(crate) async fn trending_status_models(
+    state: &AppState,
+    trends: Vec<roosty_db::TrendingStatus>,
+    viewer: Option<AccountId>,
+) -> Result<Vec<StatusResponse>, RoostyError> {
+    let metrics = trends
+        .iter()
+        .map(|trend| (trend.favourites_count, trend.reblogs_count))
+        .collect::<Vec<_>>();
+    let timeline = trends.into_iter().map(|trend| trend.item).collect();
+    let mut statuses = public_timeline_models(state, timeline, viewer).await?;
+    for (status, (favourites_count, reblogs_count)) in statuses.iter_mut().zip(metrics) {
+        status.favourites_count = favourites_count;
+        status.reblogs_count = reblogs_count;
+    }
+    Ok(statuses)
+}
+
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
 pub(crate) async fn timeline_response(
     state: &AppState,
@@ -6319,17 +6338,22 @@ mod tests {
         let response = context.get("/api/v1/tags/testing").await;
         assert_eq!(response.status(), StatusCode::OK);
         let tag = json_body(response).await;
+        let history = tag["history"].as_array().unwrap();
         assert_eq!(
             tag,
             serde_json::json!({
                 "id": tag["id"],
                 "name": "testing",
                 "url": "https://localhost:4000/tags/testing",
-                "history": [{
-                    "day": tag["history"][0]["day"],
-                    "uses": "1",
-                    "accounts": "1"
-                }]
+                "history": [
+                    {"day": history[0]["day"], "uses": "1", "accounts": "1"},
+                    {"day": history[1]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[2]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[3]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[4]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[5]["day"], "uses": "0", "accounts": "0"},
+                    {"day": history[6]["day"], "uses": "0", "accounts": "0"}
+                ]
             })
         );
 
@@ -6351,14 +6375,40 @@ mod tests {
             .access_token_for("trend_bob", "trend-bob@example.com")
             .await;
         context
-            .create_status(&admin_token, "first #rust #quiet", Some("public"), None)
+            .create_status(
+                &admin_token,
+                "first #rust #quiet #fediverse",
+                Some("public"),
+                None,
+            )
             .await;
         context
             .create_status(&admin_token, "second #rust", Some("public"), None)
             .await;
         context
-            .create_status(&bob_token, "third #rust", Some("public"), None)
+            .create_status(
+                &bob_token,
+                "third #rust #quiet #fediverse",
+                Some("public"),
+                None,
+            )
             .await;
+        for index in 0..5 {
+            let token = context
+                .access_token_for(
+                    &format!("trend_user_{index}"),
+                    &format!("trend-user-{index}@example.com"),
+                )
+                .await;
+            let content = match index {
+                0 | 1 => "more #rust #quiet #fediverse",
+                2 | 3 => "more #rust #quiet",
+                _ => "more #rust",
+            };
+            context
+                .create_status(&token, content, Some("public"), None)
+                .await;
+        }
         context
             .create_status(&admin_token, "not public #hidden", Some("unlisted"), None)
             .await;
@@ -6417,12 +6467,17 @@ mod tests {
         .await
         .unwrap();
 
+        while roosty_db::maintain_trends(&context.db)
+            .await
+            .unwrap()
+            .has_more
+        {}
         let canonical = json_body(context.get("/api/v1/trends/tags?limit=20&offset=0").await).await;
         let alias = json_body(context.get("/api/v1/trends?limit=20").await).await;
         assert_eq!(alias, canonical);
         assert_eq!(canonical[0]["name"], "rust");
-        assert_eq!(canonical[0]["history"][0]["uses"], "3");
-        assert_eq!(canonical[0]["history"][0]["accounts"], "2");
+        assert_eq!(canonical[0]["history"][0]["uses"], "8");
+        assert_eq!(canonical[0]["history"][0]["accounts"], "7");
         let names = canonical
             .as_array()
             .unwrap()
@@ -6446,6 +6501,63 @@ mod tests {
         assert_eq!(
             context
                 .get("/api/v1/trends/tags?offset=invalid")
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given enough cached interactions, trend APIs return complete status and link response shapes.
+    async fn trending_statuses_and_links_have_compatible_shapes(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let mut expected = context
+            .create_status(
+                &author_token,
+                "A status gaining attention",
+                Some("public"),
+                None,
+            )
+            .await;
+        let status_id = expected["id"].as_str().unwrap().to_owned();
+
+        for index in 0..5 {
+            let token = context
+                .access_token_for(
+                    &format!("trend_fan_{index}"),
+                    &format!("trend-fan-{index}@example.com"),
+                )
+                .await;
+            let response = context
+                .authenticated_empty(
+                    "POST",
+                    &format!("/api/v1/statuses/{status_id}/favourite"),
+                    &token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        while roosty_db::maintain_trends(&context.db)
+            .await
+            .unwrap()
+            .has_more
+        {}
+        expected["favourites_count"] = json!(5);
+        expected["favourited"] = json!(false);
+        expected["quote_approval"]["current_user"] = json!("denied");
+        assert_eq!(
+            json_body(context.get("/api/v1/trends/statuses").await).await,
+            json!([expected])
+        );
+        assert_eq!(
+            json_body(context.get("/api/v1/trends/links?limit=20&offset=0").await).await,
+            json!([])
+        );
+        assert_eq!(
+            context
+                .get("/api/v1/trends/links?offset=invalid")
                 .await
                 .status(),
             StatusCode::BAD_REQUEST
@@ -10210,6 +10322,7 @@ mod tests {
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                trends_refresh_interval: time::Duration::minutes(5),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),

@@ -2362,7 +2362,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         let created = match roosty_db::reblog_status_by_remote_actor(
             &txn,
             remote_actor.id,
-            target.clone(),
+            target,
             &activity_id,
         )
         .await
@@ -7547,6 +7547,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            trends_refresh_interval: time::Duration::minutes(5),
             scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
             streaming: crate::config::StreamingConfig::default(),
             instance_name: "Federation test".to_owned(),
@@ -7774,7 +7775,8 @@ mod tests {
             roosty_db::JobKind::WebPushDelivery
             | roosty_db::JobKind::NotificationRequestMerge
             | roosty_db::JobKind::NotificationRequestCleanup
-            | roosty_db::JobKind::ScheduledStatusPublish => {}
+            | roosty_db::JobKind::ScheduledStatusPublish
+            | roosty_db::JobKind::TrendMaintenance => {}
         }
         assert!(
             roosty_db::mark_job_completed(&state.db, &job)

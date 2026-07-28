@@ -128,7 +128,10 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 
 |🟡
 |Explore and trends
-|Trending hashtags are available. Trending statuses/links, the profile directory, and account suggestions are missing.
+|Trending hashtags and statuses are available from shared, transactionally maintained caches.
+Results are eventually consistent and normally refresh within `ROOSTY_TRENDS_REFRESH_INTERVAL`.
+The links endpoint returns an empty collection until link-card indexing is implemented. The
+profile directory and account suggestions are missing.
 
 |===
 

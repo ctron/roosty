@@ -1622,6 +1622,7 @@ pub async fn process_remote_actor_delete(
             status_origin: StreamingStatusOrigin::Remote,
             has_media: false,
         }));
+    mark_remote_actor_interactions_dirty(txn, remote_actor_id).await?;
     remote_status_reblog::Entity::delete_many()
         .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
         .exec(txn)
@@ -2272,7 +2273,26 @@ pub async fn process_remote_status_upsert(
         remote_status_snapshot(txn, &existing, timestamp).await?;
     }
     let revision_timestamp = status.updated_at;
+    if existing.deleted_at.is_none() && existing.visibility == StatusVisibility::Public {
+        let old_tag_ids = remote_status_tag::Entity::find()
+            .filter(remote_status_tag::Column::RemoteStatusId.eq(existing.id))
+            .all(txn)
+            .await?
+            .into_iter()
+            .map(|row| row.tag_id)
+            .collect::<Vec<_>>();
+        adjust_tag_usage(
+            txn,
+            &old_tag_ids,
+            utc_date(existing.published_at),
+            "remote",
+            existing.remote_actor_id,
+            -1,
+        )
+        .await?;
+    }
     let status = upsert_remote_status_on(txn, status).await?;
+    mark_trend_dirty(txn, "remote_status", status.id.0).await?;
     replace_remote_media_attachments(txn, status.id, attachments).await?;
     replace_remote_status_tags(txn, status.id, &tag_names).await?;
     let current = remote_status::Entity::find_by_id(status.id.0)
@@ -2314,6 +2334,9 @@ async fn replace_remote_status_tags(
     status_id: StatusId,
     tag_names: &[String],
 ) -> Result<()> {
+    let status = remote_status::Entity::find_by_id(status_id.0)
+        .one(txn)
+        .await?;
     remote_status_tag::Entity::delete_many()
         .filter(remote_status_tag::Column::RemoteStatusId.eq(status_id.0))
         .exec(txn)
@@ -2332,14 +2355,30 @@ async fn replace_remote_status_tags(
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
+    let mut new_tag_ids = Vec::with_capacity(names.len());
     for name in names {
         let tag = find_or_create_local_tag(txn, &name, now).await?;
+        new_tag_ids.push(tag.id);
         remote_status_tag::ActiveModel {
             remote_status_id: Set(status_id.0),
             tag_id: Set(tag.id),
             created_at: Set(now),
         }
         .insert(txn)
+        .await?;
+    }
+    if let Some(status) = status
+        && status.deleted_at.is_none()
+        && status.visibility == StatusVisibility::Public
+    {
+        adjust_tag_usage(
+            txn,
+            &new_tag_ids,
+            utc_date(status.published_at),
+            "remote",
+            status.remote_actor_id,
+            1,
+        )
         .await?;
     }
     Ok(())
@@ -2411,18 +2450,41 @@ pub async fn delete_remote_status(
     activitypub_id: &str,
     remote_actor_id: AccountId,
 ) -> Result<bool> {
+    let txn = db.begin().await?;
     let Some(status) = remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
         .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status::Column::DeletedAt.is_null())
-        .one(db)
+        .one(&txn)
         .await?
     else {
+        txn.commit().await?;
         return Ok(false);
     };
+    let status_id = StatusId(status.id);
+    let tag_ids = remote_status_tag::Entity::find()
+        .filter(remote_status_tag::Column::RemoteStatusId.eq(status.id))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|row| row.tag_id)
+        .collect::<Vec<_>>();
+    if status.visibility == StatusVisibility::Public {
+        adjust_tag_usage(
+            &txn,
+            &tag_ids,
+            utc_date(status.published_at),
+            "remote",
+            status.remote_actor_id,
+            -1,
+        )
+        .await?;
+    }
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
-    active.update(db).await?;
+    active.update(&txn).await?;
+    mark_trend_dirty(&txn, "remote_status", status_id.0).await?;
+    txn.commit().await?;
     Ok(true)
 }
 
@@ -2496,6 +2558,24 @@ async fn repair_one_remote_status_delete(
         .count(txn)
         .await?
         > 0;
+    let tag_ids = remote_status_tag::Entity::find()
+        .filter(remote_status_tag::Column::RemoteStatusId.eq(status.id))
+        .all(txn)
+        .await?
+        .into_iter()
+        .map(|row| row.tag_id)
+        .collect::<Vec<_>>();
+    if status.visibility == StatusVisibility::Public {
+        adjust_tag_usage(
+            txn,
+            &tag_ids,
+            utc_date(status.published_at),
+            "remote",
+            status.remote_actor_id,
+            -1,
+        )
+        .await?;
+    }
 
     let local_reblogs = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(status.id))
@@ -2539,6 +2619,7 @@ async fn repair_one_remote_status_delete(
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(txn).await?;
+    mark_trend_dirty(txn, "remote_status", status_id.0).await?;
     remote_status_pin::Entity::delete_many()
         .filter(remote_status_pin::Column::RemoteStatusId.eq(status_id.0))
         .exec(txn)
@@ -2958,6 +3039,268 @@ pub struct TrendingTag {
     pub tag: LocalTag,
     /// Public local and cached-remote usage during the latest seven UTC days.
     pub history: Vec<LocalTagHistory>,
+}
+
+/// A trend-ranked status and its cached interaction totals.
+#[derive(Clone, Debug)]
+pub struct TrendingStatus {
+    /// Local or cached-remote status selected for discovery.
+    pub item: PublicTimelineItem,
+    /// Known favourites from local and remote actors.
+    pub favourites_count: u64,
+    /// Known boosts from local and remote actors.
+    pub reblogs_count: u64,
+}
+
+/// A strongly typed target in the shared trend bookkeeping tables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrendTarget {
+    LocalStatus(StatusId),
+    RemoteStatus(StatusId),
+    Tag(Uuid),
+}
+
+impl TrendTarget {
+    fn persisted(self) -> (&'static str, Uuid) {
+        match self {
+            Self::LocalStatus(id) => ("local_status", id.0),
+            Self::RemoteStatus(id) => ("remote_status", id.0),
+            Self::Tag(id) => ("tag", id),
+        }
+    }
+}
+
+/// Atomically adjust a status interaction counter and coalesce a scoring request.
+async fn adjust_status_trend<C>(
+    db: &C,
+    target: TrendTarget,
+    favourite_delta: i64,
+    reblog_delta: i64,
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let (kind, target_id, status_table, id_column, published_column, local_id, remote_id) =
+        match target {
+            TrendTarget::LocalStatus(id) => (
+                "local_status",
+                id.0,
+                "local_status",
+                "id",
+                "created_at",
+                Some(id.0),
+                None,
+            ),
+            TrendTarget::RemoteStatus(id) => (
+                "remote_status",
+                id.0,
+                "remote_status",
+                "id",
+                "published_at",
+                None,
+                Some(id.0),
+            ),
+            TrendTarget::Tag(_) => {
+                return Err(RoostyError::InvalidInput(
+                    "tag is not a status trend target".to_owned(),
+                ));
+            }
+        };
+    let sql = format!(
+        r#"INSERT INTO status_trend_metric (
+               local_status_id, remote_status_id, favourites_count, reblogs_count, published_at
+           )
+           SELECT $2, $3, greatest($4, 0), greatest($5, 0), {published_column}
+           FROM {status_table} WHERE {id_column} = $1
+           ON CONFLICT (local_status_id, remote_status_id) DO UPDATE SET
+             favourites_count = greatest(
+                 status_trend_metric.favourites_count + $4, 0),
+             reblogs_count = greatest(
+                 status_trend_metric.reblogs_count + $5, 0),
+             published_at = EXCLUDED.published_at,
+             updated_at = now()"#
+    );
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        sql,
+        vec![
+            target_id.into(),
+            local_id.into(),
+            remote_id.into(),
+            favourite_delta.into(),
+            reblog_delta.into(),
+        ],
+    ))
+    .await?;
+    mark_trend_dirty(db, kind, target_id).await
+}
+
+async fn mark_trend_dirty<C>(db: &C, kind: &str, target_id: Uuid) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO trend_dirty(kind, target_id, touched_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT (kind, target_id)
+           DO UPDATE SET touched_at = EXCLUDED.touched_at"#,
+        vec![kind.to_owned().into(), target_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Update compact per-actor hashtag usage inside the canonical status transaction.
+async fn adjust_tag_usage<C>(
+    txn: &C,
+    tag_ids: &[Uuid],
+    usage_day: time::Date,
+    actor_origin: &str,
+    actor_id: Uuid,
+    delta: i64,
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let mut tag_ids = tag_ids.to_vec();
+    tag_ids.sort_unstable();
+    tag_ids.dedup();
+    for tag_id in tag_ids {
+        // Lock the aggregate first. The following statement receives a fresh
+        // READ COMMITTED snapshot after any competing writer releases it.
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO tag_daily_usage(
+                   tag_id, usage_day, uses, accounts, updated_at)
+               VALUES ($1, $2, 0, 0, now())
+               ON CONFLICT (tag_id, usage_day)
+               DO UPDATE SET updated_at = tag_daily_usage.updated_at"#,
+            vec![tag_id.into(), usage_day.into()],
+        ))
+        .await?;
+        let statement = if delta > 0 {
+            Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"INSERT INTO tag_daily_actor_usage(
+                       tag_id, usage_day, actor_origin, actor_id, uses)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (tag_id, usage_day, actor_origin, actor_id)
+                   DO UPDATE SET uses = tag_daily_actor_usage.uses + EXCLUDED.uses"#,
+                vec![
+                    tag_id.into(),
+                    usage_day.into(),
+                    actor_origin.to_owned().into(),
+                    actor_id.into(),
+                    delta.into(),
+                ],
+            )
+        } else {
+            Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"WITH reduced AS (
+                       UPDATE tag_daily_actor_usage SET uses = uses - 1
+                       WHERE tag_id = $1 AND usage_day = $2 AND actor_origin = $3
+                         AND actor_id = $4 AND uses > 1
+                       RETURNING 1
+                   )
+                   DELETE FROM tag_daily_actor_usage
+                   WHERE tag_id = $1 AND usage_day = $2 AND actor_origin = $3
+                     AND actor_id = $4 AND uses = 1
+                     AND NOT EXISTS (SELECT 1 FROM reduced)"#,
+                vec![
+                    tag_id.into(),
+                    usage_day.into(),
+                    actor_origin.to_owned().into(),
+                    actor_id.into(),
+                ],
+            )
+        };
+        txn.execute(statement).await?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO tag_daily_usage(
+                   tag_id, usage_day, uses, accounts, updated_at)
+               SELECT $1, $2, coalesce(sum(uses), 0), count(*), now()
+               FROM tag_daily_actor_usage
+               WHERE tag_id = $1 AND usage_day = $2
+               ON CONFLICT (tag_id, usage_day) DO UPDATE SET
+                 uses = EXCLUDED.uses, accounts = EXCLUDED.accounts,
+                 updated_at = EXCLUDED.updated_at"#,
+            vec![tag_id.into(), usage_day.into()],
+        ))
+        .await?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"DELETE FROM tag_daily_usage
+               WHERE tag_id = $1 AND usage_day = $2
+                 AND uses = 0 AND accounts = 0"#,
+            vec![tag_id.into(), usage_day.into()],
+        ))
+        .await?;
+        mark_trend_dirty(txn, "tag", tag_id).await?;
+    }
+    Ok(())
+}
+
+fn utc_date(timestamp: OffsetDateTime) -> time::Date {
+    timestamp.to_offset(time::UtcOffset::UTC).date()
+}
+
+async fn mark_account_status_trends_dirty<C>(
+    db: &C,
+    origin: &str,
+    account_id: AccountId,
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let (kind, table, account_column) = match origin {
+        "local" => ("local_status", "local_status", "account_id"),
+        "remote" => ("remote_status", "remote_status", "remote_actor_id"),
+        _ => {
+            return Err(RoostyError::InvalidInput(
+                "invalid trend account origin".to_owned(),
+            ));
+        }
+    };
+    let sql = format!(
+        r#"INSERT INTO trend_dirty(kind, target_id, touched_at)
+           SELECT '{kind}', id, now() FROM {table} WHERE {account_column} = $1
+           ON CONFLICT (kind, target_id)
+           DO UPDATE SET touched_at = EXCLUDED.touched_at"#
+    );
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        sql,
+        vec![account_id.0.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn mark_remote_actor_interactions_dirty<C>(db: &C, actor_id: AccountId) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO trend_dirty(kind, target_id, touched_at)
+           SELECT kind, target_id, now() FROM (
+             SELECT 'local_status' kind, local_status_id target_id
+             FROM remote_status_favourite WHERE remote_actor_id = $1
+             UNION
+             SELECT CASE WHEN local_status_id IS NULL
+                         THEN 'remote_status' ELSE 'local_status' END,
+                    coalesce(local_status_id, remote_status_id)
+             FROM remote_status_reblog WHERE remote_actor_id = $1
+           ) targets
+           ON CONFLICT (kind, target_id)
+           DO UPDATE SET touched_at = EXCLUDED.touched_at"#,
+        vec![actor_id.0.into()],
+    ))
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -3559,7 +3902,7 @@ pub struct LocalRemoteStatusReblog {
 }
 
 /// Target of an inbound remote Announce activity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteStatusReblogTarget {
     /// A local status was boosted.
     Local(StatusId),
@@ -3812,6 +4155,7 @@ pub enum JobKind {
     NotificationRequestMerge,
     NotificationRequestCleanup,
     ScheduledStatusPublish,
+    TrendMaintenance,
 }
 
 impl JobKind {
@@ -4924,6 +5268,7 @@ pub async fn set_local_account_limited(
     let mut active = account.into_active_model();
     active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
     let account = local_account_from_model(active.update(&txn).await?)?;
+    mark_account_status_trends_dirty(&txn, "local", account.id).await?;
     txn.commit().await?;
     Ok(Some(account))
 }
@@ -4949,6 +5294,7 @@ pub async fn set_remote_actor_limited(
     let mut active = actor.into_active_model();
     active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
     let actor = remote_actor_from_model(active.update(&txn).await?);
+    mark_account_status_trends_dirty(&txn, "remote", actor.id).await?;
     txn.commit().await?;
     Ok(Some(actor))
 }
@@ -4968,7 +5314,9 @@ pub async fn set_local_account_limited_by_id(
     };
     let mut active = account.into_active_model();
     active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
-    Ok(Some(local_account_from_model(active.update(db).await?)?))
+    let account = local_account_from_model(active.update(db).await?)?;
+    mark_account_status_trends_dirty(db, "local", account.id).await?;
+    Ok(Some(account))
 }
 
 /// Set a cached remote actor's limit state inside a caller-owned transaction.
@@ -4986,7 +5334,9 @@ pub async fn set_remote_actor_limited_by_id(
     };
     let mut active = actor.into_active_model();
     active.limited_at = Set(limited.then(OffsetDateTime::now_utc));
-    Ok(Some(remote_actor_from_model(active.update(db).await?)))
+    let actor = remote_actor_from_model(active.update(db).await?);
+    mark_account_status_trends_dirty(db, "remote", actor.id).await?;
+    Ok(Some(actor))
 }
 
 /// Search local accounts by username or display name for Mastodon autocomplete.
@@ -7662,6 +8012,7 @@ where
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local account does not exist".to_owned()))?;
     let mut active = account.into_active_model();
+    let discoverability_changed = update.discoverable.is_some();
 
     set_if_some(&mut active.display_name, update.display_name);
     set_if_some(&mut active.note, update.note);
@@ -7686,7 +8037,11 @@ where
     }
     active.updated_at = Set(OffsetDateTime::now_utc());
 
-    local_account_from_model(active.update(db).await?)
+    let account = local_account_from_model(active.update(db).await?)?;
+    if discoverability_changed {
+        mark_account_status_trends_dirty(db, "local", account.id).await?;
+    }
+    Ok(account)
 }
 
 /// Replace a local account password hash by username for operator password resets.
@@ -7833,14 +8188,27 @@ pub async fn create_local_status_with_media(
     let now = OffsetDateTime::now_utc();
     tag_names.sort();
     tag_names.dedup();
+    let mut tag_ids = Vec::with_capacity(tag_names.len());
     for name in tag_names {
         let tag = find_or_create_local_tag(txn, &name, now).await?;
+        tag_ids.push(tag.id);
         local_status_tag::ActiveModel {
             status_id: Set(status_id),
             tag_id: Set(tag.id),
             created_at: Set(now),
         }
         .insert(txn)
+        .await?;
+    }
+    if status.visibility == StatusVisibility::Public {
+        adjust_tag_usage(
+            txn,
+            &tag_ids,
+            utc_date(status.created_at),
+            "local",
+            status.account_id,
+            1,
+        )
         .await?;
     }
     let mut remote_actor_ids = remote_actor_ids
@@ -7885,6 +8253,30 @@ pub async fn replace_local_status_tags(
     tag_names: &[String],
 ) -> Result<()> {
     let txn = db.begin().await?;
+    let status = local_status::Entity::find_by_id(status_id.0)
+        .one(&txn)
+        .await?;
+    let old_tag_ids = local_status_tag::Entity::find()
+        .filter(local_status_tag::Column::StatusId.eq(status_id.0))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|row| row.tag_id)
+        .collect::<Vec<_>>();
+    if let Some(status) = &status
+        && status.deleted_at.is_none()
+        && status.visibility == StatusVisibility::Public
+    {
+        adjust_tag_usage(
+            &txn,
+            &old_tag_ids,
+            utc_date(status.created_at),
+            "local",
+            status.account_id,
+            -1,
+        )
+        .await?;
+    }
     local_status_tag::Entity::delete_many()
         .filter(local_status_tag::Column::StatusId.eq(status_id.0))
         .exec(&txn)
@@ -7895,14 +8287,30 @@ pub async fn replace_local_status_tags(
     names.sort();
     names.dedup();
 
+    let mut new_tag_ids = Vec::with_capacity(names.len());
     for name in names {
         let tag = find_or_create_local_tag(&txn, &name, now).await?;
+        new_tag_ids.push(tag.id);
         local_status_tag::ActiveModel {
             status_id: Set(status_id.0),
             tag_id: Set(tag.id),
             created_at: Set(now),
         }
         .insert(&txn)
+        .await?;
+    }
+    if let Some(status) = status
+        && status.deleted_at.is_none()
+        && status.visibility == StatusVisibility::Public
+    {
+        adjust_tag_usage(
+            &txn,
+            &new_tag_ids,
+            utc_date(status.created_at),
+            "local",
+            status.account_id,
+            1,
+        )
         .await?;
     }
 
@@ -8208,46 +8616,20 @@ pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTag
         .await?;
     let rows = HistoryRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        r#"WITH bounds AS (
-               SELECT (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
-                           AT TIME ZONE 'UTC') - interval '6 days' AS starts_at,
-                      (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
-                           AT TIME ZONE 'UTC') + interval '1 day' AS ends_at
-           ),
-           usage AS (
-               SELECT s.created_at AS occurred_at,
-                      'local:' || s.account_id::text AS actor_key
-               FROM local_status_tag st
-               JOIN local_status s ON s.id = st.status_id
-               CROSS JOIN bounds b
-               WHERE st.tag_id = $1
-                 AND s.deleted_at IS NULL AND s.visibility = 'public'
-                 AND s.created_at >= b.starts_at AND s.created_at < b.ends_at
-               UNION ALL
-               SELECT s.published_at AS occurred_at,
-                      'remote:' || s.remote_actor_id::text AS actor_key
-               FROM remote_status_tag st
-               JOIN remote_status s ON s.id = st.remote_status_id
-               CROSS JOIN bounds b
-               WHERE st.tag_id = $1
-                 AND s.deleted_at IS NULL AND s.visibility = 'public'
-                 AND s.published_at >= b.starts_at AND s.published_at < b.ends_at
-           )
-           SELECT extract(epoch FROM date_trunc(
-                      'day', occurred_at AT TIME ZONE 'UTC'
-                  ))::bigint AS day,
-                  count(*)::bigint AS uses,
-                  count(DISTINCT actor_key)::bigint AS accounts
-           FROM usage
-           GROUP BY date_trunc('day', occurred_at AT TIME ZONE 'UTC')
-           ORDER BY day DESC"#,
+        r#"SELECT extract(epoch FROM usage_day::timestamp)::bigint AS day,
+                  uses, accounts
+           FROM tag_daily_usage
+           WHERE tag_id = $1
+             AND usage_day >= (now() AT TIME ZONE 'UTC')::date - 6
+           ORDER BY usage_day DESC"#,
         vec![tag_id.into()],
     ))
     .all(&txn)
     .await?;
     txn.commit().await?;
 
-    rows.into_iter()
+    let history = rows
+        .into_iter()
         .map(|row| {
             Ok(LocalTagHistory {
                 day: u64::try_from(row.day)
@@ -8258,65 +8640,32 @@ pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTag
                     .map_err(|_| DbErr::Type("negative tag account count".to_owned()))?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(fill_tag_history(history))
 }
 
-/// Rank hashtags from public local and cached-remote activity in one aggregate query.
+/// Rank hashtags from the transactionally maintained shared trend cache.
 pub async fn trending_tags(db: &DbConnection, limit: u64, offset: u64) -> Result<Vec<TrendingTag>> {
     let txn = db
         .begin_with_config(None, Some(AccessMode::ReadOnly))
         .await?;
     let rows = TrendingTagRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        r#"WITH bounds AS (
-               SELECT (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
-                           AT TIME ZONE 'UTC') - interval '6 days' AS starts_at,
-                      (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
-                           AT TIME ZONE 'UTC') + interval '1 day' AS ends_at
-           ),
-           usage AS (
-               SELECT st.tag_id, s.created_at AS occurred_at,
-                      'local:' || s.account_id::text AS actor_key
-               FROM local_status_tag st
-               JOIN local_status s ON s.id = st.status_id
-               CROSS JOIN bounds b
-               WHERE s.deleted_at IS NULL AND s.visibility = 'public'
-                 AND s.created_at >= b.starts_at AND s.created_at < b.ends_at
-               UNION ALL
-               SELECT st.tag_id, s.published_at AS occurred_at,
-                      'remote:' || s.remote_actor_id::text AS actor_key
-               FROM remote_status_tag st
-               JOIN remote_status s ON s.id = st.remote_status_id
-               CROSS JOIN bounds b
-               WHERE s.deleted_at IS NULL AND s.visibility = 'public'
-                 AND s.published_at >= b.starts_at AND s.published_at < b.ends_at
-           ),
-           selected AS (
-               SELECT u.tag_id,
-                      count(DISTINCT actor_key)::bigint AS participating_accounts,
-                      count(*)::bigint AS total_uses,
-                      max(occurred_at) AS latest_use
-               FROM usage u
-               JOIN local_tag t ON t.id = u.tag_id
-               GROUP BY u.tag_id, t.name
-               ORDER BY participating_accounts DESC, total_uses DESC,
-                        latest_use DESC, t.name ASC
+        r#"WITH selected AS (
+               SELECT trend.tag_id, trend.score
+               FROM tag_trend trend
+               WHERE trend.expires_at > now() AND trend.score >= 1
+               ORDER BY trend.score DESC, trend.tag_id
                LIMIT $1 OFFSET $2
            )
            SELECT t.id, t.name, t.created_at, t.updated_at,
-                  extract(epoch FROM date_trunc(
-                      'day', u.occurred_at AT TIME ZONE 'UTC'
-                  ))::bigint AS day,
-                  count(*)::bigint AS uses,
-                  count(DISTINCT u.actor_key)::bigint AS accounts
+                  extract(epoch FROM u.usage_day::timestamp)::bigint AS day,
+                  u.uses, u.accounts
            FROM selected s
            JOIN local_tag t ON t.id = s.tag_id
-           JOIN usage u ON u.tag_id = s.tag_id
-           GROUP BY t.id, t.name, t.created_at, t.updated_at,
-                    s.participating_accounts, s.total_uses, s.latest_use,
-                    date_trunc('day', u.occurred_at AT TIME ZONE 'UTC')
-           ORDER BY s.participating_accounts DESC, s.total_uses DESC,
-                    s.latest_use DESC, t.name ASC, day DESC"#,
+           JOIN tag_daily_usage u ON u.tag_id = s.tag_id
+             AND u.usage_day >= (now() AT TIME ZONE 'UTC')::date - 6
+           ORDER BY s.score DESC, s.tag_id, day DESC"#,
         vec![
             i64::try_from(limit)
                 .map_err(|_| DbErr::Type("trend limit exceeds bigint".to_owned()))?
@@ -8354,7 +8703,487 @@ pub async fn trending_tags(db: &DbConnection, limit: u64, offset: u64) -> Result
             });
         }
     }
+    for trend in &mut trends {
+        trend.history = fill_tag_history(std::mem::take(&mut trend.history));
+    }
     Ok(trends)
+}
+
+fn fill_tag_history(history: Vec<LocalTagHistory>) -> Vec<LocalTagHistory> {
+    const DAY_SECONDS: i64 = 86_400;
+    let by_day = history
+        .into_iter()
+        .map(|bucket| (bucket.day, bucket))
+        .collect::<HashMap<_, _>>();
+    let today = OffsetDateTime::now_utc()
+        .unix_timestamp()
+        .div_euclid(DAY_SECONDS);
+    (0..7)
+        .filter_map(|days_ago| {
+            let day = u64::try_from((today - days_ago) * DAY_SECONDS).ok()?;
+            Some(by_day.get(&day).cloned().unwrap_or(LocalTagHistory {
+                day,
+                uses: 0,
+                accounts: 0,
+            }))
+        })
+        .collect()
+}
+
+/// Return public, discoverable statuses ranked from cached interaction totals.
+pub async fn trending_statuses(
+    db: &DbConnection,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<TrendingStatus>> {
+    #[derive(Debug, FromQueryResult)]
+    struct TrendRow {
+        local_status_id: Option<Uuid>,
+        remote_status_id: Option<Uuid>,
+        favourites_count: i64,
+        reblogs_count: i64,
+    }
+
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let rows = TrendRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT metric.local_status_id, metric.remote_status_id,
+                  metric.favourites_count, metric.reblogs_count
+           FROM status_trend_metric metric
+           LEFT JOIN local_status local_status
+             ON local_status.id = metric.local_status_id
+           LEFT JOIN local_account local_account
+             ON local_account.id = local_status.account_id
+           LEFT JOIN remote_status remote_status
+             ON remote_status.id = metric.remote_status_id
+           LEFT JOIN remote_actor remote_actor
+             ON remote_actor.id = remote_status.remote_actor_id
+           WHERE metric.expires_at > now()
+             AND metric.score >= 1
+             AND (
+               (local_status.id IS NOT NULL
+                AND local_status.deleted_at IS NULL
+                AND local_status.visibility = 'public'
+                AND local_status.in_reply_to_id IS NULL
+                AND local_status.in_reply_to_remote_status_id IS NULL
+                AND local_status.sensitive = false
+                AND local_status.spoiler_text = ''
+                AND local_account.discoverable = true
+                AND local_account.limited_at IS NULL)
+               OR
+               (remote_status.id IS NOT NULL
+                AND remote_status.deleted_at IS NULL
+                AND remote_status.visibility = 'public'
+                AND remote_status.in_reply_to IS NULL
+                AND coalesce((remote_status.object->>'sensitive')::boolean, false) = false
+                AND coalesce(remote_status.object->>'summary', '') = ''
+                AND remote_actor.deleted_at IS NULL
+                AND remote_actor.limited_at IS NULL)
+             )
+           ORDER BY
+             metric.score DESC,
+             coalesce(metric.local_status_id, metric.remote_status_id) DESC
+           LIMIT $1 OFFSET $2"#,
+        vec![
+            i64::try_from(limit)
+                .map_err(|_| DbErr::Type("trend limit exceeds bigint".to_owned()))?
+                .into(),
+            i64::try_from(offset)
+                .map_err(|_| DbErr::Type("trend offset exceeds bigint".to_owned()))?
+                .into(),
+        ],
+    ))
+    .all(&txn)
+    .await?;
+
+    let local_ids = rows
+        .iter()
+        .filter_map(|row| row.local_status_id)
+        .collect::<Vec<_>>();
+    let remote_ids = rows
+        .iter()
+        .filter_map(|row| row.remote_status_id)
+        .collect::<Vec<_>>();
+    let local = local_status::Entity::find()
+        .filter(local_status::Column::Id.is_in(local_ids))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|model| local_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let remote = remote_status::Entity::find()
+        .filter(remote_status::Column::Id.is_in(remote_ids))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|model| remote_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    txn.commit().await?;
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let item = match (row.local_status_id, row.remote_status_id) {
+                (Some(id), None) => local.get(&id).cloned().map(PublicTimelineItem::Local),
+                (None, Some(id)) => remote.get(&id).cloned().map(PublicTimelineItem::Remote),
+                _ => None,
+            }?;
+            Some(
+                u64::try_from(row.favourites_count)
+                    .and_then(|favourites_count| {
+                        u64::try_from(row.reblogs_count)
+                            .map(|reblogs_count| (favourites_count, reblogs_count))
+                    })
+                    .map_err(|_| DbErr::Type("negative cached trend count".to_owned()))
+                    .map(|(favourites_count, reblogs_count)| TrendingStatus {
+                        item,
+                        favourites_count,
+                        reblogs_count,
+                    }),
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, DbErr>>()
+        .map_err(Into::into)
+}
+
+/// Outcome of one bounded Rust-owned trend refresh batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrendRefreshOutcome {
+    /// More dirty targets remain and should be processed immediately.
+    pub has_more: bool,
+    /// Number of targets scored by this worker.
+    pub processed: usize,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DirtyTrendRow {
+    kind: String,
+    target_id: Uuid,
+}
+
+/// Refresh at most 100 trend targets, returning whether a continuation is needed.
+pub async fn maintain_trends(db: &DbConnection) -> Result<TrendRefreshOutcome> {
+    const BATCH_SIZE: usize = 100;
+    let txn = db.begin().await?;
+    txn.execute_unprepared(
+        r#"
+        DELETE FROM tag_daily_actor_usage
+        WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 8;
+        DELETE FROM tag_daily_usage
+        WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 8;
+        DELETE FROM tag_trend WHERE expires_at <= now();
+        INSERT INTO trend_dirty(kind, target_id)
+        SELECT CASE WHEN local_status_id IS NULL
+                    THEN 'remote_status' ELSE 'local_status' END,
+               coalesce(local_status_id, remote_status_id)
+        FROM status_trend_metric
+        WHERE score >= 1
+        ON CONFLICT (kind, target_id) DO NOTHING;
+        INSERT INTO trend_dirty(kind, target_id)
+        SELECT 'tag', tag_id FROM tag_trend WHERE score >= 1
+        ON CONFLICT (kind, target_id) DO NOTHING;
+        "#,
+    )
+    .await?;
+    let claimed = DirtyTrendRow::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            r#"SELECT kind, target_id FROM trend_dirty
+               ORDER BY touched_at, kind, target_id
+               LIMIT {BATCH_SIZE}
+               FOR UPDATE SKIP LOCKED"#
+        ),
+    ))
+    .all(&txn)
+    .await?;
+    let now = OffsetDateTime::now_utc();
+    for row in &claimed {
+        match row.kind.as_str() {
+            "local_status" => {
+                refresh_status_trend(&txn, TrendTarget::LocalStatus(StatusId(row.target_id)), now)
+                    .await?;
+            }
+            "remote_status" => {
+                refresh_status_trend(
+                    &txn,
+                    TrendTarget::RemoteStatus(StatusId(row.target_id)),
+                    now,
+                )
+                .await?;
+            }
+            "tag" => refresh_tag_trend(&txn, row.target_id, now).await?,
+            _ => {
+                return Err(RoostyError::InvalidInput(
+                    "stored trend target kind is invalid".to_owned(),
+                ));
+            }
+        }
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM trend_dirty WHERE kind = $1 AND target_id = $2",
+            vec![row.kind.clone().into(), row.target_id.into()],
+        ))
+        .await?;
+    }
+    let has_more = DirtyTrendRow::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT kind, target_id FROM trend_dirty LIMIT 1".to_owned(),
+    ))
+    .one(&txn)
+    .await?
+    .is_some();
+    txn.commit().await?;
+    Ok(TrendRefreshOutcome {
+        has_more,
+        processed: claimed.len(),
+    })
+}
+
+async fn refresh_status_trend(
+    txn: &DatabaseTransaction,
+    target: TrendTarget,
+    now: OffsetDateTime,
+) -> Result<()> {
+    #[derive(Debug, FromQueryResult)]
+    struct Eligibility {
+        published_at: OffsetDateTime,
+        eligible: bool,
+    }
+    let (kind, id) = target.persisted();
+    let eligibility_sql = match target {
+        TrendTarget::LocalStatus(_) => {
+            r#"SELECT status.created_at AS published_at,
+                      status.deleted_at IS NULL
+                      AND status.visibility = 'public'
+                      AND status.in_reply_to_id IS NULL
+                      AND status.in_reply_to_remote_status_id IS NULL
+                      AND status.sensitive = false
+                      AND status.spoiler_text = ''
+                      AND account.discoverable = true
+                      AND account.limited_at IS NULL AS eligible
+               FROM local_status status
+               JOIN local_account account ON account.id = status.account_id
+               WHERE status.id = $1"#
+        }
+        TrendTarget::RemoteStatus(_) => {
+            r#"SELECT status.published_at,
+                      status.deleted_at IS NULL
+                      AND status.visibility = 'public'
+                      AND status.in_reply_to IS NULL
+                      AND coalesce((status.object->>'sensitive')::boolean, false) = false
+                      AND coalesce(status.object->>'summary', '') = ''
+                      AND actor.deleted_at IS NULL
+                      AND actor.limited_at IS NULL AS eligible
+               FROM remote_status status
+               JOIN remote_actor actor ON actor.id = status.remote_actor_id
+               WHERE status.id = $1"#
+        }
+        TrendTarget::Tag(_) => unreachable!("validated status target"),
+    };
+    let eligibility = Eligibility::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        eligibility_sql,
+        vec![id.into()],
+    ))
+    .one(txn)
+    .await?;
+    let Some(eligibility) = eligibility else {
+        return Ok(());
+    };
+    #[derive(Debug, FromQueryResult)]
+    struct Counts {
+        favourites_count: i64,
+        reblogs_count: i64,
+    }
+    let counts_sql = match target {
+        TrendTarget::LocalStatus(_) => {
+            r#"SELECT
+                 (SELECT count(*) FROM local_status_favourite WHERE status_id = $1)
+                 + (SELECT count(*) FROM remote_status_favourite
+                    WHERE local_status_id = $1) AS favourites_count,
+                 (SELECT count(*) FROM local_status_reblog WHERE status_id = $1)
+                 + (SELECT count(*) FROM remote_status_reblog
+                    WHERE local_status_id = $1) AS reblogs_count"#
+        }
+        TrendTarget::RemoteStatus(_) => {
+            r#"SELECT
+                 (SELECT count(*) FROM local_remote_status_favourite
+                    WHERE remote_status_id = $1) AS favourites_count,
+                 (SELECT count(*) FROM local_remote_status_reblog
+                    WHERE remote_status_id = $1)
+                 + (SELECT count(*) FROM remote_status_reblog
+                    WHERE remote_status_id = $1) AS reblogs_count"#
+        }
+        TrendTarget::Tag(_) => {
+            return Err(RoostyError::InvalidInput(
+                "tag is not a status trend target".to_owned(),
+            ));
+        }
+    };
+    let counts = Counts::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        counts_sql,
+        vec![id.into()],
+    ))
+    .one(txn)
+    .await?;
+    let Some(counts) = counts else {
+        return Ok(());
+    };
+    let interactions = counts.favourites_count + counts.reblogs_count;
+    let age_seconds = (now - eligibility.published_at).as_seconds_f64().max(0.0);
+    let score = status_trend_score(interactions, age_seconds, eligibility.eligible);
+    let expires_at = status_trend_expiry(eligibility.published_at, interactions);
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE status_trend_metric
+           SET favourites_count = $3, reblogs_count = $4,
+               published_at = $5, score = $6, expires_at = $7, updated_at = $8
+           WHERE ($1 = 'local_status' AND local_status_id = $2)
+              OR ($1 = 'remote_status' AND remote_status_id = $2)"#,
+        vec![
+            kind.to_owned().into(),
+            id.into(),
+            counts.favourites_count.into(),
+            counts.reblogs_count.into(),
+            eligibility.published_at.into(),
+            score.into(),
+            expires_at.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+fn status_trend_score(interactions: i64, age_seconds: f64, eligible: bool) -> f64 {
+    if !eligible || interactions < 5 {
+        return 0.0;
+    }
+    ((interactions - 1) as f64).powi(2) * 0.5_f64.powf(age_seconds / 3_600.0)
+}
+
+fn status_trend_expiry(published_at: OffsetDateTime, interactions: i64) -> Option<OffsetDateTime> {
+    if interactions < 5 {
+        return None;
+    }
+    let seconds = 3_600.0 * ((((interactions - 1) as f64).powi(2) / 0.3).ln() / 2.0_f64.ln());
+    Some(published_at + Duration::seconds_f64(seconds))
+}
+
+async fn refresh_tag_trend(
+    txn: &DatabaseTransaction,
+    tag_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<()> {
+    #[derive(Debug, FromQueryResult)]
+    struct Usage {
+        observed: i64,
+        expected: i64,
+        peak_score: Option<f64>,
+        peak_at: Option<OffsetDateTime>,
+    }
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO tag_daily_usage(tag_id, usage_day, uses, accounts, updated_at)
+           SELECT tag_id, usage_day, sum(uses), count(*), $2
+           FROM tag_daily_actor_usage
+           WHERE tag_id = $1
+           GROUP BY tag_id, usage_day
+           ON CONFLICT (tag_id, usage_day) DO UPDATE SET
+             uses = EXCLUDED.uses, accounts = EXCLUDED.accounts,
+             updated_at = EXCLUDED.updated_at"#,
+        vec![tag_id.into(), now.into()],
+    ))
+    .await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"DELETE FROM tag_daily_usage usage
+           WHERE tag_id = $1 AND NOT EXISTS (
+             SELECT 1 FROM tag_daily_actor_usage actor
+             WHERE actor.tag_id = usage.tag_id
+               AND actor.usage_day = usage.usage_day)"#,
+        vec![tag_id.into()],
+    ))
+    .await?;
+    let usage = Usage::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT
+             coalesce(max(usage.accounts) FILTER (
+               WHERE usage.usage_day = ($2 AT TIME ZONE 'UTC')::date), 0) AS observed,
+             coalesce(max(usage.accounts) FILTER (
+               WHERE usage.usage_day = ($2 AT TIME ZONE 'UTC')::date - 1), 1) AS expected,
+             trend.peak_score, trend.peak_at
+           FROM tag_daily_usage usage
+           LEFT JOIN tag_trend trend ON trend.tag_id = usage.tag_id
+           WHERE usage.tag_id = $1
+           GROUP BY trend.peak_score, trend.peak_at"#,
+        vec![tag_id.into(), now.into()],
+    ))
+    .one(txn)
+    .await?;
+    let Some(usage) = usage else {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM tag_trend WHERE tag_id = $1",
+            vec![tag_id.into()],
+        ))
+        .await?;
+        return Ok(());
+    };
+    let raw = tag_raw_score(usage.observed, usage.expected);
+    let (peak, peak_at) = choose_tag_peak(raw, usage.peak_score, usage.peak_at, now);
+    if peak <= 0.0 {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM tag_trend WHERE tag_id = $1",
+            vec![tag_id.into()],
+        ))
+        .await?;
+        return Ok(());
+    }
+    let score = peak * 0.5_f64.powf((now - peak_at).as_seconds_f64().max(0.0) / 14_400.0);
+    let expires_at = peak_at + Duration::seconds_f64(14_400.0 * peak.ln() / 2.0_f64.ln());
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO tag_trend(tag_id, score, peak_score, peak_at, expires_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (tag_id) DO UPDATE SET score = EXCLUDED.score,
+             peak_score = EXCLUDED.peak_score, peak_at = EXCLUDED.peak_at,
+             expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at"#,
+        vec![
+            tag_id.into(),
+            score.into(),
+            peak.into(),
+            peak_at.into(),
+            expires_at.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+fn tag_raw_score(observed: i64, expected: i64) -> f64 {
+    let expected = expected.max(1);
+    if observed < 5 || expected > observed {
+        0.0
+    } else {
+        ((observed - expected) as f64).powi(2) / expected as f64
+    }
+}
+
+fn choose_tag_peak(
+    raw: f64,
+    old_peak: Option<f64>,
+    old_peak_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> (f64, OffsetDateTime) {
+    match (old_peak, old_peak_at) {
+        (Some(peak), Some(at)) if at >= now - Duration::days(2) && raw <= peak => (peak, at),
+        _ => (raw, now),
+    }
 }
 
 /// List public local and cached remote statuses containing a hashtag.
@@ -9067,6 +9896,10 @@ pub async fn update_owned_local_status(
         .filter(local_status_tag::Column::StatusId.eq(status_id.0))
         .all(txn)
         .await?;
+    let current_tag_ids = current_tag_rows
+        .iter()
+        .map(|row| row.tag_id)
+        .collect::<Vec<_>>();
     let mut current_tags = Vec::with_capacity(current_tag_rows.len());
     for row in current_tag_rows {
         if let Some(tag) = local_tag::Entity::find_by_id(row.tag_id).one(txn).await? {
@@ -9193,7 +10026,19 @@ pub async fn update_owned_local_status(
     let revision_timestamp = OffsetDateTime::now_utc();
     active.updated_at = Set(revision_timestamp);
     let status = active.update(txn).await?;
+    mark_trend_dirty(txn, "local_status", status_id.0).await?;
 
+    if status.visibility == StatusVisibility::Public {
+        adjust_tag_usage(
+            txn,
+            &current_tag_ids,
+            utc_date(status.created_at),
+            "local",
+            status.account_id,
+            -1,
+        )
+        .await?;
+    }
     local_status_tag::Entity::delete_many()
         .filter(local_status_tag::Column::StatusId.eq(status_id.0))
         .exec(txn)
@@ -9208,14 +10053,27 @@ pub async fn update_owned_local_status(
     tag_names.sort();
     tag_names.dedup();
     let now = OffsetDateTime::now_utc();
+    let mut new_tag_ids = Vec::with_capacity(tag_names.len());
     for name in tag_names {
         let tag = find_or_create_local_tag(txn, &name, now).await?;
+        new_tag_ids.push(tag.id);
         local_status_tag::ActiveModel {
             status_id: Set(status_id.0),
             tag_id: Set(tag.id),
             created_at: Set(now),
         }
         .insert(txn)
+        .await?;
+    }
+    if status.visibility == StatusVisibility::Public {
+        adjust_tag_usage(
+            txn,
+            &new_tag_ids,
+            utc_date(status.created_at),
+            "local",
+            status.account_id,
+            1,
+        )
         .await?;
     }
     local_status_remote_mention::Entity::delete_many()
@@ -11841,8 +12699,9 @@ pub async fn favourite_local_status(
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
+    let txn = db.begin().await?;
     if local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
-        .one(db)
+        .one(&txn)
         .await?
         .is_none()
     {
@@ -11852,10 +12711,11 @@ pub async fn favourite_local_status(
             status_id: Set(status_id.0),
             created_at: Set(OffsetDateTime::now_utc()),
         }
-        .insert(db)
+        .insert(&txn)
         .await?;
+        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 1, 0).await?;
     }
-
+    txn.commit().await?;
     Ok(())
 }
 
@@ -11866,12 +12726,14 @@ pub async fn favourite_local_status_by_remote_actor(
     status_id: StatusId,
     activity_id: &str,
 ) -> Result<bool> {
+    let txn = db.begin().await?;
     let existing = remote_status_favourite::Entity::find()
         .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_favourite::Column::LocalStatusId.eq(status_id.0))
-        .one(db)
+        .one(&txn)
         .await?;
     if existing.is_some() {
+        txn.commit().await?;
         return Ok(false);
     }
     remote_status_favourite::ActiveModel {
@@ -11881,8 +12743,10 @@ pub async fn favourite_local_status_by_remote_actor(
         activity_id: Set(activity_id.to_owned()),
         created_at: Set(OffsetDateTime::now_utc()),
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
+    adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 1, 0).await?;
+    txn.commit().await?;
     Ok(true)
 }
 
@@ -11910,7 +12774,11 @@ pub async fn process_remote_like(
     .on_conflict_do_nothing()
     .exec(txn)
     .await?;
-    let notification = if matches!(inserted, TryInsertResult::Inserted(_))
+    let newly_inserted = matches!(inserted, TryInsertResult::Inserted(_));
+    if newly_inserted {
+        adjust_status_trend(txn, TrendTarget::LocalStatus(status_id), 1, 0).await?;
+    }
+    let notification = if newly_inserted
         && remote_account_allows_notification(txn, recipient_account_id, remote_actor_id).await?
     {
         notify_remote_actor_favourite(txn, recipient_account_id, remote_actor_id, status_id).await?
@@ -11926,12 +12794,21 @@ pub async fn unfavourite_local_status_by_remote_actor(
     remote_actor_id: AccountId,
     activity_id: &str,
 ) -> Result<bool> {
-    let result = remote_status_favourite::Entity::delete_many()
+    let txn = db.begin().await?;
+    let model = remote_status_favourite::Entity::find()
         .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_favourite::Column::ActivityId.eq(activity_id))
-        .exec(db)
+        .one(&txn)
         .await?;
-    Ok(result.rows_affected > 0)
+    if let Some(model) = model {
+        let status_id = StatusId(model.local_status_id);
+        model.into_active_model().delete(&txn).await?;
+        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), -1, 0).await?;
+        txn.commit().await?;
+        return Ok(true);
+    }
+    txn.commit().await?;
+    Ok(false)
 }
 
 /// Record an inbound Undo(Like) and remove its original Like atomically.
@@ -11940,11 +12817,16 @@ pub async fn process_remote_undo_like(
     remote_actor_id: AccountId,
     original_activity_id: &str,
 ) -> Result<bool> {
-    remote_status_favourite::Entity::delete_many()
+    let model = remote_status_favourite::Entity::find()
         .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_favourite::Column::ActivityId.eq(original_activity_id))
-        .exec(txn)
+        .one(txn)
         .await?;
+    if let Some(model) = model {
+        let status_id = StatusId(model.local_status_id);
+        model.into_active_model().delete(txn).await?;
+        adjust_status_trend(txn, TrendTarget::LocalStatus(status_id), -1, 0).await?;
+    }
     Ok(true)
 }
 
@@ -11955,10 +12837,11 @@ pub async fn favourite_remote_status(
     remote_status_id: StatusId,
     activity_id: &str,
 ) -> Result<()> {
+    let txn = db.begin().await?;
     if local_remote_status_favourite::Entity::find()
         .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(db)
+        .one(&txn)
         .await?
         .is_none()
     {
@@ -11969,9 +12852,11 @@ pub async fn favourite_remote_status(
             activity_id: Set(activity_id.to_owned()),
             created_at: Set(OffsetDateTime::now_utc()),
         }
-        .insert(db)
+        .insert(&txn)
         .await?;
+        adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), 1, 0).await?;
     }
+    txn.commit().await?;
     Ok(())
 }
 
@@ -11983,23 +12868,20 @@ pub async fn favourite_remote_status_with_job(
     activity_id: &str,
     job: NewJob,
 ) -> Result<()> {
-    local_remote_status_favourite::Entity::insert(local_remote_status_favourite::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        local_account_id: Set(local_account_id.0),
-        remote_status_id: Set(remote_status_id.0),
-        activity_id: Set(activity_id.to_owned()),
-        created_at: Set(OffsetDateTime::now_utc()),
-    })
-    .on_conflict(
-        OnConflict::columns([
-            local_remote_status_favourite::Column::LocalAccountId,
-            local_remote_status_favourite::Column::RemoteStatusId,
-        ])
-        .do_nothing()
-        .to_owned(),
-    )
-    .exec(txn)
-    .await?;
+    let inserted =
+        local_remote_status_favourite::Entity::insert(local_remote_status_favourite::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_account_id: Set(local_account_id.0),
+            remote_status_id: Set(remote_status_id.0),
+            activity_id: Set(activity_id.to_owned()),
+            created_at: Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict_do_nothing()
+        .exec(txn)
+        .await?;
+    if matches!(inserted, TryInsertResult::Inserted(_)) {
+        adjust_status_trend(txn, TrendTarget::RemoteStatus(remote_status_id), 1, 0).await?;
+    }
     enqueue_job_in_transaction(txn, job).await?;
     Ok(())
 }
@@ -12010,12 +12892,14 @@ pub async fn unfavourite_remote_status(
     local_account_id: AccountId,
     remote_status_id: StatusId,
 ) -> Result<Option<LocalRemoteStatusFavourite>> {
+    let txn = db.begin().await?;
     let favourite = local_remote_status_favourite::Entity::find()
         .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(db)
+        .one(&txn)
         .await?;
     let Some(favourite) = favourite else {
+        txn.commit().await?;
         return Ok(None);
     };
     let result = LocalRemoteStatusFavourite {
@@ -12023,7 +12907,9 @@ pub async fn unfavourite_remote_status(
         remote_status_id: StatusId(favourite.remote_status_id),
         activity_id: favourite.activity_id.clone(),
     };
-    favourite.into_active_model().delete(db).await?;
+    favourite.into_active_model().delete(&txn).await?;
+    adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), -1, 0).await?;
+    txn.commit().await?;
     Ok(Some(result))
 }
 
@@ -12066,6 +12952,7 @@ pub async fn unfavourite_remote_status_with_job(
         activity_id: favourite.activity_id.clone(),
     };
     favourite.into_active_model().delete(txn).await?;
+    adjust_status_trend(txn, TrendTarget::RemoteStatus(remote_status_id), -1, 0).await?;
     enqueue_job_in_transaction(txn, job).await?;
     Ok(Some(result))
 }
@@ -12076,13 +12963,15 @@ pub async fn unfavourite_local_status(
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
+    let txn = db.begin().await?;
     if let Some(model) = local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
-        .one(db)
+        .one(&txn)
         .await?
     {
-        model.into_active_model().delete(db).await?;
+        model.into_active_model().delete(&txn).await?;
+        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), -1, 0).await?;
     }
-
+    txn.commit().await?;
     Ok(())
 }
 
@@ -12291,10 +13180,12 @@ pub async fn reblog_local_status(
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<LocalStatusReblog> {
+    let txn = db.begin().await?;
     if let Some(model) = local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
-        .one(db)
+        .one(&txn)
         .await?
     {
+        txn.commit().await?;
         return Ok(local_status_reblog_from_model(model));
     }
 
@@ -12304,10 +13195,12 @@ pub async fn reblog_local_status(
         status_id: Set(status_id.0),
         created_at: Set(OffsetDateTime::now_utc()),
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
-
-    Ok(local_status_reblog_from_model(model))
+    adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 0, 1).await?;
+    let reblog = local_status_reblog_from_model(model);
+    txn.commit().await?;
+    Ok(reblog)
 }
 
 /// Remove a local account's boost from a status when it exists.
@@ -12316,15 +13209,18 @@ pub async fn unreblog_local_status(
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<Option<LocalStatusReblog>> {
+    let txn = db.begin().await?;
     if let Some(model) = local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
-        .one(db)
+        .one(&txn)
         .await?
     {
         let reblog = local_status_reblog_from_model(model.clone());
-        model.into_active_model().delete(db).await?;
+        model.into_active_model().delete(&txn).await?;
+        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 0, -1).await?;
+        txn.commit().await?;
         return Ok(Some(reblog));
     }
-
+    txn.commit().await?;
     Ok(None)
 }
 
@@ -12335,12 +13231,14 @@ pub async fn reblog_remote_status(
     remote_status_id: StatusId,
     activity_id: &str,
 ) -> Result<LocalRemoteStatusReblog> {
+    let txn = db.begin().await?;
     if let Some(model) = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(db)
+        .one(&txn)
         .await?
     {
+        txn.commit().await?;
         return Ok(local_remote_status_reblog_from_model(model));
     }
     let model = local_remote_status_reblog::ActiveModel {
@@ -12350,9 +13248,12 @@ pub async fn reblog_remote_status(
         activity_id: Set(activity_id.to_owned()),
         created_at: Set(OffsetDateTime::now_utc()),
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
-    Ok(local_remote_status_reblog_from_model(model))
+    adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), 0, 1).await?;
+    let reblog = local_remote_status_reblog_from_model(model);
+    txn.commit().await?;
+    Ok(reblog)
 }
 
 /// Store a remote-status boost and its Announce delivery job in `txn`.
@@ -12371,7 +13272,7 @@ pub async fn reblog_remote_status_with_job(
     let model = match existing {
         Some(model) => model,
         None => {
-            local_remote_status_reblog::ActiveModel {
+            let model = local_remote_status_reblog::ActiveModel {
                 id: Set(Uuid::now_v7()),
                 local_account_id: Set(local_account_id.0),
                 remote_status_id: Set(remote_status_id.0),
@@ -12379,7 +13280,9 @@ pub async fn reblog_remote_status_with_job(
                 created_at: Set(OffsetDateTime::now_utc()),
             }
             .insert(txn)
-            .await?
+            .await?;
+            adjust_status_trend(txn, TrendTarget::RemoteStatus(remote_status_id), 0, 1).await?;
+            model
         }
     };
     enqueue_job_in_transaction(txn, job).await?;
@@ -12392,16 +13295,20 @@ pub async fn unreblog_remote_status(
     local_account_id: AccountId,
     remote_status_id: StatusId,
 ) -> Result<Option<LocalRemoteStatusReblog>> {
+    let txn = db.begin().await?;
     let model = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(db)
+        .one(&txn)
         .await?;
     let Some(model) = model else {
+        txn.commit().await?;
         return Ok(None);
     };
     let reblog = local_remote_status_reblog_from_model(model.clone());
-    model.into_active_model().delete(db).await?;
+    model.into_active_model().delete(&txn).await?;
+    adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), 0, -1).await?;
+    txn.commit().await?;
     Ok(Some(reblog))
 }
 
@@ -12436,6 +13343,7 @@ pub async fn unreblog_remote_status_with_job(
     };
     let reblog = local_remote_status_reblog_from_model(model.clone());
     model.into_active_model().delete(txn).await?;
+    adjust_status_trend(txn, TrendTarget::RemoteStatus(remote_status_id), 0, -1).await?;
     enqueue_job_in_transaction(txn, job).await?;
     Ok(Some(reblog))
 }
@@ -12485,6 +13393,11 @@ pub async fn reblog_status_by_remote_actor(
     }
     .insert(db)
     .await?;
+    let trend_target = match target {
+        RemoteStatusReblogTarget::Local(id) => TrendTarget::LocalStatus(id),
+        RemoteStatusReblogTarget::Remote(id) => TrendTarget::RemoteStatus(id),
+    };
+    adjust_status_trend(db, trend_target, 0, 1).await?;
     Ok(true)
 }
 
@@ -12494,18 +13407,27 @@ pub async fn unreblog_status_by_remote_actor(
     remote_actor_id: AccountId,
     activity_id: &str,
 ) -> Result<Option<RemoteStatusReblog>> {
+    let txn = db.begin().await?;
     let model = remote_status_reblog::Entity::find()
         .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_reblog::Column::ActivityId.eq(activity_id))
-        .one(db)
+        .one(&txn)
         .await?;
     let Some(model) = model else {
+        txn.commit().await?;
         return Ok(None);
     };
     let Some(reblog) = remote_status_reblog_from_model(model.clone()) else {
+        txn.commit().await?;
         return Ok(None);
     };
-    model.into_active_model().delete(db).await?;
+    model.into_active_model().delete(&txn).await?;
+    let target = match reblog.target {
+        RemoteStatusReblogTarget::Local(id) => TrendTarget::LocalStatus(id),
+        RemoteStatusReblogTarget::Remote(id) => TrendTarget::RemoteStatus(id),
+    };
+    adjust_status_trend(&txn, target, 0, -1).await?;
+    txn.commit().await?;
     Ok(Some(reblog))
 }
 
@@ -12523,6 +13445,13 @@ pub async fn process_remote_undo_reblog(
     let reblog = model.clone().and_then(remote_status_reblog_from_model);
     if let Some(model) = model {
         model.into_active_model().delete(txn).await?;
+    }
+    if let Some(reblog) = &reblog {
+        let target = match reblog.target {
+            RemoteStatusReblogTarget::Local(id) => TrendTarget::LocalStatus(id),
+            RemoteStatusReblogTarget::Remote(id) => TrendTarget::RemoteStatus(id),
+        };
+        adjust_status_trend(txn, target, 0, -1).await?;
     }
     Ok(reblog)
 }
@@ -12906,6 +13835,24 @@ pub async fn delete_owned_local_status(
         ));
     }
 
+    let tag_ids = local_status_tag::Entity::find()
+        .filter(local_status_tag::Column::StatusId.eq(status_id.0))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.tag_id)
+        .collect::<Vec<_>>();
+    if status.visibility == StatusVisibility::Public {
+        adjust_tag_usage(
+            db,
+            &tag_ids,
+            utc_date(status.created_at),
+            "local",
+            status.account_id,
+            -1,
+        )
+        .await?;
+    }
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.updated_at = Set(OffsetDateTime::now_utc());
@@ -12914,6 +13861,7 @@ pub async fn delete_owned_local_status(
         .filter(local_status_pin::Column::StatusId.eq(status_id.0))
         .exec(db)
         .await?;
+    mark_trend_dirty(db, "local_status", status_id.0).await?;
     Ok(Some(status))
 }
 
@@ -15780,7 +16728,8 @@ pub async fn claim_due_job(
                     'federation_remote_media_fetch', 'federation_featured_refresh',
                     'federation_featured_tags_refresh', 'federation_thread_resolve',
                     'federation_replies_fetch', 'federation_reply_fetch', 'web_push_delivery',
-                    'notification_request_merge', 'notification_request_cleanup'
+                    'notification_request_merge', 'notification_request_cleanup',
+                    'scheduled_status_publish', 'trend_maintenance'
                   )
                 ORDER BY run_after, created_at
                 LIMIT 1
@@ -15994,6 +16943,37 @@ mod tests {
             "federation_reply_fetch"
         );
         assert_eq!(JobKind::WebPushDelivery.as_str(), "web_push_delivery");
+    }
+
+    /// Status ranking enforces Mastodon's interaction threshold and hourly decay.
+    #[test]
+    fn status_trend_scoring_applies_threshold_eligibility_and_decay() {
+        assert_eq!(status_trend_score(4, 0.0, true), 0.0);
+        assert_eq!(status_trend_score(5, 0.0, false), 0.0);
+        assert_eq!(status_trend_score(5, 0.0, true), 16.0);
+        assert!((status_trend_score(5, 3_600.0, true) - 8.0).abs() < f64::EPSILON);
+    }
+
+    /// Hashtag ranking compares distinct actors and retains a recent peak during cooldown.
+    #[test]
+    fn tag_trend_scoring_applies_threshold_and_peak_cooldown() {
+        assert_eq!(tag_raw_score(4, 1), 0.0);
+        assert_eq!(tag_raw_score(5, 6), 0.0);
+        assert_eq!(tag_raw_score(5, 1), 16.0);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let old_at = now - Duration::hours(12);
+        assert_eq!(
+            choose_tag_peak(4.0, Some(16.0), Some(old_at), now),
+            (16.0, old_at)
+        );
+        assert_eq!(
+            choose_tag_peak(25.0, Some(16.0), Some(old_at), now),
+            (25.0, now)
+        );
+        assert_eq!(
+            choose_tag_peak(4.0, Some(16.0), Some(now - Duration::days(3)), now),
+            (4.0, now)
+        );
     }
 
     #[test]

@@ -259,6 +259,12 @@ async fn serve(
         run_migrations(&db).await?;
     }
     reconcile_domain_suspensions(&db, &config).await?;
+    schedule_trend_maintenance(
+        &db,
+        time::OffsetDateTime::now_utc(),
+        config.trends_refresh_interval,
+    )
+    .await?;
 
     let state = AppState::new(config.clone(), db.clone());
     let mut leptos_options = leptos::config::get_configuration(None)
@@ -317,6 +323,12 @@ async fn worker() -> Result<()> {
     let config = Config::from_env(None)?;
     let db = roosty_db::connect(&config.database_url).await?;
     reconcile_domain_suspensions(&db, &config).await?;
+    schedule_trend_maintenance(
+        &db,
+        time::OffsetDateTime::now_utc(),
+        config.trends_refresh_interval,
+    )
+    .await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
     let result = worker_pool(db, config, shutdown_rx).await;
@@ -546,6 +558,28 @@ async fn worker_iteration(
         roosty_db::JobKind::ScheduledStatusPublish => {
             statuses::publish_scheduled_status(&state, job.payload.clone()).await
         }
+        roosty_db::JobKind::TrendMaintenance => {
+            let outcome = roosty_db::maintain_trends(db).await?;
+            if outcome.has_more {
+                roosty_db::enqueue_job(
+                    db,
+                    roosty_db::JobKind::TrendMaintenance,
+                    serde_json::json!({}),
+                    Some(&format!("trend-refresh-continuation:{}", job.id.0)),
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                schedule_trend_maintenance(
+                    db,
+                    time::OffsetDateTime::now_utc() + config.trends_refresh_interval,
+                    config.trends_refresh_interval,
+                )
+                .await
+                .map(|_| ())
+            }
+        }
     };
     match result {
         Ok(()) => {
@@ -581,6 +615,24 @@ async fn worker_iteration(
     }
 
     Ok(true)
+}
+
+async fn schedule_trend_maintenance(
+    db: &roosty_db::DbConnection,
+    run_after: time::OffsetDateTime,
+    interval: time::Duration,
+) -> Result<roosty_core::JobId> {
+    let slot = run_after
+        .unix_timestamp()
+        .div_euclid(interval.whole_seconds());
+    roosty_db::enqueue_job(
+        db,
+        roosty_db::JobKind::TrendMaintenance,
+        serde_json::json!({}),
+        Some(&format!("trend-refresh:{slot}")),
+        run_after,
+    )
+    .await
 }
 
 fn validate_username(username: &str) -> Result<()> {
@@ -1045,6 +1097,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            trends_refresh_interval: time::Duration::minutes(5),
             scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
             streaming: crate::config::StreamingConfig::default(),
             instance_name: "Worker test".to_owned(),

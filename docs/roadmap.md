@@ -10,7 +10,8 @@
 - Mastodon-compatible private lists with local/remote membership, reply policies, exclusive home-feed filtering, and cursor-paginated list timelines.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
 - Mastodon-compatible favourite and boost actor lists for local and cached-remote statuses, with visibility enforcement and cursor pagination over locally known interactions.
-- Mastodon-compatible trending hashtags rank seven days of public local and cached-remote activity through the current and legacy Explore endpoints.
+- Mastodon-compatible trending hashtags and statuses use transactionally maintained,
+  cross-process PostgreSQL caches, with seven-day tag history and Rust-owned scheduled refreshes.
 - Mastodon-compatible safe linkification of explicit web URLs across local API, history, streaming, and outbound ActivityPub projections.
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
 - Mastodon-compatible consent-aware quote posts with transactional policy, authorization, listing, revocation, notifications, and FEP-044f delivery.
@@ -100,7 +101,7 @@
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [ ] Add SEO-friendly first-party profile and status pages. Welcome, about, login, password settings, OAuth consent, and out-of-band authorization results now use Leptos; no Askama views remain.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
-- [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags are available; trending statuses/links, the profile directory, and account suggestions remain.
+- [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags and statuses are available; the links endpoint returns an empty compatible collection until link-card indexing is added, while the profile directory and account suggestions remain.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account
   creation/password reset/limits, compatible account APIs, OAuth scope enforcement, CSRF
   protection, and transactional audit records.

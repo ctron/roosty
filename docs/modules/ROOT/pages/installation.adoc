@@ -359,6 +359,10 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 |`ROOSTY_WORKER_CONCURRENCY`
 |`4`
 |Durable worker loops per process. `0` selects the available logical CPU count.
+
+|`ROOSTY_TRENDS_REFRESH_INTERVAL`
+|`5m`
+|Trend scoring cadence. Must be at least `1m` and identical on every process sharing the database.
 |===
 
 === Scheduled statuses and streaming

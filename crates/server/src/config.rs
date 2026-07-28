@@ -178,6 +178,8 @@ pub struct Config {
     pub remote_media_fetch_concurrency: usize,
     /// Number of durable job loops to run in this process; zero in configuration uses available CPUs.
     pub worker_concurrency: usize,
+    /// Shared cadence for eventually consistent trend refreshes.
+    pub trends_refresh_interval: time::Duration,
     pub scheduled_statuses: ScheduledStatusConfig,
     pub streaming: StreamingConfig,
     pub instance_name: String,
@@ -228,6 +230,7 @@ impl Config {
             "ROOSTY_WORKER_CONCURRENCY",
             DEFAULT_WORKER_CONCURRENCY,
         )?)?;
+        let trends_refresh_interval = trends_refresh_interval_env()?;
         if federation_enabled {
             if public_base_url.scheme() != "https" || public_base_url.host_str().is_none() {
                 return Err(RoostyError::Configuration(
@@ -276,6 +279,7 @@ impl Config {
             remote_media_max_bytes,
             remote_media_fetch_concurrency,
             worker_concurrency,
+            trends_refresh_interval,
             scheduled_statuses: ScheduledStatusConfig::from_env()?,
             streaming: StreamingConfig::from_env()?,
             instance_name: required_env("ROOSTY_INSTANCE_NAME")?,
@@ -337,6 +341,20 @@ fn optional_humantime_duration_env(name: &str, default: &str) -> Result<time::Du
     let duration = nonzero_duration_env(name, default)?;
     time::Duration::try_from(duration)
         .map_err(|_| RoostyError::Configuration(format!("{name} is too large")))
+}
+
+fn trends_refresh_interval_env() -> Result<time::Duration> {
+    let duration = optional_humantime_duration_env("ROOSTY_TRENDS_REFRESH_INTERVAL", "5m")?;
+    validate_trends_refresh_interval(duration)
+}
+
+fn validate_trends_refresh_interval(duration: time::Duration) -> Result<time::Duration> {
+    if duration < time::Duration::minutes(1) {
+        return Err(RoostyError::Configuration(
+            "ROOSTY_TRENDS_REFRESH_INTERVAL must be at least 1m".to_owned(),
+        ));
+    }
+    Ok(duration)
 }
 
 fn nonzero_duration_env(name: &str, default: &str) -> Result<Duration> {
@@ -486,6 +504,7 @@ mod tests {
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
             worker_concurrency: 4,
+            trends_refresh_interval: time::Duration::minutes(5),
             scheduled_statuses: ScheduledStatusConfig::default(),
             streaming: StreamingConfig::default(),
             instance_name: "Roosty Test".to_owned(),
@@ -527,6 +546,22 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains("ROOSTY_STREAMING_IDLE_TIMEOUT"));
             assert!(message.contains("10s"));
+        }
+    }
+
+    #[test]
+    fn trend_refresh_interval_defaults_and_minimum_are_validated() {
+        assert_eq!(
+            validate_trends_refresh_interval(time::Duration::minutes(5)).unwrap(),
+            time::Duration::minutes(5)
+        );
+        assert_eq!(
+            validate_trends_refresh_interval(time::Duration::minutes(17)).unwrap(),
+            time::Duration::minutes(17)
+        );
+        for duration in [time::Duration::ZERO, time::Duration::seconds(59)] {
+            let error = validate_trends_refresh_interval(duration).unwrap_err();
+            assert!(error.to_string().contains("ROOSTY_TRENDS_REFRESH_INTERVAL"));
         }
     }
 

@@ -72,6 +72,12 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_notification_permission").await);
     assert!(table_exists(database.connection(), "local_notification_request").await);
     assert!(table_exists(database.connection(), "admin_audit_log").await);
+    assert!(table_exists(database.connection(), "status_trend_metric").await);
+    assert!(table_exists(database.connection(), "tag_daily_actor_usage").await);
+    assert!(table_exists(database.connection(), "tag_daily_usage").await);
+    assert!(table_exists(database.connection(), "tag_trend").await);
+    assert!(table_exists(database.connection(), "trend_dirty").await);
+    assert!(!roosty_trend_routines_exist(database.connection()).await);
     assert!(column_exists(database.connection(), "job", "permanently_failed_at").await);
     assert!(column_exists(database.connection(), "local_notification", "filtered").await);
     assert!(
@@ -715,4 +721,24 @@ async fn column_exists(
         .expect("column existence query returned no rows");
 
     row.try_get::<bool>("", "column_exists").unwrap()
+}
+
+async fn roosty_trend_routines_exist(connection: &DatabaseConnection) -> bool {
+    let row = connection
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM pg_proc
+                 WHERE pronamespace = 'public'::regnamespace
+                   AND (proname LIKE '%trend%' OR proname = 'adjust_tag_daily_usage')
+                 UNION ALL
+                 SELECT 1 FROM pg_trigger
+                 WHERE NOT tgisinternal AND tgname LIKE '%trend%'
+               ) AS routines_exist"#
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .expect("trend routine query returned no rows");
+    row.try_get::<bool>("", "routines_exist").unwrap()
 }
