@@ -6,6 +6,7 @@
 - The focus is on the backend, allowing integration with UIs
 - APIs should align with the ActivityPub spec and Mastodon APIs.
 - It must be possible that multiple instances of this process run on the same database.
+- The system should be designed to support large-scale instances.
 
 ## Verification
 
