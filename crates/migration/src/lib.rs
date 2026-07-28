@@ -75,6 +75,7 @@ mod m20260701_000070_create_trend_refresh_schedule;
 mod m20260701_000071_add_profile_directory;
 mod m20260701_000072_create_preview_cards;
 mod m20260701_000073_remove_notification_policy_trigger;
+mod m20260701_000074_create_status_search;
 
 pub struct Migrator;
 
@@ -155,6 +156,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000071_add_profile_directory::Migration),
             Box::new(m20260701_000072_create_preview_cards::Migration),
             Box::new(m20260701_000073_remove_notification_policy_trigger::Migration),
+            Box::new(m20260701_000074_create_status_search::Migration),
         ]
     }
 }

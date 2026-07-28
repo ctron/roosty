@@ -57,6 +57,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "preview_card").await);
     assert!(table_exists(database.connection(), "status_preview_card").await);
     assert!(table_exists(database.connection(), "status_preview_scan").await);
+    assert!(table_exists(database.connection(), "status_search_document").await);
+    assert!(index_exists(database.connection(), "status_search_document_trgm_idx").await);
     assert!(table_exists(database.connection(), "link_daily_usage").await);
     assert!(table_exists(database.connection(), "link_trend").await);
     assert!(table_exists(database.connection(), "preview_fetch_host").await);
@@ -768,6 +770,86 @@ async fn remote_status_tag_upgrade_backfill_and_rollback(database: &mut Embedded
         .unwrap();
     assert!(!table_exists(database.connection(), "remote_status_tag").await);
     assert!(table_exists(database.connection(), "local_tag").await);
+}
+
+/// Given statuses created before search support, migration 74 builds local and remote documents.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn status_search_upgrade_backfills_and_rolls_back(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(73)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO local_account (id, username, email, password_hash)
+            VALUES (
+                '10000000-0000-0000-0000-000000000074',
+                'search_local', 'search-local@example.test', 'hash'
+            );
+            INSERT INTO local_status (
+                id, account_id, content, spoiler_text, visibility, created_at
+            ) VALUES (
+                '20000000-0000-0000-0000-000000000074',
+                '10000000-0000-0000-0000-000000000074',
+                'local platypus body', 'local warning', 'public', now()
+            );
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '30000000-0000-0000-0000-000000000074',
+                'https://remote.test/users/search', 'search', 'remote.test',
+                'https://remote.test/users/search/inbox',
+                'https://remote.test/users/search#main-key', 'key',
+                now() + interval '1 day'
+            );
+            INSERT INTO remote_status (
+                id, activitypub_id, remote_actor_id, content, visibility,
+                published_at, updated_at, object
+            ) VALUES (
+                '40000000-0000-0000-0000-000000000074',
+                'https://remote.test/statuses/search',
+                '30000000-0000-0000-0000-000000000074',
+                '<p>remote capybara body</p>', 'public', now(), now(),
+                '{"summary":"remote warning"}'::jsonb
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    let local = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT document FROM status_search_document WHERE local_status_id = '20000000-0000-0000-0000-000000000074'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let remote = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT document FROM status_search_document WHERE remote_status_id = '40000000-0000-0000-0000-000000000074'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        local.try_get::<String>("", "document").unwrap(),
+        "local warning local platypus body"
+    );
+    assert_eq!(
+        remote.try_get::<String>("", "document").unwrap(),
+        "remote warning  remote capybara body "
+    );
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!table_exists(database.connection(), "status_search_document").await);
 }
 
 struct EmbeddedDatabase {

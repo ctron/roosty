@@ -250,7 +250,9 @@ pagination. Account suggestions are missing.
 
 |🟡
 |`GET /api/v2/search`
-|Status search is missing.
+|Accounts, hashtags, and authenticated interaction-scoped status search are supported.
+Status matching uses case-insensitive literal substrings of at least three characters;
+anonymous status results remain empty for Mastodon-compatible privacy.
 
 |🟡
 |Remote account resolution

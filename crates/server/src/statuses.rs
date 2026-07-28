@@ -5242,6 +5242,32 @@ async fn status_context_models(
     Ok(responses)
 }
 
+/// Serialize ordered search candidates after defensively rechecking current visibility.
+pub(crate) async fn search_status_models(
+    state: &AppState,
+    items: Vec<roosty_db::StatusContextItem>,
+    viewer: AccountId,
+) -> Result<Vec<StatusResponse>, RoostyError> {
+    let mut responses = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            roosty_db::StatusContextItem::Local(status) => {
+                if status_visible_to_viewer(state, &status, Some(viewer)).await? {
+                    responses.push(status_with_author(state, status, Some(viewer)).await?);
+                }
+            }
+            roosty_db::StatusContextItem::Remote(status) => {
+                if roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await? {
+                    responses.push(
+                        remote_status_response_for_viewer(state, status, Some(viewer)).await?,
+                    );
+                }
+            }
+        }
+    }
+    Ok(responses)
+}
+
 /// Walk visible cached parent statuses from root ancestor to direct parent.
 async fn status_ancestors(
     db: &impl ConnectionTrait,

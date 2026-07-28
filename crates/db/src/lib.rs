@@ -178,7 +178,7 @@ use entity::{
     remote_status_local_recipient, remote_status_pin, remote_status_reblog,
     remote_status_remote_recipient, remote_status_tag, scheduled_status,
     status_creation_idempotency, status_preview_card, status_preview_scan, status_quote,
-    streaming_event,
+    status_search_document, streaming_event,
 };
 
 /// Quote policy values authored by Mastodon-compatible clients.
@@ -1148,6 +1148,14 @@ enum AccountSearchKind {
     Remote,
 }
 
+#[derive(Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, PartialEq)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+enum StatusSearchKind {
+    Local,
+    Remote,
+}
+
 /// List discoverable profiles with bounded counters and stable offset ordering.
 pub async fn account_directory(
     db: &DbConnection,
@@ -1418,6 +1426,27 @@ pub enum StatusContextItem {
     Local(LocalStatus),
     /// A status received and retained in the federation cache.
     Remote(RemoteStatus),
+}
+
+/// Bounded, viewer-scoped inputs for PostgreSQL status search.
+pub struct StatusSearchOptions<'a> {
+    pub viewer_account_id: AccountId,
+    pub query: &'a str,
+    pub account_id: Option<AccountId>,
+    pub include_remote: bool,
+    pub blocked_remote_domains: &'a [String],
+    pub limit: u64,
+    pub offset: u64,
+    pub min_id: Option<StatusId>,
+    pub max_id: Option<StatusId>,
+}
+
+/// One ordered status-search page with opaque UUID cursor metadata.
+pub struct StatusSearchPage {
+    pub items: Vec<StatusContextItem>,
+    pub first_cursor: Option<Uuid>,
+    pub last_cursor: Option<Uuid>,
+    pub has_more: bool,
 }
 
 impl StatusContextItem {
@@ -2484,6 +2513,7 @@ pub async fn upsert_remote_status(
         true,
     ))
     .await?;
+    refresh_status_search_document(&txn, StatusReference::Remote(status.id)).await?;
     txn.commit().await?;
     Ok(status)
 }
@@ -2576,6 +2606,7 @@ pub async fn process_remote_status_upsert(
             true,
         ))
         .await?;
+        refresh_status_search_document(txn, StatusReference::Remote(status.id)).await?;
         return Ok(RemoteStatusUpsertResult::Created(status));
     };
     if existing.remote_actor_id != status.remote_actor_id.0 {
@@ -2661,6 +2692,7 @@ pub async fn process_remote_status_upsert(
         true,
     ))
     .await?;
+    refresh_status_search_document(txn, StatusReference::Remote(status.id)).await?;
     let current = remote_status::Entity::find_by_id(status.id.0)
         .one(txn)
         .await?
@@ -2851,6 +2883,7 @@ pub async fn delete_remote_status(
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(&txn).await?;
+    refresh_status_search_document(&txn, StatusReference::Remote(status_id)).await?;
     refresh_remote_actor_last_status_at(&txn, actor_id).await?;
     mark_trend_dirty(&txn, "remote_status", status_id.0).await?;
     txn.commit().await?;
@@ -2992,6 +3025,7 @@ async fn repair_one_remote_status_delete(
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(txn).await?;
+    refresh_status_search_document(txn, StatusReference::Remote(status_id)).await?;
     if refresh_directory_activity {
         refresh_remote_actor_last_status_at(txn, author_id).await?;
     }
@@ -3630,6 +3664,114 @@ impl PreviewStatusTarget {
             Self::Remote(id) => (None, Some(id.0)),
         }
     }
+}
+
+fn normalized_search_document(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .flat_map(|part| {
+            part.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn remote_content_text(content: &str) -> String {
+    Html::parse_fragment(content)
+        .root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Rebuild one compact search document after its canonical status projection changes.
+async fn refresh_status_search_document<C>(db: &C, target: StatusReference) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let (local_status_id, remote_status_id, parts, updated_at) = match target {
+        StatusReference::Local(status_id) => {
+            let Some(status) = local_status::Entity::find_by_id(status_id.0)
+                .one(db)
+                .await?
+            else {
+                return Ok(());
+            };
+            if status.deleted_at.is_some() {
+                status_search_document::Entity::delete_many()
+                    .filter(status_search_document::Column::LocalStatusId.eq(status_id.0))
+                    .exec(db)
+                    .await?;
+                return Ok(());
+            }
+            let media = local_media_attachment::Entity::find()
+                .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
+                .all(db)
+                .await?;
+            let mut parts = vec![status.spoiler_text, status.content];
+            parts.extend(media.into_iter().filter_map(|item| item.description));
+            (Some(status_id.0), None, parts, status.updated_at)
+        }
+        StatusReference::Remote(status_id) => {
+            let Some(status) = remote_status::Entity::find_by_id(status_id.0)
+                .one(db)
+                .await?
+            else {
+                return Ok(());
+            };
+            if status.deleted_at.is_some() {
+                status_search_document::Entity::delete_many()
+                    .filter(status_search_document::Column::RemoteStatusId.eq(status_id.0))
+                    .exec(db)
+                    .await?;
+                return Ok(());
+            }
+            let media = remote_media_attachment::Entity::find()
+                .filter(remote_media_attachment::Column::RemoteStatusId.eq(status_id.0))
+                .all(db)
+                .await?;
+            let mut parts = vec![
+                status
+                    .object
+                    .get("summary")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                remote_content_text(&status.content),
+            ];
+            parts.extend(media.into_iter().filter_map(|item| item.description));
+            (None, Some(status_id.0), parts, status.updated_at)
+        }
+    };
+    let mut query = status_search_document::Entity::find();
+    query = match local_status_id {
+        Some(id) => query.filter(status_search_document::Column::LocalStatusId.eq(id)),
+        None => query.filter(status_search_document::Column::LocalStatusId.is_null()),
+    };
+    query = match remote_status_id {
+        Some(id) => query.filter(status_search_document::Column::RemoteStatusId.eq(id)),
+        None => query.filter(status_search_document::Column::RemoteStatusId.is_null()),
+    };
+    let document = normalized_search_document(parts);
+    if let Some(existing) = query.one(db).await? {
+        let mut active = existing.into_active_model();
+        active.document = Set(document);
+        active.updated_at = Set(updated_at);
+        active.update(db).await?;
+    } else {
+        status_search_document::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_status_id: Set(local_status_id),
+            remote_status_id: Set(remote_status_id),
+            document: Set(document),
+            updated_at: Set(updated_at),
+        }
+        .insert(db)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Replace one status's preview association and coalesce scoring/fetch work atomically.
@@ -6121,6 +6263,262 @@ pub async fn search_accounts(
         }
     }
     Ok(results)
+}
+
+/// Search status documents while enforcing Mastodon's viewer interaction scope.
+pub async fn search_statuses(
+    db: &DbConnection,
+    options: StatusSearchOptions<'_>,
+) -> Result<StatusSearchPage> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        status_kind: StatusSearchKind,
+        status_id: Uuid,
+    }
+
+    if options.query.chars().count() < 3 || options.limit == 0 {
+        return Ok(StatusSearchPage {
+            items: Vec::new(),
+            first_cursor: None,
+            last_cursor: None,
+            has_more: false,
+        });
+    }
+    let escaped_query = options
+        .query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let blocked_domains = serde_json::to_string(options.blocked_remote_domains)
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+        WITH candidates AS (
+            SELECT 'local'::text AS status_kind, status.id AS status_id
+            FROM status_search_document document
+            JOIN local_status status ON status.id = document.local_status_id
+            JOIN local_account author ON author.id = status.account_id
+            WHERE document.document ILIKE '%' || $2 || '%' ESCAPE '\'
+              AND status.deleted_at IS NULL
+              AND (author.limited_at IS NULL OR author.id = $1)
+              AND ($3::uuid IS NULL OR author.id = $3)
+              AND (
+                author.id = $1
+                OR EXISTS (
+                    SELECT 1 FROM local_status_local_mention mention
+                    WHERE mention.status_id = status.id
+                      AND mention.account_id = $1 AND mention.active
+                )
+                OR EXISTS (
+                    SELECT 1 FROM local_status_favourite favourite
+                    WHERE favourite.status_id = status.id
+                      AND favourite.account_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1 FROM local_status_reblog reblog
+                    WHERE reblog.status_id = status.id
+                      AND reblog.account_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1 FROM local_status_bookmark bookmark
+                    WHERE bookmark.status_id = status.id
+                      AND bookmark.account_id = $1
+                )
+              )
+              AND (
+                status.visibility IN ('public', 'unlisted')
+                OR author.id = $1
+                OR (
+                    status.visibility = 'private'
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM local_follow follow
+                            WHERE follow.follower_account_id = $1
+                              AND follow.followed_account_id = author.id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM local_status_local_recipient recipient
+                            WHERE recipient.status_id = status.id
+                              AND recipient.account_id = $1
+                        )
+                    )
+                )
+                OR (
+                    status.visibility = 'direct'
+                    AND EXISTS (
+                        SELECT 1 FROM local_status_local_recipient recipient
+                        WHERE recipient.status_id = status.id
+                          AND recipient.account_id = $1
+                    )
+                )
+              )
+              AND (
+                author.id = $1
+                OR NOT EXISTS (
+                    SELECT 1 FROM local_account_block block
+                    WHERE (block.account_id = $1 AND block.target_account_id = author.id)
+                       OR (block.account_id = author.id AND block.target_account_id = $1)
+                )
+              )
+              AND (
+                author.id = $1
+                OR NOT EXISTS (
+                    SELECT 1 FROM local_account_mute mute
+                    WHERE mute.account_id = $1
+                      AND mute.target_account_id = author.id
+                      AND (mute.expires_at IS NULL OR mute.expires_at > now())
+                )
+              )
+            UNION ALL
+            SELECT 'remote'::text, status.id
+            FROM status_search_document document
+            JOIN remote_status status ON status.id = document.remote_status_id
+            JOIN remote_actor author ON author.id = status.remote_actor_id
+            WHERE $4
+              AND document.document ILIKE '%' || $2 || '%' ESCAPE '\'
+              AND status.deleted_at IS NULL
+              AND author.deleted_at IS NULL
+              AND author.limited_at IS NULL
+              AND ($3::uuid IS NULL OR author.id = $3)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text($5::jsonb) blocked(domain)
+                WHERE author.domain = blocked.domain
+                   OR author.domain LIKE '%.' || blocked.domain
+              )
+              AND (
+                EXISTS (
+                    SELECT 1 FROM remote_status_local_mention mention
+                    WHERE mention.remote_status_id = status.id
+                      AND mention.account_id = $1 AND mention.active
+                )
+                OR EXISTS (
+                    SELECT 1 FROM local_remote_status_favourite favourite
+                    WHERE favourite.remote_status_id = status.id
+                      AND favourite.local_account_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1 FROM local_remote_status_reblog reblog
+                    WHERE reblog.remote_status_id = status.id
+                      AND reblog.local_account_id = $1
+                )
+              )
+              AND (
+                status.visibility IN ('public', 'unlisted')
+                OR (
+                    status.visibility = 'private'
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM remote_following follow
+                            WHERE follow.local_account_id = $1
+                              AND follow.remote_actor_id = author.id
+                              AND follow.state = 'accepted'
+                              AND follow.deactivated_at IS NULL
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM remote_status_local_recipient recipient
+                            WHERE recipient.remote_status_id = status.id
+                              AND recipient.account_id = $1
+                        )
+                    )
+                )
+                OR (
+                    status.visibility = 'direct'
+                    AND EXISTS (
+                        SELECT 1 FROM remote_status_local_recipient recipient
+                        WHERE recipient.remote_status_id = status.id
+                          AND recipient.account_id = $1
+                    )
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM local_remote_account_block block
+                WHERE block.local_account_id = $1
+                  AND block.remote_actor_id = author.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM local_remote_account_mute mute
+                WHERE mute.local_account_id = $1
+                  AND mute.remote_actor_id = author.id
+                  AND (mute.expires_at IS NULL OR mute.expires_at > now())
+              )
+        )
+        SELECT status_kind, status_id
+        FROM candidates
+        WHERE ($6::uuid IS NULL OR status_id > $6)
+          AND ($7::uuid IS NULL OR status_id < $7)
+        ORDER BY status_id DESC
+        LIMIT $8 OFFSET $9
+        "#,
+        vec![
+            options.viewer_account_id.0.into(),
+            escaped_query.into(),
+            options.account_id.map(|id| id.0).into(),
+            options.include_remote.into(),
+            blocked_domains.into(),
+            options.min_id.map(|id| id.0).into(),
+            options.max_id.map(|id| id.0).into(),
+            (page_query_limit(options.limit) as i64).into(),
+            (options.offset as i64).into(),
+        ],
+    ))
+    .all(&txn)
+    .await?;
+
+    let has_more = rows.len() > options.limit as usize;
+    let mut rows = rows;
+    if has_more {
+        rows.truncate(options.limit as usize);
+    }
+    let first_cursor = rows.first().map(|row| row.status_id);
+    let last_cursor = rows.last().map(|row| row.status_id);
+    let local_ids = rows
+        .iter()
+        .filter(|row| row.status_kind == StatusSearchKind::Local)
+        .map(|row| row.status_id)
+        .collect::<Vec<_>>();
+    let remote_ids = rows
+        .iter()
+        .filter(|row| row.status_kind == StatusSearchKind::Remote)
+        .map(|row| row.status_id)
+        .collect::<Vec<_>>();
+    let local = local_status::Entity::find()
+        .filter(local_status::Column::Id.is_in(local_ids))
+        .all(&txn)
+        .await?;
+    let remote = remote_status::Entity::find()
+        .filter(remote_status::Column::Id.is_in(remote_ids))
+        .all(&txn)
+        .await?;
+    txn.commit().await?;
+
+    let mut local = local
+        .into_iter()
+        .map(|model| local_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mut remote = remote
+        .into_iter()
+        .map(|model| remote_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let items = rows
+        .into_iter()
+        .filter_map(|row| match row.status_kind {
+            StatusSearchKind::Local => local.remove(&row.status_id).map(StatusContextItem::Local),
+            StatusSearchKind::Remote => {
+                remote.remove(&row.status_id).map(StatusContextItem::Remote)
+            }
+        })
+        .collect();
+    Ok(StatusSearchPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
 }
 
 /// Count local accounts following this account.
@@ -8759,6 +9157,7 @@ pub async fn create_local_status(
         false,
     ))
     .await?;
+    refresh_status_search_document(&txn, StatusReference::Local(StatusId(status_id))).await?;
     txn.commit().await?;
     local_status_from_model(status)
 }
@@ -8848,6 +9247,7 @@ pub async fn create_local_status_with_media(
         active.updated_at = Set(OffsetDateTime::now_utc());
         active.update(txn).await?;
     }
+    refresh_status_search_document(txn, StatusReference::Local(StatusId(status_id))).await?;
 
     let now = OffsetDateTime::now_utc();
     tag_names.sort();
@@ -11555,6 +11955,7 @@ pub async fn update_owned_local_status(
         false,
     ))
     .await?;
+    refresh_status_search_document(txn, StatusReference::Local(status_id)).await?;
 
     if status.visibility == StatusVisibility::Public {
         adjust_tag_usage(
@@ -15443,6 +15844,7 @@ pub async fn delete_owned_local_status(
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.updated_at = Set(OffsetDateTime::now_utc());
     let status = local_status_from_model(active.update(db).await?)?;
+    refresh_status_search_document(db, StatusReference::Local(status_id)).await?;
     refresh_local_account_last_status_at(db, account_id).await?;
     local_status_pin::Entity::delete_many()
         .filter(local_status_pin::Column::StatusId.eq(status_id.0))

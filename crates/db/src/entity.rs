@@ -66,4 +66,5 @@ pub mod status_creation_idempotency;
 pub mod status_preview_card;
 pub mod status_preview_scan;
 pub mod status_quote;
+pub mod status_search_document;
 pub mod streaming_event;

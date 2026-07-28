@@ -1,18 +1,19 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
+    http::{HeaderValue, header},
     response::{IntoResponse, Response},
     routing::get,
 };
-use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
+use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError, StatusId};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
     accounts::{RemoteAccountResponse, remote_account_response},
     auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
     http::AppState,
-    statuses::TagResponse,
+    statuses::{StatusResponse, TagResponse, search_status_models},
 };
 
 const DEFAULT_SEARCH_LIMIT: u64 = 20;
@@ -35,6 +36,9 @@ struct SearchParams {
     offset: Option<u64>,
     resolve: Option<bool>,
     following: Option<bool>,
+    account_id: Option<Uuid>,
+    min_id: Option<Uuid>,
+    max_id: Option<Uuid>,
 }
 
 /// Mastodon search result categories, retaining unknown extensions as unsupported.
@@ -51,8 +55,13 @@ enum SearchType {
 #[derive(Serialize)]
 struct SearchResponse {
     accounts: Vec<SearchAccountResponse>,
-    statuses: Vec<Value>,
+    statuses: Vec<StatusResponse>,
     hashtags: Vec<TagResponse>,
+}
+
+struct StatusSearchResults {
+    items: Vec<StatusResponse>,
+    link: Option<HeaderValue>,
 }
 
 /// Untagged Mastodon account shape shared by local and cached remote search results.
@@ -96,15 +105,29 @@ async fn search(
     } else {
         Ok(Vec::new())
     };
-
-    match (accounts, hashtags) {
-        (Ok(accounts), Ok(hashtags)) => Json(SearchResponse {
-            accounts,
-            statuses: Vec::new(),
-            hashtags,
+    let statuses = if matches!(params.search_type, None | Some(SearchType::Statuses)) {
+        search_statuses(&state, account.as_ref().map(|account| account.id), &params).await
+    } else {
+        Ok(StatusSearchResults {
+            items: Vec::new(),
+            link: None,
         })
-        .into_response(),
-        (Err(error), _) | (_, Err(error)) => server_error(error),
+    };
+
+    match (accounts, hashtags, statuses) {
+        (Ok(accounts), Ok(hashtags), Ok(statuses)) => {
+            let mut response = Json(SearchResponse {
+                accounts,
+                statuses: statuses.items,
+                hashtags,
+            })
+            .into_response();
+            if let Some(link) = statuses.link {
+                response.headers_mut().insert(header::LINK, link);
+            }
+            response
+        }
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => server_error(error),
     }
 }
 
@@ -203,6 +226,79 @@ async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<
     Ok(responses)
 }
 
+/// Search only statuses related to the authenticated user, matching Mastodon's privacy scope.
+async fn search_statuses(
+    state: &AppState,
+    account_id: Option<AccountId>,
+    params: &SearchParams,
+) -> Result<StatusSearchResults> {
+    let Some(viewer_account_id) = account_id else {
+        return Ok(StatusSearchResults {
+            items: Vec::new(),
+            link: None,
+        });
+    };
+    let Some(query) = normalized_status_query(params.q.as_deref()) else {
+        return Ok(StatusSearchResults {
+            items: Vec::new(),
+            link: None,
+        });
+    };
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_LIMIT);
+    let page = roosty_db::search_statuses(
+        &state.db,
+        roosty_db::StatusSearchOptions {
+            viewer_account_id,
+            query: &query,
+            account_id: params.account_id.map(AccountId),
+            include_remote: state.config.federation_enabled,
+            blocked_remote_domains: &state.config.federation_blocked_domains,
+            limit,
+            offset: params.offset.unwrap_or(0),
+            min_id: params.min_id.map(StatusId),
+            max_id: params.max_id.map(StatusId),
+        },
+    )
+    .await?;
+    let link = status_search_link(&query, params.account_id, limit, &page);
+    let items = search_status_models(state, page.items, viewer_account_id).await?;
+    Ok(StatusSearchResults { items, link })
+}
+
+fn status_search_link(
+    query: &str,
+    account_id: Option<Uuid>,
+    limit: u64,
+    page: &roosty_db::StatusSearchPage,
+) -> Option<HeaderValue> {
+    if !page.has_more {
+        return None;
+    }
+    let first = page.first_cursor?;
+    let last = page.last_cursor?;
+    let query_for = |cursor: &str, id: Uuid| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer
+            .append_pair("type", "statuses")
+            .append_pair("q", query)
+            .append_pair("limit", &limit.to_string())
+            .append_pair(cursor, &id.to_string());
+        if let Some(account_id) = account_id {
+            serializer.append_pair("account_id", &account_id.to_string());
+        }
+        format!("/api/v2/search?{}", serializer.finish())
+    };
+    HeaderValue::from_str(&format!(
+        r#"<{}>; rel="prev", <{}>; rel="next""#,
+        query_for("min_id", first),
+        query_for("max_id", last)
+    ))
+    .ok()
+}
+
 /// Normalize local mention-style search terms and reject remote account queries.
 fn normalized_account_query(query: Option<&str>) -> Option<String> {
     let trimmed = query?.trim().trim_start_matches('@');
@@ -217,6 +313,11 @@ fn normalized_account_query(query: Option<&str>) -> Option<String> {
 fn normalized_tag_query(query: Option<&str>) -> Option<String> {
     let trimmed = query?.trim().trim_start_matches('#').to_lowercase();
     non_empty(&trimmed)
+}
+
+fn normalized_status_query(query: Option<&str>) -> Option<String> {
+    let trimmed = query?.trim();
+    (trimmed.chars().count() >= 3).then(|| trimmed.to_owned())
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -458,6 +559,78 @@ mod tests {
 
     #[test_context(SearchContext)]
     #[tokio::test]
+    /// Given owned and favourited posts, status search returns partial matches only to the authenticated viewer.
+    async fn search_returns_interaction_scoped_statuses(context: &mut SearchContext) {
+        let token = context.access_token().await;
+        let author_id = context
+            .create_account("alice", "alice@example.com", "Alice Example")
+            .await;
+        let owned = roosty_db::create_local_status(
+            &context.db,
+            roosty_db::NewLocalStatus {
+                id: None,
+                account_id: context.account_id,
+                content: "A searchable platypus".to_owned(),
+                visibility: StatusVisibility::Public,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+        let interacted = roosty_db::create_local_status(
+            &context.db,
+            roosty_db::NewLocalStatus {
+                id: None,
+                account_id: author_id,
+                content: "Another PLATYPUS report".to_owned(),
+                visibility: StatusVisibility::Public,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+        roosty_db::favourite_local_status(&context.db, context.account_id, interacted.id)
+            .await
+            .unwrap();
+
+        let response = context
+            .authenticated_get("/api/v2/search?type=statuses&q=typus", &token)
+            .await;
+        let anonymous = context.get("/api/v2/search?type=statuses&q=typus").await;
+        let short = context
+            .authenticated_get("/api/v2/search?type=statuses&q=ty", &token)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let ids = body["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|status| status["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&owned.id.0.to_string()));
+        assert!(ids.contains(&interacted.id.0.to_string()));
+        assert_eq!(
+            json_body(anonymous).await["statuses"],
+            serde_json::json!([])
+        );
+        assert_eq!(json_body(short).await["statuses"], serde_json::json!([]));
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
     /// Verifies that account search supports display names and requires auth.
     async fn account_search_matches_display_name(context: &mut SearchContext) {
         let token = context.access_token().await;
@@ -623,7 +796,12 @@ mod tests {
             .token
         }
 
-        async fn create_account(&self, username: &str, email: &str, display_name: &str) {
+        async fn create_account(
+            &self,
+            username: &str,
+            email: &str,
+            display_name: &str,
+        ) -> AccountId {
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
                 roosty_db::create_local_account(&self.db, username, email, &password_hash)
@@ -640,6 +818,7 @@ mod tests {
             )
             .await
             .unwrap();
+            account_id
         }
 
         async fn cache_remote_actor(&self, username: &str, domain: &str) -> roosty_db::RemoteActor {
