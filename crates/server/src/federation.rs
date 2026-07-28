@@ -7630,6 +7630,7 @@ mod tests {
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            discoverable: Some(true),
         };
         roosty_db::upsert_remote_actor(&state.db, &actor)
             .await

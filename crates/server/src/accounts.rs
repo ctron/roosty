@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Path, Query, RawQuery, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,7 +17,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    auth::{
+        AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response,
+        account_response_with_stats, format_account_date,
+    },
     http::AppState,
     statuses::CollectionLink,
 };
@@ -28,6 +31,7 @@ const MAX_ACCOUNT_LIMIT: u64 = 80;
 /// Build routes for Mastodon-compatible account lookup and local follows.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/v1/directory", get(directory))
         .route("/api/v1/accounts/relationships", get(relationships))
         .route("/api/v1/follow_requests", get(follow_requests))
         .route(
@@ -88,6 +92,40 @@ struct LookupParams {
     resolve: Option<bool>,
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectoryOrder {
+    #[default]
+    Active,
+    New,
+}
+
+impl DirectoryOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::New => "new",
+        }
+    }
+}
+
+impl From<DirectoryOrder> for roosty_db::AccountDirectoryOrder {
+    fn from(order: DirectoryOrder) -> Self {
+        match order {
+            DirectoryOrder::Active => Self::Active,
+            DirectoryOrder::New => Self::New,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DirectoryParams {
+    offset: Option<u64>,
+    limit: Option<u64>,
+    order: Option<DirectoryOrder>,
+    local: Option<bool>,
+}
+
 #[derive(Serialize)]
 pub(crate) struct RemoteAccountResponse {
     id: String,
@@ -120,6 +158,14 @@ pub(crate) struct RemoteAccountResponse {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum CollectionAccountResponse {
+    Local(Box<AccountResponse>),
+    Remote(Box<RemoteAccountResponse>),
+}
+
+/// Mastodon account projection returned by the mixed profile directory.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DirectoryAccountResponse {
     Local(Box<AccountResponse>),
     Remote(Box<RemoteAccountResponse>),
 }
@@ -172,6 +218,124 @@ struct RelationshipResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// Return the public Mastodon-compatible profile directory.
+async fn directory(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Query(params): Query<DirectoryParams>,
+) -> Response {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
+        .clamp(1, MAX_ACCOUNT_LIMIT);
+    let offset = params.offset.unwrap_or_default();
+    let order = params.order.unwrap_or_default();
+    let local_only = params.local.unwrap_or(false);
+    let page = match roosty_db::account_directory(
+        &state.db,
+        roosty_db::AccountDirectoryOptions {
+            viewer_account_id: viewer.as_ref().map(|account| account.id),
+            order: order.into(),
+            local_only,
+            limit,
+            offset,
+            blocked_remote_domains: &state.config.federation_blocked_domains,
+        },
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => return server_error(error),
+    };
+    let remote_ids = page
+        .items
+        .iter()
+        .filter_map(|item| match &item.account {
+            roosty_db::AccountSearchResult::Remote(actor) => Some(actor.id),
+            roosty_db::AccountSearchResult::Local(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_media =
+        match roosty_db::remote_profile_media_for_actors(&state.db, &remote_ids).await {
+            Ok(media) => media,
+            Err(error) => return server_error(error),
+        };
+    let mut accounts = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        match item.account {
+            roosty_db::AccountSearchResult::Local(account) => {
+                accounts.push(DirectoryAccountResponse::Local(Box::new(
+                    account_response_with_stats(
+                        &state,
+                        account,
+                        item.followers_count,
+                        item.following_count,
+                        item.statuses_count,
+                        item.last_status_at,
+                    ),
+                )));
+            }
+            roosty_db::AccountSearchResult::Remote(actor) => {
+                let media_url = |kind| {
+                    remote_media
+                        .iter()
+                        .find(|media| media.remote_actor_id == actor.id && media.kind == kind)
+                        .map(|media| crate::media::remote_profile_media_url(&state, media.id))
+                        .unwrap_or_default()
+                };
+                let avatar = media_url(RemoteProfileMediaKind::Avatar);
+                let header = media_url(RemoteProfileMediaKind::Header);
+                let mut response = remote_account_response_from_media(actor, avatar, header);
+                response.followers_count = item.followers_count;
+                response.following_count = item.following_count;
+                response.statuses_count = item.statuses_count;
+                response.last_status_at = item.last_status_at.map(format_account_date);
+                accounts.push(DirectoryAccountResponse::Remote(Box::new(response)));
+            }
+        }
+    }
+
+    let mut links = Vec::with_capacity(2);
+    if page.has_more {
+        links.push(directory_link(
+            offset.saturating_add(limit),
+            limit,
+            order,
+            local_only,
+            "next",
+        ));
+    }
+    if offset > 0 {
+        links.push(directory_link(
+            offset.saturating_sub(limit),
+            limit,
+            order,
+            local_only,
+            "prev",
+        ));
+    }
+    let mut response = Json(accounts).into_response();
+    if !links.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&links.join(", "))
+    {
+        response.headers_mut().insert(header::LINK, value);
+    }
+    response
+}
+
+fn directory_link(
+    offset: u64,
+    limit: u64,
+    order: DirectoryOrder,
+    local_only: bool,
+    relation: &str,
+) -> String {
+    format!(
+        "</api/v1/directory?offset={offset}&limit={limit}&order={}&local={local_only}>; rel=\"{relation}\"",
+        order.as_str()
+    )
 }
 
 /// Return a public local account profile by local username or address.
@@ -244,7 +408,7 @@ pub(crate) async fn remote_account_response(
     let statuses_count = roosty_db::count_remote_statuses_by_account(&txn, actor.id).await?;
     let last_status_at = roosty_db::last_remote_status_at(&txn, actor.id)
         .await?
-        .map(crate::statuses::format_timestamp);
+        .map(format_account_date);
     let followers_count =
         roosty_db::count_remote_actor_followers_known_locally(&txn, actor.id).await?;
     let following_count =
@@ -328,7 +492,7 @@ fn remote_account_response_from_media(
         display_name: actor.display_name,
         locked: false,
         bot: false,
-        discoverable: None,
+        discoverable: actor.discoverable,
         limited: actor.limited_at.is_some(),
         group: false,
         created_at: crate::statuses::format_timestamp(
@@ -1454,6 +1618,7 @@ mod tests {
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            discoverable: Some(true),
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1508,6 +1673,7 @@ mod tests {
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            discoverable: Some(true),
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1521,6 +1687,67 @@ mod tests {
             response["created_at"],
             crate::statuses::format_timestamp(first_seen_at)
         );
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Given mixed discoverable profiles, the directory filters, orders, and paginates them compatibly.
+    async fn directory_lists_discoverable_accounts(context: &mut AccountContext) {
+        let (_alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        let (bob_id, bob_token) = context.create_account("bob", "bob@example.com").await;
+        let bob_status = context
+            .create_status(&bob_token, "Bob was active", Some("public"))
+            .await;
+        context.create_remote_actor("carol", "remote.test").await;
+        context.create_remote_actor("blocked", "blocked.test").await;
+
+        let first_page = context.get("/api/v1/directory?order=active&limit=1").await;
+        assert_eq!(first_page.status(), StatusCode::OK);
+        let link = first_page
+            .headers()
+            .get(header::LINK)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(link.contains("offset=1"));
+        assert!(link.contains("rel=\"next\""));
+        let first_page = json_body(first_page).await;
+        assert_eq!(account_usernames(&first_page), ["bob"]);
+        assert_eq!(first_page[0]["last_status_at"].as_str().unwrap().len(), 10);
+
+        let local = context.get("/api/v1/directory?order=new&local=true").await;
+        assert_eq!(account_usernames(&json_body(local).await), ["bob", "alice"]);
+
+        let personalized = context
+            .authenticated_get("/api/v1/directory", &alice_token)
+            .await;
+        let personalized = json_body(personalized).await;
+        let usernames = account_usernames(&personalized);
+        assert!(!usernames.contains(&"alice"));
+        assert!(usernames.contains(&"bob"));
+        assert!(usernames.contains(&"carol"));
+        assert!(!usernames.contains(&"blocked"));
+
+        let deleted = context
+            .authenticated_empty(
+                "DELETE",
+                &format!("/api/v1/statuses/{}", bob_status["id"].as_str().unwrap()),
+                &bob_token,
+            )
+            .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let row = context
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT last_status_at IS NULL AS cleared FROM local_account WHERE id = $1",
+                vec![bob_id.0.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.try_get::<bool>("", "cleared").unwrap());
     }
 
     #[test_context(AccountContext)]
@@ -2677,6 +2904,7 @@ mod tests {
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
                 limited_at: None,
+                discoverable: Some(true),
             };
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

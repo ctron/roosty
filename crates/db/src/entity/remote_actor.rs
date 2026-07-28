@@ -26,6 +26,8 @@ pub struct Model {
     pub deleted_at: Option<OffsetDateTime>,
     pub moved_to_remote_actor_id: Option<Uuid>,
     pub limited_at: Option<OffsetDateTime>,
+    pub discoverable: Option<bool>,
+    pub last_status_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

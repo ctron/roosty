@@ -861,6 +861,8 @@ pub struct RemoteActor {
     pub moved_to_remote_actor_id: Option<AccountId>,
     /// When an operator limited this cached actor locally.
     pub limited_at: Option<OffsetDateTime>,
+    /// Whether the remote actor explicitly opted into profile discovery.
+    pub discoverable: Option<bool>,
 }
 
 /// One account returned by the unified Mastodon account search.
@@ -870,6 +872,42 @@ pub enum AccountSearchResult {
     Local(LocalAccount),
     /// An active actor held in the federation cache.
     Remote(RemoteActor),
+}
+
+/// Stable ordering modes exposed by Mastodon's profile directory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AccountDirectoryOrder {
+    /// Accounts with the newest active status first.
+    #[default]
+    Active,
+    /// Accounts with the newest profile creation timestamp first.
+    New,
+}
+
+/// Inputs for one offset-paginated profile-directory query.
+pub struct AccountDirectoryOptions<'a> {
+    pub viewer_account_id: Option<AccountId>,
+    pub order: AccountDirectoryOrder,
+    pub local_only: bool,
+    pub limit: u64,
+    pub offset: u64,
+    pub blocked_remote_domains: &'a [String],
+}
+
+/// One directory account with counters loaded by the page query.
+#[derive(Clone, Debug)]
+pub struct DirectoryAccount {
+    pub account: AccountSearchResult,
+    pub followers_count: u64,
+    pub following_count: u64,
+    pub statuses_count: u64,
+    pub last_status_at: Option<OffsetDateTime>,
+}
+
+/// One profile-directory page plus forward-pagination state.
+pub struct AccountDirectoryPage {
+    pub items: Vec<DirectoryAccount>,
+    pub has_more: bool,
 }
 
 /// Administrative projection shared by compatible and first-party account views.
@@ -1037,6 +1075,210 @@ pub async fn find_admin_account_by_id(
 enum AccountSearchKind {
     Local,
     Remote,
+}
+
+/// List discoverable profiles with bounded counters and stable offset ordering.
+pub async fn account_directory(
+    db: &DbConnection,
+    options: AccountDirectoryOptions<'_>,
+) -> Result<AccountDirectoryPage> {
+    #[derive(Clone)]
+    struct DirectoryRow {
+        kind: AccountSearchKind,
+        id: AccountId,
+        followers_count: u64,
+        following_count: u64,
+        statuses_count: u64,
+        last_status_at: Option<OffsetDateTime>,
+    }
+
+    let order = match options.order {
+        AccountDirectoryOrder::Active => {
+            "sort_status_at DESC NULLS LAST, sort_created_at DESC, id DESC"
+        }
+        AccountDirectoryOrder::New => "sort_created_at DESC, id DESC",
+    };
+    let sql = format!(
+        r#"
+        WITH candidates AS (
+            SELECT 'local'::text AS account_kind, account.id,
+                   account.last_status_at AS sort_status_at,
+                   account.created_at AS sort_created_at
+              FROM local_account account
+             WHERE account.discoverable
+               AND account.limited_at IS NULL
+               AND ($1::uuid IS NULL OR (
+                    account.id <> $1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_account_block block
+                         WHERE (block.account_id = $1 AND block.target_account_id = account.id)
+                            OR (block.account_id = account.id AND block.target_account_id = $1)
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_account_mute mute
+                         WHERE mute.account_id = $1
+                           AND mute.target_account_id = account.id
+                           AND (mute.expires_at IS NULL OR mute.expires_at > now())
+                    )
+               ))
+            UNION ALL
+            SELECT 'remote'::text, actor.id, actor.last_status_at,
+                   coalesce(actor.profile_created_at, actor.created_at)
+              FROM remote_actor actor
+             WHERE NOT $2
+               AND actor.discoverable IS TRUE
+               AND actor.limited_at IS NULL
+               AND actor.deleted_at IS NULL
+               AND actor.moved_to_remote_actor_id IS NULL
+               AND actor.domain NOT IN (
+                    SELECT jsonb_array_elements_text($3::jsonb)
+               )
+               AND ($1::uuid IS NULL OR (
+                    NOT EXISTS (
+                        SELECT 1 FROM local_remote_account_block block
+                         WHERE block.local_account_id = $1
+                           AND block.remote_actor_id = actor.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM remote_local_account_block block
+                         WHERE block.local_account_id = $1
+                           AND block.remote_actor_id = actor.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_remote_account_mute mute
+                         WHERE mute.local_account_id = $1
+                           AND mute.remote_actor_id = actor.id
+                           AND (mute.expires_at IS NULL OR mute.expires_at > now())
+                    )
+               ))
+        ),
+        selected AS (
+            SELECT *
+              FROM candidates
+             ORDER BY {order}
+             LIMIT $4 OFFSET $5
+        )
+        SELECT selected.account_kind, selected.id, selected.sort_status_at,
+               CASE selected.account_kind
+                 WHEN 'local' THEN
+                   (SELECT count(*) FROM local_follow follow
+                     WHERE follow.followed_account_id = selected.id)
+                   + (SELECT count(*) FROM remote_follow follow
+                       WHERE follow.local_account_id = selected.id
+                         AND follow.state = 'accepted')
+                 ELSE
+                   (SELECT count(*) FROM remote_following follow
+                     WHERE follow.remote_actor_id = selected.id
+                       AND follow.state = 'accepted'
+                       AND follow.deactivated_at IS NULL)
+               END AS followers_count,
+               CASE selected.account_kind
+                 WHEN 'local' THEN
+                   (SELECT count(*) FROM local_follow follow
+                     WHERE follow.follower_account_id = selected.id)
+                   + (SELECT count(*) FROM remote_following follow
+                       WHERE follow.local_account_id = selected.id
+                         AND follow.state = 'accepted'
+                         AND follow.deactivated_at IS NULL)
+                 ELSE
+                   (SELECT count(*) FROM remote_follow follow
+                     WHERE follow.remote_actor_id = selected.id
+                       AND follow.state = 'accepted')
+               END AS following_count,
+               CASE selected.account_kind
+                 WHEN 'local' THEN
+                   (SELECT count(*) FROM local_status status
+                     WHERE status.account_id = selected.id
+                       AND status.deleted_at IS NULL)
+                 ELSE
+                   (SELECT count(*) FROM remote_status status
+                     WHERE status.remote_actor_id = selected.id
+                       AND status.deleted_at IS NULL)
+               END AS statuses_count
+          FROM selected
+         ORDER BY {order}
+        "#
+    );
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let query_limit = options.limit.saturating_add(1).min(i64::MAX as u64) as i64;
+    let rows = txn
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                options.viewer_account_id.map(|id| id.0).into(),
+                options.local_only.into(),
+                serde_json::to_string(options.blocked_remote_domains)
+                    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?
+                    .into(),
+                query_limit.into(),
+                (options.offset.min(i64::MAX as u64) as i64).into(),
+            ],
+        ))
+        .await?;
+    let mut rows = rows
+        .into_iter()
+        .map(|row| {
+            Ok(DirectoryRow {
+                kind: row.try_get("", "account_kind")?,
+                id: AccountId(row.try_get("", "id")?),
+                followers_count: u64::try_from(row.try_get::<i64>("", "followers_count")?)
+                    .map_err(|_| DbErr::Type("negative directory follower count".to_owned()))?,
+                following_count: u64::try_from(row.try_get::<i64>("", "following_count")?)
+                    .map_err(|_| DbErr::Type("negative directory following count".to_owned()))?,
+                statuses_count: u64::try_from(row.try_get::<i64>("", "statuses_count")?)
+                    .map_err(|_| DbErr::Type("negative directory status count".to_owned()))?,
+                last_status_at: row.try_get("", "sort_status_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let has_more = rows.len() > options.limit as usize;
+    rows.truncate(options.limit as usize);
+
+    let local_ids = rows
+        .iter()
+        .filter(|row| row.kind == AccountSearchKind::Local)
+        .map(|row| row.id)
+        .collect();
+    let remote_ids = rows
+        .iter()
+        .filter(|row| row.kind == AccountSearchKind::Remote)
+        .map(|row| row.id)
+        .collect();
+    let local_accounts = local_accounts_by_id(&txn, local_ids).await?;
+    let remote_actors = remote_actors_by_id(&txn, remote_ids).await?;
+    txn.commit().await?;
+    let mut local_accounts = local_accounts
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect::<HashMap<_, _>>();
+    let mut remote_actors = remote_actors
+        .into_iter()
+        .map(|actor| (actor.id, actor))
+        .collect::<HashMap<_, _>>();
+    let items = rows
+        .into_iter()
+        .filter_map(|row| {
+            let account = match row.kind {
+                AccountSearchKind::Local => {
+                    AccountSearchResult::Local(local_accounts.remove(&row.id)?)
+                }
+                AccountSearchKind::Remote => {
+                    AccountSearchResult::Remote(remote_actors.remove(&row.id)?)
+                }
+            };
+            Some(DirectoryAccount {
+                account,
+                followers_count: row.followers_count,
+                following_count: row.following_count,
+                statuses_count: row.statuses_count,
+                last_status_at: row.last_status_at,
+            })
+        })
+        .collect();
+    Ok(AccountDirectoryPage { items, has_more })
 }
 
 /// Inputs controlling unified local and cached-remote account search.
@@ -1599,13 +1841,14 @@ pub async fn process_remote_actor_delete(
         .await?;
     let mut repair = RemoteDeleteRepair::default();
     for status in statuses {
-        let status_repair = repair_one_remote_status_delete(txn, status).await?;
+        let status_repair = repair_one_remote_status_delete(txn, status, false).await?;
         repair.projections.extend(status_repair.projections);
         repair
             .conversation_refreshes
             .extend(status_repair.conversation_refreshes);
         repair.deleted_status_count += status_repair.deleted_status_count;
     }
+    refresh_remote_actor_last_status_at(txn, remote_actor_id).await?;
 
     let actor_reblogs = remote_status_reblog::Entity::find()
         .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
@@ -1971,6 +2214,26 @@ pub async fn remote_profile_media_for_actor(
         .collect()
 }
 
+/// Batch profile-image metadata for a bounded collection of remote actors.
+pub async fn remote_profile_media_for_actors(
+    db: &impl ConnectionTrait,
+    remote_actor_ids: &[AccountId],
+) -> Result<Vec<RemoteProfileMedia>> {
+    if remote_actor_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    remote_profile_media::Entity::find()
+        .filter(
+            remote_profile_media::Column::RemoteActorId
+                .is_in(remote_actor_ids.iter().map(|id| id.0)),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_profile_media_from_model)
+        .collect()
+}
+
 /// Find a remote profile image by its public cache identity.
 pub async fn find_remote_profile_media(
     db: &impl ConnectionTrait,
@@ -2201,6 +2464,8 @@ where
         .insert(db)
         .await?
     };
+    let actor_id = AccountId(model.remote_actor_id);
+    refresh_remote_actor_last_status_at(db, actor_id).await?;
     remote_status_from_model(model)
 }
 
@@ -2480,9 +2745,11 @@ pub async fn delete_remote_status(
         )
         .await?;
     }
+    let actor_id = AccountId(status.remote_actor_id);
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(&txn).await?;
+    refresh_remote_actor_last_status_at(&txn, actor_id).await?;
     mark_trend_dirty(&txn, "remote_status", status_id.0).await?;
     txn.commit().await?;
     Ok(true)
@@ -2501,7 +2768,9 @@ pub async fn process_remote_status_delete(
         .one(txn)
         .await?;
     match status {
-        Some(status) => repair_one_remote_status_delete(txn, status).await.map(Some),
+        Some(status) => repair_one_remote_status_delete(txn, status, true)
+            .await
+            .map(Some),
         None => Ok(None),
     }
 }
@@ -2510,6 +2779,7 @@ pub async fn process_remote_status_delete(
 async fn repair_one_remote_status_delete(
     txn: &DatabaseTransaction,
     status: remote_status::Model,
+    refresh_directory_activity: bool,
 ) -> Result<RemoteDeleteRepair> {
     let status_id = StatusId(status.id);
     let author_id = AccountId(status.remote_actor_id);
@@ -2619,6 +2889,9 @@ async fn repair_one_remote_status_delete(
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(txn).await?;
+    if refresh_directory_activity {
+        refresh_remote_actor_last_status_at(txn, author_id).await?;
+    }
     mark_trend_dirty(txn, "remote_status", status_id.0).await?;
     remote_status_pin::Entity::delete_many()
         .filter(remote_status_pin::Column::RemoteStatusId.eq(status_id.0))
@@ -2778,6 +3051,7 @@ async fn upsert_remote_actor_with_identity(
         active.featured_tags_url = Set(actor.featured_tags_url.clone());
         active.public_key_id = Set(actor.public_key_id.clone());
         active.public_key_pem = Set(actor.public_key_pem.clone());
+        active.discoverable = Set(actor.discoverable);
         active.fetched_at = Set(now);
         active.expires_at = Set(actor.expires_at);
         if let Some(profile_created_at) = actor.profile_created_at {
@@ -2801,6 +3075,7 @@ async fn upsert_remote_actor_with_identity(
             featured_tags_url: Set(actor.featured_tags_url.clone()),
             public_key_id: Set(actor.public_key_id.clone()),
             public_key_pem: Set(actor.public_key_pem.clone()),
+            discoverable: Set(actor.discoverable),
             fetched_at: Set(now),
             expires_at: Set(actor.expires_at),
             profile_created_at: Set(actor.profile_created_at),
@@ -8086,12 +8361,14 @@ pub async fn create_local_status(
     db: &DbConnection,
     new_status: NewLocalStatus,
 ) -> Result<LocalStatus> {
+    let txn = db.begin().await?;
     let status_id = new_status.id.map_or_else(Uuid::now_v7, |id| id.0);
     let created_at = OffsetDateTime::now_utc();
+    let account_id = new_status.account_id;
 
     let status = local_status::ActiveModel {
         id: Set(status_id),
-        account_id: Set(new_status.account_id.0),
+        account_id: Set(account_id.0),
         content: Set(new_status.content),
         visibility: Set(new_status.visibility),
         sensitive: Set(new_status.sensitive),
@@ -8105,9 +8382,11 @@ pub async fn create_local_status(
         deleted_at: Set(None),
         quote_approval_policy: Set(new_status.quote_approval_policy),
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
 
+    update_local_account_last_status_at(&txn, account_id, created_at).await?;
+    txn.commit().await?;
     local_status_from_model(status)
 }
 
@@ -8167,6 +8446,7 @@ pub async fn create_local_status_with_media(
     }
     .insert(txn)
     .await?;
+    update_local_account_last_status_at(txn, account_id, created_at).await?;
 
     for (index, media_id) in media_ids.iter().enumerate() {
         let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
@@ -11785,6 +12065,63 @@ pub async fn last_local_status_at(
     Ok(status.map(|status| status.created_at))
 }
 
+/// Advance the stored directory activity timestamp after creating a local status.
+async fn update_local_account_last_status_at(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    created_at: OffsetDateTime,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE local_account
+            SET last_status_at = greatest(last_status_at, $2)
+          WHERE id = $1",
+        vec![account_id.0.into(), created_at.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Recompute local directory activity after a status is removed.
+async fn refresh_local_account_last_status_at(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE local_account
+            SET last_status_at = (
+                SELECT max(created_at)
+                  FROM local_status
+                 WHERE account_id = $1 AND deleted_at IS NULL
+            )
+          WHERE id = $1",
+        vec![account_id.0.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Recompute cached remote directory activity after a Note changes lifecycle state.
+async fn refresh_remote_actor_last_status_at(
+    db: &impl ConnectionTrait,
+    actor_id: AccountId,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE remote_actor
+            SET last_status_at = (
+                SELECT max(published_at)
+                  FROM remote_status
+                 WHERE remote_actor_id = $1 AND deleted_at IS NULL
+            )
+          WHERE id = $1",
+        vec![actor_id.0.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Count active local replies to a status.
 pub async fn count_local_replies(db: &DbConnection, status_id: StatusId) -> Result<u64> {
     Ok(local_status::Entity::find()
@@ -13970,6 +14307,7 @@ pub async fn delete_owned_local_status(
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.updated_at = Set(OffsetDateTime::now_utc());
     let status = local_status_from_model(active.update(db).await?)?;
+    refresh_local_account_last_status_at(db, account_id).await?;
     local_status_pin::Entity::delete_many()
         .filter(local_status_pin::Column::StatusId.eq(status_id.0))
         .exec(db)
@@ -16090,6 +16428,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         deleted_at: actor.deleted_at,
         moved_to_remote_actor_id: actor.moved_to_remote_actor_id.map(AccountId),
         limited_at: actor.limited_at,
+        discoverable: actor.discoverable,
     }
 }
 

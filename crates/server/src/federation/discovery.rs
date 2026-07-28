@@ -52,6 +52,8 @@ struct RemoteActorDocument {
     #[serde(default)]
     summary: String,
     #[serde(default)]
+    discoverable: Option<bool>,
+    #[serde(default)]
     icon: Option<RemoteActorImage>,
     #[serde(default)]
     image: Option<RemoteActorImage>,
@@ -167,6 +169,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         deleted_at: None,
         moved_to_remote_actor_id: None,
         limited_at: None,
+        discoverable: document.discoverable,
     };
     let actor = store_remote_actor_on(
         &lock,
@@ -373,6 +376,7 @@ async fn fetch_remote_actor_by_id(
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            discoverable: document.discoverable,
         },
         document.icon,
         document.image,
@@ -438,6 +442,7 @@ pub async fn resolve_remote_move_target(
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            discoverable: document.discoverable,
         },
         document.icon,
         document.image,
@@ -848,6 +853,7 @@ mod tests {
                 "id": "https://social.example/users/alice",
                 "type": "Person",
                 "preferredUsername": "alice",
+                "discoverable": true,
                 "inbox": "https://social.example/users/alice/inbox",
                 "publicKey": {
                     "id": "https://social.example/users/alice#main-key",
@@ -859,6 +865,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(actor.preferred_username, "alice");
+        assert_eq!(actor.discoverable, Some(true));
     }
 
     /// Reads both allowed ActivityStreams forms for remote profile images.

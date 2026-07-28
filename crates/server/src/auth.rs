@@ -1198,6 +1198,31 @@ pub(crate) async fn account_response(
     state: &AppState,
     account: roosty_db::LocalAccount,
 ) -> Result<AccountResponse, RoostyError> {
+    let statuses_count = roosty_db::count_local_statuses_by_account(&state.db, account.id).await?;
+    let followers_count = roosty_db::count_local_followers(&state.db, account.id).await?
+        + roosty_db::count_remote_followers(&state.db, account.id).await?;
+    let following_count = roosty_db::count_local_following(&state.db, account.id).await?
+        + roosty_db::count_remote_following(&state.db, account.id).await?;
+    let last_status_at = roosty_db::last_local_status_at(&state.db, account.id).await?;
+    Ok(account_response_with_stats(
+        state,
+        account,
+        followers_count,
+        following_count,
+        statuses_count,
+        last_status_at,
+    ))
+}
+
+/// Build an account response from counters loaded by a containing collection query.
+pub(crate) fn account_response_with_stats(
+    state: &AppState,
+    account: roosty_db::LocalAccount,
+    followers_count: u64,
+    following_count: u64,
+    statuses_count: u64,
+    last_status_at: Option<OffsetDateTime>,
+) -> AccountResponse {
     let account_url = match state
         .config
         .public_base_url
@@ -1212,14 +1237,7 @@ pub(crate) async fn account_response(
     } else {
         account.display_name.clone()
     };
-    let statuses_count = roosty_db::count_local_statuses_by_account(&state.db, account.id).await?;
-    let followers_count = roosty_db::count_local_followers(&state.db, account.id).await?
-        + roosty_db::count_remote_followers(&state.db, account.id).await?;
-    let following_count = roosty_db::count_local_following(&state.db, account.id).await?
-        + roosty_db::count_remote_following(&state.db, account.id).await?;
-    let last_status_at = roosty_db::last_local_status_at(&state.db, account.id)
-        .await?
-        .map(|timestamp| DateOnly(timestamp).to_string());
+    let last_status_at = last_status_at.map(format_account_date);
     let avatar = account
         .avatar_file_path
         .as_deref()
@@ -1231,7 +1249,7 @@ pub(crate) async fn account_response(
         .map(|path| crate::media::media_url(state, path))
         .unwrap_or_default();
 
-    Ok(AccountResponse {
+    AccountResponse {
         id: account.id.0.to_string(),
         username: account.username.clone(),
         acct: account.username.clone(),
@@ -1270,7 +1288,7 @@ pub(crate) async fn account_response(
             permissions: "0".to_owned(),
             highlighted: account.is_admin,
         },
-    })
+    }
 }
 
 /// Convert stored profile fields to the array shape expected by account APIs.
@@ -1291,6 +1309,11 @@ impl fmt::Display for DateOnly {
             self.0.day()
         )
     }
+}
+
+/// Format Mastodon's date-only `last_status_at` account field.
+pub(crate) fn format_account_date(timestamp: OffsetDateTime) -> String {
+    DateOnly(timestamp).to_string()
 }
 
 /// Convert parsed update input into a validated database update.

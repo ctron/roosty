@@ -92,6 +92,13 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     );
     assert!(column_exists(database.connection(), "local_account", "limited_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "limited_at").await);
+    assert!(column_exists(database.connection(), "local_account", "last_status_at").await);
+    assert!(column_exists(database.connection(), "remote_actor", "discoverable").await);
+    assert!(column_exists(database.connection(), "remote_actor", "last_status_at").await);
+    assert!(index_exists(database.connection(), "local_account_directory_active_idx").await);
+    assert!(index_exists(database.connection(), "local_account_directory_new_idx").await);
+    assert!(index_exists(database.connection(), "remote_actor_directory_active_idx").await);
+    assert!(index_exists(database.connection(), "remote_actor_directory_new_idx").await);
     assert!(
         column_exists(
             database.connection(),
@@ -284,6 +291,87 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_tag_follow", "tag_id").await);
     assert!(column_exists(database.connection(), "remote_following", "show_reblogs").await);
     assert!(column_exists(database.connection(), "remote_following", "notify").await);
+}
+
+/// Existing status activity is backfilled for directory ordering and rollback removes only new columns.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn profile_directory_upgrade_backfills_and_rolls_back(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(70)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO local_account (id, username, email, password_hash)
+            VALUES (
+                '10000000-0000-0000-0000-000000000071',
+                'local_directory', 'directory@example.test', 'hash'
+            );
+            INSERT INTO local_status (
+                id, account_id, content, visibility, created_at
+            ) VALUES (
+                '20000000-0000-0000-0000-000000000071',
+                '10000000-0000-0000-0000-000000000071',
+                'directory status', 'public', '2026-07-27 12:00:00+00'
+            );
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '30000000-0000-0000-0000-000000000071',
+                'https://remote.test/users/directory', 'directory', 'remote.test',
+                'https://remote.test/users/directory/inbox',
+                'https://remote.test/users/directory#main-key', 'key',
+                now() + interval '1 day'
+            );
+            INSERT INTO remote_status (
+                id, activitypub_id, remote_actor_id, content, visibility,
+                published_at, updated_at, object
+            ) VALUES (
+                '40000000-0000-0000-0000-000000000071',
+                'https://remote.test/statuses/directory',
+                '30000000-0000-0000-0000-000000000071',
+                'remote directory status', 'public',
+                '2026-07-28 12:00:00+00', '2026-07-28 12:00:00+00', '{}'::jsonb
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    let local = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT last_status_at IS NOT NULL AS populated FROM local_account WHERE username = 'local_directory'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let remote = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT discoverable, last_status_at IS NOT NULL AS populated FROM remote_actor WHERE username = 'directory'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(local.try_get::<bool>("", "populated").unwrap());
+    assert!(remote.try_get::<bool>("", "populated").unwrap());
+    assert_eq!(
+        remote.try_get::<Option<bool>>("", "discoverable").unwrap(),
+        None
+    );
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!column_exists(database.connection(), "local_account", "last_status_at").await);
+    assert!(!column_exists(database.connection(), "remote_actor", "discoverable").await);
+    assert!(!column_exists(database.connection(), "remote_actor", "last_status_at").await);
+    assert!(table_exists(database.connection(), "remote_actor").await);
 }
 
 /// Existing cached actors retain an unknown followers collection across the nullable upgrade.
@@ -724,6 +812,27 @@ async fn column_exists(
         .expect("column existence query returned no rows");
 
     row.try_get::<bool>("", "column_exists").unwrap()
+}
+
+async fn index_exists(connection: &DatabaseConnection, index_name: &str) -> bool {
+    let row = connection
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                  FROM pg_indexes
+                 WHERE schemaname = 'public'
+                   AND indexname = $1
+            ) AS index_exists
+            "#,
+            vec![index_name.to_owned().into()],
+        ))
+        .await
+        .unwrap()
+        .expect("index existence query returned no rows");
+
+    row.try_get::<bool>("", "index_exists").unwrap()
 }
 
 async fn roosty_trend_routines_exist(connection: &DatabaseConnection) -> bool {

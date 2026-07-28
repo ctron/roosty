@@ -25,6 +25,7 @@ pub struct Model {
     pub avatar_file_path: Option<String>,
     pub header_file_path: Option<String>,
     pub limited_at: Option<OffsetDateTime>,
+    pub last_status_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
