@@ -323,6 +323,11 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 |`5`
 |Maximum concurrent remote media downloads per worker process; must be positive.
 
+|`ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY`
+|`5`
+|Maximum concurrent preview-card downloads per process; must be positive. PostgreSQL additionally
+serializes and rate-limits requests to each remote host across all processes.
+
 |`ROOSTY_VAPID_PRIVATE_KEY`
 |Unset
 |Base64-encoded PKCS#8 P-256 private key for Web Push. All processes sharing the database must use the same key.
@@ -365,6 +370,10 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 |Trend scoring cadence. Must be at least `1m`. The database rejects a process whose value differs
 from the shared schedule initialized by another process.
 |===
+
+When multiple Roosty processes serve media, `ROOSTY_MEDIA_ROOT` must refer to the same shared
+filesystem on every API and worker process. This includes cached preview-card thumbnails. The
+currently supported `local` backend does not replicate files between node-local filesystems.
 
 === Scheduled statuses and streaming
 

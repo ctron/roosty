@@ -2,10 +2,12 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
+use linkify::{LinkFinder, LinkKind};
 use rand_core::{OsRng, RngCore};
 use roosty_core::{
     AccountId, AccountRelationshipError, JobClaimId, JobId, Result, RoostyError, StatusId,
 };
+use scraper::{Html, Selector};
 use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
@@ -16,13 +18,16 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use std::str::FromStr;
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
+    mem,
+    net::IpAddr,
+    str::FromStr,
 };
 use strum::{Display, EnumString, IntoStaticStr};
-use time::{Duration, OffsetDateTime};
+use time::{Date, Duration, OffsetDateTime};
+use url::Url;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -166,13 +171,14 @@ use entity::{
     local_status_local_recipient, local_status_pin, local_status_reblog,
     local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
     local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    processed_inbox_activity, push_subscription, remote_actor, remote_custom_emoji,
+    preview_card, processed_inbox_activity, push_subscription, remote_actor, remote_custom_emoji,
     remote_featured_tag, remote_follow, remote_following, remote_local_account_block,
     remote_media_attachment, remote_profile_media, remote_status, remote_status_edit,
     remote_status_edit_media, remote_status_favourite, remote_status_local_mention,
     remote_status_local_recipient, remote_status_pin, remote_status_reblog,
     remote_status_remote_recipient, remote_status_tag, scheduled_status,
-    status_creation_idempotency, status_quote, streaming_event,
+    status_creation_idempotency, status_preview_card, status_preview_scan, status_quote,
+    streaming_event,
 };
 
 /// Quote policy values authored by Mastodon-compatible clients.
@@ -270,7 +276,7 @@ pub enum QuoteState {
 }
 
 /// A local or cached-remote status identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StatusReference {
     Local(StatusId),
     Remote(StatusId),
@@ -397,6 +403,29 @@ pub enum RemoteMediaState {
     Pending,
     Ready,
     Failed,
+}
+
+/// Lifecycle state of an asynchronously fetched preview card.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum PreviewFetchState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+/// Origin namespace for a status author counted in link usage.
+#[derive(
+    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+pub enum PreviewActorOrigin {
+    Local,
+    Remote,
 }
 
 /// Cached remote attachment metadata exposed to API projections.
@@ -678,45 +707,76 @@ pub async fn create_bootstrap_admin(
     email: &str,
     password_hash: &str,
 ) -> Result<Uuid> {
-    let count = local_account::Entity::find().count(db).await?;
+    let txn = db.begin().await?;
+    let count = local_account::Entity::find().count(&txn).await?;
     if count != 0 {
         return Err(RoostyError::InvalidInput(
             "bootstrap is only allowed before local accounts exist".to_owned(),
         ));
     }
 
-    insert_local_account(db, username, email, password_hash, true).await
+    let account_id = insert_local_account(&txn, username, email, password_hash, true).await?;
+    txn.commit().await?;
+    Ok(account_id)
 }
 
 /// Create a non-admin local account.
 pub async fn create_local_account(
-    db: &impl ConnectionTrait,
+    db: &DbConnection,
     username: &str,
     email: &str,
     password_hash: &str,
 ) -> Result<Uuid> {
-    insert_local_account(db, username, email, password_hash, false).await
+    let txn = db.begin().await?;
+    let account_id =
+        create_local_account_in_transaction(&txn, username, email, password_hash).await?;
+    txn.commit().await?;
+    Ok(account_id)
+}
+
+/// Create a non-admin account inside a caller-owned transaction.
+pub async fn create_local_account_in_transaction(
+    txn: &DatabaseTransaction,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+) -> Result<Uuid> {
+    insert_local_account(txn, username, email, password_hash, false).await
 }
 
 /// Create an administrator local account after bootstrap.
 pub async fn create_admin_account(
-    db: &impl ConnectionTrait,
+    db: &DbConnection,
     username: &str,
     email: &str,
     password_hash: &str,
 ) -> Result<Uuid> {
-    insert_local_account(db, username, email, password_hash, true).await
+    let txn = db.begin().await?;
+    let account_id =
+        create_admin_account_in_transaction(&txn, username, email, password_hash).await?;
+    txn.commit().await?;
+    Ok(account_id)
 }
 
-/// Insert a local account after checking user-facing unique account fields.
+/// Create an administrator account inside a caller-owned transaction.
+pub async fn create_admin_account_in_transaction(
+    txn: &DatabaseTransaction,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+) -> Result<Uuid> {
+    insert_local_account(txn, username, email, password_hash, true).await
+}
+
+/// Insert an account and its required default policy as one transaction unit.
 async fn insert_local_account(
-    db: &impl ConnectionTrait,
+    txn: &DatabaseTransaction,
     username: &str,
     email: &str,
     password_hash: &str,
     is_admin: bool,
 ) -> Result<Uuid> {
-    ensure_local_account_available(db, username, email).await?;
+    ensure_local_account_available(txn, username, email).await?;
 
     let account_id = Uuid::now_v7();
     local_account::ActiveModel {
@@ -727,7 +787,18 @@ async fn insert_local_account(
         is_admin: Set(is_admin),
         ..Default::default()
     }
-    .insert(db)
+    .insert(txn)
+    .await?;
+    local_notification_policy::ActiveModel {
+        account_id: Set(account_id),
+        for_not_following: Set(NotificationPolicyAction::Accept),
+        for_not_followers: Set(NotificationPolicyAction::Accept),
+        for_new_accounts: Set(NotificationPolicyAction::Accept),
+        for_private_mentions: Set(NotificationPolicyAction::Filter),
+        for_limited_accounts: Set(NotificationPolicyAction::Filter),
+        updated_at: Set(OffsetDateTime::now_utc()),
+    }
+    .insert(txn)
     .await?;
 
     Ok(account_id)
@@ -2403,6 +2474,16 @@ pub async fn upsert_remote_status(
     let txn = db.begin().await?;
     let status = upsert_remote_status_on(&txn, status).await?;
     replace_remote_status_tags(&txn, status.id, &tag_names).await?;
+    Box::pin(replace_status_preview_card(
+        &txn,
+        PreviewStatusTarget::Remote(status.id),
+        &status.content,
+        utc_date(status.published_at),
+        PreviewActorOrigin::Remote,
+        status.remote_actor_id.0,
+        true,
+    ))
+    .await?;
     txn.commit().await?;
     Ok(status)
 }
@@ -2485,6 +2566,16 @@ pub async fn process_remote_status_upsert(
         let status = upsert_remote_status_on(txn, status).await?;
         replace_remote_media_attachments(txn, status.id, attachments).await?;
         replace_remote_status_tags(txn, status.id, &tag_names).await?;
+        Box::pin(replace_status_preview_card(
+            txn,
+            PreviewStatusTarget::Remote(status.id),
+            &status.content,
+            utc_date(status.published_at),
+            PreviewActorOrigin::Remote,
+            status.remote_actor_id.0,
+            true,
+        ))
+        .await?;
         return Ok(RemoteStatusUpsertResult::Created(status));
     };
     if existing.remote_actor_id != status.remote_actor_id.0 {
@@ -2560,6 +2651,16 @@ pub async fn process_remote_status_upsert(
     mark_trend_dirty(txn, "remote_status", status.id.0).await?;
     replace_remote_media_attachments(txn, status.id, attachments).await?;
     replace_remote_status_tags(txn, status.id, &tag_names).await?;
+    Box::pin(replace_status_preview_card(
+        txn,
+        PreviewStatusTarget::Remote(status.id),
+        &status.content,
+        utc_date(status.published_at),
+        PreviewActorOrigin::Remote,
+        status.remote_actor_id.0,
+        true,
+    ))
+    .await?;
     let current = remote_status::Entity::find_by_id(status.id.0)
         .one(txn)
         .await?
@@ -2727,6 +2828,7 @@ pub async fn delete_remote_status(
         return Ok(false);
     };
     let status_id = StatusId(status.id);
+    remove_status_preview_card(&txn, PreviewStatusTarget::Remote(status_id)).await?;
     let tag_ids = remote_status_tag::Entity::find()
         .filter(remote_status_tag::Column::RemoteStatusId.eq(status.id))
         .all(&txn)
@@ -2886,6 +2988,7 @@ async fn repair_one_remote_status_delete(
         });
     }
 
+    remove_status_preview_card(txn, PreviewStatusTarget::Remote(status_id)).await?;
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
     active.update(txn).await?;
@@ -3335,6 +3438,47 @@ pub enum TrendTarget {
     Tag(Uuid),
 }
 
+/// Cached Mastodon preview-card metadata for one normalized article URL.
+#[derive(Clone, Debug)]
+pub struct PreviewCard {
+    pub id: Uuid,
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub author_name: String,
+    pub author_url: String,
+    pub provider_name: String,
+    pub provider_url: String,
+    pub image_file_path: Option<String>,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub blurhash: Option<String>,
+    pub published_at: Option<OffsetDateTime>,
+}
+
+/// Metadata written after a bounded, SSRF-safe preview fetch.
+#[derive(Clone, Debug)]
+pub struct PreviewCardUpdate {
+    pub title: String,
+    pub description: String,
+    pub author_name: String,
+    pub author_url: String,
+    pub provider_name: String,
+    pub provider_url: String,
+    pub image_file_path: Option<String>,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub blurhash: Option<String>,
+    pub published_at: Option<OffsetDateTime>,
+}
+
+/// One trend-ranked preview card and its seven complete UTC usage buckets.
+#[derive(Clone, Debug)]
+pub struct TrendingLink {
+    pub card: PreviewCard,
+    pub history: Vec<LocalTagHistory>,
+}
+
 impl TrendTarget {
     fn persisted(self) -> (&'static str, Uuid) {
         match self {
@@ -3426,11 +3570,207 @@ where
     Ok(())
 }
 
+/// Normalize an HTTP(S) article URL for shared preview-card identity.
+pub fn normalize_preview_url(value: &str) -> Option<String> {
+    let mut url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+        || url.host_str()?.parse::<IpAddr>().is_ok()
+    {
+        return None;
+    }
+    url.set_fragment(None);
+    if matches!(
+        (url.scheme(), url.port()),
+        ("http", Some(80)) | ("https", Some(443))
+    ) {
+        url.set_port(None).ok()?;
+    }
+    Some(url.to_string())
+}
+
+fn first_local_preview_url(content: &str) -> Option<String> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder.url_must_have_scheme(true);
+    finder
+        .links(content)
+        .find_map(|link| normalize_preview_url(link.as_str()))
+}
+
+fn first_remote_preview_url(content: &str) -> Option<String> {
+    let document = Html::parse_fragment(content);
+    let selector = Selector::parse("a[href]").ok()?;
+    document
+        .select(&selector)
+        .filter(|element| {
+            let class = element.value().attr("class").unwrap_or_default();
+            let rel = element.value().attr("rel").unwrap_or_default();
+            !class
+                .split_ascii_whitespace()
+                .any(|value| matches!(value, "mention" | "hashtag"))
+                && !rel.split_ascii_whitespace().any(|value| value == "tag")
+        })
+        .filter_map(|element| element.value().attr("href"))
+        .find_map(normalize_preview_url)
+}
+
+#[derive(Clone, Copy)]
+enum PreviewStatusTarget {
+    Local(StatusId),
+    Remote(StatusId),
+}
+
+impl PreviewStatusTarget {
+    fn ids(self) -> (Option<Uuid>, Option<Uuid>) {
+        match self {
+            Self::Local(id) => (Some(id.0), None),
+            Self::Remote(id) => (None, Some(id.0)),
+        }
+    }
+}
+
+/// Replace one status's preview association and coalesce scoring/fetch work atomically.
+async fn replace_status_preview_card(
+    txn: &DatabaseTransaction,
+    target: PreviewStatusTarget,
+    content: &str,
+    usage_day: Date,
+    actor_origin: PreviewActorOrigin,
+    actor_id: Uuid,
+    remote_html: bool,
+) -> Result<()> {
+    let (local_status_id, remote_status_id) = target.ids();
+    let mut association_query = status_preview_card::Entity::find();
+    association_query = match local_status_id {
+        Some(id) => association_query.filter(status_preview_card::Column::LocalStatusId.eq(id)),
+        None => association_query.filter(status_preview_card::Column::LocalStatusId.is_null()),
+    };
+    association_query = match remote_status_id {
+        Some(id) => association_query.filter(status_preview_card::Column::RemoteStatusId.eq(id)),
+        None => association_query.filter(status_preview_card::Column::RemoteStatusId.is_null()),
+    };
+    let existing = association_query.one(txn).await?;
+    let url = if remote_html {
+        first_remote_preview_url(content)
+    } else {
+        first_local_preview_url(content)
+    };
+    let scanned_at = OffsetDateTime::now_utc();
+    let mut scan_query = status_preview_scan::Entity::find();
+    scan_query = match local_status_id {
+        Some(id) => scan_query.filter(status_preview_scan::Column::LocalStatusId.eq(id)),
+        None => scan_query.filter(status_preview_scan::Column::LocalStatusId.is_null()),
+    };
+    scan_query = match remote_status_id {
+        Some(id) => scan_query.filter(status_preview_scan::Column::RemoteStatusId.eq(id)),
+        None => scan_query.filter(status_preview_scan::Column::RemoteStatusId.is_null()),
+    };
+    if let Some(scan) = scan_query.one(txn).await? {
+        let mut active = scan.into_active_model();
+        active.scanned_at = Set(scanned_at);
+        active.update(txn).await?;
+    } else {
+        status_preview_scan::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_status_id: Set(local_status_id),
+            remote_status_id: Set(remote_status_id),
+            scanned_at: Set(scanned_at),
+        }
+        .insert(txn)
+        .await?;
+    }
+    if let Some(existing) = &existing {
+        mark_trend_dirty(txn, "link", existing.preview_card_id).await?;
+    }
+    let Some(url) = url else {
+        if let Some(existing) = existing {
+            existing.delete(txn).await?;
+        }
+        return Ok(());
+    };
+    let card = preview_card::Entity::insert(preview_card::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        url: Set(url),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(preview_card::Column::Url)
+            .update_column(preview_card::Column::Url)
+            .to_owned(),
+    )
+    .exec_with_returning(txn)
+    .await?;
+    let card_id = card.id;
+    let needs_fetch = card.fetch_state == PreviewFetchState::Pending
+        || card
+            .fetched_at
+            .is_none_or(|fetched_at| fetched_at <= OffsetDateTime::now_utc() - Duration::days(7));
+    if let Some(existing) = existing {
+        let mut active = existing.into_active_model();
+        active.preview_card_id = Set(card_id);
+        active.usage_day = Set(usage_day);
+        active.actor_origin = Set(actor_origin);
+        active.actor_id = Set(actor_id);
+        active.update(txn).await?;
+    } else {
+        status_preview_card::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_status_id: Set(local_status_id),
+            remote_status_id: Set(remote_status_id),
+            preview_card_id: Set(card_id),
+            usage_day: Set(usage_day),
+            actor_origin: Set(actor_origin),
+            actor_id: Set(actor_id),
+            created_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(txn)
+        .await?;
+    }
+    mark_trend_dirty(txn, "link", card_id).await?;
+    if needs_fetch {
+        enqueue_job_in_transaction(
+            txn,
+            NewJob {
+                kind: JobKind::PreviewCardFetch,
+                payload: serde_json::json!({"preview_card_id": card_id}),
+                deduplication_key: Some(format!("preview-card:{card_id}")),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn remove_status_preview_card<C>(db: &C, target: PreviewStatusTarget) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let (local_status_id, remote_status_id) = target.ids();
+    let mut query = status_preview_card::Entity::find();
+    query = match local_status_id {
+        Some(id) => query.filter(status_preview_card::Column::LocalStatusId.eq(id)),
+        None => query.filter(status_preview_card::Column::LocalStatusId.is_null()),
+    };
+    query = match remote_status_id {
+        Some(id) => query.filter(status_preview_card::Column::RemoteStatusId.eq(id)),
+        None => query.filter(status_preview_card::Column::RemoteStatusId.is_null()),
+    };
+    if let Some(row) = query.one(db).await? {
+        mark_trend_dirty(db, "link", row.preview_card_id).await?;
+        row.delete(db).await?;
+    }
+    Ok(())
+}
+
 /// Update compact per-actor hashtag usage inside the canonical status transaction.
 async fn adjust_tag_usage<C>(
     txn: &C,
     tag_ids: &[Uuid],
-    usage_day: time::Date,
+    usage_day: Date,
     actor_origin: &str,
     actor_id: Uuid,
     delta: i64,
@@ -3548,6 +3888,26 @@ where
     db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         sql,
+        vec![account_id.0.into()],
+    ))
+    .await?;
+    let status_column = if origin == "local" {
+        "local_status_id"
+    } else {
+        "remote_status_id"
+    };
+    let link_sql = format!(
+        r#"INSERT INTO trend_dirty(kind, target_id, touched_at)
+           SELECT 'link', association.preview_card_id, now()
+           FROM status_preview_card association
+           JOIN {table} status ON status.id = association.{status_column}
+           WHERE status.{account_column} = $1
+           ON CONFLICT (kind, target_id)
+           DO UPDATE SET touched_at = EXCLUDED.touched_at"#
+    );
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        link_sql,
         vec![account_id.0.into()],
     ))
     .await?;
@@ -4431,6 +4791,8 @@ pub enum JobKind {
     NotificationRequestCleanup,
     ScheduledStatusPublish,
     TrendMaintenance,
+    PreviewCardFetch,
+    PreviewCardBackfill,
 }
 
 impl JobKind {
@@ -8366,6 +8728,7 @@ pub async fn create_local_status(
     let created_at = OffsetDateTime::now_utc();
     let account_id = new_status.account_id;
 
+    let preview_content = new_status.content.clone();
     let status = local_status::ActiveModel {
         id: Set(status_id),
         account_id: Set(account_id.0),
@@ -8386,6 +8749,16 @@ pub async fn create_local_status(
     .await?;
 
     update_local_account_last_status_at(&txn, account_id, created_at).await?;
+    Box::pin(replace_status_preview_card(
+        &txn,
+        PreviewStatusTarget::Local(StatusId(status_id)),
+        &preview_content,
+        utc_date(created_at),
+        PreviewActorOrigin::Local,
+        account_id.0,
+        false,
+    ))
+    .await?;
     txn.commit().await?;
     local_status_from_model(status)
 }
@@ -8428,6 +8801,7 @@ pub async fn create_local_status_with_media(
         }
     }
 
+    let preview_content = new_status.content.clone();
     let status = local_status::ActiveModel {
         id: Set(status_id),
         account_id: Set(account_id.0),
@@ -8447,6 +8821,16 @@ pub async fn create_local_status_with_media(
     .insert(txn)
     .await?;
     update_local_account_last_status_at(txn, account_id, created_at).await?;
+    Box::pin(replace_status_preview_card(
+        txn,
+        PreviewStatusTarget::Local(StatusId(status_id)),
+        &preview_content,
+        utc_date(created_at),
+        PreviewActorOrigin::Local,
+        account_id.0,
+        false,
+    ))
+    .await?;
 
     for (index, media_id) in media_ids.iter().enumerate() {
         let Some(media) = local_media_attachment::Entity::find_by_id(*media_id)
@@ -8984,7 +9368,7 @@ pub async fn trending_tags(db: &DbConnection, limit: u64, offset: u64) -> Result
         }
     }
     for trend in &mut trends {
-        trend.history = fill_tag_history(std::mem::take(&mut trend.history));
+        trend.history = fill_tag_history(mem::take(&mut trend.history));
     }
     Ok(trends)
 }
@@ -9127,6 +9511,612 @@ pub async fn trending_statuses(
         .map_err(Into::into)
 }
 
+fn preview_card_from_model(model: preview_card::Model) -> Result<PreviewCard> {
+    Ok(PreviewCard {
+        id: model.id,
+        url: model.url,
+        title: model.title,
+        description: model.description,
+        author_name: model.author_name,
+        author_url: model.author_url,
+        provider_name: model.provider_name,
+        provider_url: model.provider_url,
+        image_file_path: model.image_file_path,
+        image_width: u32::try_from(model.image_width)
+            .map_err(|_| DbErr::Type("negative preview width".to_owned()))?,
+        image_height: u32::try_from(model.image_height)
+            .map_err(|_| DbErr::Type("negative preview height".to_owned()))?,
+        blurhash: model.blurhash,
+        published_at: model.published_at,
+    })
+}
+
+/// Load the preview card associated with one local or cached remote status.
+pub async fn preview_card_for_status(
+    db: &impl ConnectionTrait,
+    status: StatusReference,
+) -> Result<Option<PreviewCard>> {
+    let (local_id, remote_id) = match status {
+        StatusReference::Local(id) => (Some(id.0), None),
+        StatusReference::Remote(id) => (None, Some(id.0)),
+    };
+    let mut association = status_preview_card::Entity::find();
+    association = match local_id {
+        Some(id) => association.filter(status_preview_card::Column::LocalStatusId.eq(id)),
+        None => association.filter(status_preview_card::Column::LocalStatusId.is_null()),
+    };
+    association = match remote_id {
+        Some(id) => association.filter(status_preview_card::Column::RemoteStatusId.eq(id)),
+        None => association.filter(status_preview_card::Column::RemoteStatusId.is_null()),
+    };
+    let Some(association) = association.one(db).await? else {
+        return Ok(None);
+    };
+    let model = preview_card::Entity::find_by_id(association.preview_card_id)
+        .one(db)
+        .await?;
+    model.map(preview_card_from_model).transpose()
+}
+
+/// Batch-load preview cards for a mixed status collection without per-status queries.
+pub async fn preview_cards_for_statuses(
+    db: &DbConnection,
+    statuses: &[StatusReference],
+) -> Result<HashMap<StatusReference, PreviewCard>> {
+    let local_ids = statuses
+        .iter()
+        .filter_map(|status| match status {
+            StatusReference::Local(id) => Some(id.0),
+            StatusReference::Remote(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_ids = statuses
+        .iter()
+        .filter_map(|status| match status {
+            StatusReference::Local(_) => None,
+            StatusReference::Remote(id) => Some(id.0),
+        })
+        .collect::<Vec<_>>();
+    if local_ids.is_empty() && remote_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let mut condition = Condition::any();
+    if !local_ids.is_empty() {
+        condition = condition.add(status_preview_card::Column::LocalStatusId.is_in(local_ids));
+    }
+    if !remote_ids.is_empty() {
+        condition = condition.add(status_preview_card::Column::RemoteStatusId.is_in(remote_ids));
+    }
+    let associations = status_preview_card::Entity::find()
+        .filter(condition)
+        .all(&txn)
+        .await?;
+    let card_ids = associations
+        .iter()
+        .map(|association| association.preview_card_id)
+        .collect::<HashSet<_>>();
+    let cards = preview_card::Entity::find()
+        .filter(preview_card::Column::Id.is_in(card_ids))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|model| preview_card_from_model(model).map(|card| (card.id, card)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    txn.commit().await?;
+
+    Ok(associations
+        .into_iter()
+        .filter_map(|association| {
+            let status = match (association.local_status_id, association.remote_status_id) {
+                (Some(id), None) => StatusReference::Local(StatusId(id)),
+                (None, Some(id)) => StatusReference::Remote(StatusId(id)),
+                _ => return None,
+            };
+            cards
+                .get(&association.preview_card_id)
+                .cloned()
+                .map(|card| (status, card))
+        })
+        .collect())
+}
+
+/// Load a preview card by durable job identifier.
+pub async fn preview_card_by_id(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+) -> Result<Option<PreviewCard>> {
+    preview_card::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .map(preview_card_from_model)
+        .transpose()
+}
+
+/// Persist successfully fetched preview metadata.
+pub async fn update_preview_card(
+    db: &DbConnection,
+    id: Uuid,
+    update: PreviewCardUpdate,
+) -> Result<()> {
+    let Some(model) = preview_card::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut active = model.into_active_model();
+    active.title = Set(update.title);
+    active.description = Set(update.description);
+    active.author_name = Set(update.author_name);
+    active.author_url = Set(update.author_url);
+    active.provider_name = Set(update.provider_name);
+    active.provider_url = Set(update.provider_url);
+    active.image_file_path = Set(update.image_file_path);
+    active.image_width = Set(i32::try_from(update.image_width)
+        .map_err(|_| DbErr::Type("preview width exceeds integer".to_owned()))?);
+    active.image_height = Set(i32::try_from(update.image_height)
+        .map_err(|_| DbErr::Type("preview height exceeds integer".to_owned()))?);
+    active.blurhash = Set(update.blurhash);
+    active.published_at = Set(update.published_at);
+    active.fetch_state = Set(PreviewFetchState::Ready);
+    active.fetched_at = Set(Some(now));
+    active.updated_at = Set(now);
+    active.update(db).await?;
+    Ok(())
+}
+
+/// Mark a preview fetch permanently unsuccessful while retaining its compatible URL card.
+pub async fn mark_preview_card_failed(db: &DbConnection, id: Uuid) -> Result<()> {
+    preview_card::Entity::update_many()
+        .col_expr(
+            preview_card::Column::FetchState,
+            Expr::value(PreviewFetchState::Failed),
+        )
+        .col_expr(
+            preview_card::Column::FetchedAt,
+            Expr::current_timestamp().into(),
+        )
+        .col_expr(
+            preview_card::Column::UpdatedAt,
+            Expr::current_timestamp().into(),
+        )
+        .filter(preview_card::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Acquire a short cluster-wide lease and rate slot for one preview host.
+pub async fn acquire_preview_host_lease(db: &DbConnection, host: &str) -> Result<bool> {
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO preview_fetch_host(host) VALUES ($1)
+           ON CONFLICT (host) DO NOTHING"#,
+        vec![host.to_owned().into()],
+    ))
+    .await?;
+    let result = txn
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"UPDATE preview_fetch_host
+               SET lease_until = now() + interval '30 seconds',
+                   next_fetch_at = now() + interval '1 second',
+                   updated_at = now()
+               WHERE host = $1
+                 AND next_fetch_at <= now()
+                 AND (lease_until IS NULL OR lease_until <= now())"#,
+            vec![host.to_owned().into()],
+        ))
+        .await?;
+    txn.commit().await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Release a preview host lease without relaxing its cluster-wide request spacing.
+pub async fn release_preview_host_lease(db: &DbConnection, host: &str) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE preview_fetch_host SET lease_until = NULL, updated_at = now() WHERE host = $1",
+        vec![host.to_owned().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Delete a bounded batch of old, unreferenced preview rows and return their storage keys.
+pub async fn prune_preview_cards(
+    db: &DbConnection,
+    older_than: OffsetDateTime,
+) -> Result<Vec<String>> {
+    const CANDIDATE_LIMIT: u64 = 500;
+    const DELETE_LIMIT: usize = 100;
+    let txn = db.begin().await?;
+    let candidates = preview_card::Entity::find()
+        .filter(preview_card::Column::UpdatedAt.lt(older_than))
+        .order_by_asc(preview_card::Column::UpdatedAt)
+        .limit(CANDIDATE_LIMIT)
+        .all(&txn)
+        .await?;
+    let ids = candidates.iter().map(|card| card.id).collect::<Vec<_>>();
+    let referenced = if ids.is_empty() {
+        HashSet::new()
+    } else {
+        status_preview_card::Entity::find()
+            .filter(status_preview_card::Column::PreviewCardId.is_in(ids))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|association| association.preview_card_id)
+            .collect::<HashSet<_>>()
+    };
+    let orphaned = candidates
+        .into_iter()
+        .filter(|card| !referenced.contains(&card.id))
+        .take(DELETE_LIMIT)
+        .collect::<Vec<_>>();
+    let orphaned_ids = orphaned.iter().map(|card| card.id).collect::<Vec<_>>();
+    if !orphaned_ids.is_empty() {
+        preview_card::Entity::delete_many()
+            .filter(preview_card::Column::Id.is_in(orphaned_ids))
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(orphaned
+        .into_iter()
+        .filter_map(|card| card.image_file_path)
+        .collect())
+}
+
+/// Rank preview cards from the shared link-trend cache.
+pub async fn trending_links(
+    db: &DbConnection,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<TrendingLink>> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        id: Uuid,
+        url: String,
+        title: String,
+        description: String,
+        author_name: String,
+        author_url: String,
+        provider_name: String,
+        provider_url: String,
+        image_file_path: Option<String>,
+        image_width: i32,
+        image_height: i32,
+        blurhash: Option<String>,
+        published_at: Option<OffsetDateTime>,
+        day: Option<i64>,
+        uses: Option<i64>,
+        accounts: Option<i64>,
+    }
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"WITH selected AS (
+             SELECT preview_card_id, score FROM link_trend
+             WHERE expires_at > now() AND score >= 1
+             ORDER BY score DESC, preview_card_id
+             LIMIT $1 OFFSET $2
+           )
+           SELECT card.id, card.url, card.title, card.description,
+                  card.author_name, card.author_url, card.provider_name,
+                  card.provider_url, card.image_file_path, card.image_width,
+                  card.image_height, card.blurhash, card.published_at,
+                  extract(epoch FROM usage.usage_day::timestamp)::bigint AS day,
+                  usage.uses, usage.accounts
+           FROM selected
+           JOIN preview_card card ON card.id = selected.preview_card_id
+           LEFT JOIN link_daily_usage usage
+             ON usage.preview_card_id = card.id
+            AND usage.usage_day >= (now() AT TIME ZONE 'UTC')::date - 6
+           ORDER BY selected.score DESC, selected.preview_card_id, day DESC"#,
+        vec![
+            i64::try_from(limit)
+                .map_err(|_| DbErr::Type("trend limit exceeds bigint".to_owned()))?
+                .into(),
+            i64::try_from(offset)
+                .map_err(|_| DbErr::Type("trend offset exceeds bigint".to_owned()))?
+                .into(),
+        ],
+    ))
+    .all(&txn)
+    .await?;
+    txn.commit().await?;
+    let mut trends = Vec::<TrendingLink>::new();
+    for row in rows {
+        if trends.last().is_none_or(|trend| trend.card.id != row.id) {
+            trends.push(TrendingLink {
+                card: PreviewCard {
+                    id: row.id,
+                    url: row.url.clone(),
+                    title: row.title.clone(),
+                    description: row.description.clone(),
+                    author_name: row.author_name.clone(),
+                    author_url: row.author_url.clone(),
+                    provider_name: row.provider_name.clone(),
+                    provider_url: row.provider_url.clone(),
+                    image_file_path: row.image_file_path.clone(),
+                    image_width: u32::try_from(row.image_width)
+                        .map_err(|_| DbErr::Type("negative preview width".to_owned()))?,
+                    image_height: u32::try_from(row.image_height)
+                        .map_err(|_| DbErr::Type("negative preview height".to_owned()))?,
+                    blurhash: row.blurhash.clone(),
+                    published_at: row.published_at,
+                },
+                history: Vec::new(),
+            });
+        }
+        if let (Some(day), Some(uses), Some(accounts), Some(trend)) =
+            (row.day, row.uses, row.accounts, trends.last_mut())
+        {
+            trend.history.push(LocalTagHistory {
+                day: u64::try_from(day)
+                    .map_err(|_| DbErr::Type("negative link history day".to_owned()))?,
+                uses: u64::try_from(uses)
+                    .map_err(|_| DbErr::Type("negative link usage count".to_owned()))?,
+                accounts: u64::try_from(accounts)
+                    .map_err(|_| DbErr::Type("negative link account count".to_owned()))?,
+            });
+        }
+    }
+    for trend in &mut trends {
+        trend.history = fill_tag_history(mem::take(&mut trend.history));
+    }
+    Ok(trends)
+}
+
+/// Index at most 100 recent statuses that predate preview-card support.
+pub async fn backfill_preview_cards(db: &DbConnection) -> Result<TrendRefreshOutcome> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        local_status_id: Option<Uuid>,
+        remote_status_id: Option<Uuid>,
+        content: String,
+        published_at: OffsetDateTime,
+        actor_id: Uuid,
+    }
+    const BATCH_SIZE: usize = 100;
+    let txn = db.begin().await?;
+    let rows = Row::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        r#"SELECT * FROM (
+             SELECT status.id AS local_status_id, NULL::uuid AS remote_status_id,
+                    status.content, status.created_at AS published_at,
+                    status.account_id AS actor_id
+             FROM local_status status
+             WHERE status.deleted_at IS NULL
+               AND status.created_at >= now() - interval '8 days'
+               AND NOT EXISTS (
+                 SELECT 1 FROM status_preview_scan scan
+                 WHERE scan.local_status_id = status.id)
+             UNION ALL
+             SELECT NULL::uuid, status.id, status.content, status.published_at,
+                    status.remote_actor_id
+             FROM remote_status status
+             WHERE status.deleted_at IS NULL
+               AND status.published_at >= now() - interval '8 days'
+               AND NOT EXISTS (
+                 SELECT 1 FROM status_preview_scan scan
+                 WHERE scan.remote_status_id = status.id)
+           ) candidates
+           ORDER BY published_at, coalesce(local_status_id, remote_status_id)
+           LIMIT 100"#
+            .to_owned(),
+    ))
+    .all(&txn)
+    .await?;
+    for row in &rows {
+        let (target, origin, remote_html) = match (row.local_status_id, row.remote_status_id) {
+            (Some(id), None) => (
+                PreviewStatusTarget::Local(StatusId(id)),
+                PreviewActorOrigin::Local,
+                false,
+            ),
+            (None, Some(id)) => (
+                PreviewStatusTarget::Remote(StatusId(id)),
+                PreviewActorOrigin::Remote,
+                true,
+            ),
+            _ => continue,
+        };
+        Box::pin(replace_status_preview_card(
+            &txn,
+            target,
+            &row.content,
+            utc_date(row.published_at),
+            origin,
+            row.actor_id,
+            remote_html,
+        ))
+        .await?;
+    }
+    let processed = rows.len();
+    txn.commit().await?;
+    Ok(TrendRefreshOutcome {
+        has_more: processed == BATCH_SIZE,
+        processed,
+    })
+}
+
+/// Enqueue the singleton preview backfill only when an upgrade left recent statuses unscanned.
+pub async fn enqueue_preview_backfill_if_needed(db: &DbConnection) -> Result<Option<JobId>> {
+    #[derive(FromQueryResult)]
+    struct Pending {
+        pending: bool,
+    }
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let pending = Pending::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        r#"SELECT EXISTS (
+             SELECT 1 FROM local_status status
+             WHERE status.deleted_at IS NULL
+               AND status.created_at >= now() - interval '8 days'
+               AND NOT EXISTS (
+                 SELECT 1 FROM status_preview_scan scan
+                 WHERE scan.local_status_id = status.id)
+             UNION ALL
+             SELECT 1 FROM remote_status status
+             WHERE status.deleted_at IS NULL
+               AND status.published_at >= now() - interval '8 days'
+               AND NOT EXISTS (
+                 SELECT 1 FROM status_preview_scan scan
+                 WHERE scan.remote_status_id = status.id)
+           ) AS pending"#
+            .to_owned(),
+    ))
+    .one(&txn)
+    .await?
+    .is_some_and(|row| row.pending);
+    txn.commit().await?;
+    if !pending {
+        return Ok(None);
+    }
+    enqueue_job(
+        db,
+        JobKind::PreviewCardBackfill,
+        serde_json::json!({}),
+        Some("preview-card-backfill"),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .map(Some)
+}
+
+/// Return public statuses sharing an actively trending canonical article URL.
+pub async fn link_timeline(
+    db: &DbConnection,
+    url: &str,
+    limit: u64,
+    cursor: TimelineCursor,
+) -> Result<TimelinePage<PublicTimelineItem>> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        local_status_id: Option<Uuid>,
+        remote_status_id: Option<Uuid>,
+    }
+    let Some(url) = normalize_preview_url(url) else {
+        return Ok(TimelinePage {
+            items: Vec::new(),
+            first_cursor: None,
+            last_cursor: None,
+            has_more: false,
+        });
+    };
+    let txn = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT association.local_status_id, association.remote_status_id
+           FROM status_preview_card association
+           JOIN preview_card card ON card.id = association.preview_card_id
+           JOIN link_trend trend ON trend.preview_card_id = card.id
+           LEFT JOIN local_status local_status
+             ON local_status.id = association.local_status_id
+           LEFT JOIN local_account local_account
+             ON local_account.id = local_status.account_id
+           LEFT JOIN remote_status remote_status
+             ON remote_status.id = association.remote_status_id
+           LEFT JOIN remote_actor remote_actor
+             ON remote_actor.id = remote_status.remote_actor_id
+           WHERE card.url = $1 AND trend.score >= 1 AND trend.expires_at > now()
+             AND ($2::uuid IS NULL OR
+                  coalesce(association.local_status_id, association.remote_status_id) < $2)
+             AND ($3::uuid IS NULL OR
+                  coalesce(association.local_status_id, association.remote_status_id) > $3)
+             AND ($4::uuid IS NULL OR
+                  coalesce(association.local_status_id, association.remote_status_id) > $4)
+             AND (
+               (local_status.id IS NOT NULL AND local_status.deleted_at IS NULL
+                AND local_status.visibility = 'public'
+                AND local_status.in_reply_to_id IS NULL
+                AND local_status.in_reply_to_remote_status_id IS NULL
+                AND local_status.sensitive = false
+                AND local_status.spoiler_text = ''
+                AND local_account.discoverable = true
+                AND local_account.limited_at IS NULL)
+               OR
+               (remote_status.id IS NOT NULL AND remote_status.deleted_at IS NULL
+                AND remote_status.visibility = 'public'
+                AND remote_status.in_reply_to IS NULL
+                AND coalesce(
+                    (remote_status.object->>'sensitive')::boolean, false) = false
+                AND coalesce(remote_status.object->>'summary', '') = ''
+                AND remote_actor.deleted_at IS NULL AND remote_actor.limited_at IS NULL)
+             )
+           ORDER BY coalesce(
+             association.local_status_id, association.remote_status_id) DESC
+           LIMIT $5"#,
+        vec![
+            url.into(),
+            cursor.max_id.map(|id| id.0).into(),
+            cursor.since_id.map(|id| id.0).into(),
+            cursor.min_id.map(|id| id.0).into(),
+            i64::try_from(limit.saturating_add(1))
+                .map_err(|_| DbErr::Type("timeline limit exceeds bigint".to_owned()))?
+                .into(),
+        ],
+    ))
+    .all(&txn)
+    .await?;
+    let has_more = rows.len() > limit as usize;
+    let rows = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
+    let local_ids = rows
+        .iter()
+        .filter_map(|row| row.local_status_id)
+        .collect::<Vec<_>>();
+    let remote_ids = rows
+        .iter()
+        .filter_map(|row| row.remote_status_id)
+        .collect::<Vec<_>>();
+    let local = local_status::Entity::find()
+        .filter(local_status::Column::Id.is_in(local_ids))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|model| local_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let remote = remote_status::Entity::find()
+        .filter(remote_status::Column::Id.is_in(remote_ids))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|model| remote_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    txn.commit().await?;
+    let items = rows
+        .iter()
+        .filter_map(|row| match (row.local_status_id, row.remote_status_id) {
+            (Some(id), None) => local.get(&id).cloned().map(PublicTimelineItem::Local),
+            (None, Some(id)) => remote.get(&id).cloned().map(PublicTimelineItem::Remote),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Ok(TimelinePage {
+        first_cursor: items.first().map(|item| match item {
+            PublicTimelineItem::Local(status) => status.id.0,
+            PublicTimelineItem::Remote(status) => status.id.0,
+        }),
+        last_cursor: items.last().map(|item| match item {
+            PublicTimelineItem::Local(status) => status.id.0,
+            PublicTimelineItem::Remote(status) => status.id.0,
+        }),
+        items,
+        has_more,
+    })
+}
+
 /// Outcome of one bounded Rust-owned trend refresh batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrendRefreshOutcome {
@@ -9265,7 +10255,10 @@ pub async fn maintain_trends(db: &DbConnection) -> Result<TrendRefreshOutcome> {
         WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 8;
         DELETE FROM tag_daily_usage
         WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 8;
+        DELETE FROM link_daily_usage
+        WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 8;
         DELETE FROM tag_trend WHERE expires_at <= now();
+        DELETE FROM link_trend WHERE expires_at <= now();
         INSERT INTO trend_dirty(kind, target_id)
         SELECT CASE WHEN local_status_id IS NULL
                     THEN 'remote_status' ELSE 'local_status' END,
@@ -9275,6 +10268,9 @@ pub async fn maintain_trends(db: &DbConnection) -> Result<TrendRefreshOutcome> {
         ON CONFLICT (kind, target_id) DO NOTHING;
         INSERT INTO trend_dirty(kind, target_id)
         SELECT 'tag', tag_id FROM tag_trend WHERE score >= 1
+        ON CONFLICT (kind, target_id) DO NOTHING;
+        INSERT INTO trend_dirty(kind, target_id)
+        SELECT 'link', preview_card_id FROM link_trend WHERE score >= 1
         ON CONFLICT (kind, target_id) DO NOTHING;
         "#,
     )
@@ -9306,6 +10302,7 @@ pub async fn maintain_trends(db: &DbConnection) -> Result<TrendRefreshOutcome> {
                 .await?;
             }
             "tag" => refresh_tag_trend(&txn, row.target_id, now).await?,
+            "link" => refresh_link_trend(&txn, row.target_id, now).await?,
             _ => {
                 return Err(RoostyError::InvalidInput(
                     "stored trend target kind is invalid".to_owned(),
@@ -9577,6 +10574,134 @@ fn choose_tag_peak(
         (Some(peak), Some(at)) if at >= now - Duration::days(2) && raw <= peak => (peak, at),
         _ => (raw, now),
     }
+}
+
+async fn refresh_link_trend(
+    txn: &DatabaseTransaction,
+    card_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<()> {
+    #[derive(FromQueryResult)]
+    struct Usage {
+        observed: i64,
+        expected: i64,
+        peak_score: Option<f64>,
+        peak_at: Option<OffsetDateTime>,
+    }
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO link_daily_usage(
+               preview_card_id, usage_day, uses, accounts, updated_at)
+           SELECT association.preview_card_id, association.usage_day,
+                  count(*), count(DISTINCT
+                    (association.actor_origin, association.actor_id)), $2
+           FROM status_preview_card association
+           LEFT JOIN local_status local_status
+             ON local_status.id = association.local_status_id
+           LEFT JOIN local_account local_account
+             ON local_account.id = local_status.account_id
+           LEFT JOIN remote_status remote_status
+             ON remote_status.id = association.remote_status_id
+           LEFT JOIN remote_actor remote_actor
+             ON remote_actor.id = remote_status.remote_actor_id
+           WHERE association.preview_card_id = $1
+             AND association.usage_day >= ($2 AT TIME ZONE 'UTC')::date - 8
+             AND (
+               (local_status.id IS NOT NULL
+                AND local_status.deleted_at IS NULL
+                AND local_status.visibility = 'public'
+                AND local_status.in_reply_to_id IS NULL
+                AND local_status.in_reply_to_remote_status_id IS NULL
+                AND local_status.sensitive = false
+                AND local_status.spoiler_text = ''
+                AND local_account.discoverable = true
+                AND local_account.limited_at IS NULL)
+               OR
+               (remote_status.id IS NOT NULL
+                AND remote_status.deleted_at IS NULL
+                AND remote_status.visibility = 'public'
+                AND remote_status.in_reply_to IS NULL
+                AND coalesce((remote_status.object->>'sensitive')::boolean, false) = false
+                AND coalesce(remote_status.object->>'summary', '') = ''
+                AND remote_actor.deleted_at IS NULL
+                AND remote_actor.limited_at IS NULL)
+             )
+           GROUP BY association.preview_card_id, association.usage_day
+           ON CONFLICT (preview_card_id, usage_day) DO UPDATE SET
+             uses = EXCLUDED.uses, accounts = EXCLUDED.accounts,
+             updated_at = EXCLUDED.updated_at"#,
+        vec![card_id.into(), now.into()],
+    ))
+    .await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"DELETE FROM link_daily_usage usage
+           WHERE preview_card_id = $1
+             AND NOT EXISTS (
+               SELECT 1 FROM status_preview_card association
+               WHERE association.preview_card_id = usage.preview_card_id
+                 AND association.usage_day = usage.usage_day)"#,
+        vec![card_id.into()],
+    ))
+    .await?;
+    let usage = Usage::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT
+             coalesce(max(usage.accounts) FILTER (
+               WHERE usage.usage_day = ($2 AT TIME ZONE 'UTC')::date), 0) AS observed,
+             coalesce(max(usage.accounts) FILTER (
+               WHERE usage.usage_day = ($2 AT TIME ZONE 'UTC')::date - 1), 1) AS expected,
+             trend.peak_score, trend.peak_at
+           FROM link_daily_usage usage
+           LEFT JOIN link_trend trend
+             ON trend.preview_card_id = usage.preview_card_id
+           WHERE usage.preview_card_id = $1
+           GROUP BY trend.peak_score, trend.peak_at"#,
+        vec![card_id.into(), now.into()],
+    ))
+    .one(txn)
+    .await?;
+    let Some(usage) = usage else {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM link_trend WHERE preview_card_id = $1",
+            vec![card_id.into()],
+        ))
+        .await?;
+        return Ok(());
+    };
+    let raw = tag_raw_score(usage.observed, usage.expected);
+    let (peak, peak_at) = choose_tag_peak(raw, usage.peak_score, usage.peak_at, now);
+    if peak <= 0.0 {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM link_trend WHERE preview_card_id = $1",
+            vec![card_id.into()],
+        ))
+        .await?;
+        return Ok(());
+    }
+    let score = peak * 0.5_f64.powf((now - peak_at).as_seconds_f64().max(0.0) / 14_400.0);
+    let expires_at = peak_at + Duration::seconds_f64(14_400.0 * peak.ln() / 2.0_f64.ln());
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO link_trend(
+             preview_card_id, score, peak_score, peak_at, expires_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (preview_card_id) DO UPDATE SET score = EXCLUDED.score,
+             peak_score = EXCLUDED.peak_score, peak_at = EXCLUDED.peak_at,
+             expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at"#,
+        vec![
+            card_id.into(),
+            score.into(),
+            peak.into(),
+            peak_at.into(),
+            expires_at.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// List public local and cached remote statuses containing a hashtag.
@@ -10420,6 +11545,16 @@ pub async fn update_owned_local_status(
     active.updated_at = Set(revision_timestamp);
     let status = active.update(txn).await?;
     mark_trend_dirty(txn, "local_status", status_id.0).await?;
+    Box::pin(replace_status_preview_card(
+        txn,
+        PreviewStatusTarget::Local(status_id),
+        &status.content,
+        utc_date(status.created_at),
+        PreviewActorOrigin::Local,
+        status.account_id,
+        false,
+    ))
+    .await?;
 
     if status.visibility == StatusVisibility::Public {
         adjust_tag_usage(
@@ -14285,6 +15420,7 @@ pub async fn delete_owned_local_status(
         ));
     }
 
+    remove_status_preview_card(db, PreviewStatusTarget::Local(status_id)).await?;
     let tag_ids = local_status_tag::Entity::find()
         .filter(local_status_tag::Column::StatusId.eq(status_id.0))
         .all(db)
@@ -17181,7 +18317,8 @@ pub async fn claim_due_job(
                     'federation_featured_tags_refresh', 'federation_thread_resolve',
                     'federation_replies_fetch', 'federation_reply_fetch', 'web_push_delivery',
                     'notification_request_merge', 'notification_request_cleanup',
-                    'scheduled_status_publish', 'trend_maintenance'
+                    'scheduled_status_publish', 'trend_maintenance',
+                    'preview_card_fetch', 'preview_card_backfill'
                   )
                 ORDER BY run_after, created_at
                 LIMIT 1

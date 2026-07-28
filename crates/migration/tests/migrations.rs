@@ -54,6 +54,13 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "streaming_event").await);
     assert!(table_exists(database.connection(), "push_subscription").await);
     assert!(table_exists(database.connection(), "trend_refresh_schedule").await);
+    assert!(table_exists(database.connection(), "preview_card").await);
+    assert!(table_exists(database.connection(), "status_preview_card").await);
+    assert!(table_exists(database.connection(), "status_preview_scan").await);
+    assert!(table_exists(database.connection(), "link_daily_usage").await);
+    assert!(table_exists(database.connection(), "link_trend").await);
+    assert!(table_exists(database.connection(), "preview_fetch_host").await);
+    assert!(index_exists(database.connection(), "link_trend_rank_idx").await);
     assert!(table_exists(database.connection(), "status_quote").await);
     assert!(table_exists(database.connection(), "local_status_pin").await);
     assert!(table_exists(database.connection(), "remote_status_pin").await);
@@ -70,6 +77,14 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "remote_status_edit_media").await);
     assert!(table_exists(database.connection(), "remote_status_tag").await);
     assert!(table_exists(database.connection(), "local_notification_policy").await);
+    assert!(!trigger_exists(database.connection(), "local_account_notification_policy").await);
+    assert!(
+        !function_exists(
+            database.connection(),
+            "create_default_local_notification_policy"
+        )
+        .await
+    );
     assert!(table_exists(database.connection(), "local_notification_permission").await);
     assert!(table_exists(database.connection(), "local_notification_request").await);
     assert!(table_exists(database.connection(), "admin_audit_log").await);
@@ -291,6 +306,69 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_tag_follow", "tag_id").await);
     assert!(column_exists(database.connection(), "remote_following", "show_reblogs").await);
     assert!(column_exists(database.connection(), "remote_following", "notify").await);
+}
+
+/// The preview-card migration is independently reversible without removing the shared trend cache.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn preview_card_upgrade_and_rollback_are_self_contained(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(71)).await.unwrap();
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    assert!(table_exists(database.connection(), "preview_card").await);
+    assert!(table_exists(database.connection(), "status_preview_scan").await);
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!table_exists(database.connection(), "preview_card").await);
+    assert!(!table_exists(database.connection(), "status_preview_scan").await);
+    assert!(table_exists(database.connection(), "trend_dirty").await);
+}
+
+/// Databases upgraded from the trigger-backed policy invariant hand ownership to Rust.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn notification_policy_trigger_upgrade_and_rollback(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(72)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            CREATE FUNCTION create_default_local_notification_policy() RETURNS trigger AS $$
+            BEGIN
+                INSERT INTO local_notification_policy (account_id) VALUES (NEW.id);
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER local_account_notification_policy
+                AFTER INSERT ON local_account FOR EACH ROW
+                EXECUTE FUNCTION create_default_local_notification_policy();
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    assert!(!trigger_exists(database.connection(), "local_account_notification_policy").await);
+    assert!(
+        !function_exists(
+            database.connection(),
+            "create_default_local_notification_policy"
+        )
+        .await
+    );
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(trigger_exists(database.connection(), "local_account_notification_policy").await);
+    assert!(
+        function_exists(
+            database.connection(),
+            "create_default_local_notification_policy"
+        )
+        .await
+    );
 }
 
 /// Existing status activity is backfilled for directory ordering and rollback removes only new columns.
@@ -833,6 +911,38 @@ async fn index_exists(connection: &DatabaseConnection, index_name: &str) -> bool
         .expect("index existence query returned no rows");
 
     row.try_get::<bool>("", "index_exists").unwrap()
+}
+
+async fn trigger_exists(connection: &DatabaseConnection, trigger_name: &str) -> bool {
+    let row = connection
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM pg_trigger
+                 WHERE NOT tgisinternal AND tgname = $1
+               ) AS trigger_exists"#,
+            vec![trigger_name.to_owned().into()],
+        ))
+        .await
+        .unwrap()
+        .expect("trigger existence query returned no rows");
+    row.try_get::<bool>("", "trigger_exists").unwrap()
+}
+
+async fn function_exists(connection: &DatabaseConnection, function_name: &str) -> bool {
+    let row = connection
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM pg_proc
+                 WHERE pronamespace = 'public'::regnamespace AND proname = $1
+               ) AS function_exists"#,
+            vec![function_name.to_owned().into()],
+        ))
+        .await
+        .unwrap()
+        .expect("function existence query returned no rows");
+    row.try_get::<bool>("", "function_exists").unwrap()
 }
 
 async fn roosty_trend_routines_exist(connection: &DatabaseConnection) -> bool {

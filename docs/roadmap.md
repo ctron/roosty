@@ -101,7 +101,7 @@
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [ ] Add SEO-friendly first-party profile and status pages. Welcome, about, login, password settings, OAuth consent, and out-of-band authorization results now use Leptos; no Askama views remain.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
-- [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags and statuses and the offset-paginated local/remote profile directory are available; the links endpoint returns an empty compatible collection until link-card indexing is added, while account suggestions remain.
+- [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags, statuses, rich link cards, link timelines, and the offset-paginated local/remote profile directory are available; account suggestions remain.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account
   creation/password reset/limits, compatible account APIs, OAuth scope enforcement, CSRF
   protection, and transactional audit records.

@@ -3249,6 +3249,7 @@ mod tests {
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
+                preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),

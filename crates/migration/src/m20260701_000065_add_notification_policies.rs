@@ -29,15 +29,6 @@ impl MigrationTrait for Migration {
             );
             INSERT INTO local_notification_policy (account_id)
                 SELECT id FROM local_account;
-            CREATE FUNCTION create_default_local_notification_policy() RETURNS trigger AS $$
-            BEGIN
-                INSERT INTO local_notification_policy (account_id) VALUES (NEW.id);
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-            CREATE TRIGGER local_account_notification_policy
-                AFTER INSERT ON local_account FOR EACH ROW
-                EXECUTE FUNCTION create_default_local_notification_policy();
 
             ALTER TABLE local_account ADD COLUMN limited_at timestamptz;
             ALTER TABLE remote_actor ADD COLUMN limited_at timestamptz;

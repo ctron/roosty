@@ -1150,6 +1150,48 @@ fn validate_image_content_type(value: &str) -> Result<SupportedImageFormat, Stri
         .ok_or_else(|| "file content type is invalid".to_owned())
 }
 
+/// Validate, thumbnail, and store a preview-card image beneath the shared media root.
+pub(crate) async fn store_preview_card_image(
+    state: &AppState,
+    card_id: Uuid,
+    bytes: Vec<u8>,
+    content_type: &str,
+) -> Result<(String, u32, u32, String), RoostyError> {
+    ensure_local_storage(state)?;
+    if bytes.len() as u64 > state.config.remote_media_max_bytes {
+        return Err(RoostyError::InvalidInput(
+            "preview image exceeds configured size limit".to_owned(),
+        ));
+    }
+    let format = validate_image_content_type(content_type).map_err(RoostyError::InvalidInput)?;
+    let processed = process_image(bytes, None, format.image_format)
+        .await
+        .map_err(media_store_error_to_roosty)?;
+    let path = format!("preview_cards/{card_id}.png");
+    let full_path = media_path(state, &path);
+    create_media_parent(&full_path)
+        .await
+        .map_err(media_store_error_to_roosty)?;
+    tokio::fs::write(full_path, processed.preview_bytes)
+        .await
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    Ok((
+        path,
+        u32::try_from(processed.preview_width)
+            .map_err(|_| RoostyError::InvalidInput("invalid preview width".to_owned()))?,
+        u32::try_from(processed.preview_height)
+            .map_err(|_| RoostyError::InvalidInput("invalid preview height".to_owned()))?,
+        processed.blurhash,
+    ))
+}
+
+/// Remove an orphaned preview image; absence is already the desired state.
+pub(crate) async fn remove_preview_card_image(state: &AppState, relative_path: &str) {
+    if let Some(path) = safe_relative_path(relative_path) {
+        let _ = tokio::fs::remove_file(Path::new(&state.config.media_root).join(path)).await;
+    }
+}
+
 /// Normalize optional alt text while enforcing Mastodon's media description limit.
 fn normalize_description(value: Option<String>) -> Result<Option<String>, String> {
     let Some(value) = value else {

@@ -11,10 +11,10 @@ use axum::{
 use linkify::{LinkFinder, LinkKind};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus,
+    ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus, PreviewCard,
     QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus, ScheduleStatusResult,
     ScheduledStatus, StatusContextItem, StatusContextParent, StatusCreationReservation,
-    StatusVisibility,
+    StatusReference, StatusVisibility,
 };
 use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use crate::{
         OAuthScopeResource, OptionalAuthenticatedAccount, account_response,
     },
     conversations::{publish_conversation_update, publish_conversation_updates},
+    explore::PreviewCardResponse,
     federation::{
         StatusActivityKind, enqueue_quote_request_in_transaction,
         enqueue_quote_revocation_in_transaction, enqueue_status_activity_in_transaction,
@@ -118,6 +119,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/bookmarks", get(bookmarks))
         .route("/api/v1/timelines/home", get(home_timeline))
         .route("/api/v1/timelines/public", get(public_timeline))
+        .route("/api/v1/timelines/link", get(link_timeline))
         .route("/api/v1/timelines/tag/{hashtag}", get(tag_timeline))
         .route("/api/v1/tags/{hashtag}", get(show_tag))
         .route("/api/v1/tags/{hashtag}/follow", post(follow_tag))
@@ -168,6 +170,15 @@ struct TimelineQuery {
 
 #[derive(Deserialize)]
 struct TimelineParams {
+    limit: Option<u64>,
+    max_id: Option<String>,
+    since_id: Option<String>,
+    min_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LinkTimelineParams {
+    url: String,
     limit: Option<u64>,
     max_id: Option<String>,
     since_id: Option<String>,
@@ -293,6 +304,7 @@ pub(crate) struct StatusResponse {
     content: String,
     account: StatusAccountResponse,
     media_attachments: Vec<MediaAttachmentResponse>,
+    card: Option<Box<PreviewCardResponse>>,
     mentions: Vec<MentionResponse>,
     tags: Vec<TagResponse>,
     emojis: Vec<Value>,
@@ -309,6 +321,32 @@ pub(crate) struct StatusResponse {
     quote: Option<QuoteResponse>,
     quote_approval: QuoteApprovalResponse,
     application: Option<Value>,
+}
+
+enum PreviewCardSource {
+    Load,
+    Preloaded(Option<Box<PreviewCard>>),
+}
+
+impl From<Option<PreviewCard>> for PreviewCardSource {
+    fn from(card: Option<PreviewCard>) -> Self {
+        Self::Preloaded(card.map(Box::new))
+    }
+}
+
+impl PreviewCardSource {
+    async fn load(
+        self,
+        state: &AppState,
+        status: StatusReference,
+    ) -> Result<Option<Box<PreviewCard>>, RoostyError> {
+        match self {
+            Self::Load => Ok(roosty_db::preview_card_for_status(&state.db, status)
+                .await?
+                .map(Box::new)),
+            Self::Preloaded(card) => Ok(card),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2753,6 +2791,48 @@ async fn public_timeline(
     }
 }
 
+async fn link_timeline(
+    State(state): State<AppState>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Query(params): Query<LinkTimelineParams>,
+) -> Response {
+    let url = params.url;
+    let query = match timeline_query(TimelineParams {
+        limit: params.limit,
+        max_id: params.max_id,
+        since_id: params.since_id,
+        min_id: params.min_id,
+    }) {
+        Ok(query) => query,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    match roosty_db::link_timeline(&state.db, &url, query.limit, query.cursor).await {
+        Ok(page) => {
+            let encoded =
+                percent_encoding::utf8_percent_encode(&url, percent_encoding::NON_ALPHANUMERIC);
+            let path = format!("/api/v1/timelines/link?url={encoded}");
+            let link = timeline_link_header(&page, query.limit, &path);
+            match public_timeline_models(
+                &state,
+                page.items,
+                viewer.as_ref().map(|account| account.id),
+            )
+            .await
+            {
+                Ok(items) => {
+                    let mut response = Json(items).into_response();
+                    if let Some(link) = link {
+                        response.headers_mut().insert(header::LINK, link);
+                    }
+                    response
+                }
+                Err(error) => server_error(error),
+            }
+        }
+        Err(error) => server_error(error),
+    }
+}
+
 async fn tag_timeline(
     State(state): State<AppState>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
@@ -3849,16 +3929,29 @@ async fn public_timeline_models(
         .collect::<Vec<_>>();
     let local_pins = roosty_db::pinned_local_status_ids(&state.db, &local_ids).await?;
     let remote_pins = roosty_db::pinned_remote_status_ids(&state.db, &remote_ids).await?;
+    let status_references = timeline
+        .iter()
+        .map(|item| match item {
+            roosty_db::PublicTimelineItem::Local(status) => StatusReference::Local(status.id),
+            roosty_db::PublicTimelineItem::Remote(status) => StatusReference::Remote(status.id),
+        })
+        .collect::<Vec<_>>();
+    let mut cards = roosty_db::preview_cards_for_statuses(&state.db, &status_references).await?;
     let mut items = Vec::with_capacity(timeline.len());
     for item in timeline {
         let result = match item {
             roosty_db::PublicTimelineItem::Local(status) => {
                 let pinned = local_pins.contains(&status.id);
-                status_with_author_and_pin(state, status, viewer, pinned).await
+                let card = cards.remove(&StatusReference::Local(status.id));
+                status_with_author_and_pin_and_card(state, status, viewer, pinned, card).await
             }
             roosty_db::PublicTimelineItem::Remote(status) => {
                 let pinned = remote_pins.contains(&status.id);
-                remote_status_response_for_viewer_with_pin(state, status, viewer, pinned).await
+                let card = cards.remove(&StatusReference::Remote(status.id));
+                remote_status_response_for_viewer_with_pin_and_card(
+                    state, status, viewer, pinned, card,
+                )
+                .await
             }
         };
         items.push(result?);
@@ -3978,11 +4071,32 @@ async fn status_with_author_and_pin(
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
+    status_with_author_and_pin_with_source(state, status, viewer, pinned, PreviewCardSource::Load)
+        .await
+}
+
+async fn status_with_author_and_pin_and_card(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    viewer: Option<AccountId>,
+    pinned: bool,
+    card: Option<PreviewCard>,
+) -> Result<StatusResponse, RoostyError> {
+    status_with_author_and_pin_with_source(state, status, viewer, pinned, card.into()).await
+}
+
+async fn status_with_author_and_pin_with_source(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    viewer: Option<AccountId>,
+    pinned: bool,
+    card: PreviewCardSource,
+) -> Result<StatusResponse, RoostyError> {
     let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("status author does not exist".to_owned()))?;
 
-    status_response_for_viewer_with_pin(state, status, account, viewer, pinned).await
+    status_response_for_viewer_with_pin_and_card(state, status, account, viewer, pinned, card).await
 }
 
 async fn status_response(
@@ -4067,6 +4181,7 @@ pub(crate) async fn remote_reblog_response(
             remote_account_response(state, actor).await?,
         )),
         media_attachments: Vec::new(),
+        card: None,
         mentions: Vec::new(),
         tags: Vec::new(),
         emojis: Vec::new(),
@@ -4153,8 +4268,32 @@ async fn remote_status_response_for_viewer_with_pin(
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
+    remote_status_response_for_viewer_with_pin_and_card(
+        state,
+        status,
+        viewer,
+        pinned,
+        PreviewCardSource::Load,
+    )
+    .await
+}
+
+async fn remote_status_response_for_viewer_with_pin_and_card(
+    state: &AppState,
+    status: roosty_db::RemoteStatus,
+    viewer: Option<AccountId>,
+    pinned: bool,
+    card: impl Into<PreviewCardSource>,
+) -> Result<StatusResponse, RoostyError> {
     let status_ref = roosty_db::StatusReference::Remote(status.id);
-    let mut response = remote_status_response_base(state, status, viewer, pinned).await?;
+    let mut response = Box::pin(remote_status_response_base(
+        state,
+        status,
+        viewer,
+        pinned,
+        card.into(),
+    ))
+    .await?;
     response.quote = status_quote_response(state, status_ref, viewer).await?;
     Ok(response)
 }
@@ -4164,6 +4303,7 @@ async fn remote_status_response_base(
     status: roosty_db::RemoteStatus,
     viewer: Option<AccountId>,
     pinned: bool,
+    card: PreviewCardSource,
 ) -> Result<StatusResponse, RoostyError> {
     let replies_count =
         roosty_db::count_status_context_replies(&state.db, StatusContextParent::Remote(status.id))
@@ -4199,6 +4339,10 @@ async fn remote_status_response_base(
         roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Remote(status.id))
             .await?;
     let quote_approval = remote_quote_approval(state, &status, viewer).await?;
+    let card = card
+        .load(state, StatusReference::Remote(status.id))
+        .await?
+        .map(|card| Box::new(PreviewCardResponse::new(state, *card, None)));
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.published_at),
@@ -4230,6 +4374,7 @@ async fn remote_status_response_base(
             .into_iter()
             .map(|media| remote_media_attachment_response(state, media))
             .collect(),
+        card,
         mentions,
         tags,
         emojis: remote_custom_emojis(&status.object),
@@ -4371,6 +4516,7 @@ async fn reblog_response(
         content: String::new(),
         account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
         media_attachments: Vec::new(),
+        card: None,
         mentions: Vec::new(),
         tags: Vec::new(),
         emojis: Vec::new(),
@@ -4430,6 +4576,7 @@ async fn local_remote_reblog_response(
         content: String::new(),
         account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
         media_attachments: Vec::new(),
+        card: None,
         mentions: Vec::new(),
         tags: Vec::new(),
         emojis: Vec::new(),
@@ -4470,8 +4617,30 @@ async fn status_response_for_viewer_with_pin(
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
+    status_response_for_viewer_with_pin_and_card(
+        state,
+        status,
+        account,
+        viewer,
+        pinned,
+        PreviewCardSource::Load,
+    )
+    .await
+}
+
+async fn status_response_for_viewer_with_pin_and_card(
+    state: &AppState,
+    status: roosty_db::LocalStatus,
+    account: LocalAccount,
+    viewer: Option<AccountId>,
+    pinned: bool,
+    card: PreviewCardSource,
+) -> Result<StatusResponse, RoostyError> {
     let status_ref = roosty_db::StatusReference::Local(status.id);
-    let mut response = status_response_base(state, status, account, viewer, pinned).await?;
+    let mut response = Box::pin(status_response_base(
+        state, status, account, viewer, pinned, card,
+    ))
+    .await?;
     response.quote = status_quote_response(state, status_ref, viewer).await?;
     if let Some(quote) = roosty_db::quote_for_status(&state.db, status_ref).await?
         && !response.content.contains(&quote.quoted_activitypub_id)
@@ -4492,6 +4661,7 @@ async fn status_response_base(
     account: LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
+    card: PreviewCardSource,
 ) -> Result<StatusResponse, RoostyError> {
     let status_path = format!("@{}/{}", account.username, status.id.0);
     let url = public_url(state, &status_path);
@@ -4567,6 +4737,10 @@ async fn status_response_base(
         .iter()
         .map(|media| media_response(state, media))
         .collect();
+    let card = card
+        .load(state, StatusReference::Local(status.id))
+        .await?
+        .map(|card| Box::new(PreviewCardResponse::new(state, *card, None)));
 
     let quotes_count =
         roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Local(status.id))
@@ -4594,6 +4768,7 @@ async fn status_response_base(
         ),
         account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
         media_attachments,
+        card,
         mentions,
         tags,
         emojis: Vec::new(),
@@ -4665,7 +4840,15 @@ async fn status_quote_response(
                     }
                     let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
                     Some(Box::new(
-                        status_response_base(state, status, account, viewer, pinned).await?,
+                        Box::pin(status_response_base(
+                            state,
+                            status,
+                            account,
+                            viewer,
+                            pinned,
+                            PreviewCardSource::Load,
+                        ))
+                        .await?,
                     ))
                 }
             }
@@ -4720,7 +4903,14 @@ async fn status_quote_response(
                 } else {
                     let pinned = roosty_db::is_remote_status_pinned(&state.db, status.id).await?;
                     Some(Box::new(
-                        remote_status_response_base(state, status, viewer, pinned).await?,
+                        Box::pin(remote_status_response_base(
+                            state,
+                            status,
+                            viewer,
+                            pinned,
+                            PreviewCardSource::Load,
+                        ))
+                        .await?,
                     ))
                 }
             }
@@ -6562,6 +6752,50 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given five discoverable authors sharing one article, the scorer exposes its card and status timeline.
+    async fn trending_links_include_history_cards_and_a_link_timeline(context: &mut StatusContext) {
+        let article = "https://news.example/articles/rust#discussion";
+        for index in 0..5 {
+            let token = context
+                .access_token_for(
+                    &format!("link_author_{index}"),
+                    &format!("link-author-{index}@example.com"),
+                )
+                .await;
+            let status = context
+                .create_status(
+                    &token,
+                    &format!("Worth reading {article}"),
+                    Some("public"),
+                    None,
+                )
+                .await;
+            assert_eq!(status["card"]["url"], "https://news.example/articles/rust");
+        }
+
+        while roosty_db::maintain_trends(&context.db)
+            .await
+            .unwrap()
+            .has_more
+        {}
+
+        let links = json_body(context.get("/api/v1/trends/links?limit=10&offset=0").await).await;
+        assert_eq!(links.as_array().unwrap().len(), 1);
+        assert_eq!(links[0]["url"], "https://news.example/articles/rust");
+        assert_eq!(links[0]["type"], "link");
+        assert_eq!(links[0]["history"][0]["accounts"], "5");
+        assert_eq!(links[0]["history"][0]["uses"], "5");
+
+        let timeline = context
+            .get("/api/v1/timelines/link?url=https%3A%2F%2Fnews.example%2Farticles%2Frust&limit=2")
+            .await;
+        assert_eq!(timeline.status(), StatusCode::OK);
+        assert!(timeline.headers().contains_key(header::LINK));
+        assert_eq!(json_body(timeline).await.as_array().unwrap().len(), 2);
     }
 
     #[test_context(StatusContext)]
@@ -10321,6 +10555,7 @@ mod tests {
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
+                preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),

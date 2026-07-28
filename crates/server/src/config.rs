@@ -176,6 +176,8 @@ pub struct Config {
     pub remote_media_max_bytes: u64,
     /// Maximum remote media downloads this worker runs concurrently.
     pub remote_media_fetch_concurrency: usize,
+    /// Maximum preview-card downloads this process runs concurrently.
+    pub preview_card_fetch_concurrency: usize,
     /// Number of durable job loops to run in this process; zero in configuration uses available CPUs.
     pub worker_concurrency: usize,
     /// Shared cadence for eventually consistent trend refreshes.
@@ -226,6 +228,10 @@ impl Config {
                 "ROOSTY_REMOTE_MEDIA_FETCH_CONCURRENCY must be positive".to_owned(),
             ));
         }
+        let preview_card_fetch_concurrency = positive_concurrency(
+            "ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY",
+            parse_env("ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY", "5")?,
+        )?;
         let worker_concurrency = resolve_worker_concurrency(parse_env(
             "ROOSTY_WORKER_CONCURRENCY",
             DEFAULT_WORKER_CONCURRENCY,
@@ -278,6 +284,7 @@ impl Config {
             remote_media_cache_ttl,
             remote_media_max_bytes,
             remote_media_fetch_concurrency,
+            preview_card_fetch_concurrency,
             worker_concurrency,
             trends_refresh_interval,
             scheduled_statuses: ScheduledStatusConfig::from_env()?,
@@ -471,6 +478,16 @@ fn optional_bool_env(name: &str) -> Result<Option<bool>> {
         .transpose()
 }
 
+fn positive_concurrency(name: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        Err(RoostyError::Configuration(format!(
+            "{name} must be positive"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +520,7 @@ mod tests {
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
+            preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
             scheduled_statuses: ScheduledStatusConfig::default(),
@@ -563,6 +581,20 @@ mod tests {
             let error = validate_trends_refresh_interval(duration).unwrap_err();
             assert!(error.to_string().contains("ROOSTY_TRENDS_REFRESH_INTERVAL"));
         }
+    }
+
+    #[test]
+    fn preview_fetch_concurrency_rejects_zero() {
+        assert_eq!(
+            positive_concurrency("ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY", 5).unwrap(),
+            5
+        );
+        assert!(
+            positive_concurrency("ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY", 0)
+                .unwrap_err()
+                .to_string()
+                .contains("ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY")
+        );
     }
 
     #[test]

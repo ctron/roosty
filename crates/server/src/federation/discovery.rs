@@ -778,7 +778,7 @@ fn activitypub_actor_href(webfinger: WebFingerResponse) -> Option<String> {
     })
 }
 
-fn is_unsafe_address(address: IpAddr) -> bool {
+pub(crate) fn is_unsafe_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             address.is_private()

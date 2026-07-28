@@ -7546,6 +7546,7 @@ mod tests {
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
+            preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
             scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
@@ -7698,11 +7699,25 @@ mod tests {
     }
 
     async fn deliver_test_job(state: &AppState, kind: roosty_db::JobKind) {
-        let job =
-            roosty_db::claim_due_job(&state.db, "federation-test", time::Duration::minutes(1))
-                .await
-                .unwrap()
-                .unwrap();
+        let job = loop {
+            let claimed =
+                roosty_db::claim_due_job(&state.db, "federation-test", time::Duration::minutes(1))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if matches!(
+                claimed.kind,
+                roosty_db::JobKind::PreviewCardFetch | roosty_db::JobKind::PreviewCardBackfill
+            ) {
+                assert!(
+                    roosty_db::mark_job_completed(&state.db, &claimed)
+                        .await
+                        .unwrap()
+                );
+                continue;
+            }
+            break claimed;
+        };
         assert_eq!(job.kind, kind);
         match kind {
             roosty_db::JobKind::FederationFollowResponse => {
@@ -7777,7 +7792,9 @@ mod tests {
             | roosty_db::JobKind::NotificationRequestMerge
             | roosty_db::JobKind::NotificationRequestCleanup
             | roosty_db::JobKind::ScheduledStatusPublish
-            | roosty_db::JobKind::TrendMaintenance => {}
+            | roosty_db::JobKind::TrendMaintenance
+            | roosty_db::JobKind::PreviewCardFetch
+            | roosty_db::JobKind::PreviewCardBackfill => {}
         }
         assert!(
             roosty_db::mark_job_completed(&state.db, &job)

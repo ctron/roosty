@@ -27,6 +27,8 @@ pub struct AppState {
     pub streaming_events: StreamingEvents,
     /// Per-process permit pool held for each upgraded streaming socket.
     pub streaming_connections: Arc<Semaphore>,
+    /// Per-process bound on concurrent outbound preview-card requests.
+    pub preview_card_fetches: Arc<Semaphore>,
     /// Web Push API, credential protection, and delivery service.
     pub push: crate::push::PushService,
     /// Asset and hydration settings for the first-party web UI.
@@ -42,12 +44,14 @@ impl AppState {
             config.streaming.event_retention,
         );
         let streaming_connections = Arc::new(Semaphore::new(config.streaming.max_connections));
+        let preview_card_fetches = Arc::new(Semaphore::new(config.preview_card_fetch_concurrency));
         let push = crate::push::PushService::new(&config, db.clone());
         Self {
             config: Arc::new(config),
             db,
             streaming_events,
             streaming_connections,
+            preview_card_fetches,
             push,
             leptos_options: leptos::config::LeptosOptions::builder()
                 .output_name("roosty-web")

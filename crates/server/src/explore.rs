@@ -8,6 +8,7 @@ use axum::{
     routing::get,
 };
 use roosty_core::RoostyError;
+use roosty_db::{LocalTagHistory, PreviewCard};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -15,6 +16,7 @@ use tracing::warn;
 use crate::{
     auth::OptionalAuthenticatedAccount,
     http::AppState,
+    media::media_url,
     statuses::{TagResponse, trending_status_models},
 };
 
@@ -63,7 +65,10 @@ async fn trending_statuses(
     }
 }
 
-async fn trending_links(query: Result<Query<TrendParams>, QueryRejection>) -> Response {
+async fn trending_links(
+    State(state): State<AppState>,
+    query: Result<Query<TrendParams>, QueryRejection>,
+) -> Response {
     let Query(params) = match query {
         Ok(params) => params,
         Err(_) => return bad_request(),
@@ -72,10 +77,110 @@ async fn trending_links(query: Result<Query<TrendParams>, QueryRejection>) -> Re
         .limit
         .unwrap_or(DEFAULT_TAG_LIMIT)
         .clamp(1, MAX_TAG_LIMIT);
-    if i64::try_from(params.offset.unwrap_or_default()).is_err() {
+    let offset = params.offset.unwrap_or_default();
+    if i64::try_from(offset).is_err() {
         return bad_request();
     }
-    Json(Vec::<Value>::with_capacity(limit as usize)).into_response()
+    match roosty_db::trending_links(&state.db, limit, offset).await {
+        Ok(links) => Json(
+            links
+                .into_iter()
+                .map(|link| PreviewCardResponse::new(&state, link.card, Some(link.history)))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+/// Mastodon preview-card projection, with optional trend history.
+#[derive(Clone, Serialize)]
+pub(crate) struct PreviewCardResponse {
+    url: String,
+    title: String,
+    description: String,
+    #[serde(rename = "type")]
+    card_type: &'static str,
+    authors: Vec<PreviewCardAuthorResponse>,
+    author_name: String,
+    author_url: String,
+    provider_name: String,
+    provider_url: String,
+    html: &'static str,
+    width: u32,
+    height: u32,
+    image: Option<String>,
+    embed_url: &'static str,
+    blurhash: Option<String>,
+    missing_attribution: Option<bool>,
+    published_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<Vec<HistoryResponse>>,
+}
+
+#[derive(Clone, Serialize)]
+struct PreviewCardAuthorResponse {
+    name: String,
+    url: String,
+    account: Option<Value>,
+}
+
+#[derive(Clone, Serialize)]
+struct HistoryResponse {
+    day: String,
+    uses: String,
+    accounts: String,
+}
+
+impl PreviewCardResponse {
+    pub(crate) fn new(
+        state: &AppState,
+        card: PreviewCard,
+        history: Option<Vec<LocalTagHistory>>,
+    ) -> Self {
+        let authors = (!card.author_name.is_empty())
+            .then(|| PreviewCardAuthorResponse {
+                name: card.author_name.clone(),
+                url: card.author_url.clone(),
+                account: None,
+            })
+            .into_iter()
+            .collect();
+        Self {
+            url: card.url,
+            title: card.title,
+            description: card.description,
+            card_type: "link",
+            authors,
+            author_name: card.author_name,
+            author_url: card.author_url,
+            provider_name: card.provider_name,
+            provider_url: card.provider_url,
+            html: "",
+            width: card.image_width,
+            height: card.image_height,
+            image: card
+                .image_file_path
+                .as_deref()
+                .map(|path| media_url(state, path)),
+            embed_url: "",
+            blurhash: card.blurhash,
+            missing_attribution: None,
+            published_at: card
+                .published_at
+                .map(|value| value.unix_timestamp().to_string()),
+            history: history.map(|history| {
+                history
+                    .into_iter()
+                    .map(|bucket| HistoryResponse {
+                        day: bucket.day.to_string(),
+                        uses: bucket.uses.to_string(),
+                        accounts: bucket.accounts.to_string(),
+                    })
+                    .collect()
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

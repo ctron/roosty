@@ -5,6 +5,8 @@ use std::{net::SocketAddr, time::Duration};
 use axum::Router;
 use clap::{Parser, Subcommand};
 use roosty_core::{AccountId, Result, RoostyError};
+#[cfg(test)]
+use roosty_db::NotificationPolicyUpdate;
 use roosty_migration::Migrator;
 use sea_orm_migration::MigratorTrait;
 use tokio::{sync::watch, task::JoinSet};
@@ -27,6 +29,7 @@ mod markers;
 mod media;
 mod notifications;
 mod password;
+mod preview_cards;
 mod push;
 mod search;
 mod statuses;
@@ -260,6 +263,7 @@ async fn serve(
     }
     reconcile_domain_suspensions(&db, &config).await?;
     roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
+    roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
 
     let state = AppState::new(config.clone(), db.clone());
     let mut leptos_options = leptos::config::get_configuration(None)
@@ -319,6 +323,7 @@ async fn worker() -> Result<()> {
     let db = roosty_db::connect(&config.database_url).await?;
     reconcile_domain_suspensions(&db, &config).await?;
     roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
+    roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
     let result = worker_pool(db, config, shutdown_rx).await;
@@ -586,6 +591,30 @@ async fn worker_iteration(
                 .await
                 .map(|_| ())
             } else {
+                let expired_before =
+                    time::OffsetDateTime::now_utc() - config.remote_media_cache_ttl;
+                for path in roosty_db::prune_preview_cards(db, expired_before).await? {
+                    media::remove_preview_card_image(&state, &path).await;
+                }
+                Ok(())
+            }
+        }
+        roosty_db::JobKind::PreviewCardFetch => {
+            preview_cards::fetch_preview_card(&state, job.payload.clone(), job.attempts).await
+        }
+        roosty_db::JobKind::PreviewCardBackfill => {
+            let outcome = roosty_db::backfill_preview_cards(db).await?;
+            if outcome.has_more {
+                roosty_db::enqueue_job(
+                    db,
+                    roosty_db::JobKind::PreviewCardBackfill,
+                    serde_json::json!({}),
+                    Some(&format!("preview-card-backfill:{}", job.id.0)),
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await
+                .map(|_| ())
+            } else {
                 Ok(())
             }
         }
@@ -759,6 +788,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let policy = roosty_db::update_notification_policy(
+            &db,
+            AccountId(user_id),
+            NotificationPolicyUpdate {
+                for_not_following: None,
+                for_not_followers: None,
+                for_new_accounts: None,
+                for_private_mentions: None,
+                for_limited_accounts: None,
+            },
+        )
+        .await;
         let duplicate_username =
             roosty_db::create_local_account(&db, "alice", "alice2@example.com", &password_hash)
                 .await;
@@ -768,6 +809,7 @@ mod tests {
 
         assert!(!user.is_admin);
         assert!(admin.is_admin);
+        assert!(policy.is_ok());
         assert!(matches!(
             duplicate_username,
             Err(RoostyError::InvalidInput(message)) if message == "username is already in use"
@@ -1217,6 +1259,7 @@ mod tests {
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
+            preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
             scheduled_statuses: crate::config::ScheduledStatusConfig::default(),

@@ -75,9 +75,11 @@ pub(crate) async fn create_local_account(
     let password_hash = password::hash_password(&temporary_password)?;
     let txn = db.begin().await?;
     let id = if is_admin {
-        roosty_db::create_admin_account(&txn, username, email, &password_hash).await?
+        roosty_db::create_admin_account_in_transaction(&txn, username, email, &password_hash)
+            .await?
     } else {
-        roosty_db::create_local_account(&txn, username, email, &password_hash).await?
+        roosty_db::create_local_account_in_transaction(&txn, username, email, &password_hash)
+            .await?
     };
     roosty_db::insert_admin_audit_entry(
         &txn,

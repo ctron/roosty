@@ -30,6 +30,7 @@ linkify = { workspace = true }
 percent-encoding = { workspace = true }
 rand_core = { workspace = true }
 reqwest = { workspace = true }
+scraper = { workspace = true }
 ring = { workspace = true }
 rsa = { workspace = true }
 sea-orm-migration = { workspace = true }
