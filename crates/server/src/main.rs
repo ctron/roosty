@@ -259,12 +259,7 @@ async fn serve(
         run_migrations(&db).await?;
     }
     reconcile_domain_suspensions(&db, &config).await?;
-    schedule_trend_maintenance(
-        &db,
-        time::OffsetDateTime::now_utc(),
-        config.trends_refresh_interval,
-    )
-    .await?;
+    roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
 
     let state = AppState::new(config.clone(), db.clone());
     let mut leptos_options = leptos::config::get_configuration(None)
@@ -323,12 +318,7 @@ async fn worker() -> Result<()> {
     let config = Config::from_env(None)?;
     let db = roosty_db::connect(&config.database_url).await?;
     reconcile_domain_suspensions(&db, &config).await?;
-    schedule_trend_maintenance(
-        &db,
-        time::OffsetDateTime::now_utc(),
-        config.trends_refresh_interval,
-    )
-    .await?;
+    roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
     let result = worker_pool(db, config, shutdown_rx).await;
@@ -398,6 +388,7 @@ async fn worker_pool(
         "starting durable worker pool"
     );
 
+    workers.spawn(trend_scheduler_loop(db.clone(), shutdown_rx.clone()));
     for slot in 0..config.worker_concurrency {
         let worker_id = format!("{process_identity}:{slot}");
         workers.spawn(worker_loop(
@@ -413,6 +404,30 @@ async fn worker_pool(
     }
 
     Ok(())
+}
+
+/// Poll and claim the shared trend schedule without electing a process leader.
+async fn trend_scheduler_loop(
+    db: roosty_db::DbConnection,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return Ok(());
+        }
+        if let Some(job_id) = roosty_db::enqueue_due_trend_refresh(&db).await? {
+            info!(job_id = %job_id.0, "enqueued scheduled trend refresh");
+        }
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+            }
+        }
+    }
 }
 
 /// Repeatedly claim and execute one durable job for a single worker identity.
@@ -571,13 +586,7 @@ async fn worker_iteration(
                 .await
                 .map(|_| ())
             } else {
-                schedule_trend_maintenance(
-                    db,
-                    time::OffsetDateTime::now_utc() + config.trends_refresh_interval,
-                    config.trends_refresh_interval,
-                )
-                .await
-                .map(|_| ())
+                Ok(())
             }
         }
     };
@@ -617,24 +626,6 @@ async fn worker_iteration(
     Ok(true)
 }
 
-async fn schedule_trend_maintenance(
-    db: &roosty_db::DbConnection,
-    run_after: time::OffsetDateTime,
-    interval: time::Duration,
-) -> Result<roosty_core::JobId> {
-    let slot = run_after
-        .unix_timestamp()
-        .div_euclid(interval.whole_seconds());
-    roosty_db::enqueue_job(
-        db,
-        roosty_db::JobKind::TrendMaintenance,
-        serde_json::json!({}),
-        Some(&format!("trend-refresh:{slot}")),
-        run_after,
-    )
-    .await
-}
-
 fn validate_username(username: &str) -> Result<()> {
     if username.len() < 2
         || username.len() > 30
@@ -671,7 +662,7 @@ mod tests {
 
     use postgresql_embedded::PostgreSQL;
     use roosty_migration::Migrator;
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
 
@@ -998,6 +989,136 @@ mod tests {
 
         assert_eq!(ids.len(), 3);
         assert_eq!(claims.len(), 3);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given several scheduler loops, only one claims and advances the shared due row.
+    #[tokio::test]
+    async fn concurrent_trend_schedulers_enqueue_one_job() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        roosty_db::configure_trend_refresh_schedule(&db, time::Duration::minutes(5))
+            .await
+            .unwrap();
+
+        let (first, second, third) = tokio::join!(
+            roosty_db::enqueue_due_trend_refresh(&db),
+            roosty_db::enqueue_due_trend_refresh(&db),
+            roosty_db::enqueue_due_trend_refresh(&db),
+        );
+        let claims = [first.unwrap(), second.unwrap(), third.unwrap()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(claims.len(), 1);
+
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                r#"SELECT
+                     (SELECT count(*) FROM job
+                      WHERE kind = 'trend_maintenance' AND completed_at IS NULL)
+                       AS active_jobs,
+                     interval_milliseconds, next_run_at
+                   FROM trend_refresh_schedule WHERE id = 1"#
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let active_jobs: i64 = row.try_get("", "active_jobs").unwrap();
+        let interval_milliseconds: i64 = row.try_get("", "interval_milliseconds").unwrap();
+        let next_run_at: time::OffsetDateTime = row.try_get("", "next_run_at").unwrap();
+        assert_eq!(active_jobs, 1);
+        assert_eq!(interval_milliseconds, 300_000);
+        assert_eq!(
+            next_run_at
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000)
+                .rem_euclid(i128::from(interval_milliseconds)),
+            0
+        );
+        assert!(next_run_at > time::OffsetDateTime::now_utc());
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// A scheduler skips a locked due row instead of waiting for another instance.
+    #[tokio::test]
+    async fn trend_scheduler_skips_a_concurrently_locked_schedule() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        roosty_db::configure_trend_refresh_schedule(&db, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        let txn = db.begin().await.unwrap();
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "UPDATE trend_refresh_schedule SET updated_at = now() WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        let claim = tokio::time::timeout(
+            Duration::from_secs(1),
+            roosty_db::enqueue_due_trend_refresh(&db),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(claim.is_none());
+        txn.rollback().await.unwrap();
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// The database cadence is shared configuration, while active work suppresses overlap.
+    #[tokio::test]
+    async fn trend_schedule_rejects_mismatches_and_active_overlap() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        roosty_db::configure_trend_refresh_schedule(&db, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        roosty_db::configure_trend_refresh_schedule(&db, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        let mismatch = roosty_db::configure_trend_refresh_schedule(&db, time::Duration::minutes(6))
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatch, RoostyError::Configuration(_)));
+
+        let job_id = roosty_db::enqueue_due_trend_refresh(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "UPDATE trend_refresh_schedule SET next_run_at = now() - interval '1 minute' WHERE id = 1"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            roosty_db::enqueue_due_trend_refresh(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE job SET completed_at = now() WHERE id = $1",
+            vec![job_id.0.into()],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            roosty_db::enqueue_due_trend_refresh(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         db.close().await.unwrap();
         postgresql.stop().await.unwrap();

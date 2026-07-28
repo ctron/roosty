@@ -362,7 +362,8 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 
 |`ROOSTY_TRENDS_REFRESH_INTERVAL`
 |`5m`
-|Trend scoring cadence. Must be at least `1m` and identical on every process sharing the database.
+|Trend scoring cadence. Must be at least `1m`. The database rejects a process whose value differs
+from the shared schedule initialized by another process.
 |===
 
 === Scheduled statuses and streaming

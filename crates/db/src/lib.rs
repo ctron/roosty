@@ -8862,6 +8862,119 @@ struct DirtyTrendRow {
     target_id: Uuid,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct TrendRefreshScheduleRow {
+    interval_milliseconds: i64,
+    next_run_at: OffsetDateTime,
+}
+
+/// Initialize the shared trend schedule or verify this instance uses its cadence.
+pub async fn configure_trend_refresh_schedule(db: &DbConnection, interval: Duration) -> Result<()> {
+    let interval_milliseconds = trend_interval_milliseconds(interval)?;
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO trend_refresh_schedule(
+               id, interval_milliseconds, next_run_at, updated_at)
+           VALUES (1, $1, now(), now())
+           ON CONFLICT (id) DO NOTHING"#,
+        vec![interval_milliseconds.into()],
+    ))
+    .await?;
+    let schedule = TrendRefreshScheduleRow::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        r#"SELECT interval_milliseconds, next_run_at
+           FROM trend_refresh_schedule WHERE id = 1"#
+            .to_owned(),
+    ))
+    .one(&txn)
+    .await?
+    .ok_or_else(|| {
+        RoostyError::Configuration("trend refresh schedule could not be initialized".to_owned())
+    })?;
+    if schedule.interval_milliseconds != interval_milliseconds {
+        return Err(RoostyError::Configuration(format!(
+            "ROOSTY_TRENDS_REFRESH_INTERVAL conflicts with the shared database schedule: \
+             configured {interval_milliseconds}ms, stored {}ms",
+            schedule.interval_milliseconds
+        )));
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Claim one due schedule without waiting, advance it, and enqueue its durable job atomically.
+pub async fn enqueue_due_trend_refresh(db: &DbConnection) -> Result<Option<JobId>> {
+    let txn = db.begin().await?;
+    let schedule = TrendRefreshScheduleRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT interval_milliseconds, next_run_at
+           FROM trend_refresh_schedule
+           WHERE id = 1
+             AND next_run_at <= now()
+             AND NOT EXISTS (
+               SELECT 1 FROM job
+               WHERE kind = $1 AND completed_at IS NULL
+             )
+           FOR UPDATE SKIP LOCKED"#,
+        vec![JobKind::TrendMaintenance.as_str().to_owned().into()],
+    ))
+    .one(&txn)
+    .await?;
+    let Some(schedule) = schedule else {
+        txn.commit().await?;
+        return Ok(None);
+    };
+    let now = OffsetDateTime::now_utc();
+    let next_run_at =
+        next_trend_refresh_at(now, schedule.interval_milliseconds).ok_or_else(|| {
+            RoostyError::Configuration("trend refresh schedule timestamp overflowed".to_owned())
+        })?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE trend_refresh_schedule
+           SET next_run_at = $1, updated_at = $2
+           WHERE id = 1"#,
+        vec![next_run_at.into(), now.into()],
+    ))
+    .await?;
+    let scheduled_milliseconds = schedule
+        .next_run_at
+        .unix_timestamp_nanos()
+        .div_euclid(1_000_000);
+    let job_id = enqueue_job_in_transaction(
+        &txn,
+        NewJob {
+            kind: JobKind::TrendMaintenance,
+            payload: serde_json::json!({}),
+            deduplication_key: Some(format!("trend-refresh:{scheduled_milliseconds}")),
+            run_after: now,
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(Some(job_id))
+}
+
+fn trend_interval_milliseconds(interval: Duration) -> Result<i64> {
+    i64::try_from(interval.whole_milliseconds()).map_err(|_| {
+        RoostyError::Configuration("ROOSTY_TRENDS_REFRESH_INTERVAL is too large".to_owned())
+    })
+}
+
+fn next_trend_refresh_at(
+    now: OffsetDateTime,
+    interval_milliseconds: i64,
+) -> Option<OffsetDateTime> {
+    let now_milliseconds = now.unix_timestamp_nanos().div_euclid(1_000_000);
+    let interval_milliseconds = i128::from(interval_milliseconds);
+    let next_milliseconds = now_milliseconds
+        .div_euclid(interval_milliseconds)
+        .checked_add(1)?
+        .checked_mul(interval_milliseconds)?;
+    OffsetDateTime::from_unix_timestamp_nanos(next_milliseconds.checked_mul(1_000_000)?).ok()
+}
+
 /// Refresh at most 100 trend targets, returning whether a continuation is needed.
 pub async fn maintain_trends(db: &DbConnection) -> Result<TrendRefreshOutcome> {
     const BATCH_SIZE: usize = 100;
@@ -16973,6 +17086,25 @@ mod tests {
         assert_eq!(
             choose_tag_peak(4.0, Some(16.0), Some(now - Duration::days(3)), now),
             (4.0, now)
+        );
+    }
+
+    /// Scheduled trend cycles align to exact UTC cadence boundaries without drift.
+    #[test]
+    fn trend_refresh_boundaries_are_strictly_future_and_aligned() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_123).unwrap();
+        let interval_milliseconds = 300_000;
+        let next = next_trend_refresh_at(now, interval_milliseconds).unwrap();
+        assert!(next > now);
+        assert_eq!(
+            next.unix_timestamp_nanos()
+                .div_euclid(1_000_000)
+                .rem_euclid(i128::from(interval_milliseconds)),
+            0
+        );
+        assert_eq!(
+            next_trend_refresh_at(next, interval_milliseconds).unwrap() - next,
+            Duration::minutes(5)
         );
     }
 

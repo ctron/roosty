@@ -53,6 +53,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_remote_account_mute").await);
     assert!(table_exists(database.connection(), "streaming_event").await);
     assert!(table_exists(database.connection(), "push_subscription").await);
+    assert!(table_exists(database.connection(), "trend_refresh_schedule").await);
     assert!(table_exists(database.connection(), "status_quote").await);
     assert!(table_exists(database.connection(), "local_status_pin").await);
     assert!(table_exists(database.connection(), "remote_status_pin").await);
@@ -77,6 +78,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "tag_daily_usage").await);
     assert!(table_exists(database.connection(), "tag_trend").await);
     assert!(table_exists(database.connection(), "trend_dirty").await);
+    assert!(table_exists(database.connection(), "trend_refresh_schedule").await);
     assert!(!roosty_trend_routines_exist(database.connection()).await);
     assert!(column_exists(database.connection(), "job", "permanently_failed_at").await);
     assert!(column_exists(database.connection(), "local_notification", "filtered").await);
@@ -446,6 +448,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "status_quote").await);
     assert!(!table_exists(database.connection(), "streaming_event").await);
     assert!(!table_exists(database.connection(), "push_subscription").await);
+    assert!(!table_exists(database.connection(), "trend_refresh_schedule").await);
 }
 
 /// A legacy ID-only replay marker survives the payload-aware ledger upgrade.

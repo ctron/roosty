@@ -278,7 +278,9 @@ Roosty runs four durable worker loops by default for both `roosty worker` and
 count; set it to `0` to use the logical CPU count available to the process.
 Trend scores refresh every five minutes by default. Set
 `ROOSTY_TRENDS_REFRESH_INTERVAL` to a humantime duration of at least one minute,
-using the same value for every process connected to the database.
+using the same value for every process connected to the database. Worker processes
+claim the shared schedule through PostgreSQL without electing a leader; a process
+with a conflicting interval is rejected during startup.
 
 This surface provides WebFinger, local actor documents, public Notes, outboxes,
 follower/following collections, policy-controlled remote `resolve=true` lookup,
