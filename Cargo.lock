@@ -4483,6 +4483,7 @@ dependencies = [
  "leptos_meta",
  "leptos_router",
  "serde",
+ "serde_json",
  "strum 0.27.2",
  "uuid",
  "wasm-bindgen",

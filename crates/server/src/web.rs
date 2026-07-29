@@ -2121,6 +2121,19 @@ mod tests {
             assert!(html.contains("fediverse:creator"));
             assert!(html.contains("h-card"));
             assert!(html.contains("h-entry"));
+            if path == "/@alice" {
+                let script_type = "type=\"application/ld+json\"";
+                let type_position = html.find(script_type).expect("profile JSON-LD script type");
+                let script_content = html[type_position..]
+                    .split_once('>')
+                    .and_then(|(_, rest)| rest.split_once("</script>"))
+                    .map(|(script, _)| script)
+                    .expect("profile JSON-LD script content");
+                let structured_data: serde_json::Value =
+                    serde_json::from_str(script_content).expect("valid profile JSON-LD");
+                assert_eq!(structured_data["@type"], "ProfilePage");
+                assert_eq!(structured_data["mainEntity"]["@type"], "Person");
+            }
         }
     }
 

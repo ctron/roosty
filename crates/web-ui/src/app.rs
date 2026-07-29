@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, Title, provide_meta_context};
+use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, Script, Title, provide_meta_context};
 use leptos_router::{
     ParamSegment, StaticSegment,
     components::{A, Route, Router, Routes},
@@ -337,9 +337,9 @@ fn public_profile_content(page: UiProfilePage) -> AnyView {
             </section>
 
             <nav class="tabs tabs-box" aria-label="Profile timelines">
-                <a class=posts_class href=profile_path.clone()>"Posts"</a>
-                <a class=replies_class href=format!("{profile_path}/with_replies")>"Posts and replies"</a>
-                <a class=media_class href=format!("{profile_path}/media")>"Media"</a>
+                <A attr:class=posts_class href=profile_path.clone()>"Posts"</A>
+                <A attr:class=replies_class href=format!("{profile_path}/with_replies")>"Posts and replies"</A>
+                <A attr:class=media_class href=format!("{profile_path}/media")>"Media"</A>
             </nav>
 
             {(!page.pinned_statuses.is_empty() && matches!(page.tab, UiProfileTab::Posts)).then(|| view! {
@@ -557,6 +557,7 @@ fn PublicProfileMetadata(page: UiProfilePage) -> impl IntoView {
         page.account.bio.clone()
     };
     let image = page.account.avatar_url.clone();
+    let structured_data = profile_structured_data(&page);
     view! {
         <Title text=title.clone()/>
         <Meta name="description" content=description.clone()/>
@@ -569,7 +570,84 @@ fn PublicProfileMetadata(page: UiProfilePage) -> impl IntoView {
         <Meta name="fediverse:creator" content=format!("@{}", page.account.username)/>
         <Link rel="canonical" href=page.canonical_url/>
         <Link rel="alternate" type_="application/activity+json" href=page.activitypub_url/>
+        <Script type_="application/ld+json">{structured_data}</Script>
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfilePageStructuredData<'a> {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    #[serde(rename = "@type")]
+    schema_type: &'static str,
+    date_created: &'a str,
+    main_entity: ProfilePersonStructuredData<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfilePersonStructuredData<'a> {
+    #[serde(rename = "@type")]
+    schema_type: &'static str,
+    name: &'a str,
+    alternate_name: String,
+    identifier: String,
+    interaction_statistic: InteractionCounter,
+    agent_interaction_statistic: InteractionCounter,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractionCounter {
+    #[serde(rename = "@type")]
+    schema_type: &'static str,
+    interaction_type: &'static str,
+    user_interaction_count: u64,
+}
+
+fn profile_structured_data(page: &UiProfilePage) -> String {
+    let account = &page.account;
+    let name = if account.display_name.trim().is_empty() {
+        account.username.as_str()
+    } else {
+        account.display_name.as_str()
+    };
+    let data = ProfilePageStructuredData {
+        context: "https://schema.org",
+        schema_type: "ProfilePage",
+        date_created: &account.created_at,
+        main_entity: ProfilePersonStructuredData {
+            schema_type: "Person",
+            name,
+            alternate_name: format!("@{}", account.username),
+            identifier: account.id.to_string(),
+            interaction_statistic: InteractionCounter {
+                schema_type: "InteractionCounter",
+                interaction_type: "https://schema.org/FollowAction",
+                user_interaction_count: account.followers_count,
+            },
+            agent_interaction_statistic: InteractionCounter {
+                schema_type: "InteractionCounter",
+                interaction_type: "https://schema.org/WriteAction",
+                user_interaction_count: account.statuses_count,
+            },
+            description: (!account.bio.trim().is_empty()).then_some(account.bio.as_str()),
+            image: account.avatar_url.as_deref(),
+        },
+    };
+
+    // JSON-LD is embedded in a raw-text script element, so neutralize HTML delimiters even
+    // though serde_json has already escaped the JSON string contents.
+    serde_json::to_string(&data)
+        .expect("serializing profile structured data cannot fail")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
 }
 
 #[component]
@@ -626,8 +704,11 @@ fn strip_html(html: &str) -> String {
 mod public_page_tests {
     use uuid::Uuid;
 
-    use super::{append_unique_statuses, strip_html};
-    use crate::public_pages::{UiStatus, UiStatusAuthor, UiStatusVisibility};
+    use super::{append_unique_statuses, profile_structured_data, strip_html};
+    use crate::public_pages::{
+        UiProfilePage, UiProfileTab, UiPublicAccount, UiStatus, UiStatusAuthor, UiStatusPage,
+        UiStatusVisibility,
+    };
 
     fn status(id: Uuid) -> UiStatus {
         UiStatus {
@@ -676,6 +757,47 @@ mod public_page_tests {
             strip_html("<p>Hello <strong>world</strong></p>"),
             "Hello world"
         );
+    }
+
+    #[test]
+    fn profile_structured_data_is_google_compatible_and_script_safe() {
+        let page = UiProfilePage {
+            account: UiPublicAccount {
+                id: Uuid::nil(),
+                username: "alice".to_owned(),
+                display_name: "Alice </script><script>alert(1)</script>".to_owned(),
+                bio: "A profile & biography".to_owned(),
+                avatar_url: Some("https://roosty.test/alice.png".to_owned()),
+                header_url: None,
+                fields: Vec::new(),
+                created_at: "2026-07-29T00:00:00Z".to_owned(),
+                followers_count: 4,
+                following_count: 2,
+                statuses_count: 8,
+                limited: false,
+                discoverable: true,
+            },
+            tab: UiProfileTab::Posts,
+            hashtag: None,
+            featured_tags: Vec::new(),
+            pinned_statuses: Vec::new(),
+            timeline: UiStatusPage {
+                statuses: Vec::new(),
+                next_cursor: None,
+            },
+            canonical_url: "https://roosty.test/@alice".to_owned(),
+            activitypub_url: "https://roosty.test/users/alice".to_owned(),
+            noindex: false,
+        };
+
+        let structured_data = profile_structured_data(&page);
+
+        assert!(structured_data.contains("\"@type\":\"ProfilePage\""));
+        assert!(structured_data.contains("\"@type\":\"Person\""));
+        assert!(structured_data.contains("\"userInteractionCount\":4"));
+        assert!(structured_data.contains("\"userInteractionCount\":8"));
+        assert!(!structured_data.contains("</script>"));
+        assert!(structured_data.contains("\\u003c/script\\u003e"));
     }
 }
 
