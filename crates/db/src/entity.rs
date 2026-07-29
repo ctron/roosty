@@ -2,6 +2,7 @@
 
 pub mod admin_audit_log;
 pub mod federation_domain_block;
+pub mod instance_rule;
 pub mod job;
 pub mod local_account;
 pub mod local_account_block;
@@ -38,6 +39,9 @@ pub mod local_status_tag;
 pub mod local_tag;
 pub mod local_tag_follow;
 pub mod local_timeline_marker;
+pub mod moderation_report;
+pub mod moderation_report_rule;
+pub mod moderation_report_status;
 pub mod oauth_access_token;
 pub mod oauth_application;
 pub mod oauth_authorization_code;

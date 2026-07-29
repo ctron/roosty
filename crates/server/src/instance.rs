@@ -1,4 +1,10 @@
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -19,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/nodeinfo/2.1", get(nodeinfo))
         .route("/api/v2/instance", get(instance_v2))
         .route("/api/v1/instance", get(instance_v1))
+        .route("/api/v1/instance/rules", get(instance_rules))
 }
 
 async fn nodeinfo_discovery(State(state): State<AppState>) -> Json<NodeInfoDiscovery> {
@@ -29,12 +36,25 @@ async fn nodeinfo(State(state): State<AppState>) -> Json<Value> {
     Json(nodeinfo_response(&state.config))
 }
 
-async fn instance_v2(State(state): State<AppState>) -> Json<Value> {
-    Json(instance_v2_response(&state.config))
+async fn instance_v2(State(state): State<AppState>) -> Response {
+    match roosty_db::list_instance_rules(&state.db).await {
+        Ok(rules) => Json(instance_v2_response(&state.config, &rules)).into_response(),
+        Err(error) => instance_error(error),
+    }
 }
 
-async fn instance_v1(State(state): State<AppState>) -> Json<Value> {
-    Json(instance_v1_response(&state.config))
+async fn instance_v1(State(state): State<AppState>) -> Response {
+    match roosty_db::list_instance_rules(&state.db).await {
+        Ok(rules) => Json(instance_v1_response(&state.config, &rules)).into_response(),
+        Err(error) => instance_error(error),
+    }
+}
+
+async fn instance_rules(State(state): State<AppState>) -> Response {
+    match roosty_db::list_instance_rules(&state.db).await {
+        Ok(rules) => Json(rule_values(&rules)).into_response(),
+        Err(error) => instance_error(error),
+    }
 }
 
 #[derive(Serialize)]
@@ -91,7 +111,7 @@ fn nodeinfo_response(config: &Config) -> Value {
 }
 
 /// Build the Mastodon v2 instance response from static configuration.
-fn instance_v2_response(config: &Config) -> Value {
+fn instance_v2_response(config: &Config, rules: &[roosty_db::InstanceRule]) -> Value {
     json!({
         "domain": domain(config),
         "title": config.instance_name,
@@ -127,12 +147,12 @@ fn instance_v2_response(config: &Config) -> Value {
             "email": "",
             "account": null,
         },
-        "rules": [],
+        "rules": rule_values(rules),
     })
 }
 
 /// Build the legacy Mastodon v1 instance response from static configuration.
-fn instance_v1_response(config: &Config) -> Value {
+fn instance_v1_response(config: &Config, rules: &[roosty_db::InstanceRule]) -> Value {
     json!({
         "uri": domain(config),
         "title": config.instance_name,
@@ -155,8 +175,24 @@ fn instance_v1_response(config: &Config) -> Value {
         "invites_enabled": false,
         "configuration": configuration(config),
         "contact_account": null,
-        "rules": [],
+        "rules": rule_values(rules),
     })
+}
+
+fn rule_values(rules: &[roosty_db::InstanceRule]) -> Vec<Value> {
+    rules
+        .iter()
+        .map(|rule| json!({"id": rule.id.to_string(), "text": rule.text}))
+        .collect()
+}
+
+fn instance_error(error: roosty_core::RoostyError) -> Response {
+    tracing::error!(%error, "instance metadata database operation failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "Internal server error"})),
+    )
+        .into_response()
 }
 
 /// Build shared Mastodon instance capability and limit metadata.
@@ -289,7 +325,7 @@ mod tests {
     fn instance_v2_uses_configured_instance_metadata() {
         let config = test_config(RegistrationMode::Closed);
 
-        let body = instance_v2_response(&config);
+        let body = instance_v2_response(&config, &[]);
 
         assert_eq!(body["domain"], "roosty.localhost");
         assert_eq!(body["title"], "Roosty Test");
@@ -312,7 +348,7 @@ mod tests {
     fn instance_v1_maps_legacy_field_names() {
         let config = test_config(RegistrationMode::Approval);
 
-        let body = instance_v1_response(&config);
+        let body = instance_v1_response(&config, &[]);
 
         assert_eq!(body["uri"], "roosty.localhost");
         assert_eq!(body["short_description"], "Endpoint test instance");

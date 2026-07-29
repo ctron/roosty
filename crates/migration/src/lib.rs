@@ -77,6 +77,7 @@ mod m20260701_000072_create_preview_cards;
 mod m20260701_000073_remove_notification_policy_trigger;
 mod m20260701_000074_create_status_search;
 mod m20260701_000075_add_account_suspension_and_domain_blocks;
+mod m20260701_000076_create_reports_and_instance_rules;
 
 pub struct Migrator;
 
@@ -159,6 +160,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000073_remove_notification_policy_trigger::Migration),
             Box::new(m20260701_000074_create_status_search::Migration),
             Box::new(m20260701_000075_add_account_suspension_and_domain_blocks::Migration),
+            Box::new(m20260701_000076_create_reports_and_instance_rules::Migration),
         ]
     }
 }

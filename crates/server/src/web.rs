@@ -17,12 +17,17 @@ use axum::{
 };
 use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
+use roosty_db::{
+    AdminAuditAction, AdminAuditEntry, AdminAuditSource, AdminAuditTargetKind, JobKind,
+    ReportAccount, ReportListOptions, ReportStatus,
+};
 use roosty_web_ui::{
     App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
     UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
-    UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext, shell,
+    UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiInstanceRule,
+    UiModerationReport, UiServerContext, shell,
 };
-use sea_orm::TransactionTrait;
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -33,6 +38,7 @@ use crate::{
     admin::{self, AdminSource},
     auth::{account_id_from_session, csrf_token_from_session, validate_csrf_token},
     http::AppState,
+    statuses::delete_reported_status,
 };
 
 static UI_ROUTES: OnceLock<Vec<AxumRouteListing>> = OnceLock::new();
@@ -69,6 +75,19 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route(
             "/admin/federation/{domain_block_id}",
             post(update_admin_domain_block),
+        )
+        .route("/admin/moderation/rules", post(create_admin_instance_rule))
+        .route(
+            "/admin/moderation/rules/{rule_id}",
+            post(update_admin_instance_rule),
+        )
+        .route(
+            "/admin/moderation/reports/{report_id}",
+            post(update_admin_report),
+        )
+        .route(
+            "/admin/moderation/reports/{report_id}/statuses/{status_id}/delete",
+            post(delete_admin_report_status),
         )
         .leptos_routes_with_context(
             state,
@@ -130,6 +149,7 @@ fn login_return_query(next: &str) -> &'static str {
         "/admin/accounts" => "next=%2Fadmin%2Faccounts",
         "/admin/remote-accounts" => "next=%2Fadmin%2Fremote-accounts",
         "/admin/federation" => "next=%2Fadmin%2Ffederation",
+        "/admin/moderation" => "next=%2Fadmin%2Fmoderation",
         "/admin/audit-log" => "next=%2Fadmin%2Faudit-log",
         path if path.starts_with("/admin") => "next=%2Fadmin",
         _ => "next=%2Fauth%2Fedit",
@@ -275,6 +295,70 @@ impl UiBackend for RoostyUiBackend {
             })
         })
     }
+
+    fn admin_moderation(
+        &self,
+        cookie_header: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminModeration, String>> + Send + 'static>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let headers = authenticated_admin_headers(&state, cookie_header).await?;
+            let csrf_token = csrf_token_from_session(&state, &headers)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "administrator session required".to_owned())?;
+            let (rules, reports) = tokio::try_join!(
+                roosty_db::list_instance_rules(&state.db),
+                roosty_db::list_moderation_reports(
+                    &state.db,
+                    ReportListOptions {
+                        resolved: None,
+                        limit: 100,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(UiAdminModeration {
+                csrf_token,
+                rules: rules
+                    .into_iter()
+                    .map(|rule| UiInstanceRule {
+                        id: rule.id,
+                        text: rule.text,
+                    })
+                    .collect(),
+                reports: reports
+                    .into_iter()
+                    .map(|report| UiModerationReport {
+                        id: report.id,
+                        category: report.category.to_string(),
+                        comment: report.comment,
+                        source: report_account_label(report.source),
+                        target: report_account_label(report.target),
+                        target_id: match report.target {
+                            ReportAccount::Local(id) | ReportAccount::Remote(id) => id.0,
+                        },
+                        resolved: report.action_taken_at.is_some(),
+                        assigned: report.assigned_account_id.is_some(),
+                        status_ids: report
+                            .statuses
+                            .into_iter()
+                            .map(|status| match status {
+                                ReportStatus::Local(id) | ReportStatus::Remote(id) => id.0,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        })
+    }
+}
+
+fn report_account_label(account: ReportAccount) -> String {
+    match account {
+        ReportAccount::Local(id) => format!("local:{}", id.0),
+        ReportAccount::Remote(id) => format!("remote:{}", id.0),
+    }
 }
 
 async fn authenticated_admin_headers(
@@ -349,7 +433,7 @@ fn ui_admin_domain_block(block: roosty_db::FederationDomainBlock) -> UiAdminDoma
     }
 }
 
-fn ui_admin_audit_entry(entry: roosty_db::AdminAuditEntry) -> UiAdminAuditEntry {
+fn ui_admin_audit_entry(entry: AdminAuditEntry) -> UiAdminAuditEntry {
     UiAdminAuditEntry {
         id: entry.id,
         action: entry.action.to_string(),
@@ -412,6 +496,39 @@ struct DomainBlockForm {
     #[serde(default)]
     obfuscate: bool,
     operation: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstanceRuleForm {
+    csrf_token: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    operation: InstanceRuleOperation,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InstanceRuleOperation {
+    #[default]
+    Save,
+    Delete,
+    Up,
+    Down,
+}
+
+#[derive(Deserialize)]
+struct ReportActionForm {
+    csrf_token: String,
+    operation: ReportOperation,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportOperation {
+    Assign,
+    Resolve,
+    Reopen,
 }
 
 async fn authenticated_admin_form(
@@ -562,13 +679,8 @@ async fn create_admin_domain_block(
         Ok(block) => block,
         Err(error) => return admin_form_error(error),
     };
-    if let Err(error) = audit_web_domain_block(
-        &txn,
-        actor,
-        roosty_db::AdminAuditAction::DomainBlockCreate,
-        &block,
-    )
-    .await
+    if let Err(error) =
+        audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockCreate, &block).await
     {
         return admin_form_error(error);
     }
@@ -579,6 +691,234 @@ async fn create_admin_domain_block(
         Ok(()) => Redirect::to("/admin/federation").into_response(),
         Err(error) => admin_form_error(error.into()),
     }
+}
+
+async fn create_admin_instance_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<InstanceRuleForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return admin_form_error(error.into()),
+    };
+    let rule = match roosty_db::create_instance_rule(&txn, &form.text).await {
+        Ok(rule) => rule,
+        Err(error) => return admin_form_error(error),
+    };
+    if let Err(error) =
+        audit_web_rule(&txn, actor, AdminAuditAction::InstanceRuleCreate, &rule).await
+    {
+        return admin_form_error(error);
+    }
+    match txn.commit().await {
+        Ok(()) => Redirect::to("/admin/moderation").into_response(),
+        Err(error) => admin_form_error(error.into()),
+    }
+}
+
+async fn update_admin_instance_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rule_id): Path<Uuid>,
+    Form(form): Form<InstanceRuleForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return admin_form_error(error.into()),
+    };
+    if matches!(
+        form.operation,
+        InstanceRuleOperation::Up | InstanceRuleOperation::Down
+    ) {
+        let rules = match roosty_db::list_instance_rules(&txn).await {
+            Ok(rules) => rules,
+            Err(error) => return admin_form_error(error),
+        };
+        let mut ids = rules.iter().map(|rule| rule.id).collect::<Vec<_>>();
+        let Some(index) = ids.iter().position(|id| *id == rule_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let destination = if matches!(form.operation, InstanceRuleOperation::Up) {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(ids.len().saturating_sub(1))
+        };
+        ids.swap(index, destination);
+        if let Err(error) = roosty_db::reorder_instance_rules(&txn, &ids).await {
+            return admin_form_error(error);
+        }
+        if let Err(error) = roosty_db::insert_admin_audit_entry(
+            &txn,
+            Some(actor),
+            AdminAuditSource::Web,
+            AdminAuditAction::InstanceRuleReorder,
+            AdminAuditTargetKind::InstanceRule,
+            &rule_id.to_string(),
+            json!({"rule_ids": ids}),
+        )
+        .await
+        {
+            return admin_form_error(error);
+        }
+        return match txn.commit().await {
+            Ok(()) => Redirect::to("/admin/moderation").into_response(),
+            Err(error) => admin_form_error(error.into()),
+        };
+    }
+    let (rule, action) = if matches!(form.operation, InstanceRuleOperation::Delete) {
+        match roosty_db::discard_instance_rule(&txn, rule_id).await {
+            Ok(Some(rule)) => (rule, AdminAuditAction::InstanceRuleDelete),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => return admin_form_error(error),
+        }
+    } else {
+        match roosty_db::update_instance_rule(&txn, rule_id, &form.text).await {
+            Ok(Some(rule)) => (rule, AdminAuditAction::InstanceRuleUpdate),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => return admin_form_error(error),
+        }
+    };
+    if let Err(error) = audit_web_rule(&txn, actor, action, &rule).await {
+        return admin_form_error(error);
+    }
+    match txn.commit().await {
+        Ok(()) => Redirect::to("/admin/moderation").into_response(),
+        Err(error) => admin_form_error(error.into()),
+    }
+}
+
+async fn update_admin_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(report_id): Path<Uuid>,
+    Form(form): Form<ReportActionForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return admin_form_error(error.into()),
+    };
+    let result = match form.operation {
+        ReportOperation::Assign => {
+            roosty_db::assign_moderation_report(&txn, report_id, Some(actor)).await
+        }
+        ReportOperation::Resolve => {
+            roosty_db::set_moderation_report_resolved(&txn, report_id, Some(actor)).await
+        }
+        ReportOperation::Reopen => {
+            roosty_db::set_moderation_report_resolved(&txn, report_id, None).await
+        }
+    };
+    match result {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return admin_form_error(error),
+    }
+    let action = match form.operation {
+        ReportOperation::Assign => AdminAuditAction::ReportAssign,
+        ReportOperation::Resolve => AdminAuditAction::ReportResolve,
+        ReportOperation::Reopen => AdminAuditAction::ReportReopen,
+    };
+    if let Err(error) = roosty_db::insert_admin_audit_entry(
+        &txn,
+        Some(actor),
+        AdminAuditSource::Web,
+        action,
+        AdminAuditTargetKind::Report,
+        &report_id.to_string(),
+        json!({}),
+    )
+    .await
+    {
+        return admin_form_error(error);
+    }
+    match txn.commit().await {
+        Ok(()) => Redirect::to("/admin/moderation").into_response(),
+        Err(error) => admin_form_error(error.into()),
+    }
+}
+
+async fn delete_admin_report_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((report_id, status_id)): Path<(Uuid, Uuid)>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let report = match roosty_db::find_moderation_report(&state.db, report_id).await {
+        Ok(Some(report)) => report,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return admin_form_error(error),
+    };
+    let Some(reference) = report
+        .statuses
+        .into_iter()
+        .find(|reference| match reference {
+            ReportStatus::Local(id) | ReportStatus::Remote(id) => id.0 == status_id,
+        })
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match delete_reported_status(&state, reference).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return admin_form_error(error),
+    }
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return admin_form_error(error.into()),
+    };
+    if let Err(error) = roosty_db::insert_admin_audit_entry(
+        &txn,
+        Some(actor),
+        AdminAuditSource::Web,
+        AdminAuditAction::ReportUpdate,
+        AdminAuditTargetKind::Report,
+        &report_id.to_string(),
+        json!({"removed_status_id": status_id}),
+    )
+    .await
+    {
+        return admin_form_error(error);
+    }
+    match txn.commit().await {
+        Ok(()) => Redirect::to("/admin/moderation").into_response(),
+        Err(error) => admin_form_error(error.into()),
+    }
+}
+
+async fn audit_web_rule(
+    txn: &DatabaseTransaction,
+    actor: roosty_core::AccountId,
+    action: AdminAuditAction,
+    rule: &roosty_db::InstanceRule,
+) -> Result<(), roosty_core::RoostyError> {
+    roosty_db::insert_admin_audit_entry(
+        txn,
+        Some(actor),
+        AdminAuditSource::Web,
+        action,
+        AdminAuditTargetKind::InstanceRule,
+        &rule.id.to_string(),
+        json!({"text": rule.text}),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn update_admin_domain_block(
@@ -601,13 +941,8 @@ async fn update_admin_domain_block(
             Ok(None) => return StatusCode::NOT_FOUND.into_response(),
             Err(error) => return admin_form_error(error),
         };
-        if let Err(error) = audit_web_domain_block(
-            &txn,
-            actor,
-            roosty_db::AdminAuditAction::DomainBlockDelete,
-            &block,
-        )
-        .await
+        if let Err(error) =
+            audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockDelete, &block).await
         {
             return admin_form_error(error);
         }
@@ -635,13 +970,8 @@ async fn update_admin_domain_block(
             Ok(block) => block,
             Err(error) => return admin_form_error(error),
         };
-        if let Err(error) = audit_web_domain_block(
-            &txn,
-            actor,
-            roosty_db::AdminAuditAction::DomainBlockUpdate,
-            &block,
-        )
-        .await
+        if let Err(error) =
+            audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockUpdate, &block).await
         {
             return admin_form_error(error);
         }
@@ -660,17 +990,17 @@ fn nonempty(value: String) -> Option<String> {
 }
 
 async fn audit_web_domain_block(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     actor: roosty_core::AccountId,
-    action: roosty_db::AdminAuditAction,
+    action: AdminAuditAction,
     block: &roosty_db::FederationDomainBlock,
 ) -> roosty_core::Result<()> {
     roosty_db::insert_admin_audit_entry(
         txn,
         Some(actor),
-        roosty_db::AdminAuditSource::Web,
+        AdminAuditSource::Web,
         action,
-        roosty_db::AdminAuditTargetKind::FederationDomain,
+        AdminAuditTargetKind::FederationDomain,
         &block.id.to_string(),
         json!({"domain": block.domain, "severity": block.severity}),
     )
@@ -679,13 +1009,13 @@ async fn audit_web_domain_block(
 }
 
 async fn enqueue_web_domain_reconciliation(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     block: &roosty_db::FederationDomainBlock,
 ) -> roosty_core::Result<()> {
     roosty_db::enqueue_job_in_transaction(
         txn,
         roosty_db::NewJob {
-            kind: roosty_db::JobKind::DomainModerationReconcile,
+            kind: JobKind::DomainModerationReconcile,
             payload: json!({"domain_block_id": block.id}),
             deduplication_key: Some(format!("domain-moderation:{}", block.id)),
             run_after: OffsetDateTime::now_utc(),

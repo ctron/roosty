@@ -7,6 +7,7 @@ pub(crate) enum AdminSection {
     LocalAccounts,
     RemoteAccounts,
     Federation,
+    Moderation,
     AuditLog,
 }
 
@@ -38,6 +39,15 @@ pub(crate) fn AdminLayout(active: AdminSection, children: Children) -> impl Into
                 <nav aria-label="Administration">
                     <ul class="menu bg-base-200 min-h-full w-64 p-4">
                         <li class="menu-title">"Administration"</li>
+                        <li>
+                            <a
+                                href="/admin/moderation"
+                                class=selected(AdminSection::Moderation)
+                                aria-current=current(AdminSection::Moderation)
+                            >
+                                "Moderation"
+                            </a>
+                        </li>
                         <li>
                             <a
                                 href="/admin"

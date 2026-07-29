@@ -23,8 +23,10 @@ use rand_core::{OsRng, RngCore};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    FeaturedTag, LocalStatus, NewRemoteCustomEmoji, RemoteActor, RemoteConversationParticipant,
-    RemoteFeaturedTagInput, StatusVisibility,
+    FeaturedTag, JobKind, LocalStatus, NewModerationReport, NewRemoteCustomEmoji, RemoteActor,
+    RemoteConversationParticipant, RemoteFeaturedTagInput, ReportAccount, ReportCategory,
+    ReportStatus, StatusVisibility, create_moderation_report, federation_domain_policy,
+    find_local_status_by_id, notify_administrators_of_report,
 };
 use rsa::{
     RsaPrivateKey,
@@ -42,7 +44,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 use uuid::Uuid;
 
-use crate::http::AppState;
+use crate::{http::AppState, notifications::publish_committed_notification};
 
 const ACTIVITYSTREAMS_CONTENT_TYPE: &str = "application/activity+json";
 const JRD_CONTENT_TYPE: &str = "application/jrd+json";
@@ -162,6 +164,7 @@ enum InboundActivityType {
     Block,
     Add,
     Remove,
+    Flag,
     #[serde(rename = "https://w3id.org/fep/044f#QuoteRequest")]
     QuoteRequest,
     #[serde(other)]
@@ -184,6 +187,7 @@ impl InboundActivityType {
             Self::Block => Some(roosty_db::InboxActivityType::Block),
             Self::Add => Some(roosty_db::InboxActivityType::Add),
             Self::Remove => Some(roosty_db::InboxActivityType::Remove),
+            Self::Flag => Some(roosty_db::InboxActivityType::Flag),
             Self::QuoteRequest => Some(roosty_db::InboxActivityType::QuoteRequest),
             Self::Other => None,
         }
@@ -1710,6 +1714,102 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             }
         };
     }
+    if activity_type == Some(InboundActivityType::Flag) {
+        let policy = match federation_domain_policy(&state.db, &remote_actor.domain).await {
+            Ok(policy) => policy,
+            Err(error) => return internal_error(error),
+        };
+        if policy.reject_reports {
+            return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+        }
+        let references = activity
+            .get("object")
+            .map(activitypub_references)
+            .unwrap_or_default();
+        let mut target = None;
+        for reference in &references {
+            if let Some(account) = local_account_from_actor_url(state, reference).await {
+                target = Some(account);
+                break;
+            }
+        }
+        let Some(target) = target else {
+            return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+        };
+        let mut statuses = Vec::new();
+        for reference in references {
+            let Some(raw_id) = reference.rsplit('/').next() else {
+                continue;
+            };
+            let Ok(status_id) = raw_id.parse::<Uuid>().map(StatusId) else {
+                continue;
+            };
+            let status = match find_local_status_by_id(&state.db, status_id).await {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(error) => return internal_error(error),
+            };
+            if status.account_id == target.id
+                && reference == status_url(state, &target.username, status_id)
+            {
+                statuses.push(ReportStatus::Local(status_id));
+            }
+        }
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(error) => return internal_error(error),
+        };
+        let is_new = match is_new_inbox_activity(&txn, &activity, &remote_actor).await {
+            Ok(is_new) => is_new,
+            Err(error) => return internal_error(error),
+        };
+        let mut notifications = Vec::new();
+        if is_new {
+            let comment = activity
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .chars()
+                .take(1_000)
+                .collect();
+            let report = match create_moderation_report(
+                &txn,
+                NewModerationReport {
+                    source: ReportAccount::Remote(remote_actor.id),
+                    target: ReportAccount::Local(target.id),
+                    category: ReportCategory::Other,
+                    comment,
+                    forwarded: false,
+                    activitypub_id: Some(activity_id),
+                    statuses,
+                    rule_ids: Vec::new(),
+                },
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => return internal_error(error),
+            };
+            notifications = match notify_administrators_of_report(&txn, &report).await {
+                Ok(notifications) => notifications,
+                Err(error) => return internal_error(error),
+            };
+        }
+        return match txn.commit().await {
+            Ok(()) => {
+                for notification in notifications {
+                    if let Err(error) =
+                        publish_committed_notification(state, notification.account_id, notification)
+                            .await
+                    {
+                        tracing::warn!(%error, "could not stream administrator report notification");
+                    }
+                }
+                StatusCode::ACCEPTED.into_response()
+            }
+            Err(error) => internal_error(error),
+        };
+    }
     if matches!(
         activity_type,
         Some(InboundActivityType::Add | InboundActivityType::Remove)
@@ -2286,12 +2386,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     return internal_error(error);
                 }
                 if let Some(notification) = notification
-                    && let Err(error) = crate::notifications::publish_committed_notification(
-                        state,
-                        status.account_id,
-                        notification,
-                    )
-                    .await
+                    && let Err(error) =
+                        publish_committed_notification(state, status.account_id, notification).await
                 {
                     tracing::warn!(%error, activity_id, "could not create remote favourite notification");
                 }
@@ -2402,12 +2498,9 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         }
         if created {
             if let Some(notification) = notification
-                && let Err(error) = crate::notifications::publish_committed_notification(
-                    state,
-                    notification.account_id,
-                    notification,
-                )
-                .await
+                && let Err(error) =
+                    publish_committed_notification(state, notification.account_id, notification)
+                        .await
             {
                 tracing::warn!(%error, activity_id, "could not publish remote reblog notification");
             }
@@ -2632,12 +2725,9 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 "processed remote follow"
             );
             if let Some(notification) = notification
-                && let Err(error) = crate::notifications::publish_committed_notification(
-                    state,
-                    notification.account_id,
-                    notification,
-                )
-                .await
+                && let Err(error) =
+                    publish_committed_notification(state, notification.account_id, notification)
+                        .await
             {
                 tracing::warn!(%error, "failed to publish remote follow notification");
             }
@@ -3731,12 +3821,8 @@ async fn publish_remote_status_change(
                 }
             }
             for notification in notifications {
-                crate::notifications::publish_committed_notification(
-                    state,
-                    notification.account_id,
-                    notification,
-                )
-                .await?;
+                publish_committed_notification(state, notification.account_id, notification)
+                    .await?;
             }
         }
         RemoteStatusChange::Delete(repair) => publish_delete_repair(state, repair).await?,
@@ -5207,6 +5293,56 @@ pub(crate) async fn prepare_remote_block(
     ))
 }
 
+/// Build a stable Mastodon-shaped ActivityPub Flag for a report against a remote actor.
+pub(crate) async fn prepare_report_flag(
+    state: &AppState,
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    statuses: &[ReportStatus],
+    comment: &str,
+) -> Result<roosty_db::NewJob, RoostyError> {
+    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("reporting account does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("reported account does not exist".to_owned()))?;
+    let actor = actor_url(state, &local.username);
+    let id = format!("{actor}#flag-{}", Uuid::now_v7());
+    let mut objects = vec![remote.activitypub_id];
+    for status in statuses {
+        match status {
+            ReportStatus::Remote(status_id) => {
+                let status = roosty_db::find_remote_status_by_id(&state.db, *status_id)
+                    .await?
+                    .ok_or_else(|| {
+                        RoostyError::InvalidInput("reported status does not exist".to_owned())
+                    })?;
+                if status.remote_actor_id != remote_actor_id {
+                    return Err(RoostyError::InvalidInput(
+                        "reported status belongs to another account".to_owned(),
+                    ));
+                }
+                objects.push(status.activitypub_id);
+            }
+            ReportStatus::Local(_) => {
+                return Err(RoostyError::InvalidInput(
+                    "a remote report cannot contain a local status".to_owned(),
+                ));
+            }
+        }
+    }
+    let activity = serde_json::json!({
+        "@context": ACTIVITYSTREAMS_CONTEXT,
+        "id": id,
+        "type": "Flag",
+        "actor": actor,
+        "object": objects,
+        "content": comment,
+    });
+    moderation_delivery_job(local_account_id, remote_actor_id, activity, &id)
+}
+
 /// Build an Undo that references the stable Block identity stored with the relationship.
 pub(crate) async fn prepare_remote_unblock(
     state: &AppState,
@@ -5240,7 +5376,7 @@ fn moderation_delivery_job(
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     Ok(roosty_db::NewJob {
-        kind: roosty_db::JobKind::FederationModerationDelivery,
+        kind: JobKind::FederationModerationDelivery,
         payload,
         deduplication_key: Some(activity_id.to_owned()),
         run_after: OffsetDateTime::now_utc(),
@@ -6144,6 +6280,19 @@ fn activity_response<T: Serialize>(value: T) -> Response {
 }
 fn actor_url(state: &AppState, username: &str) -> String {
     public_url(state, &format!("users/{username}"))
+}
+
+fn activitypub_references(value: &JsonValue) -> Vec<String> {
+    match value {
+        JsonValue::Array(values) => values
+            .iter()
+            .filter_map(activitypub_reference)
+            .map(str::to_owned)
+            .collect(),
+        value => activitypub_reference(value)
+            .map(|value| vec![value.to_owned()])
+            .unwrap_or_default(),
+    }
 }
 
 async fn local_account_from_actor_url(

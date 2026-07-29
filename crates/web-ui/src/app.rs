@@ -10,8 +10,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     bootstrap::{
         UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditLog, UiAdminDomainBlocks,
-        UiAdminWorkQueue, UiBootstrap, load_admin_accounts, load_admin_audit_log,
-        load_admin_domain_blocks, load_admin_work_queue, load_bootstrap,
+        UiAdminModeration, UiAdminWorkQueue, UiBootstrap, load_admin_accounts,
+        load_admin_audit_log, load_admin_domain_blocks, load_admin_moderation,
+        load_admin_work_queue, load_bootstrap,
     },
     forms::{LoginError, PasswordChangeResult},
     ui::{
@@ -86,9 +87,34 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("admin/accounts") view=AdminLocalAccountsPage/>
                 <Route path=path!("admin/remote-accounts") view=AdminRemoteAccountsPage/>
                 <Route path=path!("admin/federation") view=AdminFederationPage/>
+                <Route path=path!("admin/moderation") view=AdminModerationPage/>
                 <Route path=path!("admin/audit-log") view=AdminAuditLogPage/>
             </Routes>
         </Router>
+    }
+}
+
+#[component]
+fn AdminModerationPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let moderation = Resource::new_blocking(|| (), |_| load_admin_moderation());
+    install_periodic_refresh(moderation);
+
+    view! {
+        <PageMetadata bootstrap page_title="Moderation" path="/admin/moderation"/>
+        <PageFrame bootstrap login_next="/admin/moderation" wide=true>
+            <AdminLayout active=AdminSection::Moderation>
+                <AdminPageHeading title="Moderation" resource=moderation/>
+                <Transition fallback=|| admin_loading("Loading moderation reports…")>
+                    {Suspend::new(async move {
+                        match moderation.await {
+                            Ok(moderation) => admin_moderation_content(moderation),
+                            Err(_) => admin_load_error("moderation reports"),
+                        }
+                    })}
+                </Transition>
+            </AdminLayout>
+        </PageFrame>
     }
 }
 
@@ -680,6 +706,111 @@ fn admin_domain_blocks_content(domain_blocks: UiAdminDomainBlocks) -> AnyView {
                                     </div>
                                 </div>
                             </form>
+                        }
+                    }).collect_view()}
+                </div>
+            </AdminPanel>
+        </section>
+    }
+    .into_any()
+}
+
+fn admin_moderation_content(moderation: UiAdminModeration) -> AnyView {
+    let create_csrf = moderation.csrf_token.clone();
+    let rule_csrf = moderation.csrf_token.clone();
+    let report_csrf = moderation.csrf_token;
+    view! {
+        <section class="grid gap-6 pb-8">
+            <AdminPanel title="Instance rules">
+                <form class="flex gap-3" method="post" action="/admin/moderation/rules">
+                    <input type="hidden" name="csrf_token" value=create_csrf/>
+                    <input
+                        class="input flex-1"
+                        name="text"
+                        maxlength="300"
+                        placeholder="Describe prohibited conduct"
+                        required
+                    />
+                    <button class="btn btn-primary" type="submit">"Add rule"</button>
+                </form>
+                <div class="mt-4 grid gap-3">
+                    {moderation.rules.into_iter().map(|rule| {
+                        let csrf = rule_csrf.clone();
+                        view! {
+                            <form
+                                class="flex gap-3"
+                                method="post"
+                                action=format!("/admin/moderation/rules/{}", rule.id)
+                            >
+                                <input type="hidden" name="csrf_token" value=csrf/>
+                                <input class="input flex-1" name="text" maxlength="300" value=rule.text required/>
+                                <button class="btn btn-primary" type="submit">"Save"</button>
+                                <button class="btn" name="operation" value="up" type="submit">"↑"</button>
+                                <button class="btn" name="operation" value="down" type="submit">"↓"</button>
+                                <button class="btn btn-error" name="operation" value="delete" type="submit">"Delete"</button>
+                            </form>
+                        }
+                    }).collect_view()}
+                </div>
+            </AdminPanel>
+            <AdminPanel title="Reports">
+                <div class="grid gap-4">
+                    {moderation.reports.into_iter().map(|report| {
+                        let csrf = report_csrf.clone();
+                        let action = format!("/admin/moderation/reports/{}", report.id);
+                        view! {
+                            <article class="card border-base-300 border">
+                                <div class="card-body gap-3">
+                                    <div class="flex flex-wrap items-center gap-2">
+                                        <h3 class="card-title">{format!("{} → {}", report.source, report.target)}</h3>
+                                        <span class="badge">{report.category}</span>
+                                        {report.assigned.then(|| view! { <span class="badge badge-info">"Assigned"</span> })}
+                                    </div>
+                                    <p class="whitespace-pre-wrap">{report.comment}</p>
+                                    <p class="text-sm text-base-content/70">
+                                        {format!("{} reported post(s)", report.status_ids.len())}
+                                    </p>
+                                    <div class="flex flex-wrap gap-2">
+                                        {report.status_ids.into_iter().map(|status_id| {
+                                            let csrf = report_csrf.clone();
+                                            view! {
+                                                <form
+                                                    method="post"
+                                                    action=format!("/admin/moderation/reports/{}/statuses/{status_id}/delete", report.id)
+                                                >
+                                                    <input type="hidden" name="csrf_token" value=csrf/>
+                                                    <button class="btn btn-xs btn-error" type="submit">
+                                                        {format!("Remove post {status_id}")}
+                                                    </button>
+                                                </form>
+                                            }
+                                        }).collect_view()}
+                                    </div>
+                                    <form class="card-actions" method="post" action=action>
+                                        <input type="hidden" name="csrf_token" value=csrf/>
+                                        <button class="btn btn-sm" name="operation" value="assign" type="submit">"Assign to me"</button>
+                                        <button
+                                            class="btn btn-sm btn-primary"
+                                            name="operation"
+                                            value=if report.resolved { "reopen" } else { "resolve" }
+                                            type="submit"
+                                        >
+                                            {if report.resolved { "Reopen" } else { "Resolve" }}
+                                        </button>
+                                    </form>
+                                    <div class="card-actions">
+                                        <form method="post" action=format!("/admin/accounts/{}/limit", report.target_id)>
+                                            <input type="hidden" name="csrf_token" value=report_csrf.clone()/>
+                                            <input type="hidden" name="limited" value="true"/>
+                                            <button class="btn btn-sm btn-warning" type="submit">"Limit target"</button>
+                                        </form>
+                                        <form method="post" action=format!("/admin/accounts/{}/suspend", report.target_id)>
+                                            <input type="hidden" name="csrf_token" value=report_csrf.clone()/>
+                                            <button class="btn btn-sm btn-error" type="submit">"Suspend target"</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </article>
                         }
                     }).collect_view()}
                 </div>

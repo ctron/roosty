@@ -107,6 +107,11 @@ and subdomains. Optional media/report rejection and comments are persisted.
 |Account and domain suspension is local server policy. Suspending a local actor emits the standard
 ActivityPub actor `Delete`; ActivityPub defines no inverse unsuspend activity.
 
+|🟢
+|Federated reports
+|Signed ActivityPub `Flag` activities are delivered for forwarded remote reports and accepted
+idempotently for local targets. Domain `reject_reports` policy drops inbound reports.
+
 |===
 
 
@@ -122,7 +127,11 @@ ActivityPub actor `Delete`; ActivityPub defines no inverse unsuspend activity.
 
 |🟡
 |`/api/v1/instance`, `/api/v2/instance`
-|Counts and advertised capabilities are minimal.
+|Counts and advertised capabilities are minimal. Ordered database-backed rules are included.
+
+|🟢
+|`GET /api/v1/instance/rules`
+|Returns the active administrator-configured rules in display order.
 
 |⚪
 |`/api/v1/version`
@@ -206,7 +215,7 @@ pagination. Account suggestions are missing.
 |🟢
 |Admin accounts API
 |Account listing, limit, suspend, unsuspend, and suspended-account deletion are available.
-Reports and custom roles are missing.
+Report-linked limit and suspension actions are available. Custom roles are missing.
 
 |🟢
 |Admin domain blocks API
@@ -215,6 +224,11 @@ Reports and custom roles are missing.
 |🟢
 |Roosty admin API/UI
 |
+
+|🟡
+|Reports
+|Client filing and administrator list/detail/update/assignment/resolution APIs are available with
+cursor pagination. `collection_ids[]`, warnings, and custom moderator roles are not yet supported.
 
 |🔴
 |`POST /api/v1/accounts`
@@ -413,7 +427,7 @@ Bare domains without a URL scheme remain plain text.
 
 |🟡
 |`GET /api/v1/notifications`
-|Poll and administrative notification types are missing.
+|Poll notification types are missing. `admin.report` is available to administrators.
 
 |🟢
 |Notification policies and requests
@@ -515,7 +529,7 @@ Bare domains without a URL scheme remain plain text.
 
 |🟡
 |`notification` events
-|Poll and administrative notification events are unavailable.
+|Poll notification events are unavailable. `admin.report` uses the normal notification stream.
 
 |🟡
 |`delete` events

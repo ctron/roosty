@@ -7,12 +7,14 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    CollectionCursor, CollectionPage, LocalNotification, LocalNotificationType, NotificationFilter,
-    NotificationPolicyAction,
+    CollectionCursor, CollectionPage, LocalNotification, LocalNotificationType, ModerationReport,
+    NotificationFilter, NotificationPolicyAction, ReportAccount, ReportCategory, ReportStatus,
+    find_moderation_report,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::HashSet, future::Future, pin::Pin, str::FromStr};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
@@ -136,6 +138,53 @@ struct NotificationResponse {
     account: NotificationAccountResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<StatusResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<ReportNotificationResponse>,
+}
+
+#[derive(Serialize)]
+struct ReportNotificationResponse {
+    id: String,
+    action_taken: bool,
+    #[serde(with = "time::serde::rfc3339::option")]
+    action_taken_at: Option<OffsetDateTime>,
+    category: ReportCategory,
+    comment: String,
+    forwarded: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    status_ids: Vec<String>,
+    rule_ids: Vec<String>,
+    target_account_id: String,
+}
+
+impl From<ModerationReport> for ReportNotificationResponse {
+    fn from(report: ModerationReport) -> Self {
+        Self {
+            id: report.id.to_string(),
+            action_taken: report.action_taken_at.is_some(),
+            action_taken_at: report.action_taken_at,
+            category: report.category,
+            comment: report.comment,
+            forwarded: report.forwarded,
+            created_at: report.created_at,
+            status_ids: report
+                .statuses
+                .into_iter()
+                .map(|status| match status {
+                    ReportStatus::Local(id) | ReportStatus::Remote(id) => id.0.to_string(),
+                })
+                .collect(),
+            rule_ids: report
+                .rules
+                .into_iter()
+                .filter_map(|rule| rule.id.map(|id| id.to_string()))
+                .collect(),
+            target_account_id: match report.target {
+                ReportAccount::Local(id) | ReportAccount::Remote(id) => id.0.to_string(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1091,6 +1140,12 @@ async fn notification_response(
         (None, None) => None,
         (Some(_), Some(_)) => return Ok(None),
     };
+    let report = match notification.report_id {
+        Some(report_id) => find_moderation_report(&state.db, report_id)
+            .await?
+            .map(ReportNotificationResponse::from),
+        None => None,
+    };
 
     Ok(Some(NotificationResponse {
         id: notification.id.to_string(),
@@ -1099,6 +1154,7 @@ async fn notification_response(
         created_at: crate::statuses::format_timestamp(notification.created_at),
         account: actor,
         status,
+        report,
     }))
 }
 
@@ -1175,6 +1231,7 @@ pub(crate) async fn push_payload(
             "A related post was edited".to_owned()
         }
         LocalNotificationType::Quote => format!("{actor} quoted your post"),
+        LocalNotificationType::AdminReport => "A new moderation report was filed".to_owned(),
     };
     Ok(MastodonPushPayload {
         access_token,

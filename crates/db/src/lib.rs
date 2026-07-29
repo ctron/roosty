@@ -174,6 +174,9 @@ pub struct RetainedStreamingEvent {
 }
 
 mod entity;
+mod reports;
+
+pub use reports::*;
 
 impl StatusVisibility {
     /// Parse a persisted or wire visibility without accepting unknown values.
@@ -367,6 +370,7 @@ pub enum InboxActivityType {
     Block,
     Add,
     Remove,
+    Flag,
     #[strum(serialize = "https://w3id.org/fep/044f#QuoteRequest")]
     QuoteRequest,
 }
@@ -4969,6 +4973,9 @@ pub enum LocalNotificationType {
     Update,
     Quote,
     QuotedUpdate,
+    #[strum(serialize = "admin.report")]
+    #[serde(rename = "admin.report")]
+    AdminReport,
 }
 
 /// Stored local boost relationship between an account and a status.
@@ -5131,6 +5138,8 @@ pub struct LocalNotification {
     pub status_id: Option<StatusId>,
     /// Related cached remote status for a remote mention notification.
     pub remote_status_id: Option<StatusId>,
+    /// Related moderation report for `admin.report` notifications.
+    pub report_id: Option<Uuid>,
     /// Persisted rolling group identity for groupable notification types.
     pub group_id: Option<Uuid>,
     /// Whether the recipient's policy hid this notification.
@@ -5703,6 +5712,7 @@ pub async fn notify_remote_actor_follow(
         group_id: Set(None),
         filtered: Set(action == NotificationPolicyAction::Filter),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5762,6 +5772,7 @@ where
         group_id: Set(None),
         filtered: Set(action == NotificationPolicyAction::Filter),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5819,6 +5830,7 @@ pub async fn notify_remote_actor_reblog(
         group_id: Set(None),
         filtered: Set(action == NotificationPolicyAction::Filter),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5885,6 +5897,7 @@ where
         group_id: Set(None),
         filtered: Set(request_id.is_some()),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -5930,6 +5943,7 @@ pub async fn replace_local_status_update_notifications(
             group_id: Set(None),
             filtered: Set(false),
             notification_request_id: Set(None),
+            report_id: Set(None),
             created_at: Set(OffsetDateTime::now_utc()),
             dismissed_at: Set(None),
         }
@@ -5973,6 +5987,7 @@ pub async fn replace_remote_status_update_notifications(
             group_id: Set(None),
             filtered: Set(false),
             notification_request_id: Set(None),
+            report_id: Set(None),
             created_at: Set(OffsetDateTime::now_utc()),
             dismissed_at: Set(None),
         }
@@ -6018,6 +6033,7 @@ where
         group_id: Set(None),
         filtered: Set(false),
         notification_request_id: Set(None),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -6257,6 +6273,8 @@ pub struct PushAlerts {
     pub quote: bool,
     #[serde(default)]
     pub quoted_update: bool,
+    #[serde(default, rename = "admin.report")]
+    pub admin_report: bool,
 }
 
 impl PushAlerts {
@@ -6271,8 +6289,47 @@ impl PushAlerts {
             LocalNotificationType::Update => self.update,
             LocalNotificationType::Quote => self.quote,
             LocalNotificationType::QuotedUpdate => self.quoted_update,
+            LocalNotificationType::AdminReport => self.admin_report,
         }
     }
+}
+
+/// Notify every active local administrator about a newly accepted report.
+pub async fn notify_administrators_of_report(
+    txn: &DatabaseTransaction,
+    report: &ModerationReport,
+) -> Result<Vec<LocalNotification>> {
+    let administrators = local_account::Entity::find()
+        .filter(local_account::Column::IsAdmin.eq(true))
+        .filter(local_account::Column::SuspendedAt.is_null())
+        .all(txn)
+        .await?;
+    let (actor_account_id, remote_actor_id) = match report.source {
+        ReportAccount::Local(id) => (Some(id.0), None),
+        ReportAccount::Remote(id) => (None, Some(id.0)),
+    };
+    let mut notifications = Vec::with_capacity(administrators.len());
+    for administrator in administrators {
+        let model = local_notification::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            account_id: Set(administrator.id),
+            notification_type: Set(LocalNotificationType::AdminReport),
+            actor_account_id: Set(actor_account_id),
+            remote_actor_id: Set(remote_actor_id),
+            status_id: Set(None),
+            remote_status_id: Set(None),
+            group_id: Set(None),
+            filtered: Set(false),
+            notification_request_id: Set(None),
+            report_id: Set(Some(report.id)),
+            created_at: Set(OffsetDateTime::now_utc()),
+            dismissed_at: Set(None),
+        }
+        .insert(txn)
+        .await?;
+        notifications.push(local_notification_from_model(model));
+    }
+    Ok(notifications)
 }
 
 /// Persisted Web Push subscription and encrypted Mastodon payload credential.
@@ -8159,6 +8216,7 @@ pub async fn notify_local_account(
         group_id: Set(None),
         filtered: Set(false),
         notification_request_id: Set(None),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -8263,6 +8321,7 @@ pub async fn notify_local_account_with_policy(
         group_id: Set(None),
         filtered: Set(action == NotificationPolicyAction::Filter),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -8753,6 +8812,7 @@ pub async fn notify_local_status_mention(
         group_id: Set(None),
         filtered: Set(request_id.is_some()),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -13764,6 +13824,7 @@ pub async fn notify_remote_actor_quote(
         group_id: Set(None),
         filtered: Set(request_id.is_some()),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -13831,6 +13892,7 @@ pub async fn notify_local_status_quote(
         group_id: Set(None),
         filtered: Set(request_id.is_some()),
         notification_request_id: Set(request_id),
+        report_id: Set(None),
         created_at: Set(OffsetDateTime::now_utc()),
         dismissed_at: Set(None),
     }
@@ -18805,6 +18867,7 @@ fn local_notification_from_model(notification: local_notification::Model) -> Loc
         remote_actor_id: notification.remote_actor_id.map(AccountId),
         status_id: notification.status_id.map(StatusId),
         remote_status_id: notification.remote_status_id.map(StatusId),
+        report_id: notification.report_id,
         group_id: notification.group_id,
         filtered: notification.filtered,
         notification_request_id: notification.notification_request_id,
@@ -19022,6 +19085,24 @@ pub enum AdminAuditAction {
     DomainBlockUpdate,
     #[strum(serialize = "domain_block.delete")]
     DomainBlockDelete,
+    #[strum(serialize = "instance_rule.create")]
+    InstanceRuleCreate,
+    #[strum(serialize = "instance_rule.update")]
+    InstanceRuleUpdate,
+    #[strum(serialize = "instance_rule.delete")]
+    InstanceRuleDelete,
+    #[strum(serialize = "instance_rule.reorder")]
+    InstanceRuleReorder,
+    #[strum(serialize = "report.update")]
+    ReportUpdate,
+    #[strum(serialize = "report.assign")]
+    ReportAssign,
+    #[strum(serialize = "report.unassign")]
+    ReportUnassign,
+    #[strum(serialize = "report.resolve")]
+    ReportResolve,
+    #[strum(serialize = "report.reopen")]
+    ReportReopen,
 }
 
 /// Kind of record affected by an administrator mutation.
@@ -19034,6 +19115,8 @@ pub enum AdminAuditTargetKind {
     LocalAccount,
     RemoteActor,
     FederationDomain,
+    InstanceRule,
+    Report,
 }
 
 /// Immutable administrator action suitable for an audit-log UI.
@@ -19607,6 +19690,7 @@ mod tests {
             update: true,
             quote: true,
             quoted_update: true,
+            admin_report: true,
         };
         for notification_type in [
             LocalNotificationType::Mention,
@@ -19618,6 +19702,7 @@ mod tests {
             LocalNotificationType::Update,
             LocalNotificationType::Quote,
             LocalNotificationType::QuotedUpdate,
+            LocalNotificationType::AdminReport,
         ] {
             assert!(enabled.enabled(notification_type));
             assert!(!PushAlerts::default().enabled(notification_type));

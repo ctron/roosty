@@ -21,7 +21,8 @@ pub use authorization::{
 pub use bootstrap::{
     UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
     UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
-    UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext,
+    UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiInstanceRule,
+    UiModerationReport, UiServerContext,
 };
 pub use forms::{LoginError, PasswordChangeResult};
 

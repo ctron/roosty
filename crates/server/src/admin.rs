@@ -8,7 +8,11 @@ use axum::{
     routing::{delete, get, post},
 };
 use roosty_core::{AccountId, RoostyError};
-use sea_orm::TransactionTrait;
+use roosty_db::{
+    AdminAccount, AdminAuditAction, AdminAuditEntry, AdminAuditSource, AdminAuditTargetKind,
+    DbConnection, JobKind, ReportAccount,
+};
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,7 +20,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{auth::AuthenticatedAccessToken, http::AppState, password};
+use crate::{
+    auth::AuthenticatedAccessToken, federation::enqueue_actor_delete_in_transaction,
+    http::AppState, password,
+};
 
 /// Mount Mastodon-compatible and Roosty-specific administrator routes.
 pub fn router() -> Router<AppState> {
@@ -66,22 +73,22 @@ pub(crate) enum AdminSource {
 }
 
 impl AdminSource {
-    fn audit_source(self) -> roosty_db::AdminAuditSource {
+    fn audit_source(self) -> AdminAuditSource {
         match self {
-            Self::Web => roosty_db::AdminAuditSource::Web,
-            Self::Api => roosty_db::AdminAuditSource::Api,
-            Self::Cli => roosty_db::AdminAuditSource::Cli,
+            Self::Web => AdminAuditSource::Web,
+            Self::Api => AdminAuditSource::Api,
+            Self::Cli => AdminAuditSource::Cli,
         }
     }
 }
 
 pub(crate) struct TemporaryCredential {
-    pub account: roosty_db::AdminAccount,
+    pub account: AdminAccount,
     pub temporary_password: String,
 }
 
 pub(crate) async fn create_local_account(
-    db: &roosty_db::DbConnection,
+    db: &DbConnection,
     actor: Option<AccountId>,
     source: AdminSource,
     username: &str,
@@ -104,8 +111,8 @@ pub(crate) async fn create_local_account(
         &txn,
         actor,
         source.audit_source(),
-        roosty_db::AdminAuditAction::AccountCreate,
-        roosty_db::AdminAuditTargetKind::LocalAccount,
+        AdminAuditAction::AccountCreate,
+        AdminAuditTargetKind::LocalAccount,
         &id.to_string(),
         json!({ "username": username, "is_admin": is_admin }),
     )
@@ -121,7 +128,7 @@ pub(crate) async fn create_local_account(
 }
 
 pub(crate) async fn reset_local_password(
-    db: &roosty_db::DbConnection,
+    db: &DbConnection,
     actor: Option<AccountId>,
     source: AdminSource,
     account_id: AccountId,
@@ -136,8 +143,8 @@ pub(crate) async fn reset_local_password(
         &txn,
         actor,
         source.audit_source(),
-        roosty_db::AdminAuditAction::AccountResetPassword,
-        roosty_db::AdminAuditTargetKind::LocalAccount,
+        AdminAuditAction::AccountResetPassword,
+        AdminAuditTargetKind::LocalAccount,
         &account.id.0.to_string(),
         json!({ "username": account.username }),
     )
@@ -160,36 +167,48 @@ pub(crate) async fn set_account_limited(
     limited: bool,
 ) -> Result<roosty_db::AdminAccount, RoostyError> {
     let txn = db.begin().await?;
-    let existing = roosty_db::find_admin_account_by_id(&txn, account_id)
+    let account =
+        set_account_limited_in_transaction(&txn, actor, source, account_id, limited).await?;
+    txn.commit().await?;
+    Ok(account)
+}
+
+async fn set_account_limited_in_transaction(
+    txn: &DatabaseTransaction,
+    actor: Option<AccountId>,
+    source: AdminSource,
+    account_id: AccountId,
+    limited: bool,
+) -> Result<roosty_db::AdminAccount, RoostyError> {
+    let existing = roosty_db::find_admin_account_by_id(txn, account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
     if existing.domain.is_some() {
-        roosty_db::set_remote_actor_limited_by_id(&txn, account_id, limited).await?;
+        roosty_db::set_remote_actor_limited_by_id(txn, account_id, limited).await?;
     } else {
-        roosty_db::set_local_account_limited_by_id(&txn, account_id, limited).await?;
+        roosty_db::set_local_account_limited_by_id(txn, account_id, limited).await?;
     }
     roosty_db::insert_admin_audit_entry(
-        &txn,
+        txn,
         actor,
         source.audit_source(),
         if limited {
-            roosty_db::AdminAuditAction::AccountLimit
+            AdminAuditAction::AccountLimit
         } else {
-            roosty_db::AdminAuditAction::AccountUnlimit
+            AdminAuditAction::AccountUnlimit
         },
         if existing.domain.is_some() {
-            roosty_db::AdminAuditTargetKind::RemoteActor
+            AdminAuditTargetKind::RemoteActor
         } else {
-            roosty_db::AdminAuditTargetKind::LocalAccount
+            AdminAuditTargetKind::LocalAccount
         },
         &account_id.0.to_string(),
         json!({ "username": existing.username, "domain": existing.domain }),
     )
     .await?;
-    let account = roosty_db::find_admin_account_by_id(&txn, account_id)
+    let account = roosty_db::find_admin_account_by_id(txn, account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("updated account was not found".to_owned()))?;
-    txn.commit().await?;
     Ok(account)
 }
 
@@ -200,16 +219,31 @@ pub(crate) async fn set_account_suspended(
     account_id: AccountId,
     suspended: bool,
 ) -> Result<roosty_db::AdminAccount, RoostyError> {
+    let txn = state.db.begin().await?;
+    let account =
+        set_account_suspended_in_transaction(state, &txn, actor, source, account_id, suspended)
+            .await?;
+    txn.commit().await?;
+    Ok(account)
+}
+
+async fn set_account_suspended_in_transaction(
+    state: &AppState,
+    txn: &DatabaseTransaction,
+    actor: AccountId,
+    source: AdminSource,
+    account_id: AccountId,
+    suspended: bool,
+) -> Result<roosty_db::AdminAccount, RoostyError> {
     if suspended && actor == account_id {
         return Err(RoostyError::InvalidInput(
             "administrators cannot suspend themselves".to_owned(),
         ));
     }
-    let txn = state.db.begin().await?;
-    let existing = roosty_db::find_admin_account_by_id(&txn, account_id)
+    let existing = roosty_db::find_admin_account_by_id(txn, account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
-    if suspended && existing.is_admin && roosty_db::count_active_admin_accounts(&txn).await? <= 1 {
+    if suspended && existing.is_admin && roosty_db::count_active_admin_accounts(txn).await? <= 1 {
         return Err(RoostyError::InvalidInput(
             "the final active administrator cannot be suspended".to_owned(),
         ));
@@ -220,37 +254,36 @@ pub(crate) async fn set_account_suspended(
         ));
     }
     if suspended && !existing.suspended && existing.domain.is_none() {
-        let local = roosty_db::find_local_account_by_id(&txn, account_id)
+        let local = roosty_db::find_local_account_by_id(txn, account_id)
             .await?
             .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
-        crate::federation::enqueue_actor_delete_in_transaction(state, &txn, &local).await?;
+        enqueue_actor_delete_in_transaction(state, txn, &local).await?;
     }
-    let account = roosty_db::set_account_suspended_by_id(&txn, account_id, suspended)
+    let account = roosty_db::set_account_suspended_by_id(txn, account_id, suspended)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
     roosty_db::insert_admin_audit_entry(
-        &txn,
+        txn,
         Some(actor),
         source.audit_source(),
         if suspended {
-            roosty_db::AdminAuditAction::AccountSuspend
+            AdminAuditAction::AccountSuspend
         } else {
-            roosty_db::AdminAuditAction::AccountUnsuspend
+            AdminAuditAction::AccountUnsuspend
         },
         if account.domain.is_some() {
-            roosty_db::AdminAuditTargetKind::RemoteActor
+            AdminAuditTargetKind::RemoteActor
         } else {
-            roosty_db::AdminAuditTargetKind::LocalAccount
+            AdminAuditTargetKind::LocalAccount
         },
         &account_id.0.to_string(),
         json!({"username": account.username, "domain": account.domain}),
     )
     .await?;
-    txn.commit().await?;
     Ok(account)
 }
 
-fn require_admin(
+pub(crate) fn require_admin(
     token: &AuthenticatedAccessToken,
     permission: AdminPermission,
 ) -> Result<AccountId, AdminAuthorizationError> {
@@ -269,7 +302,7 @@ fn require_admin(
 }
 
 #[derive(Debug, Error)]
-enum AdminAuthorizationError {
+pub(crate) enum AdminAuthorizationError {
     #[error("This action is not allowed")]
     NotAdministrator,
     #[error("This action requires an administrator OAuth scope")]
@@ -284,22 +317,24 @@ impl IntoResponse for AdminAuthorizationError {
 
 /// Closed administrator capability checked after OAuth strings cross the wire boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdminPermission {
+pub(crate) enum AdminPermission {
     Read(AdminReadPermission),
     Write(AdminWritePermission),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdminReadPermission {
+pub(crate) enum AdminReadPermission {
     All,
     Accounts,
     DomainBlocks,
+    Reports,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdminWritePermission {
+pub(crate) enum AdminWritePermission {
     Accounts,
     DomainBlocks,
+    Reports,
 }
 
 impl AdminPermission {
@@ -312,11 +347,17 @@ impl AdminPermission {
             Self::Read(AdminReadPermission::DomainBlocks) => {
                 matches!(scope, "admin:read" | "admin:read:domain_blocks")
             }
+            Self::Read(AdminReadPermission::Reports) => {
+                matches!(scope, "admin:read" | "admin:read:reports")
+            }
             Self::Write(AdminWritePermission::Accounts) => {
                 matches!(scope, "admin:write" | "admin:write:accounts")
             }
             Self::Write(AdminWritePermission::DomainBlocks) => {
                 matches!(scope, "admin:write" | "admin:write:domain_blocks")
+            }
+            Self::Write(AdminWritePermission::Reports) => {
+                matches!(scope, "admin:write" | "admin:write:reports")
             }
         }
     }
@@ -583,7 +624,7 @@ async fn delete_domain_block(
 }
 
 async fn audit_domain_block(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     actor: AccountId,
     action: &str,
     block: &roosty_db::FederationDomainBlock,
@@ -591,13 +632,13 @@ async fn audit_domain_block(
     roosty_db::insert_admin_audit_entry(
         txn,
         Some(actor),
-        roosty_db::AdminAuditSource::Api,
+        AdminAuditSource::Api,
         match action {
-            "domain_block.create" => roosty_db::AdminAuditAction::DomainBlockCreate,
-            "domain_block.update" => roosty_db::AdminAuditAction::DomainBlockUpdate,
-            _ => roosty_db::AdminAuditAction::DomainBlockDelete,
+            "domain_block.create" => AdminAuditAction::DomainBlockCreate,
+            "domain_block.update" => AdminAuditAction::DomainBlockUpdate,
+            _ => AdminAuditAction::DomainBlockDelete,
         },
-        roosty_db::AdminAuditTargetKind::FederationDomain,
+        AdminAuditTargetKind::FederationDomain,
         &block.id.to_string(),
         json!({"domain": block.domain, "severity": block.severity}),
     )
@@ -606,13 +647,13 @@ async fn audit_domain_block(
 }
 
 async fn enqueue_domain_reconciliation(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     block: &roosty_db::FederationDomainBlock,
 ) -> Result<(), RoostyError> {
     roosty_db::enqueue_job_in_transaction(
         txn,
         roosty_db::NewJob {
-            kind: roosty_db::JobKind::DomainModerationReconcile,
+            kind: JobKind::DomainModerationReconcile,
             payload: json!({"domain_block_id": block.id}),
             deduplication_key: Some(format!("domain-moderation:{}", block.id)),
             run_after: OffsetDateTime::now_utc(),
@@ -721,6 +762,7 @@ async fn account(
 struct AccountAction {
     #[serde(rename = "type")]
     action_type: String,
+    report_id: Option<Uuid>,
 }
 
 async fn account_action(
@@ -736,6 +778,16 @@ async fn account_action(
         Ok(actor) => actor,
         Err(response) => return response.into_response(),
     };
+    if let Some(report_id) = action.report_id {
+        return account_action_for_report(
+            &state,
+            actor,
+            AccountId(account_id),
+            report_id,
+            &action.action_type,
+        )
+        .await;
+    }
     match action.action_type.as_str() {
         "silence" => match set_account_limited(
             &state.db,
@@ -772,6 +824,98 @@ async fn account_action(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Only none, silence, and suspend actions are supported",
         ),
+    }
+}
+
+async fn account_action_for_report(
+    state: &AppState,
+    actor: AccountId,
+    account_id: AccountId,
+    report_id: Uuid,
+    action_type: &str,
+) -> Response {
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let report = match roosty_db::find_moderation_report(&txn, report_id).await {
+        Ok(Some(report)) => report,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Record not found"),
+        Err(error) => return server_error(error),
+    };
+    let target_id = match report.target {
+        ReportAccount::Local(id) | ReportAccount::Remote(id) => id,
+    };
+    if target_id != account_id {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Report target does not match account",
+        );
+    }
+    let action = match action_type {
+        "silence" => {
+            set_account_limited_in_transaction(
+                &txn,
+                Some(actor),
+                AdminSource::Api,
+                account_id,
+                true,
+            )
+            .await
+        }
+        "suspend" => {
+            set_account_suspended_in_transaction(
+                state,
+                &txn,
+                actor,
+                AdminSource::Api,
+                account_id,
+                true,
+            )
+            .await
+        }
+        "none" => roosty_db::find_admin_account_by_id(&txn, account_id)
+            .await
+            .and_then(|account| {
+                account
+                    .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))
+            }),
+        _ => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Only none, silence, and suspend actions are supported",
+            );
+        }
+    };
+    if let Err(error) = action {
+        return match error {
+            RoostyError::InvalidInput(reason) => {
+                api_error(StatusCode::UNPROCESSABLE_ENTITY, &reason)
+            }
+            error => server_error(error),
+        };
+    }
+    if let Err(error) =
+        roosty_db::set_moderation_report_resolved(&txn, report_id, Some(actor)).await
+    {
+        return server_error(error);
+    }
+    if let Err(error) = roosty_db::insert_admin_audit_entry(
+        &txn,
+        Some(actor),
+        AdminSource::Api.audit_source(),
+        AdminAuditAction::ReportResolve,
+        AdminAuditTargetKind::Report,
+        &report_id.to_string(),
+        json!({"account_id": account_id.0, "action": action_type}),
+    )
+    .await
+    {
+        return server_error(error);
+    }
+    match txn.commit().await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(error) => server_error(error.into()),
     }
 }
 
@@ -840,11 +984,11 @@ async fn delete_suspended_account(
         &txn,
         Some(actor),
         AdminSource::Api.audit_source(),
-        roosty_db::AdminAuditAction::AccountPurge,
+        AdminAuditAction::AccountPurge,
         if account.domain.is_some() {
-            roosty_db::AdminAuditTargetKind::RemoteActor
+            AdminAuditTargetKind::RemoteActor
         } else {
-            roosty_db::AdminAuditTargetKind::LocalAccount
+            AdminAuditTargetKind::LocalAccount
         },
         &account_id.0.to_string(),
         json!({"username": account.username, "domain": account.domain}),
@@ -1006,7 +1150,7 @@ async fn reset_password(
 }
 
 #[derive(Serialize)]
-struct AdminAccountResponse {
+pub(crate) struct AdminAccountResponse {
     id: String,
     username: String,
     domain: Option<String>,
@@ -1161,8 +1305,8 @@ struct AdminAuditResponse {
     created_at: String,
 }
 
-impl From<roosty_db::AdminAuditEntry> for AdminAuditResponse {
-    fn from(entry: roosty_db::AdminAuditEntry) -> Self {
+impl From<AdminAuditEntry> for AdminAuditResponse {
+    fn from(entry: AdminAuditEntry) -> Self {
         Self {
             id: entry.id.to_string(),
             actor_account_id: entry.actor_account_id.map(|id| id.0.to_string()),

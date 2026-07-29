@@ -9,6 +9,8 @@
   `Delete` delivery, delayed content purge, unsuspension, and administrator-triggered deletion.
 - Database-backed Mastodon-compatible domain rules (`noop`, `silence`, and `suspend`) with
   administrator API/UI management and cross-process enforcement.
+- Mastodon-compatible reports with ordered instance rules, administrator triage and enforcement,
+  `admin.report` notifications, and signed ActivityPub `Flag` delivery and ingestion.
 - Local public/unlisted home-timeline fan-out, including streaming status creation and edit replacements, replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
 - Mastodon-compatible private lists with local/remote membership, reply policies, exclusive home-feed filtering, and cursor-paginated list timelines.
@@ -76,14 +78,15 @@
 - ActivityPub federation: signed delivery, inbound processing, remote actor/object cache, and moderation policy enforcement. Opt-in local WebFinger, actor, Note, outbox, and collection endpoints are available.
 - Production-grade timelines: follow graph fan-out, repair jobs, cursor pagination, remote statuses, and scalable streaming fan-out.
 - Media support: local and S3-compatible storage, validation, thumbnails, processing jobs, and remote media fetch limits.
-- Moderation and operations: reports, custom administrator roles, metrics, and broader audit-friendly workflows.
+- Moderation and operations: custom administrator roles, metrics, warnings, and broader audit-friendly workflows.
 - Compatibility hardening: broader Mastodon API coverage, versioned response DTOs, pagination headers, scope enforcement, and client regression tests.
 
 ## Medium Term
 
 - Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: poll and administrative notification events remain. Notification-policy/request APIs, grouped presentation, merge completion streaming, and Web Push delivery for currently supported visible notification types are available.
+- Notifications: poll notification events remain. Administrative report notifications are available
+  through the REST API, streaming, and Web Push.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 
@@ -112,6 +115,8 @@
   creation/password reset/limits/suspension, database-backed domain moderation, compatible account
   and domain-block APIs, OAuth scope enforcement, CSRF
   protection, and transactional audit records.
+- [x] Add end-to-end Mastodon reports, ordered public instance rules, report-linked account actions,
+  moderator post removal, `admin.report` notifications, and ActivityPub `Flag` federation.
 - [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [x] Add cursor pagination for local and cached-remote account status collections.
 - [x] Add cached-remote hashtag discovery, timelines, history, and followed-tag fan-out.

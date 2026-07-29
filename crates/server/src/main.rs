@@ -32,6 +32,7 @@ mod notifications;
 mod password;
 mod preview_cards;
 mod push;
+mod reports;
 mod search;
 mod statuses;
 mod streaming;

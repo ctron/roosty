@@ -64,6 +64,33 @@ pub struct UiAdminDomainBlock {
     pub obfuscate: bool,
 }
 
+/// Reports and public rules displayed by the first-party moderation console.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiAdminModeration {
+    pub csrf_token: String,
+    pub rules: Vec<UiInstanceRule>,
+    pub reports: Vec<UiModerationReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiInstanceRule {
+    pub id: Uuid,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiModerationReport {
+    pub id: Uuid,
+    pub category: String,
+    pub comment: String,
+    pub source: String,
+    pub target: String,
+    pub target_id: Uuid,
+    pub resolved: bool,
+    pub assigned: bool,
+    pub status_ids: Vec<Uuid>,
+}
+
 /// Account origin selected by an administrator account page.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -164,6 +191,13 @@ pub trait UiBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminDomainBlocks, String>> + Send + 'static>> {
         Box::pin(async { Err("administrator federation settings are unavailable".to_owned()) })
     }
+
+    fn admin_moderation(
+        &self,
+        _cookie_header: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminModeration, String>> + Send + 'static>> {
+        Box::pin(async { Err("administrator moderation is unavailable".to_owned()) })
+    }
 }
 
 /// Load administrator-only queue health and durable work as a JSON response.
@@ -225,6 +259,22 @@ pub async fn load_admin_domain_blocks() -> Result<UiAdminDomainBlocks, ServerFnE
         expect_context::<UiServerContext>()
             .0
             .admin_domain_blocks(request_cookie().await?)
+            .await
+            .map_err(ServerFnError::new)
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    unreachable!("the browser build uses the generated server-function client")
+}
+
+/// Load unresolved reports and instance rules for the moderation console.
+#[server(prefix = "/api/web", protocol = Http<GetUrl, Json>)]
+pub async fn load_admin_moderation() -> Result<UiAdminModeration, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        expect_context::<UiServerContext>()
+            .0
+            .admin_moderation(request_cookie().await?)
             .await
             .map_err(ServerFnError::new)
     }

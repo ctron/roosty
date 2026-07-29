@@ -12,9 +12,9 @@ use linkify::{LinkFinder, LinkKind};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
     ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus, PreviewCard,
-    QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus, ScheduleStatusResult,
-    ScheduledStatus, StatusContextItem, StatusContextParent, StatusCreationReservation,
-    StatusReference, StatusVisibility,
+    QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus, ReportStatus,
+    ScheduleStatusResult, ScheduledStatus, StatusContextItem, StatusContextParent,
+    StatusCreationReservation, StatusReference, StatusVisibility,
 };
 use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
@@ -2248,6 +2248,59 @@ async fn delete_status(
     }
 }
 
+/// Remove report evidence as an administrator while preserving normal federation side effects.
+pub(crate) async fn delete_reported_status(
+    state: &AppState,
+    reference: ReportStatus,
+) -> Result<bool, RoostyError> {
+    match reference {
+        ReportStatus::Local(status_id) => {
+            let Some(existing) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
+            else {
+                return Ok(false);
+            };
+            let had_media = roosty_db::local_status_has_media(&state.db, status_id).await?;
+            let txn = state.db.begin().await?;
+            let Some(status) =
+                roosty_db::delete_owned_local_status(&txn, status_id, existing.account_id).await?
+            else {
+                return Ok(false);
+            };
+            roosty_db::mark_quotes_target_deleted(
+                &txn,
+                roosty_db::StatusReference::Local(status.id),
+            )
+            .await?;
+            roosty_db::repair_direct_conversation_after_delete(&txn, status.conversation_id)
+                .await?;
+            enqueue_status_activity_in_transaction(
+                state,
+                &txn,
+                &status,
+                StatusActivityKind::Delete,
+                &[],
+            )
+            .await?;
+            txn.commit().await?;
+            let reblogs = roosty_db::local_reblogs_for_status(&state.db, status_id).await?;
+            publish_status_delete(state, &status, &reblogs, had_media).await;
+            Ok(true)
+        }
+        ReportStatus::Remote(status_id) => {
+            let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await?
+            else {
+                return Ok(false);
+            };
+            roosty_db::delete_remote_status(
+                &state.db,
+                &status.activitypub_id,
+                status.remote_actor_id,
+            )
+            .await
+        }
+    }
+}
+
 async fn update_interaction_policy(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
@@ -4265,7 +4318,7 @@ pub(crate) async fn publish_remote_reblog_delete(
 }
 
 /// Build a cached remote Note projection with viewer-specific favourite state.
-async fn remote_status_response_for_viewer(
+pub(crate) async fn remote_status_response_for_viewer(
     state: &AppState,
     status: roosty_db::RemoteStatus,
     viewer: Option<AccountId>,
@@ -4615,7 +4668,7 @@ async fn local_remote_reblog_response(
     }))
 }
 
-async fn status_response_for_viewer(
+pub(crate) async fn status_response_for_viewer(
     state: &AppState,
     status: roosty_db::LocalStatus,
     account: LocalAccount,

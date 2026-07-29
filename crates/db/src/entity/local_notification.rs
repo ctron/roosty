@@ -19,6 +19,7 @@ pub struct Model {
     pub group_id: Option<Uuid>,
     pub filtered: bool,
     pub notification_request_id: Option<Uuid>,
+    pub report_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
     pub dismissed_at: Option<OffsetDateTime>,
 }

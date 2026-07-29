@@ -91,6 +91,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::markers::router())
         .merge(crate::notifications::router())
         .merge(crate::push::router())
+        .merge(crate::reports::router())
         .merge(crate::search::router())
         .merge(crate::statuses::router())
         .merge(crate::version::router())
