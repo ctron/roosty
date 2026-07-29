@@ -9,8 +9,9 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     bootstrap::{
-        UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditLog, UiAdminWorkQueue, UiBootstrap,
-        load_admin_accounts, load_admin_audit_log, load_admin_work_queue, load_bootstrap,
+        UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditLog, UiAdminDomainBlocks,
+        UiAdminWorkQueue, UiBootstrap, load_admin_accounts, load_admin_audit_log,
+        load_admin_domain_blocks, load_admin_work_queue, load_bootstrap,
     },
     forms::{LoginError, PasswordChangeResult},
     ui::{
@@ -84,9 +85,34 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("admin/jobs") view=AdminWorkQueuePage/>
                 <Route path=path!("admin/accounts") view=AdminLocalAccountsPage/>
                 <Route path=path!("admin/remote-accounts") view=AdminRemoteAccountsPage/>
+                <Route path=path!("admin/federation") view=AdminFederationPage/>
                 <Route path=path!("admin/audit-log") view=AdminAuditLogPage/>
             </Routes>
         </Router>
+    }
+}
+
+#[component]
+fn AdminFederationPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let domain_blocks = Resource::new_blocking(|| (), |_| load_admin_domain_blocks());
+    install_periodic_refresh(domain_blocks);
+
+    view! {
+        <PageMetadata bootstrap page_title="Federation" path="/admin/federation"/>
+        <PageFrame bootstrap login_next="/admin/federation" wide=true>
+            <AdminLayout active=AdminSection::Federation>
+                <AdminPageHeading title="Federation" resource=domain_blocks/>
+                <Transition fallback=|| admin_loading("Loading federation settings…")>
+                    {Suspend::new(async move {
+                        match domain_blocks.await {
+                            Ok(domain_blocks) => admin_domain_blocks_content(domain_blocks),
+                            Err(_) => admin_load_error("federation settings"),
+                        }
+                    })}
+                </Transition>
+            </AdminLayout>
+        </PageFrame>
     }
 }
 
@@ -394,6 +420,7 @@ fn local_accounts_content(
                                 let account_id = account.id.to_string();
                                 let reset_id = account_id.clone();
                                 let csrf_limit = csrf_actions.clone();
+                                let csrf_suspend = csrf_actions.clone();
                                 let csrf_reset = csrf_actions.clone();
                                 let (action, title) = if account.limited {
                                     ("Unlimit", "Unlimit local account?")
@@ -401,6 +428,11 @@ fn local_accounts_content(
                                     ("Limit", "Limit local account?")
                                 };
                                 let username = account.username;
+                                let (suspend_action, suspend_title) = if account.suspended {
+                                    ("Unsuspend", "Unsuspend local account?")
+                                } else {
+                                    ("Suspend", "Suspend local account?")
+                                };
                                 view! {
                                     <tr>
                                         <td>
@@ -410,7 +442,7 @@ fn local_accounts_content(
                                         </td>
                                         <td>{account.email.unwrap_or_default()}</td>
                                         <td>{if account.is_admin { "Admin" } else { "User" }}</td>
-                                        <td>{if account.limited { "Limited" } else { "Active" }}</td>
+                                        <td>{if account.suspended { "Suspended" } else if account.limited { "Limited" } else { "Active" }}</td>
                                         <td class="flex flex-wrap gap-2">
                                             <AdminActionModal
                                                 id=format!("limit-{account_id}")
@@ -423,6 +455,17 @@ fn local_accounts_content(
                                                 form_action=format!("/admin/accounts/{account_id}/limit")
                                                 csrf_token=csrf_limit
                                                 limited=!account.limited
+                                            />
+                                            <AdminActionModal
+                                                id=format!("suspend-{account_id}")
+                                                trigger_label=suspend_action
+                                                title=suspend_title
+                                                message=format!(
+                                                    "{} {username}? Suspension hides all content and severs follows.",
+                                                    suspend_action,
+                                                )
+                                                form_action=format!("/admin/accounts/{account_id}/suspend")
+                                                csrf_token=csrf_suspend
                                             />
                                             <AdminActionModal
                                                 id=format!("reset-password-{reset_id}")
@@ -483,6 +526,7 @@ fn remote_accounts_content(
                             {accounts.accounts.into_iter().map(|account| {
                                 let account_id = account.id.to_string();
                                 let csrf_limit = csrf_actions.clone();
+                                let csrf_suspend = csrf_actions.clone();
                                 let (action, title) = if account.limited {
                                     ("Unlimit", "Unlimit remote account?")
                                 } else {
@@ -492,6 +536,11 @@ fn remote_accounts_content(
                                     || account.username.clone(),
                                     |domain| format!("{}@{domain}", account.username),
                                 );
+                                let (suspend_action, suspend_title) = if account.suspended {
+                                    ("Unsuspend", "Unsuspend remote account?")
+                                } else {
+                                    ("Suspend", "Suspend remote account?")
+                                };
                                 view! {
                                     <tr>
                                         <td>
@@ -499,7 +548,7 @@ fn remote_accounts_content(
                                             <br/>
                                             <small>{account.display_name}</small>
                                         </td>
-                                        <td>{if account.limited { "Limited" } else { "Active" }}</td>
+                                        <td>{if account.suspended { "Suspended" } else if account.limited { "Limited" } else { "Active" }}</td>
                                         <td>
                                             <AdminActionModal
                                                 id=format!("limit-{account_id}")
@@ -513,12 +562,126 @@ fn remote_accounts_content(
                                                 csrf_token=csrf_limit
                                                 limited=!account.limited
                                             />
+                                            <AdminActionModal
+                                                id=format!("suspend-{account_id}")
+                                                trigger_label=suspend_action
+                                                title=suspend_title
+                                                message=format!(
+                                                    "{} {handle}? Suspension purges cached content and severs follows.",
+                                                    suspend_action,
+                                                )
+                                                form_action=format!("/admin/accounts/{account_id}/suspend")
+                                                csrf_token=csrf_suspend
+                                            />
                                         </td>
                                     </tr>
                                 }
                             }).collect_view()}
                         </tbody>
                     </table>
+                </div>
+            </AdminPanel>
+        </section>
+    }
+    .into_any()
+}
+
+fn admin_domain_blocks_content(domain_blocks: UiAdminDomainBlocks) -> AnyView {
+    let create_csrf = domain_blocks.csrf_token.clone();
+    let action_csrf = domain_blocks.csrf_token;
+    view! {
+        <section class="grid gap-6 pb-8">
+            <p class="text-base-content/70">
+                "Domain rules are stored in the database and apply consistently to every Roosty process."
+            </p>
+            <AdminPanel title="Add domain rule">
+                <form class="fieldset grid gap-4 lg:grid-cols-2" method="post" action="/admin/federation">
+                    <input type="hidden" name="csrf_token" value=create_csrf/>
+                    <FormField label="Domain">
+                        <input class="input w-full" name="domain" placeholder="example.org" required/>
+                    </FormField>
+                    <FormField label="Severity">
+                        <select class="select w-full" name="severity">
+                            <option value="noop">"No-op"</option>
+                            <option value="silence">"Limit"</option>
+                            <option value="suspend">"Suspend"</option>
+                        </select>
+                    </FormField>
+                    <FormField label="Public comment">
+                        <input class="input w-full" name="public_comment"/>
+                    </FormField>
+                    <FormField label="Private comment">
+                        <input class="input w-full" name="private_comment"/>
+                    </FormField>
+                    <label class="label justify-start gap-3">
+                        <input class="checkbox" name="reject_media" type="checkbox" value="true"/>
+                        <span>"Reject media"</span>
+                    </label>
+                    <label class="label justify-start gap-3">
+                        <input class="checkbox" name="reject_reports" type="checkbox" value="true"/>
+                        <span>"Reject reports"</span>
+                    </label>
+                    <label class="label justify-start gap-3">
+                        <input class="checkbox" name="obfuscate" type="checkbox" value="true"/>
+                        <span>"Obfuscate domain in public listings"</span>
+                    </label>
+                    <div><button class="btn btn-primary" type="submit">"Add rule"</button></div>
+                </form>
+            </AdminPanel>
+            <AdminPanel title="Domain rules">
+                <div class="grid gap-4">
+                    {domain_blocks.domain_blocks.into_iter().map(|block| {
+                        let id = block.id;
+                        let csrf = action_csrf.clone();
+                        view! {
+                            <form
+                                class="card border-base-300 border"
+                                method="post"
+                                action=format!("/admin/federation/{id}")
+                            >
+                                <div class="card-body grid gap-4 lg:grid-cols-2">
+                                    <h3 class="card-title lg:col-span-2">{block.domain}</h3>
+                                    <input type="hidden" name="csrf_token" value=csrf/>
+                                    <FormField label="Severity">
+                                        <select class="select w-full" name="severity">
+                                            <option value="noop" selected=block.severity == "noop">"No-op"</option>
+                                            <option value="silence" selected=block.severity == "silence">"Limit"</option>
+                                            <option value="suspend" selected=block.severity == "suspend">"Suspend"</option>
+                                        </select>
+                                    </FormField>
+                                    <FormField label="Public comment">
+                                        <input class="input w-full" name="public_comment" value=block.public_comment/>
+                                    </FormField>
+                                    <FormField label="Private comment">
+                                        <input class="input w-full" name="private_comment" value=block.private_comment/>
+                                    </FormField>
+                                    <label class="label justify-start gap-3">
+                                        <input class="checkbox" name="reject_media" type="checkbox" value="true" checked=block.reject_media/>
+                                        <span>"Reject media"</span>
+                                    </label>
+                                    <label class="label justify-start gap-3">
+                                        <input class="checkbox" name="reject_reports" type="checkbox" value="true" checked=block.reject_reports/>
+                                        <span>"Reject reports"</span>
+                                    </label>
+                                    <label class="label justify-start gap-3">
+                                        <input class="checkbox" name="obfuscate" type="checkbox" value="true" checked=block.obfuscate/>
+                                        <span>"Obfuscate"</span>
+                                    </label>
+                                    <div class="card-actions lg:col-span-2">
+                                        <button class="btn btn-primary" type="submit">"Save"</button>
+                                        <button
+                                            class="btn btn-error"
+                                            type="submit"
+                                            name="operation"
+                                            value="delete"
+                                        >
+                                            "Delete"
+                                        </button>
+                                    </div>
+                                </div>
+                            </form>
+                        }
+                    }).collect_view()}
                 </div>
             </AdminPanel>
         </section>

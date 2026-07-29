@@ -11,8 +11,9 @@ Roosty only shows the administration navigation to administrators, and the serve
 The responsive administration menu separates the interface into:
 
 * Work queue at `/admin`, with durable queue health and sanitized job diagnostics.
-* Local accounts at `/admin/accounts`, with account creation, password resets, and account limits.
-* Remote accounts at `/admin/remote-accounts`, with cached-remote account limits.
+* Local accounts at `/admin/accounts`, with account creation, password resets, limits, and suspension.
+* Remote accounts at `/admin/remote-accounts`, with cached-remote account limits and suspension.
+* Federation at `/admin/federation`, with database-backed domain moderation rules.
 * Audit log at `/admin/audit-log`, with recent administrator actions.
 
 Each active category refreshes its own JSON data every 15 seconds while the page is visible.
@@ -45,9 +46,35 @@ When the web interface is unavailable, run the password-reset command inside the
 Administrators can limit a local or cached-remote account without discarding its ActivityPub data.
 A limited account is suppressed from discovery and public timelines and participates in notification filtering.
 Removing the limit restores normal presentation.
-The interface confirms limit, unlimit, and password-reset actions in a modal before submitting them.
+The interface confirms account actions before submitting them.
 
-Account suspension, deletion, reports, and custom administrator roles are not yet implemented.
+== Suspend an account
+
+Suspending an account immediately hides its profile and posts, revokes its sessions and tokens,
+cancels scheduled posts, and severs follow relationships. Suspending a local account also queues an
+ActivityPub `Delete` for its accepted remote followers before relationship cleanup. Its content is
+purged after 30 days unless an administrator unsuspends it; the compatible admin API can request an
+immediate purge. Suspending a cached remote account immediately removes its cached posts and
+relationships. There is no federated "unsuspend" activity, so unsuspension is local policy.
+
+An administrator cannot suspend their own account or the final active administrator.
+
+== Moderate a domain
+
+Use `/admin/federation` to create, edit, and delete domain rules. Rules are durable PostgreSQL
+configuration, so changes apply across every server and worker without restarting Roosty.
+
+The Mastodon-compatible severities are:
+
+* `noop`, which retains the domain while applying optional media or report rejection.
+* `silence`, shown as *Limit*, which removes the domain from public discovery.
+* `suspend`, which rejects federation and purges cached actors and posts from the domain.
+
+A rule covers its subdomains. More-specific and parent rules are combined conservatively, so the
+strongest severity and rejection flags win. The old `ROOSTY_FEDERATION_BLOCKED_DOMAINS` environment
+variable is no longer read; recreate those entries on this page when upgrading.
+
+Reports and custom administrator roles are not yet implemented.
 See the xref:compatibility.adoc[compatibility matrix] for the current Mastodon administration API coverage.
 
 == Inspect background work

@@ -1002,12 +1002,16 @@ async fn notification_accounts(
             accounts.push(NotificationAccountResponse::Local(Box::new(
                 account_response(state, account).await?,
             )));
-        } else if let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, id).await?
-            && !state.config.federation_domain_is_blocked(&actor.domain)
-        {
-            accounts.push(NotificationAccountResponse::Remote(Box::new(
-                crate::accounts::remote_account_response(state, actor).await?,
-            )));
+        } else if let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, id).await? {
+            let suspended = actor.suspended_at.is_some()
+                || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+                    .await?
+                    .is_suspended();
+            if !suspended {
+                accounts.push(NotificationAccountResponse::Remote(Box::new(
+                    crate::accounts::remote_account_response(state, actor).await?,
+                )));
+            }
         }
     }
     Ok(accounts)

@@ -8,6 +8,7 @@ use roosty_core::{AccountId, Result, RoostyError};
 #[cfg(test)]
 use roosty_db::NotificationPolicyUpdate;
 use roosty_migration::Migrator;
+use sea_orm::TransactionTrait;
 use sea_orm_migration::MigratorTrait;
 use tokio::{sync::watch, task::JoinSet};
 use tracing::{info, warn};
@@ -261,7 +262,6 @@ async fn serve(
         info!("running database migrations before server startup");
         run_migrations(&db).await?;
     }
-    reconcile_domain_suspensions(&db, &config).await?;
     roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
     roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
 
@@ -321,7 +321,6 @@ async fn serve(
 async fn worker() -> Result<()> {
     let config = Config::from_env(None)?;
     let db = roosty_db::connect(&config.database_url).await?;
-    reconcile_domain_suspensions(&db, &config).await?;
     roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
     roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -329,20 +328,6 @@ async fn worker() -> Result<()> {
     let result = worker_pool(db, config, shutdown_rx).await;
     shutdown_task.abort();
     result
-}
-
-/// Apply configured domain suspensions before this process becomes ready.
-async fn reconcile_domain_suspensions(db: &roosty_db::DbConnection, config: &Config) -> Result<()> {
-    use sea_orm::TransactionTrait;
-    let txn = db.begin().await?;
-    let reconciled =
-        roosty_db::reconcile_suspended_remote_domains(&txn, &config.federation_blocked_domains)
-            .await?;
-    txn.commit().await?;
-    if reconciled > 0 {
-        info!(reconciled, "reconciled suspended remote-domain actors");
-    }
-    Ok(())
 }
 
 async fn serve_router(
@@ -574,6 +559,49 @@ async fn worker_iteration(
                 Ok(account_id) => roosty_db::cleanup_notification_requests(db, account_id).await,
                 Err(error) => Err(error),
             }
+        }
+        roosty_db::JobKind::AccountPurge => {
+            let account_id = job
+                .payload
+                .get("account_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("account purge job account_id is missing".to_owned())
+                })?
+                .parse()
+                .map(AccountId)
+                .map_err(|_| {
+                    RoostyError::InvalidInput("account purge job account_id is invalid".to_owned())
+                })?;
+            let txn = db.begin().await?;
+            let paths = roosty_db::purge_suspended_local_account(&txn, account_id).await?;
+            txn.commit().await?;
+            for path in paths {
+                let _ = tokio::fs::remove_file(std::path::Path::new(&config.media_root).join(path))
+                    .await;
+            }
+            Ok(())
+        }
+        roosty_db::JobKind::DomainModerationReconcile => {
+            let block_id = job
+                .payload
+                .get("domain_block_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput(
+                        "domain reconciliation job domain_block_id is missing".to_owned(),
+                    )
+                })?
+                .parse()
+                .map_err(|_| {
+                    RoostyError::InvalidInput(
+                        "domain reconciliation job domain_block_id is invalid".to_owned(),
+                    )
+                })?;
+            let txn = db.begin().await?;
+            roosty_db::reconcile_federation_domain_block(&txn, block_id).await?;
+            txn.commit().await?;
+            Ok(())
         }
         roosty_db::JobKind::ScheduledStatusPublish => {
             statuses::publish_scheduled_status(&state, job.payload.clone()).await
@@ -1254,7 +1282,6 @@ mod tests {
                 "test-federation-key-encryption-secret-000".to_owned(),
             ),
             federation_allowed_domains: vec!["*".to_owned()],
-            federation_blocked_domains: Vec::new(),
             federation_delivery_max_age: time::Duration::days(7),
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,

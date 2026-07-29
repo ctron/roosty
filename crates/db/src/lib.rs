@@ -27,7 +27,7 @@ use std::{
 };
 use strum::{Display, EnumString, IntoStaticStr};
 use time::{Date, Duration, OffsetDateTime};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -77,6 +77,33 @@ pub enum NotificationPolicyAction {
     Accept,
     Filter,
     Drop,
+}
+
+/// Mastodon-compatible enforcement level for one federated domain.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    DeriveValueType,
+    Display,
+    EnumString,
+    Eq,
+    IntoStaticStr,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+)]
+#[sea_orm(value_type = "String")]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum DomainBlockSeverity {
+    #[default]
+    Noop,
+    Silence,
+    Suspend,
 }
 
 /// Lifecycle state of a sender-scoped filtered-notification request.
@@ -160,10 +187,10 @@ impl StatusVisibility {
 }
 
 use entity::{
-    job, local_account, local_account_block, local_account_mute, local_actor_key,
-    local_conversation, local_conversation_account, local_conversation_remote_participant,
-    local_featured_tag, local_follow, local_list, local_list_local_member,
-    local_list_remote_member, local_media_attachment, local_notification,
+    federation_domain_block, job, local_account, local_account_block, local_account_mute,
+    local_actor_key, local_conversation, local_conversation_account,
+    local_conversation_remote_participant, local_featured_tag, local_follow, local_list,
+    local_list_local_member, local_list_remote_member, local_media_attachment, local_notification,
     local_notification_permission, local_notification_policy, local_notification_request,
     local_remote_account_block, local_remote_account_mute, local_remote_status_favourite,
     local_remote_status_reblog, local_status, local_status_bookmark, local_status_edit,
@@ -874,6 +901,10 @@ pub struct LocalAccount {
     pub header_file_path: Option<String>,
     /// When an operator limited this account locally.
     pub limited_at: Option<OffsetDateTime>,
+    /// When an administrator suspended this account.
+    pub suspended_at: Option<OffsetDateTime>,
+    /// When retained account content was permanently purged.
+    pub data_purged_at: Option<OffsetDateTime>,
     /// Timestamp when the local account was created.
     pub created_at: OffsetDateTime,
 }
@@ -932,6 +963,10 @@ pub struct RemoteActor {
     pub moved_to_remote_actor_id: Option<AccountId>,
     /// When an operator limited this cached actor locally.
     pub limited_at: Option<OffsetDateTime>,
+    /// When an administrator directly suspended this cached actor.
+    pub suspended_at: Option<OffsetDateTime>,
+    /// When cached actor content was purged after suspension.
+    pub data_purged_at: Option<OffsetDateTime>,
     /// Whether the remote actor explicitly opted into profile discovery.
     pub discoverable: Option<bool>,
 }
@@ -991,7 +1026,253 @@ pub struct AdminAccount {
     pub display_name: String,
     pub is_admin: bool,
     pub limited: bool,
+    pub suspended: bool,
+    pub data_purged_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+}
+
+/// Persisted Mastodon-compatible domain moderation rule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FederationDomainBlock {
+    pub id: Uuid,
+    pub domain: String,
+    pub severity: DomainBlockSeverity,
+    pub reject_media: bool,
+    pub reject_reports: bool,
+    pub private_comment: Option<String>,
+    pub public_comment: Option<String>,
+    pub obfuscate: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// Fields accepted when an administrator creates a domain rule.
+pub struct NewFederationDomainBlock {
+    pub domain: String,
+    pub severity: DomainBlockSeverity,
+    pub reject_media: bool,
+    pub reject_reports: bool,
+    pub private_comment: Option<String>,
+    pub public_comment: Option<String>,
+    pub obfuscate: bool,
+}
+
+/// Optional replacements accepted by Mastodon's domain-block update endpoint.
+#[derive(Default)]
+pub struct FederationDomainBlockUpdate {
+    pub severity: Option<DomainBlockSeverity>,
+    pub reject_media: Option<bool>,
+    pub reject_reports: Option<bool>,
+    pub private_comment: Option<Option<String>>,
+    pub public_comment: Option<Option<String>>,
+    pub obfuscate: Option<bool>,
+}
+
+/// Effective policy after combining every exact or parent-domain rule.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FederationDomainPolicy {
+    pub severity: DomainBlockSeverity,
+    pub reject_media: bool,
+    pub reject_reports: bool,
+}
+
+impl FederationDomainPolicy {
+    pub fn is_suspended(self) -> bool {
+        self.severity == DomainBlockSeverity::Suspend
+    }
+
+    pub fn is_limited(self) -> bool {
+        self.severity >= DomainBlockSeverity::Silence
+    }
+}
+
+/// Normalize a DNS domain for durable policy matching.
+pub fn normalize_federation_domain(domain: &str) -> Result<String> {
+    let domain = domain.trim().trim_end_matches('.');
+    match Host::parse(domain) {
+        Ok(Host::Domain(domain)) if domain.contains('.') && !domain.contains('*') => {
+            Ok(domain.to_ascii_lowercase())
+        }
+        _ => Err(RoostyError::InvalidInput(
+            "domain must be a public DNS name".to_owned(),
+        )),
+    }
+}
+
+/// Return all exact DNS suffixes that can cover one remote domain.
+fn federation_domain_suffixes(domain: &str) -> Result<Vec<String>> {
+    let domain = normalize_federation_domain(domain)?;
+    let labels = domain.split('.').collect::<Vec<_>>();
+    Ok((0..labels.len().saturating_sub(1))
+        .map(|index| labels[index..].join("."))
+        .collect())
+}
+
+/// Resolve the effective database-backed policy for a remote domain.
+pub async fn federation_domain_policy<C>(db: &C, domain: &str) -> Result<FederationDomainPolicy>
+where
+    C: ConnectionTrait,
+{
+    let suffixes = federation_domain_suffixes(domain)?;
+    let rules = federation_domain_block::Entity::find()
+        .filter(federation_domain_block::Column::Domain.is_in(suffixes))
+        .all(db)
+        .await?;
+    Ok(rules
+        .into_iter()
+        .fold(FederationDomainPolicy::default(), |mut policy, rule| {
+            policy.severity = policy.severity.max(rule.severity);
+            policy.reject_media |= rule.reject_media;
+            policy.reject_reports |= rule.reject_reports;
+            policy
+        }))
+}
+
+/// Return domains hidden from public discovery by silence or suspension rules.
+pub async fn hidden_federation_domains<C>(db: &C) -> Result<Vec<String>>
+where
+    C: ConnectionTrait,
+{
+    Ok(federation_domain_block::Entity::find()
+        .filter(
+            federation_domain_block::Column::Severity
+                .is_in([DomainBlockSeverity::Silence, DomainBlockSeverity::Suspend]),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|rule| rule.domain)
+        .collect())
+}
+
+/// List domain rules in stable UUIDv7 cursor order.
+pub async fn list_federation_domain_blocks(
+    db: &DbConnection,
+    limit: u64,
+    max_id: Option<Uuid>,
+) -> Result<Vec<FederationDomainBlock>> {
+    let mut query = federation_domain_block::Entity::find();
+    if let Some(max_id) = max_id {
+        query = query.filter(federation_domain_block::Column::Id.lt(max_id));
+    }
+    Ok(query
+        .order_by_desc(federation_domain_block::Column::Id)
+        .limit(limit.min(201))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(federation_domain_block_from_model)
+        .collect())
+}
+
+pub async fn find_federation_domain_block<C>(
+    db: &C,
+    id: Uuid,
+) -> Result<Option<FederationDomainBlock>>
+where
+    C: ConnectionTrait,
+{
+    Ok(federation_domain_block::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .map(federation_domain_block_from_model))
+}
+
+/// Create one rule after validating that the exact domain is not already present.
+pub async fn create_federation_domain_block(
+    txn: &DatabaseTransaction,
+    input: NewFederationDomainBlock,
+) -> Result<FederationDomainBlock> {
+    let domain = normalize_federation_domain(&input.domain)?;
+    if federation_domain_block::Entity::find()
+        .filter(federation_domain_block::Column::Domain.eq(&domain))
+        .one(txn)
+        .await?
+        .is_some()
+    {
+        return Err(RoostyError::InvalidInput(
+            "domain is already blocked".to_owned(),
+        ));
+    }
+    let now = OffsetDateTime::now_utc();
+    let model = federation_domain_block::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        domain: Set(domain),
+        severity: Set(input.severity),
+        reject_media: Set(input.reject_media),
+        reject_reports: Set(input.reject_reports),
+        private_comment: Set(input.private_comment),
+        public_comment: Set(input.public_comment),
+        obfuscate: Set(input.obfuscate),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(txn)
+    .await?;
+    Ok(federation_domain_block_from_model(model))
+}
+
+pub async fn update_federation_domain_block(
+    txn: &DatabaseTransaction,
+    id: Uuid,
+    update: FederationDomainBlockUpdate,
+) -> Result<FederationDomainBlock> {
+    let model = federation_domain_block::Entity::find_by_id(id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("domain block does not exist".to_owned()))?;
+    let mut active = model.into_active_model();
+    set_if_some(&mut active.severity, update.severity);
+    set_if_some(&mut active.reject_media, update.reject_media);
+    set_if_some(&mut active.reject_reports, update.reject_reports);
+    set_if_some(&mut active.private_comment, update.private_comment);
+    set_if_some(&mut active.public_comment, update.public_comment);
+    set_if_some(&mut active.obfuscate, update.obfuscate);
+    active.updated_at = Set(OffsetDateTime::now_utc());
+    Ok(federation_domain_block_from_model(
+        active.update(txn).await?,
+    ))
+}
+
+pub async fn delete_federation_domain_block(
+    txn: &DatabaseTransaction,
+    id: Uuid,
+) -> Result<Option<FederationDomainBlock>> {
+    let Some(model) = federation_domain_block::Entity::find_by_id(id)
+        .one(txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let block = federation_domain_block_from_model(model.clone());
+    model.delete(txn).await?;
+    Ok(Some(block))
+}
+
+/// Apply irreversible cache cleanup for an active suspended-domain rule.
+pub async fn reconcile_federation_domain_block(txn: &DatabaseTransaction, id: Uuid) -> Result<u64> {
+    let Some(block) = federation_domain_block::Entity::find_by_id(id)
+        .one(txn)
+        .await?
+    else {
+        return Ok(0);
+    };
+    if block.severity != DomainBlockSeverity::Suspend {
+        return Ok(0);
+    }
+    let actors = remote_actor::Entity::find()
+        .filter(
+            remote_actor::Column::Domain
+                .eq(&block.domain)
+                .or(remote_actor::Column::Domain.ends_with(format!(".{}", block.domain))),
+        )
+        .all(txn)
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    for actor in &actors {
+        purge_remote_actor_cache(txn, AccountId(actor.id), now).await?;
+    }
+    Ok(actors.len() as u64)
 }
 
 /// List local and cached-remote accounts for administrator tooling.
@@ -1000,6 +1281,7 @@ pub async fn list_admin_accounts(
     query: &str,
     origin: Option<&str>,
     limited: Option<bool>,
+    suspended: Option<bool>,
     limit: u64,
     max_id: Option<Uuid>,
 ) -> Result<Vec<AdminAccount>> {
@@ -1032,6 +1314,13 @@ pub async fn list_admin_accounts(
                 local_account::Column::LimitedAt.is_null()
             });
         }
+        if let Some(suspended) = suspended {
+            select = select.filter(if suspended {
+                local_account::Column::SuspendedAt.is_not_null()
+            } else {
+                local_account::Column::SuspendedAt.is_null()
+            });
+        }
         if let Some(max_id) = max_id {
             select = select.filter(local_account::Column::Id.lt(max_id));
         }
@@ -1050,6 +1339,8 @@ pub async fn list_admin_accounts(
                     display_name: account.display_name,
                     is_admin: account.is_admin,
                     limited: account.limited_at.is_some(),
+                    suspended: account.suspended_at.is_some(),
+                    data_purged_at: account.data_purged_at,
                     created_at: account.created_at,
                 }),
         );
@@ -1073,6 +1364,13 @@ pub async fn list_admin_accounts(
                 remote_actor::Column::LimitedAt.is_null()
             });
         }
+        if let Some(suspended) = suspended {
+            select = select.filter(if suspended {
+                remote_actor::Column::SuspendedAt.is_not_null()
+            } else {
+                remote_actor::Column::SuspendedAt.is_null()
+            });
+        }
         if let Some(max_id) = max_id {
             select = select.filter(remote_actor::Column::Id.lt(max_id));
         }
@@ -1091,6 +1389,8 @@ pub async fn list_admin_accounts(
                     display_name: actor.display_name,
                     is_admin: false,
                     limited: actor.limited_at.is_some(),
+                    suspended: actor.suspended_at.is_some(),
+                    data_purged_at: actor.data_purged_at,
                     created_at: actor.profile_created_at.unwrap_or(actor.created_at),
                 }),
         );
@@ -1122,6 +1422,8 @@ pub async fn find_admin_account_by_id(
             display_name: account.display_name,
             is_admin: account.is_admin,
             limited: account.limited_at.is_some(),
+            suspended: account.suspended_at.is_some(),
+            data_purged_at: account.data_purged_at,
             created_at: account.created_at,
         }));
     }
@@ -1136,8 +1438,22 @@ pub async fn find_admin_account_by_id(
             display_name: actor.display_name,
             is_admin: false,
             limited: actor.limited_at.is_some(),
+            suspended: actor.suspended_at.is_some(),
+            data_purged_at: actor.data_purged_at,
             created_at: actor.profile_created_at.unwrap_or(actor.first_seen_at),
         }))
+}
+
+/// Count administrators that can still authenticate and recover the instance.
+pub async fn count_active_admin_accounts<C>(db: &C) -> Result<u64>
+where
+    C: ConnectionTrait,
+{
+    Ok(local_account::Entity::find()
+        .filter(local_account::Column::IsAdmin.eq(true))
+        .filter(local_account::Column::SuspendedAt.is_null())
+        .count(db)
+        .await?)
 }
 
 #[derive(Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, PartialEq)]
@@ -1186,6 +1502,7 @@ pub async fn account_directory(
               FROM local_account account
              WHERE account.discoverable
                AND account.limited_at IS NULL
+               AND account.suspended_at IS NULL
                AND ($1::uuid IS NULL OR (
                     account.id <> $1
                     AND NOT EXISTS (
@@ -1207,10 +1524,14 @@ pub async fn account_directory(
              WHERE NOT $2
                AND actor.discoverable IS TRUE
                AND actor.limited_at IS NULL
+               AND actor.suspended_at IS NULL
                AND actor.deleted_at IS NULL
                AND actor.moved_to_remote_actor_id IS NULL
-               AND actor.domain NOT IN (
-                    SELECT jsonb_array_elements_text($3::jsonb)
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text($3::jsonb) blocked(domain)
+                    WHERE actor.domain = blocked.domain
+                       OR actor.domain LIKE '%.' || blocked.domain
                )
                AND ($1::uuid IS NULL OR (
                     NOT EXISTS (
@@ -4931,6 +5252,8 @@ pub enum JobKind {
     WebPushDelivery,
     NotificationRequestMerge,
     NotificationRequestCleanup,
+    AccountPurge,
+    DomainModerationReconcile,
     ScheduledStatusPublish,
     TrendMaintenance,
     PreviewCardFetch,
@@ -6118,6 +6441,235 @@ pub async fn set_remote_actor_limited_by_id(
     Ok(Some(actor))
 }
 
+/// Set or clear direct administrator suspension and enqueue irreversible cleanup work.
+pub async fn set_account_suspended_by_id(
+    txn: &DatabaseTransaction,
+    account_id: AccountId,
+    suspended: bool,
+) -> Result<Option<AdminAccount>> {
+    let now = OffsetDateTime::now_utc();
+    if let Some(account) = local_account::Entity::find_by_id(account_id.0)
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    {
+        let was_suspended = account.suspended_at.is_some();
+        let mut active = account.into_active_model();
+        active.suspended_at = Set(suspended.then_some(now));
+        let updated = active.update(txn).await?;
+        if suspended && !was_suspended {
+            sever_local_account_relationships(txn, account_id, now).await?;
+            enqueue_job_on_connection(
+                txn,
+                NewJob {
+                    kind: JobKind::AccountPurge,
+                    payload: serde_json::json!({
+                        "account_id": account_id.0,
+                        "origin": "local"
+                    }),
+                    deduplication_key: Some(format!("account-purge:{}", account_id.0)),
+                    run_after: now + Duration::days(30),
+                },
+            )
+            .await?;
+        } else if !suspended {
+            cancel_account_purge(txn, account_id, now).await?;
+        }
+        mark_account_status_trends_dirty(txn, "local", account_id).await?;
+        return Ok(Some(AdminAccount {
+            id: account_id,
+            username: updated.username,
+            domain: None,
+            email: Some(updated.email),
+            display_name: updated.display_name,
+            is_admin: updated.is_admin,
+            limited: updated.limited_at.is_some(),
+            suspended: updated.suspended_at.is_some(),
+            data_purged_at: updated.data_purged_at,
+            created_at: updated.created_at,
+        }));
+    }
+    if let Some(actor) = remote_actor::Entity::find_by_id(account_id.0)
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    {
+        let mut active = actor.into_active_model();
+        active.suspended_at = Set(suspended.then_some(now));
+        if suspended {
+            active.data_purged_at = Set(Some(now));
+        }
+        let updated = active.update(txn).await?;
+        if suspended {
+            purge_remote_actor_cache(txn, account_id, now).await?;
+        }
+        mark_account_status_trends_dirty(txn, "remote", account_id).await?;
+        return Ok(Some(AdminAccount {
+            id: account_id,
+            username: updated.username,
+            domain: Some(updated.domain),
+            email: None,
+            display_name: updated.display_name,
+            is_admin: false,
+            limited: updated.limited_at.is_some(),
+            suspended: updated.suspended_at.is_some(),
+            data_purged_at: updated.data_purged_at,
+            created_at: updated.profile_created_at.unwrap_or(updated.created_at),
+        }));
+    }
+    Ok(None)
+}
+
+async fn sever_local_account_relationships(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    for statement in [
+        "DELETE FROM local_follow WHERE follower_account_id = $1 OR followed_account_id = $1",
+        "DELETE FROM remote_follow WHERE local_account_id = $1",
+        "DELETE FROM remote_following WHERE local_account_id = $1",
+        "DELETE FROM local_account_block WHERE account_id = $1 OR target_account_id = $1",
+        "DELETE FROM local_account_mute WHERE account_id = $1 OR target_account_id = $1",
+        "DELETE FROM local_remote_account_block WHERE local_account_id = $1",
+        "DELETE FROM local_remote_account_mute WHERE local_account_id = $1",
+        "DELETE FROM remote_local_account_block WHERE local_account_id = $1",
+        "DELETE FROM local_list_local_member WHERE account_id = $1 OR list_id IN (SELECT id FROM local_list WHERE account_id = $1)",
+        "DELETE FROM local_list_remote_member WHERE list_id IN (SELECT id FROM local_list WHERE account_id = $1)",
+        "DELETE FROM local_list WHERE account_id = $1",
+        "DELETE FROM scheduled_status WHERE account_id = $1",
+    ] {
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            statement,
+            vec![account_id.0.into()],
+        ))
+        .await?;
+    }
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE oauth_access_token SET revoked_at = $2 WHERE account_id = $1 AND revoked_at IS NULL",
+        vec![account_id.0.into(), now.into()],
+    ))
+    .await?;
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE local_notification SET dismissed_at = $2 WHERE (account_id = $1 OR actor_account_id = $1) AND dismissed_at IS NULL",
+        vec![account_id.0.into(), now.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn purge_remote_actor_cache(
+    db: &impl ConnectionTrait,
+    actor_id: AccountId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    remote_follow::Entity::delete_many()
+        .filter(remote_follow::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    remote_following::Entity::delete_many()
+        .filter(remote_following::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    local_list_remote_member::Entity::delete_many()
+        .filter(local_list_remote_member::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    local_remote_account_block::Entity::delete_many()
+        .filter(local_remote_account_block::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    local_remote_account_mute::Entity::delete_many()
+        .filter(local_remote_account_mute::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    remote_local_account_block::Entity::delete_many()
+        .filter(remote_local_account_block::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    remote_status::Entity::update_many()
+        .col_expr(remote_status::Column::DeletedAt, Expr::value(Some(now)))
+        .filter(remote_status::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE local_notification SET dismissed_at = $2 WHERE remote_actor_id = $1 AND dismissed_at IS NULL",
+        vec![actor_id.0.into(), now.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn cancel_account_purge(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE job SET completed_at = $2, last_error = 'cancelled after unsuspend'
+           WHERE kind = 'account_purge' AND completed_at IS NULL
+             AND payload->>'account_id' = $1"#,
+        vec![account_id.0.to_string().into(), now.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Permanently purge retained data if the local account remains suspended.
+pub async fn purge_suspended_local_account(
+    txn: &DatabaseTransaction,
+    account_id: AccountId,
+) -> Result<Vec<String>> {
+    let Some(account) = local_account::Entity::find_by_id(account_id.0)
+        .lock_exclusive()
+        .one(txn)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    if account.suspended_at.is_none() || account.data_purged_at.is_some() {
+        return Ok(Vec::new());
+    }
+    let attachments = local_media_attachment::Entity::find()
+        .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+        .all(txn)
+        .await?;
+    let mut paths = attachments
+        .iter()
+        .flat_map(|attachment| {
+            [
+                Some(attachment.file_path.clone()),
+                attachment.preview_file_path.clone(),
+            ]
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    paths.extend(account.avatar_file_path.clone());
+    paths.extend(account.header_file_path.clone());
+    local_status::Entity::delete_many()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .exec(txn)
+        .await?;
+    local_media_attachment::Entity::delete_many()
+        .filter(local_media_attachment::Column::AccountId.eq(account_id.0))
+        .exec(txn)
+        .await?;
+    let mut active = account.into_active_model();
+    active.display_name = Set(String::new());
+    active.note = Set(String::new());
+    active.profile_fields = Set(serde_json::json!([]));
+    active.avatar_file_path = Set(None);
+    active.header_file_path = Set(None);
+    active.data_purged_at = Set(Some(OffsetDateTime::now_utc()));
+    active.update(txn).await?;
+    Ok(paths)
+}
+
 /// Search local accounts by username or display name for Mastodon autocomplete.
 pub async fn search_local_accounts(
     db: &DbConnection,
@@ -6133,6 +6685,7 @@ pub async fn search_local_accounts(
     let hidden_account_ids = blocked_local_account_ids_for_account(db, viewer_account_id).await?;
     let mut accounts = local_account::Entity::find()
         .filter(local_account::Column::LimitedAt.is_null())
+        .filter(local_account::Column::SuspendedAt.is_null())
         .filter(
             local_account::Column::Username
                 .contains(query)
@@ -6177,6 +6730,7 @@ pub async fn search_accounts(
                        ) AS followed
                 FROM local_account account
                 WHERE account.limited_at IS NULL
+                  AND account.suspended_at IS NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM local_account_block block
                     WHERE block.account_id = $1 AND block.target_account_id = account.id
@@ -6195,11 +6749,15 @@ pub async fn search_accounts(
                 FROM remote_actor actor
                 WHERE $4
                   AND actor.limited_at IS NULL
+                  AND actor.suspended_at IS NULL
                   AND ($8 OR actor.domain IN (
                     SELECT jsonb_array_elements_text($9::jsonb)
                   ))
-                  AND actor.domain NOT IN (
-                    SELECT jsonb_array_elements_text($10::jsonb)
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text($10::jsonb) blocked(domain)
+                    WHERE actor.domain = blocked.domain
+                       OR actor.domain LIKE '%.' || blocked.domain
                   )
                   AND actor.deleted_at IS NULL
                   AND NOT EXISTS (
@@ -6305,6 +6863,7 @@ pub async fn search_statuses(
             WHERE document.document ILIKE '%' || $2 || '%' ESCAPE '\'
               AND status.deleted_at IS NULL
               AND (author.limited_at IS NULL OR author.id = $1)
+              AND author.suspended_at IS NULL
               AND ($3::uuid IS NULL OR author.id = $3)
               AND (
                 author.id = $1
@@ -6383,6 +6942,7 @@ pub async fn search_statuses(
               AND status.deleted_at IS NULL
               AND author.deleted_at IS NULL
               AND author.limited_at IS NULL
+              AND author.suspended_at IS NULL
               AND ($3::uuid IS NULL OR author.id = $3)
               AND NOT EXISTS (
                 SELECT 1
@@ -9835,7 +10395,8 @@ pub async fn trending_statuses(
                 AND local_status.sensitive = false
                 AND local_status.spoiler_text = ''
                 AND local_account.discoverable = true
-                AND local_account.limited_at IS NULL)
+                AND local_account.limited_at IS NULL
+                AND local_account.suspended_at IS NULL)
                OR
                (remote_status.id IS NOT NULL
                 AND remote_status.deleted_at IS NULL
@@ -9844,7 +10405,8 @@ pub async fn trending_statuses(
                 AND coalesce((remote_status.object->>'sensitive')::boolean, false) = false
                 AND coalesce(remote_status.object->>'summary', '') = ''
                 AND remote_actor.deleted_at IS NULL
-                AND remote_actor.limited_at IS NULL)
+                AND remote_actor.limited_at IS NULL
+                AND remote_actor.suspended_at IS NULL)
              )
            ORDER BY
              metric.score DESC,
@@ -10445,7 +11007,8 @@ pub async fn link_timeline(
                 AND local_status.sensitive = false
                 AND local_status.spoiler_text = ''
                 AND local_account.discoverable = true
-                AND local_account.limited_at IS NULL)
+                AND local_account.limited_at IS NULL
+                AND local_account.suspended_at IS NULL)
                OR
                (remote_status.id IS NOT NULL AND remote_status.deleted_at IS NULL
                 AND remote_status.visibility = 'public'
@@ -10453,7 +11016,9 @@ pub async fn link_timeline(
                 AND coalesce(
                     (remote_status.object->>'sensitive')::boolean, false) = false
                 AND coalesce(remote_status.object->>'summary', '') = ''
-                AND remote_actor.deleted_at IS NULL AND remote_actor.limited_at IS NULL)
+                AND remote_actor.deleted_at IS NULL
+                AND remote_actor.limited_at IS NULL
+                AND remote_actor.suspended_at IS NULL)
              )
            ORDER BY coalesce(
              association.local_status_id, association.remote_status_id) DESC
@@ -10751,7 +11316,8 @@ async fn refresh_status_trend(
                       AND status.sensitive = false
                       AND status.spoiler_text = ''
                       AND account.discoverable = true
-                      AND account.limited_at IS NULL AS eligible
+                      AND account.limited_at IS NULL
+                      AND account.suspended_at IS NULL AS eligible
                FROM local_status status
                JOIN local_account account ON account.id = status.account_id
                WHERE status.id = $1"#
@@ -10764,7 +11330,8 @@ async fn refresh_status_trend(
                       AND coalesce((status.object->>'sensitive')::boolean, false) = false
                       AND coalesce(status.object->>'summary', '') = ''
                       AND actor.deleted_at IS NULL
-                      AND actor.limited_at IS NULL AS eligible
+                      AND actor.limited_at IS NULL
+                      AND actor.suspended_at IS NULL AS eligible
                FROM remote_status status
                JOIN remote_actor actor ON actor.id = status.remote_actor_id
                WHERE status.id = $1"#
@@ -11015,7 +11582,8 @@ async fn refresh_link_trend(
                 AND local_status.sensitive = false
                 AND local_status.spoiler_text = ''
                 AND local_account.discoverable = true
-                AND local_account.limited_at IS NULL)
+                AND local_account.limited_at IS NULL
+                AND local_account.suspended_at IS NULL)
                OR
                (remote_status.id IS NOT NULL
                 AND remote_status.deleted_at IS NULL
@@ -11024,7 +11592,8 @@ async fn refresh_link_trend(
                 AND coalesce((remote_status.object->>'sensitive')::boolean, false) = false
                 AND coalesce(remote_status.object->>'summary', '') = ''
                 AND remote_actor.deleted_at IS NULL
-                AND remote_actor.limited_at IS NULL)
+                AND remote_actor.limited_at IS NULL
+                AND remote_actor.suspended_at IS NULL)
              )
            GROUP BY association.preview_card_id, association.usage_day
            ON CONFLICT (preview_card_id, usage_day) DO UPDATE SET
@@ -11176,6 +11745,7 @@ pub async fn tag_timeline(
                         .column(local_account::Column::Id)
                         .from(local_account::Entity)
                         .and_where(local_account::Column::LimitedAt.is_null())
+                        .and_where(local_account::Column::SuspendedAt.is_null())
                         .to_owned(),
                 ),
             );
@@ -11216,7 +11786,8 @@ pub async fn tag_timeline(
     if options.origin != PublicTimelineOrigin::Local && !options.allowed_remote_domains.is_empty() {
         let mut actor_condition = Condition::all()
             .add(remote_actor::Column::DeletedAt.is_null())
-            .add(remote_actor::Column::LimitedAt.is_null());
+            .add(remote_actor::Column::LimitedAt.is_null())
+            .add(remote_actor::Column::SuspendedAt.is_null());
         if !options
             .allowed_remote_domains
             .iter()
@@ -15905,6 +16476,7 @@ pub async fn public_timeline_with_options(
                     .column(local_account::Column::Id)
                     .from(local_account::Entity)
                     .and_where(local_account::Column::LimitedAt.is_null())
+                    .and_where(local_account::Column::SuspendedAt.is_null())
                     .to_owned(),
             ),
         );
@@ -15937,7 +16509,8 @@ pub async fn public_timeline_with_options(
     if options.origin != PublicTimelineOrigin::Local && !options.allowed_remote_domains.is_empty() {
         let mut actor_condition = Condition::all()
             .add(remote_actor::Column::DeletedAt.is_null())
-            .add(remote_actor::Column::LimitedAt.is_null());
+            .add(remote_actor::Column::LimitedAt.is_null())
+            .add(remote_actor::Column::SuspendedAt.is_null());
         if !options
             .allowed_remote_domains
             .iter()
@@ -17665,6 +18238,7 @@ pub async fn find_account_by_access_token(
     }
 
     let account = local_account::Entity::find_by_id(token.account_id)
+        .filter(local_account::Column::SuspendedAt.is_null())
         .one(db)
         .await?;
 
@@ -17695,6 +18269,7 @@ pub async fn find_access_token_grant(
         return Ok(None);
     }
     let Some(account) = local_account::Entity::find_by_id(token.account_id)
+        .filter(local_account::Column::SuspendedAt.is_null())
         .one(db)
         .await?
     else {
@@ -17939,6 +18514,8 @@ fn local_account_from_model(account: local_account::Model) -> Result<LocalAccoun
         avatar_file_path: account.avatar_file_path,
         header_file_path: account.header_file_path,
         limited_at: account.limited_at,
+        suspended_at: account.suspended_at,
+        data_purged_at: account.data_purged_at,
         created_at: account.created_at,
     })
 }
@@ -17966,7 +18543,26 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         deleted_at: actor.deleted_at,
         moved_to_remote_actor_id: actor.moved_to_remote_actor_id.map(AccountId),
         limited_at: actor.limited_at,
+        suspended_at: actor.suspended_at,
+        data_purged_at: actor.data_purged_at,
         discoverable: actor.discoverable,
+    }
+}
+
+fn federation_domain_block_from_model(
+    model: federation_domain_block::Model,
+) -> FederationDomainBlock {
+    FederationDomainBlock {
+        id: model.id,
+        domain: model.domain,
+        severity: model.severity,
+        reject_media: model.reject_media,
+        reject_reports: model.reject_reports,
+        private_comment: model.private_comment,
+        public_comment: model.public_comment,
+        obfuscate: model.obfuscate,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
     }
 }
 
@@ -18414,6 +19010,18 @@ pub enum AdminAuditAction {
     AccountLimit,
     #[strum(serialize = "account.unlimit")]
     AccountUnlimit,
+    #[strum(serialize = "account.suspend")]
+    AccountSuspend,
+    #[strum(serialize = "account.unsuspend")]
+    AccountUnsuspend,
+    #[strum(serialize = "account.purge")]
+    AccountPurge,
+    #[strum(serialize = "domain_block.create")]
+    DomainBlockCreate,
+    #[strum(serialize = "domain_block.update")]
+    DomainBlockUpdate,
+    #[strum(serialize = "domain_block.delete")]
+    DomainBlockDelete,
 }
 
 /// Kind of record affected by an administrator mutation.
@@ -18425,6 +19033,7 @@ pub enum AdminAuditAction {
 pub enum AdminAuditTargetKind {
     LocalAccount,
     RemoteActor,
+    FederationDomain,
 }
 
 /// Immutable administrator action suitable for an audit-log UI.
@@ -19012,6 +19621,22 @@ mod tests {
         ] {
             assert!(enabled.enabled(notification_type));
             assert!(!PushAlerts::default().enabled(notification_type));
+        }
+    }
+
+    /// Domain moderation normalizes DNS names and applies parent rules to subdomains.
+    #[test]
+    fn federation_domain_rules_use_normalized_dns_suffixes() {
+        assert_eq!(
+            normalize_federation_domain(" Example.COM. ").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            federation_domain_suffixes("social.team.example.com").unwrap(),
+            ["social.team.example.com", "team.example.com", "example.com"]
+        );
+        for invalid in ["*", "localhost", "https://example.com", "user@example.com"] {
+            assert!(normalize_federation_domain(invalid).is_err());
         }
     }
 

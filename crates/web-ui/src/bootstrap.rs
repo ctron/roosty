@@ -45,6 +45,25 @@ pub struct UiAdminAccounts {
     pub accounts: Vec<UiAdminAccount>,
 }
 
+/// Persisted federation moderation rules and mutation protection for the administrator UI.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiAdminDomainBlocks {
+    pub csrf_token: String,
+    pub domain_blocks: Vec<UiAdminDomainBlock>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiAdminDomainBlock {
+    pub id: Uuid,
+    pub domain: String,
+    pub severity: String,
+    pub reject_media: bool,
+    pub reject_reports: bool,
+    pub private_comment: String,
+    pub public_comment: String,
+    pub obfuscate: bool,
+}
+
 /// Account origin selected by an administrator account page.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +115,7 @@ pub struct UiAdminAccount {
     pub display_name: String,
     pub is_admin: bool,
     pub limited: bool,
+    pub suspended: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -136,6 +156,13 @@ pub trait UiBackend: Send + Sync {
         _cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAuditLog, String>> + Send + 'static>> {
         Box::pin(async { Err("administrator audit log is unavailable".to_owned()) })
+    }
+
+    fn admin_domain_blocks(
+        &self,
+        _cookie_header: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminDomainBlocks, String>> + Send + 'static>> {
+        Box::pin(async { Err("administrator federation settings are unavailable".to_owned()) })
     }
 }
 
@@ -182,6 +209,22 @@ pub async fn load_admin_audit_log() -> Result<UiAdminAuditLog, ServerFnError> {
         expect_context::<UiServerContext>()
             .0
             .admin_audit_log(request_cookie().await?)
+            .await
+            .map_err(ServerFnError::new)
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    unreachable!("the browser build uses the generated server-function client")
+}
+
+/// Load administrator-managed federation domain rules as a JSON response.
+#[server(prefix = "/api/web", protocol = Http<GetUrl, Json>)]
+pub async fn load_admin_domain_blocks() -> Result<UiAdminDomainBlocks, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        expect_context::<UiServerContext>()
+            .0
+            .admin_domain_blocks(request_cookie().await?)
             .await
             .map_err(ServerFnError::new)
     }

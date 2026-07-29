@@ -369,6 +369,14 @@ async fn fetch_remote_media_inner(
         .host_str()
         .ok_or_else(|| RoostyError::InvalidInput("remote media URL has no host".to_owned()))?
         .to_owned();
+    if roosty_db::federation_domain_policy(&state.db, &host)
+        .await?
+        .reject_media
+    {
+        return Err(RoostyError::InvalidInput(
+            "remote media is rejected by federation policy".to_owned(),
+        ));
+    }
     let address = crate::federation::discovery::validate_remote_url(state, &url).await?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

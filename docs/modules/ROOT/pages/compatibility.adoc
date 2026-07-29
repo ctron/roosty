@@ -95,7 +95,8 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 
 |🟢
 |Domain policy
-|
+|Mastodon-compatible database-backed `noop`, `silence`, and `suspend` rules cover exact domains
+and subdomains. Optional media/report rejection and comments are persisted.
 
 |🟢
 |SSRF protections
@@ -103,7 +104,8 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 
 |🟢
 |Federation moderation
-|
+|Account and domain suspension is local server policy. Suspending a local actor emits the standard
+ActivityPub actor `Delete`; ActivityPub defines no inverse unsuspend activity.
 
 |===
 
@@ -201,9 +203,14 @@ pagination. Account suggestions are missing.
 |Account metadata
 |Remote counts reflect only content cached by this instance.
 
-|🟡
+|🟢
 |Admin accounts API
-|Suspension, deletion, reports, and custom roles are missing.
+|Account listing, limit, suspend, unsuspend, and suspended-account deletion are available.
+Reports and custom roles are missing.
+
+|🟢
+|Admin domain blocks API
+|`GET`, `POST`, `PUT`, and `DELETE` under `/api/v1/admin/domain_blocks`, including cursor pagination.
 
 |🟢
 |Roosty admin API/UI
@@ -319,7 +326,8 @@ anonymous status results remain empty for Mastodon-compatible privacy.
 
 |🟡
 |Status links
-|Bare domains remain plain text; preview cards are not implemented.
+|Explicit HTTP(S) URLs are safely linkified and rich preview cards are cached and exposed.
+Bare domains without a URL scheme remain plain text.
 
 |🟢
 |Conversations

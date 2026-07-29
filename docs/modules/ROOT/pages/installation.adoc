@@ -183,10 +183,6 @@ Parameters marked _Required_ have no role default and must be supplied by the in
 |Required
 |YAML list of exact domains allowed for federation. The single entry `"*"` permits all public domains.
 
-|`roosty_federation_blocked_domains`
-|Required
-|YAML list of exact domains to block. Blocks include subdomains and take precedence over the allow-list.
-
 |`roosty_federation_delivery_max_age`
 |Required
 |Maximum age for retrying failed federation deliveries, as a non-zero human-readable duration.
@@ -352,10 +348,6 @@ serializes and rate-limits requests to each remote host across all processes.
 |`ROOSTY_FEDERATION_ALLOWED_DOMAINS`
 |Required when enabled
 |Comma-separated exact domains. `*` permits all public domains.
-
-|`ROOSTY_FEDERATION_BLOCKED_DOMAINS`
-|Empty
-|Comma-separated exact domains to block, including their subdomains.
 
 |`ROOSTY_FEDERATION_DELIVERY_MAX_AGE`
 |`7d`

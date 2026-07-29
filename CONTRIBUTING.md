@@ -214,9 +214,10 @@ host's public DNS A/AAAA records point to the target, and allow inbound ports 80
 and 443 before Caddy obtains its certificate. Set
 `roosty_federation_enabled: true` only after configuring its allow-list and key
 encryption secret. The allow-list accepts exact domains or `"*"` to permit all
-public domains; entries in `roosty_federation_blocked_domains` always take
-precedence. HTTPS, public-DNS, redirect, timeout, and response-size checks still
-apply in wildcard mode.
+public domains. Configure limit and suspend rules after deployment from
+`/admin/federation`; those rules are stored in PostgreSQL and apply to every
+server and worker process. HTTPS, public-DNS, redirect, timeout, and response-size
+checks still apply in wildcard mode.
 
 Elk is enabled by default at `https://elk.roosty.example.com`. Add a DNS A/AAAA
 record for that subdomain before deployment. Set `roosty_elk_enabled: false` to
@@ -268,10 +269,11 @@ Federation is disabled by default. To expose local ActivityPub identities, set
 and provide a distinct `ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET` of at least 32
 bytes. Roosty uses this secret to encrypt per-account signing keys at rest. Set
 `ROOSTY_FEDERATION_ALLOWED_DOMAINS` to a comma-separated exact list of remote
-DNS domains permitted for discovery; `ROOSTY_FEDERATION_BLOCKED_DOMAINS` can
-exclude domains from that list. Configure `ROOSTY_FEDERATION_DELIVERY_MAX_AGE`
-with a human-readable duration such as `7d`, `12h`, or `30m`; failed delivery
-jobs retry with exponential backoff until this age is exceeded.
+DNS domains permitted for discovery, or `*` for public domains. Create limit and
+suspend rules in `/admin/federation`; database-backed rules apply across all
+processes. Configure `ROOSTY_FEDERATION_DELIVERY_MAX_AGE` with a human-readable
+duration such as `7d`, `12h`, or `30m`; failed delivery jobs retry with
+exponential backoff until this age is exceeded.
 
 Roosty runs four durable worker loops by default for both `roosty worker` and
 `serve --with-worker`. Set `ROOSTY_WORKER_CONCURRENCY` to choose a different

@@ -122,7 +122,10 @@ async fn fetch_bytes(
             .host_str()
             .ok_or_else(|| RoostyError::InvalidInput("preview URL has no host".to_owned()))?
             .to_ascii_lowercase();
+        let domain_policy = roosty_db::federation_domain_policy(&state.db, &host).await?;
         if !state.config.federation_domain_is_allowed(&host)
+            || domain_policy.is_suspended()
+            || domain_policy.reject_media
             || host.parse::<IpAddr>().is_ok()
             || !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()

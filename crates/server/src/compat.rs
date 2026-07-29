@@ -1455,7 +1455,6 @@ mod tests {
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_blocked_domains: Vec::new(),
                 federation_delivery_max_age: time::Duration::days(7),
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,

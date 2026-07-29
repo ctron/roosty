@@ -178,7 +178,11 @@ async fn conversation_is_hidden(
     else {
         return true;
     };
-    state.config.federation_domain_is_blocked(&actor.domain)
+    actor.suspended_at.is_some()
+        || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+            .await
+            .map(|policy| policy.is_suspended())
+            .unwrap_or(true)
 }
 
 async fn conversation_response(
@@ -256,13 +260,22 @@ async fn conversation_accounts(
     }
 
     for participant in participants.remote_accounts {
-        if let Some(id) = participant.remote_actor_id
-            && (roosty_db::remote_account_is_hidden_for_viewer(&state.db, account_id, id).await?
-                || roosty_db::find_remote_actor_by_id(&state.db, id)
-                    .await?
-                    .is_some_and(|actor| state.config.federation_domain_is_blocked(&actor.domain)))
-        {
-            continue;
+        if let Some(id) = participant.remote_actor_id {
+            let actor = roosty_db::find_remote_actor_by_id(&state.db, id).await?;
+            let domain_suspended = match actor {
+                Some(actor) => {
+                    actor.suspended_at.is_some()
+                        || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+                            .await?
+                            .is_suspended()
+                }
+                None => true,
+            };
+            if roosty_db::remote_account_is_hidden_for_viewer(&state.db, account_id, id).await?
+                || domain_suspended
+            {
+                continue;
+            }
         }
         let response = match participant.remote_actor_id {
             Some(id) => match roosty_db::find_remote_actor_by_id(&state.db, id).await? {

@@ -1214,7 +1214,7 @@ async fn webfinger(State(state): State<AppState>, Query(query): Query<WebFingerQ
         return StatusCode::NOT_FOUND.into_response();
     }
     match roosty_db::find_local_account_by_username(&state.db, username).await {
-        Ok(Some(_)) => {
+        Ok(Some(account)) if account.suspended_at.is_none() => {
             let subject = format!("acct:{username}@{domain}");
             (
                 [(header::CONTENT_TYPE, JRD_CONTENT_TYPE)],
@@ -1229,7 +1229,7 @@ async fn webfinger(State(state): State<AppState>, Query(query): Query<WebFingerQ
             )
                 .into_response()
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(_)) | Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -1240,7 +1240,8 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> R
         return StatusCode::NOT_FOUND.into_response();
     }
     let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) => account,
+        Ok(Some(account)) if account.suspended_at.is_none() => account,
+        Ok(Some(_)) => return StatusCode::GONE.into_response(),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     };
@@ -1304,7 +1305,8 @@ async fn featured(State(state): State<AppState>, Path(username): Path<String>) -
         return StatusCode::NOT_FOUND.into_response();
     }
     let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) => account,
+        Ok(Some(account)) if account.suspended_at.is_none() => account,
+        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     };
@@ -1341,7 +1343,8 @@ async fn featured_tags(State(state): State<AppState>, Path(username): Path<Strin
         return StatusCode::NOT_FOUND.into_response();
     }
     let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) => account,
+        Ok(Some(account)) if account.suspended_at.is_none() => account,
+        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     };
@@ -1417,7 +1420,8 @@ async fn outbox(State(state): State<AppState>, Path(username): Path<String>) -> 
         return StatusCode::NOT_FOUND.into_response();
     }
     let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) => account,
+        Ok(Some(account)) if account.suspended_at.is_none() => account,
+        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     };
@@ -1602,7 +1606,7 @@ async fn account_for_collection(
         return None;
     }
     match roosty_db::find_local_account_by_username(&state.db, username).await {
-        Ok(account) => account,
+        Ok(account) => account.filter(|account| account.suspended_at.is_none()),
         Err(error) => {
             tracing::error!(%error, "could not load ActivityPub collection actor");
             None
@@ -3316,7 +3320,7 @@ fn permanent_fetch_failure(reason: impl Into<Cow<'static, str>>) -> RoostyError 
     RoostyError::InvalidInput(format!("permanent federation fetch failure: {error}"))
 }
 
-fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, RoostyError> {
+async fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, RoostyError> {
     let url =
         Url::parse(value).map_err(|_| permanent_fetch_failure("remote status URL is invalid"))?;
     let host = url
@@ -3326,6 +3330,9 @@ fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, RoostyEr
         || !url.username().is_empty()
         || url.password().is_some()
         || !state.config.federation_domain_is_allowed(host)
+        || roosty_db::federation_domain_policy(&state.db, host)
+            .await?
+            .is_suspended()
     {
         return Err(permanent_fetch_failure(
             "remote status URL is rejected by federation policy",
@@ -3340,7 +3347,7 @@ async fn fetch_public_remote_status(
     requested_url: &str,
     expected_parent: Option<&str>,
 ) -> Result<roosty_db::RemoteStatus, RoostyError> {
-    let url = parse_remote_fetch_url(state, requested_url)?;
+    let url = parse_remote_fetch_url(state, requested_url).await?;
     let document: JsonValue = discovery::fetch_json(state, url, None).await?;
     let object = document
         .get("object")
@@ -3515,7 +3522,7 @@ async fn fetched_reply_collection(
                         "remote replies collection is outside the status origin",
                     ));
                 }
-                let url = parse_remote_fetch_url(state, &id)?;
+                let url = parse_remote_fetch_url(state, &id).await?;
                 let document: JsonValue = discovery::fetch_json(state, url, None).await?;
                 replies = serde_json::from_value(document)
                     .map_err(|_| permanent_fetch_failure("remote replies collection is invalid"))?;
@@ -5474,6 +5481,46 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
     Ok(())
 }
 
+/// Queue a local actor `Delete` before suspension severs its remote followers.
+pub(crate) async fn enqueue_actor_delete_in_transaction(
+    state: &AppState,
+    txn: &sea_orm::DatabaseTransaction,
+    account: &roosty_db::LocalAccount,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+    let actor = actor_url(state, &account.username);
+    let activity_id = format!("{actor}#delete-{}", Uuid::now_v7());
+    let activity = serde_json::json!({
+        "@context": ACTIVITYSTREAMS_CONTEXT,
+        "id": activity_id,
+        "type": "Delete",
+        "actor": actor,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": actor,
+    });
+    for remote in roosty_db::accepted_remote_followers(txn, account.id).await? {
+        let payload = serde_json::to_value(ActorUpdateDelivery {
+            local_account_id: account.id,
+            remote_actor_id: remote.id,
+            activity: activity.clone(),
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            roosty_db::NewJob {
+                kind: roosty_db::JobKind::FederationActorUpdateDelivery,
+                payload,
+                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Resolve syntactically valid remote handles for a local status without making posting fail.
 pub(crate) async fn resolve_remote_mentions(
     state: &AppState,
@@ -5696,7 +5743,12 @@ async fn deliver_activity(
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote delivery actor does not exist".to_owned())
         })?;
-    if !state.config.federation_domain_is_allowed(&remote.domain) {
+    if !state.config.federation_domain_is_allowed(&remote.domain)
+        || remote.suspended_at.is_some()
+        || roosty_db::federation_domain_policy(&state.db, &remote.domain)
+            .await?
+            .is_suspended()
+    {
         // Domain suspension intentionally drops already queued work without retrying.
         return Ok(());
     }
@@ -7541,7 +7593,6 @@ mod tests {
                 "test-federation-key-encryption-secret-000".to_owned(),
             ),
             federation_allowed_domains: vec!["*".to_owned()],
-            federation_blocked_domains: Vec::new(),
             federation_delivery_max_age: time::Duration::days(7),
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
@@ -7631,6 +7682,8 @@ mod tests {
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
             discoverable: Some(true),
         };
         roosty_db::upsert_remote_actor(&state.db, &actor)
@@ -7793,6 +7846,8 @@ mod tests {
             | roosty_db::JobKind::NotificationRequestCleanup
             | roosty_db::JobKind::ScheduledStatusPublish
             | roosty_db::JobKind::TrendMaintenance
+            | roosty_db::JobKind::AccountPurge
+            | roosty_db::JobKind::DomainModerationReconcile
             | roosty_db::JobKind::PreviewCardFetch
             | roosty_db::JobKind::PreviewCardBackfill => {}
         }

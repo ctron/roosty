@@ -170,6 +170,7 @@ async fn search_accounts(
     let offset = params.offset.unwrap_or(0);
     let viewer = account_id.unwrap_or(AccountId(uuid::Uuid::nil()));
     let local_domain = state.config.public_base_url.host_str().unwrap_or_default();
+    let hidden_domains = roosty_db::hidden_federation_domains(&state.db).await?;
     let accounts = roosty_db::search_accounts(
         &state.db,
         roosty_db::AccountSearchOptions {
@@ -184,7 +185,7 @@ async fn search_accounts(
                 .iter()
                 .any(|domain| domain == "*"),
             allowed_remote_domains: &state.config.federation_allowed_domains,
-            blocked_remote_domains: &state.config.federation_blocked_domains,
+            blocked_remote_domains: &hidden_domains,
             limit,
             offset,
         },
@@ -248,6 +249,7 @@ async fn search_statuses(
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
+    let hidden_domains = roosty_db::hidden_federation_domains(&state.db).await?;
     let page = roosty_db::search_statuses(
         &state.db,
         roosty_db::StatusSearchOptions {
@@ -255,7 +257,7 @@ async fn search_statuses(
             query: &query,
             account_id: params.account_id.map(AccountId),
             include_remote: state.config.federation_enabled,
-            blocked_remote_domains: &state.config.federation_blocked_domains,
+            blocked_remote_domains: &hidden_domains,
             limit,
             offset: params.offset.unwrap_or(0),
             min_id: params.min_id.map(StatusId),
@@ -367,6 +369,7 @@ mod tests {
     use roosty_core::AccountId;
     use roosty_db::StatusVisibility;
     use roosty_migration::Migrator;
+    use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -489,14 +492,28 @@ mod tests {
         assert!(statuses.headers().contains_key(header::LINK));
         assert_eq!(json_body(statuses).await.as_array().unwrap().len(), 1);
 
-        context.config.federation_blocked_domains = vec!["remote.test".to_owned()];
+        let txn = context.db.begin().await.unwrap();
+        roosty_db::create_federation_domain_block(
+            &txn,
+            roosty_db::NewFederationDomainBlock {
+                domain: "remote.test".to_owned(),
+                severity: roosty_db::DomainBlockSeverity::Suspend,
+                reject_media: false,
+                reject_reports: false,
+                private_comment: None,
+                public_comment: None,
+                obfuscate: false,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
         let blocked = context
             .authenticated_get("/api/v1/accounts/search?q=alice%40remote.test", &token)
             .await;
         assert_eq!(json_body(blocked).await, serde_json::json!([]));
 
         context.config.federation_enabled = false;
-        context.config.federation_blocked_domains.clear();
         let disabled = context
             .authenticated_get("/api/v1/accounts/search?q=alice%40remote.test", &token)
             .await;
@@ -721,7 +738,6 @@ mod tests {
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_blocked_domains: Vec::new(),
                 federation_delivery_max_age: time::Duration::days(7),
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
@@ -843,6 +859,8 @@ mod tests {
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
                 limited_at: None,
+                suspended_at: None,
+                data_purged_at: None,
                 discoverable: Some(true),
             };
             roosty_db::upsert_remote_actor(&self.db, &actor)

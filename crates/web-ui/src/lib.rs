@@ -20,8 +20,8 @@ pub use authorization::{
 };
 pub use bootstrap::{
     UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
-    UiAdminAuditLog, UiAdminJob, UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap,
-    UiServerContext,
+    UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
+    UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext,
 };
 pub use forms::{LoginError, PasswordChangeResult};
 

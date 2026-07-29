@@ -244,7 +244,8 @@ struct ChangePasswordForm {
 async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     let next = sanitize_next(form.next.as_deref());
     let account = match roosty_db::find_local_account_by_login(&state.db, &form.login).await {
-        Ok(Some(account)) => account,
+        Ok(Some(account)) if account.suspended_at.is_none() => account,
+        Ok(Some(_)) => return redirect_login_error(&state, &next, LoginError::InvalidCredentials),
         Ok(None) => return redirect_login_error(&state, &next, LoginError::InvalidCredentials),
         Err(error) => return server_error(error),
     };
@@ -874,6 +875,8 @@ pub(crate) struct AccountResponse {
     bot: bool,
     discoverable: bool,
     limited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suspended: Option<bool>,
     group: bool,
     created_at: String,
     note: String,
@@ -1231,23 +1234,38 @@ pub(crate) fn account_response_with_stats(
         Ok(url) => url.to_string(),
         Err(_) => format!("{}/@{}", state.config.public_base_url, account.username),
     };
-    let profile_fields = profile_fields_from_value(&account.profile_fields);
-    let display_name = if account.display_name.is_empty() {
+    let suspended = account.suspended_at.is_some();
+    let profile_fields = if suspended {
+        Vec::new()
+    } else {
+        profile_fields_from_value(&account.profile_fields)
+    };
+    let display_name = if suspended {
+        String::new()
+    } else if account.display_name.is_empty() {
         account.username.clone()
     } else {
         account.display_name.clone()
     };
     let last_status_at = last_status_at.map(format_account_date);
-    let avatar = account
-        .avatar_file_path
-        .as_deref()
-        .map(|path| crate::media::media_url(state, path))
-        .unwrap_or_default();
-    let header = account
-        .header_file_path
-        .as_deref()
-        .map(|path| crate::media::media_url(state, path))
-        .unwrap_or_default();
+    let avatar = if suspended {
+        String::new()
+    } else {
+        account
+            .avatar_file_path
+            .as_deref()
+            .map(|path| crate::media::media_url(state, path))
+            .unwrap_or_default()
+    };
+    let header = if suspended {
+        String::new()
+    } else {
+        account
+            .header_file_path
+            .as_deref()
+            .map(|path| crate::media::media_url(state, path))
+            .unwrap_or_default()
+    };
 
     AccountResponse {
         id: account.id.0.to_string(),
@@ -1258,9 +1276,14 @@ pub(crate) fn account_response_with_stats(
         bot: account.bot,
         discoverable: account.discoverable,
         limited: account.limited_at.is_some(),
+        suspended: suspended.then_some(true),
         group: false,
         created_at: crate::statuses::format_timestamp(account.created_at),
-        note: account.note.clone(),
+        note: if suspended {
+            String::new()
+        } else {
+            account.note.clone()
+        },
         url: account_url,
         avatar: avatar.clone(),
         avatar_static: avatar,
@@ -1268,12 +1291,16 @@ pub(crate) fn account_response_with_stats(
         header_static: header,
         fields: profile_fields.clone(),
         emojis: Vec::new(),
-        followers_count,
-        following_count,
-        statuses_count,
-        last_status_at,
+        followers_count: if suspended { 0 } else { followers_count },
+        following_count: if suspended { 0 } else { following_count },
+        statuses_count: if suspended { 0 } else { statuses_count },
+        last_status_at: if suspended { None } else { last_status_at },
         source: AccountSource {
-            note: account.note,
+            note: if suspended {
+                String::new()
+            } else {
+                account.note
+            },
             fields: profile_fields,
             privacy: account.default_visibility,
             sensitive: account.default_sensitive,
@@ -3244,7 +3271,6 @@ mod tests {
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_blocked_domains: Vec::new(),
                 federation_delivery_max_age: time::Duration::days(7),
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,

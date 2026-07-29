@@ -136,6 +136,8 @@ pub(crate) struct RemoteAccountResponse {
     bot: bool,
     discoverable: Option<bool>,
     limited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suspended: Option<bool>,
     group: bool,
     created_at: String,
     note: String,
@@ -233,6 +235,10 @@ async fn directory(
     let offset = params.offset.unwrap_or_default();
     let order = params.order.unwrap_or_default();
     let local_only = params.local.unwrap_or(false);
+    let hidden_domains = match roosty_db::hidden_federation_domains(&state.db).await {
+        Ok(domains) => domains,
+        Err(error) => return server_error(error),
+    };
     let page = match roosty_db::account_directory(
         &state.db,
         roosty_db::AccountDirectoryOptions {
@@ -241,7 +247,7 @@ async fn directory(
             local_only,
             limit,
             offset,
-            blocked_remote_domains: &state.config.federation_blocked_domains,
+            blocked_remote_domains: &hidden_domains,
         },
     )
     .await
@@ -360,16 +366,22 @@ async fn lookup_account(
         .and_then(crate::federation::discovery::exact_remote_handle)
     {
         match roosty_db::find_remote_actor_by_handle(&state.db, &username, &domain).await {
-            Ok(Some(actor))
-                if actor.deleted_at.is_none()
-                    && !state.config.federation_domain_is_blocked(&actor.domain)
-                    && (!params.resolve.unwrap_or(false)
-                        || actor.expires_at > time::OffsetDateTime::now_utc()) =>
-            {
-                return match remote_account_response(&state, actor).await {
-                    Ok(response) => Json(response).into_response(),
-                    Err(error) => server_error(error),
+            Ok(Some(actor)) => {
+                let unavailable = match remote_actor_is_suspended(&state, &actor).await {
+                    Ok(unavailable) => unavailable,
+                    Err(error) => return server_error(error),
                 };
+                if unavailable
+                    || (params.resolve.unwrap_or(false)
+                        && actor.expires_at <= time::OffsetDateTime::now_utc())
+                {
+                    // A stale actor may still be refreshed by the resolver below.
+                } else {
+                    return match remote_account_response(&state, actor).await {
+                        Ok(response) => Json(response).into_response(),
+                        Err(error) => server_error(error),
+                    };
+                }
             }
             Ok(_) => {}
             Err(error) => return server_error(error),
@@ -462,6 +474,7 @@ pub(crate) fn unresolved_remote_account_response(
         bot: false,
         discoverable: None,
         limited: false,
+        suspended: None,
         group: false,
         created_at: crate::statuses::format_timestamp(time::OffsetDateTime::now_utc()),
         note: String::new(),
@@ -485,27 +498,49 @@ fn remote_account_response_from_media(
     avatar: String,
     header: String,
 ) -> RemoteAccountResponse {
+    let suspended = actor.suspended_at.is_some();
     RemoteAccountResponse {
         id: actor.id.0.to_string(),
         username: actor.username.clone(),
         acct: format!("{}@{}", actor.username, actor.domain),
-        display_name: actor.display_name,
+        display_name: if suspended {
+            String::new()
+        } else {
+            actor.display_name
+        },
         locked: false,
         bot: false,
         discoverable: actor.discoverable,
         limited: actor.limited_at.is_some(),
+        suspended: suspended.then_some(true),
         group: false,
         created_at: crate::statuses::format_timestamp(
             actor.profile_created_at.unwrap_or(actor.first_seen_at),
         ),
-        note: actor.summary,
+        note: if suspended {
+            String::new()
+        } else {
+            actor.summary
+        },
         url: actor.activitypub_id,
-        avatar: avatar.clone(),
-        avatar_static: avatar,
-        header: header.clone(),
-        header_static: header,
+        avatar: if suspended {
+            String::new()
+        } else {
+            avatar.clone()
+        },
+        avatar_static: if suspended { String::new() } else { avatar },
+        header: if suspended {
+            String::new()
+        } else {
+            header.clone()
+        },
+        header_static: if suspended { String::new() } else { header },
         fields: Vec::new(),
-        emojis: remote_custom_emojis(&actor.emojis),
+        emojis: if suspended {
+            Vec::new()
+        } else {
+            remote_custom_emojis(&actor.emojis)
+        },
         followers_count: 0,
         following_count: 0,
         statuses_count: 0,
@@ -570,15 +605,15 @@ async fn show_account(State(state): State<AppState>, Path(path): Path<AccountPat
             Err(error) => server_error(error),
         },
         Ok(None) => match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
-            Ok(Some(actor))
-                if actor.deleted_at.is_none()
-                    && !state.config.federation_domain_is_blocked(&actor.domain) =>
-            {
-                match remote_account_response(&state, actor).await {
+            Ok(Some(actor)) if actor.deleted_at.is_some() => not_found(),
+            Ok(Some(actor)) => match remote_actor_domain_is_suspended(&state, &actor).await {
+                Ok(false) => match remote_account_response(&state, actor).await {
                     Ok(response) => Json(response).into_response(),
                     Err(error) => server_error(error),
-                }
-            }
+                },
+                Ok(true) => not_found(),
+                Err(error) => server_error(error),
+            },
             Ok(_) => not_found(),
             Err(error) => server_error(error),
         },
@@ -600,15 +635,20 @@ async fn account_statuses(
     };
     let limit = crate::statuses::timeline_limit(params.limit);
     let local = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+        Ok(Some(account)) if account.suspended_at.is_some() => {
+            return Json(Vec::<Value>::new()).into_response();
+        }
         Ok(Some(_)) => true,
         Ok(None) => false,
         Err(error) => return server_error(error),
     };
     if !local {
         match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
-            Ok(Some(actor))
-                if actor.deleted_at.is_none()
-                    && !state.config.federation_domain_is_blocked(&actor.domain) => {}
+            Ok(Some(actor)) => match remote_actor_is_suspended(&state, &actor).await {
+                Ok(false) => {}
+                Ok(true) => return not_found(),
+                Err(error) => return server_error(error),
+            },
             Ok(_) => return not_found(),
             Err(error) => return server_error(error),
         }
@@ -723,12 +763,20 @@ async fn follow(
     };
     let target_id = AccountId(path.account_id);
 
-    if roosty_db::find_remote_actor_by_id(&state.db, target_id)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|actor| state.config.federation_domain_is_allowed(&actor.domain))
-    {
+    let remote_target = match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
+        Ok(actor) => actor,
+        Err(error) => return server_error(error),
+    };
+    let remote_allowed = match remote_target.as_ref() {
+        Some(actor) => {
+            state.config.federation_domain_is_allowed(&actor.domain)
+                && !remote_actor_is_suspended(&state, actor)
+                    .await
+                    .unwrap_or(true)
+        }
+        None => false,
+    };
+    if remote_allowed {
         match roosty_db::local_remote_accounts_are_blocked(&state.db, account.id, target_id).await {
             Ok(true) => {
                 return forbidden(&AccountRelationshipError::FollowBlocked.to_string());
@@ -810,7 +858,11 @@ async fn block(
 ) -> Response {
     let target_id = AccountId(path.account_id);
     match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
-        Ok(Some(actor)) if !state.config.federation_domain_is_blocked(&actor.domain) => {
+        Ok(Some(actor))
+            if !remote_actor_is_suspended(&state, &actor)
+                .await
+                .unwrap_or(true) =>
+        {
             let (activity_id, job) = match crate::federation::prepare_remote_block(
                 &state, account.id, target_id,
             )
@@ -915,7 +967,11 @@ async fn mute(
     };
     let target_id = AccountId(path.account_id);
     match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
-        Ok(Some(actor)) if !state.config.federation_domain_is_blocked(&actor.domain) => {
+        Ok(Some(actor))
+            if !remote_actor_is_suspended(&state, &actor)
+                .await
+                .unwrap_or(true) =>
+        {
             let txn = match state.db.begin().await {
                 Ok(txn) => txn,
                 Err(error) => return server_error(error.into()),
@@ -1289,7 +1345,7 @@ async fn follow_account_collection(
         let Some(actor) = roosty_db::find_remote_actor_by_id(&txn, account_id).await? else {
             return Ok(None);
         };
-        if actor.deleted_at.is_some() || state.config.federation_domain_is_blocked(&actor.domain) {
+        if remote_actor_is_suspended(state, &actor).await? {
             return Ok(None);
         }
         match collection {
@@ -1320,7 +1376,7 @@ async fn account_responses(
     let mut responses = Vec::with_capacity(accounts.len());
     for account in accounts {
         if let roosty_db::FollowCollectionAccount::Remote(actor) = &account
-            && state.config.federation_domain_is_blocked(&actor.domain)
+            && remote_actor_is_suspended(state, actor).await?
         {
             continue;
         }
@@ -1335,6 +1391,31 @@ async fn account_responses(
     }
 
     Ok(responses)
+}
+
+async fn remote_actor_is_suspended(
+    state: &AppState,
+    actor: &roosty_db::RemoteActor,
+) -> roosty_core::Result<bool> {
+    if actor.deleted_at.is_some() || actor.suspended_at.is_some() {
+        return Ok(true);
+    }
+    Ok(
+        roosty_db::federation_domain_policy(&state.db, &actor.domain)
+            .await?
+            .is_suspended(),
+    )
+}
+
+async fn remote_actor_domain_is_suspended(
+    state: &AppState,
+    actor: &roosty_db::RemoteActor,
+) -> roosty_core::Result<bool> {
+    Ok(
+        roosty_db::federation_domain_policy(&state.db, &actor.domain)
+            .await?
+            .is_suspended(),
+    )
 }
 
 async fn relationship_response(
@@ -1581,7 +1662,7 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_migration::Migrator;
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1618,6 +1699,8 @@ mod tests {
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
             discoverable: Some(true),
         };
 
@@ -1673,6 +1756,8 @@ mod tests {
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
             discoverable: Some(true),
         };
 
@@ -1700,6 +1785,7 @@ mod tests {
             .await;
         context.create_remote_actor("carol", "remote.test").await;
         context.create_remote_actor("blocked", "blocked.test").await;
+        context.suspend_domain("blocked.test").await;
 
         let first_page = context.get("/api/v1/directory?order=active&limit=1").await;
         assert_eq!(first_page.status(), StatusCode::OK);
@@ -2278,6 +2364,7 @@ mod tests {
         let blocked_id = context
             .create_remote_actor("blocked_graph", "blocked.test")
             .await;
+        context.suspend_domain("blocked.test").await;
 
         for path in [
             format!("/api/v1/accounts/{}/followers", uuid::Uuid::now_v7()),
@@ -2726,7 +2813,6 @@ mod tests {
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_blocked_domains: vec!["blocked.test".to_owned()],
                 federation_delivery_max_age: time::Duration::days(7),
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
@@ -2905,12 +2991,34 @@ mod tests {
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
                 limited_at: None,
+                suspended_at: None,
+                data_purged_at: None,
                 discoverable: Some(true),
             };
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await
                 .unwrap();
             actor.id
+        }
+
+        /// Persist one suspend-level federation rule for policy-sensitive API tests.
+        async fn suspend_domain(&self, domain: &str) {
+            let txn = self.db.begin().await.unwrap();
+            roosty_db::create_federation_domain_block(
+                &txn,
+                roosty_db::NewFederationDomainBlock {
+                    domain: domain.to_owned(),
+                    severity: roosty_db::DomainBlockSeverity::Suspend,
+                    reject_media: false,
+                    reject_reports: false,
+                    private_comment: None,
+                    public_comment: None,
+                    obfuscate: false,
+                },
+            )
+            .await
+            .unwrap();
+            txn.commit().await.unwrap();
         }
 
         /// Create a local status through the HTTP API and return its JSON response.

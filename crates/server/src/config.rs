@@ -166,8 +166,6 @@ pub struct Config {
     pub federation_key_encryption_secret: Option<String>,
     /// Remote domains permitted for discovery and delivery. The `*` entry permits all domains.
     pub federation_allowed_domains: Vec<String>,
-    /// Exact remote domains prohibited for discovery and delivery, including when `*` is allowed.
-    pub federation_blocked_domains: Vec<String>,
     /// Maximum age for retrying a failed federation delivery job.
     pub federation_delivery_max_age: time::Duration,
     /// Retention period for successfully fetched remote media.
@@ -214,7 +212,6 @@ impl Config {
         let federation_key_encryption_secret =
             optional_env("ROOSTY_FEDERATION_KEY_ENCRYPTION_SECRET");
         let federation_allowed_domains = optional_domain_list("ROOSTY_FEDERATION_ALLOWED_DOMAINS")?;
-        let federation_blocked_domains = optional_domain_list("ROOSTY_FEDERATION_BLOCKED_DOMAINS")?;
         let federation_delivery_max_age =
             optional_humantime_duration_env("ROOSTY_FEDERATION_DELIVERY_MAX_AGE", "7d")?;
         let remote_media_cache_ttl =
@@ -279,7 +276,6 @@ impl Config {
             federation_enabled,
             federation_key_encryption_secret,
             federation_allowed_domains,
-            federation_blocked_domains,
             federation_delivery_max_age,
             remote_media_cache_ttl,
             remote_media_max_bytes,
@@ -296,24 +292,12 @@ impl Config {
 
     /// Return whether the configured federation policy permits a remote DNS domain.
     ///
-    /// A wildcard allow-list entry permits every domain, but an explicit block always wins.
+    /// A wildcard allow-list entry permits every public remote domain.
     pub fn federation_domain_is_allowed(&self, domain: &str) -> bool {
         let domain = domain.to_ascii_lowercase();
         self.federation_allowed_domains
             .iter()
             .any(|allowed| allowed == "*" || allowed == &domain)
-            && !self.federation_domain_is_blocked(&domain)
-    }
-
-    /// Suspend a configured domain and every subdomain below it.
-    pub fn federation_domain_is_blocked(&self, domain: &str) -> bool {
-        let domain = domain.to_ascii_lowercase();
-        self.federation_blocked_domains.iter().any(|blocked| {
-            domain == *blocked
-                || domain
-                    .strip_suffix(blocked)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        })
     }
 }
 
@@ -500,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn federation_wildcard_allows_domains_unless_explicitly_blocked() {
+    fn federation_wildcard_allows_every_public_domain() {
         let config = Config {
             database_url: "postgres://unused".to_owned(),
             public_base_url: "https://roosty.example".parse().unwrap(),
@@ -515,7 +499,6 @@ mod tests {
             federation_enabled: true,
             federation_key_encryption_secret: Some("test-federation-secret".to_owned()),
             federation_allowed_domains: vec!["*".to_owned()],
-            federation_blocked_domains: vec!["blocked.example".to_owned()],
             federation_delivery_max_age: time::Duration::days(7),
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
@@ -531,8 +514,7 @@ mod tests {
 
         assert!(config.federation_domain_is_allowed("remote.example"));
         assert!(config.federation_domain_is_allowed("REMOTE.EXAMPLE"));
-        assert!(!config.federation_domain_is_allowed("blocked.example"));
-        assert!(!config.federation_domain_is_allowed("media.blocked.example"));
+        assert!(config.federation_domain_is_allowed("blocked.example"));
         assert!(config.federation_domain_is_allowed("notblocked.example"));
     }
 

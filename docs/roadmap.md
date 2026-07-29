@@ -5,6 +5,10 @@
 ### Available now
 
 - Local profiles, lookup/search, follows/unfollows, relationships, followers/following, and local account moderation.
+- Mastodon-compatible account suspension with immediate relationship/token cleanup, local actor
+  `Delete` delivery, delayed content purge, unsuspension, and administrator-triggered deletion.
+- Database-backed Mastodon-compatible domain rules (`noop`, `silence`, and `suspend`) with
+  administrator API/UI management and cross-process enforcement.
 - Local public/unlisted home-timeline fan-out, including streaming status creation and edit replacements, replies, mentions, favourites, boosts, notifications, and direct conversations.
 - Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
 - Mastodon-compatible private lists with local/remote membership, reply policies, exclusive home-feed filtering, and cursor-paginated list timelines.
@@ -72,7 +76,7 @@
 - ActivityPub federation: signed delivery, inbound processing, remote actor/object cache, and moderation policy enforcement. Opt-in local WebFinger, actor, Note, outbox, and collection endpoints are available.
 - Production-grade timelines: follow graph fan-out, repair jobs, cursor pagination, remote statuses, and scalable streaming fan-out.
 - Media support: local and S3-compatible storage, validation, thumbnails, processing jobs, and remote media fetch limits.
-- Moderation and operations: account suspension, local status removal, domain policy, admin tools, metrics, and audit-friendly workflows.
+- Moderation and operations: reports, custom administrator roles, metrics, and broader audit-friendly workflows.
 - Compatibility hardening: broader Mastodon API coverage, versioned response DTOs, pagination headers, scope enforcement, and client regression tests.
 
 ## Medium Term
@@ -105,7 +109,8 @@
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
 - [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags, statuses, rich link cards, link timelines, and the offset-paginated local/remote profile directory are available; account suggestions remain.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account
-  creation/password reset/limits, compatible account APIs, OAuth scope enforcement, CSRF
+  creation/password reset/limits/suspension, database-backed domain moderation, compatible account
+  and domain-block APIs, OAuth scope enforcement, CSRF
   protection, and transactional audit records.
 - [x] Extend the safe, policy-controlled WebFinger remote-account lookup to account search and controlled cache refresh.
 - [x] Add cursor pagination for local and cached-remote account status collections.

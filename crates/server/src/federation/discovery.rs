@@ -169,6 +169,8 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         deleted_at: None,
         moved_to_remote_actor_id: None,
         limited_at: None,
+        suspended_at: None,
+        data_purged_at: None,
         discoverable: document.discoverable,
     };
     let actor = store_remote_actor_on(
@@ -193,7 +195,11 @@ pub async fn resolve_remote_actor_for_search(
         DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
         return Err(invalid("remote account handle is invalid"));
     };
-    if !state.config.federation_domain_is_allowed(&domain) {
+    if !state.config.federation_domain_is_allowed(&domain)
+        || roosty_db::federation_domain_policy(&state.db, &domain)
+            .await?
+            .is_suspended()
+    {
         DISCOVERY_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
         return Err(FederationDiscoveryError::PolicyRejected(domain.into()).into());
     }
@@ -376,6 +382,8 @@ async fn fetch_remote_actor_by_id(
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
             discoverable: document.discoverable,
         },
         document.icon,
@@ -442,6 +450,8 @@ pub async fn resolve_remote_move_target(
             deleted_at: None,
             moved_to_remote_actor_id: None,
             limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
             discoverable: document.discoverable,
         },
         document.icon,
@@ -663,7 +673,11 @@ pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<S
         .host_str()
         .ok_or_else(|| invalid("remote URL has no host"))?
         .to_ascii_lowercase();
-    if !state.config.federation_domain_is_allowed(&host) {
+    if !state.config.federation_domain_is_allowed(&host)
+        || roosty_db::federation_domain_policy(&state.db, &host)
+            .await?
+            .is_suspended()
+    {
         return Err(FederationDiscoveryError::PolicyRejected(host.into()).into());
     }
     if host.parse::<IpAddr>().is_ok() {

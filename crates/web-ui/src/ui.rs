@@ -6,6 +6,7 @@ pub(crate) enum AdminSection {
     WorkQueue,
     LocalAccounts,
     RemoteAccounts,
+    Federation,
     AuditLog,
 }
 
@@ -44,6 +45,15 @@ pub(crate) fn AdminLayout(active: AdminSection, children: Children) -> impl Into
                                 aria-current=current(AdminSection::WorkQueue)
                             >
                                 "Work queue"
+                            </a>
+                        </li>
+                        <li>
+                            <a
+                                href="/admin/federation"
+                                class=selected(AdminSection::Federation)
+                                aria-current=current(AdminSection::Federation)
+                            >
+                                "Federation"
                             </a>
                         </li>
                         <li>

@@ -90,6 +90,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_notification_permission").await);
     assert!(table_exists(database.connection(), "local_notification_request").await);
     assert!(table_exists(database.connection(), "admin_audit_log").await);
+    assert!(table_exists(database.connection(), "federation_domain_block").await);
     assert!(table_exists(database.connection(), "status_trend_metric").await);
     assert!(table_exists(database.connection(), "tag_daily_actor_usage").await);
     assert!(table_exists(database.connection(), "tag_daily_usage").await);
@@ -109,6 +110,10 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     );
     assert!(column_exists(database.connection(), "local_account", "limited_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "limited_at").await);
+    assert!(column_exists(database.connection(), "local_account", "suspended_at").await);
+    assert!(column_exists(database.connection(), "local_account", "data_purged_at").await);
+    assert!(column_exists(database.connection(), "remote_actor", "suspended_at").await);
+    assert!(column_exists(database.connection(), "remote_actor", "data_purged_at").await);
     assert!(column_exists(database.connection(), "local_account", "last_status_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "discoverable").await);
     assert!(column_exists(database.connection(), "remote_actor", "last_status_at").await);

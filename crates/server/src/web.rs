@@ -19,10 +19,12 @@ use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
 use roosty_web_ui::{
     App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
-    UiAdminAuditLog, UiAdminJob, UiAdminJobSummary, UiAdminWorkQueue, UiBackend, UiBootstrap,
-    UiServerContext, shell,
+    UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
+    UiAdminWorkQueue, UiBackend, UiBootstrap, UiServerContext, shell,
 };
+use sea_orm::TransactionTrait;
 use serde::Deserialize;
+use serde_json::json;
 use time::OffsetDateTime;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
@@ -56,8 +58,17 @@ pub fn router(state: &AppState) -> Router<AppState> {
             post(limit_admin_account),
         )
         .route(
+            "/admin/accounts/{account_id}/suspend",
+            post(suspend_admin_account),
+        )
+        .route(
             "/admin/accounts/{account_id}/reset-password",
             post(reset_admin_password),
+        )
+        .route("/admin/federation", post(create_admin_domain_block))
+        .route(
+            "/admin/federation/{domain_block_id}",
+            post(update_admin_domain_block),
         )
         .leptos_routes_with_context(
             state,
@@ -118,6 +129,7 @@ fn login_return_query(next: &str) -> &'static str {
         "/admin/jobs" => "next=%2Fadmin%2Fjobs",
         "/admin/accounts" => "next=%2Fadmin%2Faccounts",
         "/admin/remote-accounts" => "next=%2Fadmin%2Fremote-accounts",
+        "/admin/federation" => "next=%2Fadmin%2Ffederation",
         "/admin/audit-log" => "next=%2Fadmin%2Faudit-log",
         path if path.starts_with("/admin") => "next=%2Fadmin",
         _ => "next=%2Fauth%2Fedit",
@@ -209,6 +221,7 @@ impl UiBackend for RoostyUiBackend {
                 &query,
                 Some(origin.as_str()),
                 None,
+                None,
                 100,
                 None,
             )
@@ -236,6 +249,29 @@ impl UiBackend for RoostyUiBackend {
                     .into_iter()
                     .map(ui_admin_audit_entry)
                     .collect(),
+            })
+        })
+    }
+
+    fn admin_domain_blocks(
+        &self,
+        cookie_header: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiAdminDomainBlocks, String>> + Send + 'static>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let headers = authenticated_admin_headers(&state, cookie_header).await?;
+            let csrf_token = csrf_token_from_session(&state, &headers)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "administrator session required".to_owned())?;
+            let domain_blocks = roosty_db::list_federation_domain_blocks(&state.db, 200, None)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(ui_admin_domain_block)
+                .collect();
+            Ok(UiAdminDomainBlocks {
+                csrf_token,
+                domain_blocks,
             })
         })
     }
@@ -296,6 +332,20 @@ fn ui_admin_account(account: roosty_db::AdminAccount) -> UiAdminAccount {
         display_name: account.display_name,
         is_admin: account.is_admin,
         limited: account.limited,
+        suspended: account.suspended,
+    }
+}
+
+fn ui_admin_domain_block(block: roosty_db::FederationDomainBlock) -> UiAdminDomainBlock {
+    UiAdminDomainBlock {
+        id: block.id,
+        domain: block.domain,
+        severity: block.severity.to_string(),
+        reject_media: block.reject_media,
+        reject_reports: block.reject_reports,
+        private_comment: block.private_comment.unwrap_or_default(),
+        public_comment: block.public_comment.unwrap_or_default(),
+        obfuscate: block.obfuscate,
     }
 }
 
@@ -343,6 +393,25 @@ struct LimitAccountForm {
 #[derive(Deserialize)]
 struct CsrfForm {
     csrf_token: String,
+}
+
+#[derive(Deserialize)]
+struct DomainBlockForm {
+    csrf_token: String,
+    #[serde(default)]
+    domain: String,
+    severity: String,
+    #[serde(default)]
+    reject_media: bool,
+    #[serde(default)]
+    reject_reports: bool,
+    #[serde(default)]
+    private_comment: String,
+    #[serde(default)]
+    public_comment: String,
+    #[serde(default)]
+    obfuscate: bool,
+    operation: Option<String>,
 }
 
 async fn authenticated_admin_form(
@@ -429,6 +498,201 @@ async fn limit_admin_account(
         .into_response(),
         Err(error) => admin_form_error(error),
     }
+}
+
+async fn suspend_admin_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let account_id = roosty_core::AccountId(account_id);
+    let suspended = match roosty_db::find_admin_account_by_id(&state.db, account_id).await {
+        Ok(Some(account)) => !account.suspended,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return admin_form_error(error),
+    };
+    match admin::set_account_suspended(&state, actor, AdminSource::Web, account_id, suspended).await
+    {
+        Ok(account) => Redirect::to(if account.domain.is_some() {
+            "/admin/remote-accounts"
+        } else {
+            "/admin/accounts"
+        })
+        .into_response(),
+        Err(error) => admin_form_error(error),
+    }
+}
+
+async fn create_admin_domain_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DomainBlockForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let severity = match form.severity.parse() {
+        Ok(severity) => severity,
+        Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, "invalid severity").into_response(),
+    };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return admin_form_error(error.into()),
+    };
+    let block = match roosty_db::create_federation_domain_block(
+        &txn,
+        roosty_db::NewFederationDomainBlock {
+            domain: form.domain,
+            severity,
+            reject_media: form.reject_media,
+            reject_reports: form.reject_reports,
+            private_comment: nonempty(form.private_comment),
+            public_comment: nonempty(form.public_comment),
+            obfuscate: form.obfuscate,
+        },
+    )
+    .await
+    {
+        Ok(block) => block,
+        Err(error) => return admin_form_error(error),
+    };
+    if let Err(error) = audit_web_domain_block(
+        &txn,
+        actor,
+        roosty_db::AdminAuditAction::DomainBlockCreate,
+        &block,
+    )
+    .await
+    {
+        return admin_form_error(error);
+    }
+    if let Err(error) = enqueue_web_domain_reconciliation(&txn, &block).await {
+        return admin_form_error(error);
+    }
+    match txn.commit().await {
+        Ok(()) => Redirect::to("/admin/federation").into_response(),
+        Err(error) => admin_form_error(error.into()),
+    }
+}
+
+async fn update_admin_domain_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(domain_block_id): Path<Uuid>,
+    Form(form): Form<DomainBlockForm>,
+) -> Response {
+    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return admin_form_error(error.into()),
+    };
+    if form.operation.as_deref() == Some("delete") {
+        let block = match roosty_db::delete_federation_domain_block(&txn, domain_block_id).await {
+            Ok(Some(block)) => block,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => return admin_form_error(error),
+        };
+        if let Err(error) = audit_web_domain_block(
+            &txn,
+            actor,
+            roosty_db::AdminAuditAction::DomainBlockDelete,
+            &block,
+        )
+        .await
+        {
+            return admin_form_error(error);
+        }
+    } else {
+        let severity = match form.severity.parse() {
+            Ok(severity) => severity,
+            Err(_) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, "invalid severity").into_response();
+            }
+        };
+        let block = match roosty_db::update_federation_domain_block(
+            &txn,
+            domain_block_id,
+            roosty_db::FederationDomainBlockUpdate {
+                severity: Some(severity),
+                reject_media: Some(form.reject_media),
+                reject_reports: Some(form.reject_reports),
+                private_comment: Some(nonempty(form.private_comment)),
+                public_comment: Some(nonempty(form.public_comment)),
+                obfuscate: Some(form.obfuscate),
+            },
+        )
+        .await
+        {
+            Ok(block) => block,
+            Err(error) => return admin_form_error(error),
+        };
+        if let Err(error) = audit_web_domain_block(
+            &txn,
+            actor,
+            roosty_db::AdminAuditAction::DomainBlockUpdate,
+            &block,
+        )
+        .await
+        {
+            return admin_form_error(error);
+        }
+        if let Err(error) = enqueue_web_domain_reconciliation(&txn, &block).await {
+            return admin_form_error(error);
+        }
+    }
+    match txn.commit().await {
+        Ok(()) => Redirect::to("/admin/federation").into_response(),
+        Err(error) => admin_form_error(error.into()),
+    }
+}
+
+fn nonempty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+async fn audit_web_domain_block(
+    txn: &sea_orm::DatabaseTransaction,
+    actor: roosty_core::AccountId,
+    action: roosty_db::AdminAuditAction,
+    block: &roosty_db::FederationDomainBlock,
+) -> roosty_core::Result<()> {
+    roosty_db::insert_admin_audit_entry(
+        txn,
+        Some(actor),
+        roosty_db::AdminAuditSource::Web,
+        action,
+        roosty_db::AdminAuditTargetKind::FederationDomain,
+        &block.id.to_string(),
+        json!({"domain": block.domain, "severity": block.severity}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_web_domain_reconciliation(
+    txn: &sea_orm::DatabaseTransaction,
+    block: &roosty_db::FederationDomainBlock,
+) -> roosty_core::Result<()> {
+    roosty_db::enqueue_job_in_transaction(
+        txn,
+        roosty_db::NewJob {
+            kind: roosty_db::JobKind::DomainModerationReconcile,
+            payload: json!({"domain_block_id": block.id}),
+            deduplication_key: Some(format!("domain-moderation:{}", block.id)),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn reset_admin_password(

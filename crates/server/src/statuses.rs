@@ -2767,12 +2767,16 @@ async fn public_timeline(
         (false, true) => roosty_db::PublicTimelineOrigin::Remote,
         _ => roosty_db::PublicTimelineOrigin::Federated,
     };
+    let hidden_domains = match roosty_db::hidden_federation_domains(&state.db).await {
+        Ok(domains) => domains,
+        Err(error) => return server_error(error),
+    };
     let options = roosty_db::PublicTimelineOptions {
         origin,
         only_media: filters.only_media == Some(true),
         viewer: viewer.as_ref().map(|account| account.id),
         allowed_remote_domains: state.config.federation_allowed_domains.clone(),
-        blocked_remote_domains: state.config.federation_blocked_domains.clone(),
+        blocked_remote_domains: hidden_domains,
     };
     match roosty_db::public_timeline_with_options(&state.db, query.limit, query.cursor, options)
         .await
@@ -2857,6 +2861,10 @@ async fn tag_timeline(
         (false, true) => roosty_db::PublicTimelineOrigin::Remote,
         _ => roosty_db::PublicTimelineOrigin::Federated,
     };
+    let hidden_domains = match roosty_db::hidden_federation_domains(&state.db).await {
+        Ok(domains) => domains,
+        Err(error) => return server_error(error),
+    };
     match roosty_db::tag_timeline(
         &state.db,
         &path.hashtag,
@@ -2868,7 +2876,7 @@ async fn tag_timeline(
             origin,
             viewer: viewer.as_ref().map(|account| account.id),
             allowed_remote_domains: state.config.federation_allowed_domains.clone(),
-            blocked_remote_domains: state.config.federation_blocked_domains.clone(),
+            blocked_remote_domains: hidden_domains,
         },
         query.limit,
         query.cursor,
@@ -4124,7 +4132,11 @@ pub(crate) async fn remote_reblog_response(
     let actor = roosty_db::find_remote_actor_by_id(&state.db, reblog.remote_actor_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("remote boost actor does not exist".to_owned()))?;
-    if state.config.federation_domain_is_blocked(&actor.domain) {
+    if actor.suspended_at.is_some()
+        || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+            .await?
+            .is_suspended()
+    {
         return Ok(None);
     }
     if let Some(viewer) = viewer
@@ -4408,11 +4420,14 @@ async fn remote_status_available(
     state: &AppState,
     status: &roosty_db::RemoteStatus,
 ) -> Result<bool, RoostyError> {
-    Ok(
-        roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
+    let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?
+    else {
+        return Ok(false);
+    };
+    Ok(actor.suspended_at.is_none()
+        && !roosty_db::federation_domain_policy(&state.db, &actor.domain)
             .await?
-            .is_some_and(|actor| !state.config.federation_domain_is_blocked(&actor.domain)),
-    )
+            .is_suspended())
 }
 
 /// Project cached ActivityPub Mention tags without resolving new remote identities.
@@ -4606,6 +4621,11 @@ async fn status_response_for_viewer(
     account: LocalAccount,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
+    if account.suspended_at.is_some() {
+        return Err(RoostyError::InvalidInput(
+            "status author is suspended".to_owned(),
+        ));
+    }
     let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
     status_response_for_viewer_with_pin(state, status, account, viewer, pinned).await
 }
@@ -4862,10 +4882,16 @@ async fn status_quote_response(
                 };
                 let actor =
                     roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?;
-                if actor
-                    .as_ref()
-                    .is_some_and(|actor| state.config.federation_domain_is_blocked(&actor.domain))
-                {
+                let domain_suspended = match actor.as_ref() {
+                    Some(actor) => {
+                        actor.suspended_at.is_some()
+                            || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+                                .await?
+                                .is_suspended()
+                    }
+                    None => false,
+                };
+                if domain_suspended {
                     state_name = QuoteResponseState::BlockedDomain;
                 } else if let Some(viewer) = viewer {
                     if roosty_db::local_remote_accounts_are_blocked(
@@ -5214,7 +5240,13 @@ async fn status_context_item_visible(
     viewer: Option<AccountId>,
 ) -> Result<bool, RoostyError> {
     match item {
-        StatusContextItem::Local(status) => status_visible_to_viewer_on(db, status, viewer).await,
+        StatusContextItem::Local(status) => {
+            let author = roosty_db::find_local_account_by_id(db, status.account_id).await?;
+            if author.is_none_or(|author| author.suspended_at.is_some()) {
+                return Ok(false);
+            }
+            status_visible_to_viewer_on(db, status, viewer).await
+        }
         StatusContextItem::Remote(status) => match viewer {
             Some(viewer) => roosty_db::remote_status_visible_to_account(db, status, viewer).await,
             None => Ok(matches!(
@@ -10576,7 +10608,6 @@ mod tests {
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_blocked_domains: Vec::new(),
                 federation_delivery_max_age: time::Duration::days(7),
                 remote_media_cache_ttl: time::Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
@@ -10843,6 +10874,8 @@ mod tests {
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
                 limited_at: None,
+                suspended_at: None,
+                data_purged_at: None,
                 discoverable: Some(true),
             };
             roosty_db::upsert_remote_actor(&self.db, &actor)
