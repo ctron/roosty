@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    accounts::{RemoteAccountResponse, remote_account_response},
-    auth::{AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response},
+    accounts::{RemoteAccountResponse, remote_account_response_on},
+    auth::{
+        AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response_on,
+    },
     http::AppState,
     statuses::{StatusResponse, TagResponse, search_status_models},
 };
@@ -170,9 +172,10 @@ async fn search_accounts(
     let offset = params.offset.unwrap_or(0);
     let viewer = account_id.unwrap_or(AccountId(uuid::Uuid::nil()));
     let local_domain = state.config.public_base_url.host_str().unwrap_or_default();
-    let hidden_domains = roosty_db::hidden_federation_domains(&state.db).await?;
+    let txn = state.begin_snapshot().await?;
+    let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
     let accounts = roosty_db::search_accounts(
-        &state.db,
+        &txn,
         roosty_db::AccountSearchOptions {
             viewer_account_id: viewer,
             query: &query,
@@ -195,15 +198,16 @@ async fn search_accounts(
 
     for account in accounts {
         responses.push(match account {
-            roosty_db::AccountSearchResult::Local(account) => {
-                SearchAccountResponse::Local(Box::new(account_response(state, account).await?))
-            }
+            roosty_db::AccountSearchResult::Local(account) => SearchAccountResponse::Local(
+                Box::new(account_response_on(state, &txn, account).await?),
+            ),
             roosty_db::AccountSearchResult::Remote(actor) => SearchAccountResponse::Remote(
-                Box::new(remote_account_response(state, actor).await?),
+                Box::new(remote_account_response_on(state, &txn, actor).await?),
             ),
         });
     }
 
+    txn.commit().await?;
     Ok(responses)
 }
 
@@ -217,13 +221,15 @@ async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
     let offset = params.offset.unwrap_or(0);
-    let tags = roosty_db::search_local_tags(&state.db, &query, limit, offset).await?;
+    let txn = state.begin_snapshot().await?;
+    let tags = roosty_db::search_local_tags(&txn, &query, limit, offset).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
-        let history = roosty_db::tag_history(&state.db, tag.id).await?;
+        let history = roosty_db::tag_history(&txn, tag.id).await?;
         responses.push(TagResponse::new(state, tag, history, None));
     }
 
+    txn.commit().await?;
     Ok(responses)
 }
 

@@ -5211,34 +5211,30 @@ pub(crate) async fn enqueue_remote_unfavourite(
     state: &AppState,
     favourite: roosty_db::LocalRemoteStatusFavourite,
 ) -> Result<(), RoostyError> {
-    let job = prepare_remote_unfavourite(state, favourite).await?;
-    roosty_db::enqueue_job(
-        &state.db,
-        job.kind,
-        job.payload,
-        job.deduplication_key.as_deref(),
-        job.run_after,
-    )
-    .await?;
+    let txn = state.begin_write().await?;
+    let job = prepare_remote_unfavourite(state, &txn, favourite).await?;
+    roosty_db::enqueue_job_in_transaction(&txn, job).await?;
+    txn.commit().await?;
     Ok(())
 }
 
 /// Build the durable Undo(Like) delivery without inserting it.
 pub(crate) async fn prepare_remote_unfavourite(
     state: &AppState,
+    db: &impl ConnectionTrait,
     favourite: roosty_db::LocalRemoteStatusFavourite,
 ) -> Result<roosty_db::NewJob, RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, favourite.local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, favourite.local_account_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("local favourite actor does not exist".to_owned())
         })?;
-    let remote_status = roosty_db::find_remote_status_by_id(&state.db, favourite.remote_status_id)
+    let remote_status = roosty_db::find_remote_status_by_id(db, favourite.remote_status_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote favourite status does not exist".to_owned())
         })?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_status.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote status author does not exist".to_owned())
@@ -5381,28 +5377,24 @@ pub(crate) async fn enqueue_remote_reblog(
     local_account_id: AccountId,
     remote_status: &roosty_db::RemoteStatus,
 ) -> Result<String, RoostyError> {
-    let (id, job) = prepare_remote_reblog(state, local_account_id, remote_status).await?;
-    roosty_db::enqueue_job(
-        &state.db,
-        job.kind,
-        job.payload,
-        job.deduplication_key.as_deref(),
-        job.run_after,
-    )
-    .await?;
+    let txn = state.begin_write().await?;
+    let (id, job) = prepare_remote_reblog(state, &txn, local_account_id, remote_status).await?;
+    roosty_db::enqueue_job_in_transaction(&txn, job).await?;
+    txn.commit().await?;
     Ok(id)
 }
 
 /// Build an Announce delivery without inserting it.
 pub(crate) async fn prepare_remote_reblog(
     state: &AppState,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status: &roosty_db::RemoteStatus,
 ) -> Result<(String, roosty_db::NewJob), RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local boost actor does not exist".to_owned()))?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_status.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote boost status author does not exist".to_owned())
@@ -5428,32 +5420,28 @@ pub(crate) async fn enqueue_remote_unreblog(
     state: &AppState,
     reblog: roosty_db::LocalRemoteStatusReblog,
 ) -> Result<(), RoostyError> {
-    let job = prepare_remote_unreblog(state, reblog).await?;
-    roosty_db::enqueue_job(
-        &state.db,
-        job.kind,
-        job.payload,
-        job.deduplication_key.as_deref(),
-        job.run_after,
-    )
-    .await?;
+    let txn = state.begin_write().await?;
+    let job = prepare_remote_unreblog(state, &txn, reblog).await?;
+    roosty_db::enqueue_job_in_transaction(&txn, job).await?;
+    txn.commit().await?;
     Ok(())
 }
 
 /// Build an Undo(Announce) delivery without inserting it.
 pub(crate) async fn prepare_remote_unreblog(
     state: &AppState,
+    db: &impl ConnectionTrait,
     reblog: roosty_db::LocalRemoteStatusReblog,
 ) -> Result<roosty_db::NewJob, RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, reblog.local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, reblog.local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local boost actor does not exist".to_owned()))?;
-    let remote_status = roosty_db::find_remote_status_by_id(&state.db, reblog.remote_status_id)
+    let remote_status = roosty_db::find_remote_status_by_id(db, reblog.remote_status_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote boosted status does not exist".to_owned())
         })?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_status.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_status.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote boost status author does not exist".to_owned())
@@ -5522,28 +5510,24 @@ pub(crate) async fn enqueue_remote_follow(
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<String, RoostyError> {
-    let (id, job) = prepare_remote_follow(state, local_account_id, remote_actor_id).await?;
-    roosty_db::enqueue_job(
-        &state.db,
-        job.kind,
-        job.payload,
-        job.deduplication_key.as_deref(),
-        job.run_after,
-    )
-    .await?;
+    let txn = state.begin_write().await?;
+    let (id, job) = prepare_remote_follow(state, &txn, local_account_id, remote_actor_id).await?;
+    roosty_db::enqueue_job_in_transaction(&txn, job).await?;
+    txn.commit().await?;
     Ok(id)
 }
 
 /// Build the durable Follow delivery without inserting it.
 pub(crate) async fn prepare_remote_follow(
     state: &AppState,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<(String, roosty_db::NewJob), RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local follow actor does not exist".to_owned()))?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote follow actor does not exist".to_owned())
@@ -5563,27 +5547,23 @@ pub(crate) async fn enqueue_remote_unfollow(
     state: &AppState,
     following: roosty_db::RemoteFollowing,
 ) -> Result<(), RoostyError> {
-    let job = prepare_remote_unfollow(state, following).await?;
-    roosty_db::enqueue_job(
-        &state.db,
-        job.kind,
-        job.payload,
-        job.deduplication_key.as_deref(),
-        job.run_after,
-    )
-    .await?;
+    let txn = state.begin_write().await?;
+    let job = prepare_remote_unfollow(state, &txn, following).await?;
+    roosty_db::enqueue_job_in_transaction(&txn, job).await?;
+    txn.commit().await?;
     Ok(())
 }
 
 /// Build the durable Undo(Follow) delivery without inserting it.
 pub(crate) async fn prepare_remote_unfollow(
     state: &AppState,
+    db: &impl ConnectionTrait,
     following: roosty_db::RemoteFollowing,
 ) -> Result<roosty_db::NewJob, RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, following.local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, following.local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local follow actor does not exist".to_owned()))?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, following.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, following.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote follow actor does not exist".to_owned())
@@ -5641,13 +5621,14 @@ pub(crate) async fn deliver_follow_activity(
 /// Build a stable outbound Block and its transactional delivery job.
 pub(crate) async fn prepare_remote_block(
     state: &AppState,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<(String, roosty_db::NewJob), RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local block actor does not exist".to_owned()))?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote block target does not exist".to_owned())
@@ -5664,15 +5645,16 @@ pub(crate) async fn prepare_remote_block(
 /// Build a stable Mastodon-shaped ActivityPub Flag for a report against a remote actor.
 pub(crate) async fn prepare_report_flag(
     state: &AppState,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     statuses: &[ReportStatus],
     comment: &str,
 ) -> Result<roosty_db::NewJob, RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("reporting account does not exist".to_owned()))?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, remote_actor_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("reported account does not exist".to_owned()))?;
     let actor = actor_url(state, &local.username);
@@ -5681,7 +5663,7 @@ pub(crate) async fn prepare_report_flag(
     for status in statuses {
         match status {
             ReportStatus::Remote(status_id) => {
-                let status = roosty_db::find_remote_status_by_id(&state.db, *status_id)
+                let status = roosty_db::find_remote_status_by_id(db, *status_id)
                     .await?
                     .ok_or_else(|| {
                         RoostyError::InvalidInput("reported status does not exist".to_owned())
@@ -5714,12 +5696,13 @@ pub(crate) async fn prepare_report_flag(
 /// Build an Undo that references the stable Block identity stored with the relationship.
 pub(crate) async fn prepare_remote_unblock(
     state: &AppState,
+    db: &impl ConnectionTrait,
     block: &roosty_db::LocalRemoteAccountBlock,
 ) -> Result<roosty_db::NewJob, RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, block.local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, block.local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local block actor does not exist".to_owned()))?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, block.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, block.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote block target does not exist".to_owned())

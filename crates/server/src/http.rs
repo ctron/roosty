@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use sea_orm::{AccessMode, DatabaseTransaction, IsolationLevel, TransactionTrait};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::{DefaultMakeSpan, DefaultOnResponse, HttpMakeClassifier, TraceLayer},
@@ -59,6 +60,28 @@ impl AppState {
                 .site_pkg_dir("pkg")
                 .build(),
         }
+    }
+
+    /// Start a short read-only transaction for an isolated lookup.
+    pub async fn begin_read(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+        self.db
+            .begin_with_config(None, Some(AccessMode::ReadOnly))
+            .await
+    }
+
+    /// Start a stable read-only snapshot for a multi-query projection.
+    pub async fn begin_snapshot(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+        self.db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await
+    }
+
+    /// Start a transaction for an application mutation.
+    pub async fn begin_write(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+        self.db.begin().await
     }
 
     /// Override the default UI settings with Cargo Leptos build configuration.

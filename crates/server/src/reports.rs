@@ -20,7 +20,7 @@ use roosty_db::{
     reorder_instance_rules as reorder_instance_rule_records, set_moderation_report_resolved,
     update_instance_rule as update_instance_rule_record, update_moderation_report,
 };
-use sea_orm::{DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{borrow::Cow, collections::HashSet, str::FromStr};
@@ -40,7 +40,7 @@ use crate::{
     notifications::publish_committed_notification,
     statuses::{
         StatusResponse, delete_reported_status, remote_status_response_for_viewer,
-        status_response_for_viewer, status_visible_to_viewer,
+        status_response_for_viewer, status_visible_to_viewer_on,
     },
 };
 
@@ -190,7 +190,8 @@ async fn create_report(
             "Comment is too long (maximum is 1000 characters)",
         )));
     }
-    let target = report_target(&state, AccountId(form.account_id))
+    let txn = state.begin_write().await?;
+    let target = report_target(&txn, AccountId(form.account_id))
         .await?
         .ok_or(ReportApiError::InvalidInput(Cow::Borrowed(
             "Account does not exist",
@@ -200,10 +201,9 @@ async fn create_report(
             "You cannot report your own account",
         )));
     }
-    let statuses =
-        validate_report_statuses(&state, token.grant.account.id, target, &form.status_ids)
-            .await
-            .map_err(report_error)?;
+    let statuses = validate_report_statuses(&txn, token.grant.account.id, target, &form.status_ids)
+        .await
+        .map_err(report_error)?;
     let category = report_category(form.category.as_deref(), !form.rule_ids.is_empty())
         .map_err(|reason| ReportApiError::InvalidInput(Cow::Owned(reason)))?;
     let delivery = if form.forward {
@@ -211,6 +211,7 @@ async fn create_report(
             ReportAccount::Remote(remote_actor_id) => Some(
                 federation::prepare_report_flag(
                     &state,
+                    &txn,
                     token.grant.account.id,
                     remote_actor_id,
                     &statuses,
@@ -224,7 +225,6 @@ async fn create_report(
     } else {
         None
     };
-    let txn = state.db.begin().await?;
     let report = create_moderation_report(
         &txn,
         NewModerationReport {
@@ -771,19 +771,19 @@ async fn client_report_response(
 }
 
 async fn report_target(
-    state: &AppState,
+    db: &impl ConnectionTrait,
     id: AccountId,
 ) -> Result<Option<ReportAccount>, RoostyError> {
-    if find_local_account_by_id(&state.db, id).await?.is_some() {
+    if find_local_account_by_id(db, id).await?.is_some() {
         return Ok(Some(ReportAccount::Local(id)));
     }
-    Ok(find_remote_actor_by_id(&state.db, id)
+    Ok(find_remote_actor_by_id(db, id)
         .await?
         .map(|_| ReportAccount::Remote(id)))
 }
 
 async fn validate_report_statuses(
-    state: &AppState,
+    db: &impl ConnectionTrait,
     reporter: AccountId,
     target: ReportAccount,
     ids: &[Uuid],
@@ -799,11 +799,11 @@ async fn validate_report_statuses(
         let id = StatusId(*raw_id);
         match target {
             ReportAccount::Local(target_id) => {
-                let status = find_local_status_by_id(&state.db, id)
+                let status = find_local_status_by_id(db, id)
                     .await?
                     .ok_or_else(|| RoostyError::InvalidInput("status was not found".to_owned()))?;
                 if status.account_id != target_id
-                    || !status_visible_to_viewer(state, &status, Some(reporter)).await?
+                    || !status_visible_to_viewer_on(db, &status, Some(reporter)).await?
                 {
                     return Err(RoostyError::InvalidInput(
                         "status does not belong to the reported account".to_owned(),
@@ -812,11 +812,11 @@ async fn validate_report_statuses(
                 statuses.push(ReportStatus::Local(id));
             }
             ReportAccount::Remote(target_id) => {
-                let status = find_remote_status_by_id(&state.db, id)
+                let status = find_remote_status_by_id(db, id)
                     .await?
                     .ok_or_else(|| RoostyError::InvalidInput("status was not found".to_owned()))?;
                 if status.remote_actor_id != target_id
-                    || !remote_status_visible_to_account(&state.db, &status, reporter).await?
+                    || !remote_status_visible_to_account(db, &status, reporter).await?
                 {
                     return Err(RoostyError::InvalidInput(
                         "status does not belong to the reported account".to_owned(),

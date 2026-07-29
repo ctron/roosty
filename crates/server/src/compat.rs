@@ -48,14 +48,21 @@ async fn followed_tags(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    match roosty_db::followed_local_tags(&state.db, account.id).await {
+    let txn = match state.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::followed_local_tags(&txn, account.id).await {
         Ok(tags) => {
             let mut response = Vec::with_capacity(tags.len());
             for tag in tags {
-                match crate::statuses::tag_response_model(&state, tag, Some(true)).await {
+                match crate::statuses::tag_response_model(&state, &txn, tag, Some(true)).await {
                     Ok(tag) => response.push(tag),
                     Err(error) => return server_error(error),
                 }
+            }
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
             }
             Json(response).into_response()
         }

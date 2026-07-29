@@ -10,7 +10,7 @@ use roosty_core::{
     AccountId, AccountRelationshipError, FederationDiscoveryError, RoostyError, StatusId,
 };
 use roosty_db::{LocalNotificationType, RemoteActor, RemoteProfileMediaKind};
-use sea_orm::{AccessMode, TransactionTrait};
+use sea_orm::{AccessMode, ConnectionTrait, TransactionTrait};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tracing::warn;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     auth::{
         AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response,
-        account_response_with_stats, format_account_date,
+        account_response_on, account_response_with_stats, format_account_date,
     },
     http::AppState,
     statuses::CollectionLink,
@@ -235,12 +235,16 @@ async fn directory(
     let offset = params.offset.unwrap_or_default();
     let order = params.order.unwrap_or_default();
     let local_only = params.local.unwrap_or(false);
-    let hidden_domains = match roosty_db::hidden_federation_domains(&state.db).await {
+    let txn = match state.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let hidden_domains = match roosty_db::hidden_federation_domains(&txn).await {
         Ok(domains) => domains,
         Err(error) => return server_error(error),
     };
     let page = match roosty_db::account_directory(
-        &state.db,
+        &txn,
         roosty_db::AccountDirectoryOptions {
             viewer_account_id: viewer.as_ref().map(|account| account.id),
             order: order.into(),
@@ -263,11 +267,10 @@ async fn directory(
             roosty_db::AccountSearchResult::Local(_) => None,
         })
         .collect::<Vec<_>>();
-    let remote_media =
-        match roosty_db::remote_profile_media_for_actors(&state.db, &remote_ids).await {
-            Ok(media) => media,
-            Err(error) => return server_error(error),
-        };
+    let remote_media = match roosty_db::remote_profile_media_for_actors(&txn, &remote_ids).await {
+        Ok(media) => media,
+        Err(error) => return server_error(error),
+    };
     let mut accounts = Vec::with_capacity(page.items.len());
     for item in page.items {
         match item.account {
@@ -301,6 +304,9 @@ async fn directory(
                 accounts.push(DirectoryAccountResponse::Remote(Box::new(response)));
             }
         }
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
 
     let mut links = Vec::with_capacity(2);
@@ -413,20 +419,27 @@ pub(crate) async fn remote_account_response(
     state: &AppState,
     actor: RemoteActor,
 ) -> roosty_core::Result<RemoteAccountResponse> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let statuses_count = roosty_db::count_remote_statuses_by_account(&txn, actor.id).await?;
-    let last_status_at = roosty_db::last_remote_status_at(&txn, actor.id)
+    let txn = state.begin_snapshot().await?;
+    let response = remote_account_response_on(state, &txn, actor).await?;
+    txn.commit().await?;
+    Ok(response)
+}
+
+/// Build a remote account response within a containing database snapshot.
+pub(crate) async fn remote_account_response_on(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    actor: RemoteActor,
+) -> roosty_core::Result<RemoteAccountResponse> {
+    let statuses_count = roosty_db::count_remote_statuses_by_account(db, actor.id).await?;
+    let last_status_at = roosty_db::last_remote_status_at(db, actor.id)
         .await?
         .map(format_account_date);
     let followers_count =
-        roosty_db::count_remote_actor_followers_known_locally(&txn, actor.id).await?;
+        roosty_db::count_remote_actor_followers_known_locally(db, actor.id).await?;
     let following_count =
-        roosty_db::count_remote_actor_following_known_locally(&txn, actor.id).await?;
-    let profile_media = roosty_db::remote_profile_media_for_actor(&txn, actor.id).await?;
-    txn.commit().await?;
+        roosty_db::count_remote_actor_following_known_locally(db, actor.id).await?;
+    let profile_media = roosty_db::remote_profile_media_for_actor(db, actor.id).await?;
     let media_url = |kind| {
         profile_media
             .iter()
@@ -444,12 +457,12 @@ pub(crate) async fn remote_account_response(
     response.last_status_at = last_status_at;
     if let Some(moved_to_remote_actor_id) = moved_to_remote_actor_id
         && let Some(mut moved) =
-            roosty_db::find_remote_actor_by_id(&state.db, moved_to_remote_actor_id).await?
+            roosty_db::find_remote_actor_by_id(db, moved_to_remote_actor_id).await?
     {
         // Mastodon exposes one replacement account; suppress nested moves to avoid cycles.
         moved.moved_to_remote_actor_id = None;
         response.moved = Some(Box::new(
-            Box::pin(remote_account_response(state, moved)).await?,
+            Box::pin(remote_account_response_on(state, db, moved)).await?,
         ));
     }
     Ok(response)
@@ -599,26 +612,37 @@ enum RemoteEmojiType {
 /// Return a public local account profile by account id.
 async fn show_account(State(state): State<AppState>, Path(path): Path<AccountPath>) -> Response {
     let account_id = AccountId(path.account_id);
-    match roosty_db::find_local_account_by_id(&state.db, account_id).await {
-        Ok(Some(account)) => match account_response(&state, account).await {
+    let txn = match state.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let response = match roosty_db::find_local_account_by_id(&txn, account_id).await {
+        Ok(Some(account)) => match account_response_on(&state, &txn, account).await {
             Ok(response) => Json(response).into_response(),
             Err(error) => server_error(error),
         },
-        Ok(None) => match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
+        Ok(None) => match roosty_db::find_remote_actor_by_id(&txn, account_id).await {
             Ok(Some(actor)) if actor.deleted_at.is_some() => not_found(),
-            Ok(Some(actor)) => match remote_actor_domain_is_suspended(&state, &actor).await {
-                Ok(false) => match remote_account_response(&state, actor).await {
-                    Ok(response) => Json(response).into_response(),
-                    Err(error) => server_error(error),
-                },
-                Ok(true) => not_found(),
+            Ok(Some(actor)) => match roosty_db::federation_domain_policy(&txn, &actor.domain).await
+            {
+                Ok(policy) if !policy.is_suspended() => {
+                    match remote_account_response_on(&state, &txn, actor).await {
+                        Ok(response) => Json(response).into_response(),
+                        Err(error) => server_error(error),
+                    }
+                }
+                Ok(_) => not_found(),
                 Err(error) => server_error(error),
             },
             Ok(_) => not_found(),
             Err(error) => server_error(error),
         },
         Err(error) => server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    response
 }
 
 /// Return statuses authored by one local account.
@@ -784,11 +808,14 @@ async fn follow(
             Ok(false) => {}
             Err(error) => return server_error(error),
         }
-        let (activity_id, job) =
-            match crate::federation::prepare_remote_follow(&state, account.id, target_id).await {
-                Ok(prepared) => prepared,
-                Err(error) => return server_error(error),
-            };
+        let (activity_id, job) = match crate::federation::prepare_remote_follow(
+            &state, &state.db, account.id, target_id,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return server_error(error),
+        };
         let txn = match state.db.begin().await {
             Ok(txn) => txn,
             Err(error) => return server_error(error.into()),
@@ -864,7 +891,7 @@ async fn block(
                 .unwrap_or(true) =>
         {
             let (activity_id, job) = match crate::federation::prepare_remote_block(
-                &state, account.id, target_id,
+                &state, &state.db, account.id, target_id,
             )
             .await
             {
@@ -922,10 +949,11 @@ async fn unblock(
     let target_id = AccountId(path.account_id);
     match roosty_db::find_local_remote_account_block(&state.db, account.id, target_id).await {
         Ok(Some(block)) => {
-            let job = match crate::federation::prepare_remote_unblock(&state, &block).await {
-                Ok(job) => job,
-                Err(error) => return server_error(error),
-            };
+            let job =
+                match crate::federation::prepare_remote_unblock(&state, &state.db, &block).await {
+                    Ok(job) => job,
+                    Err(error) => return server_error(error),
+                };
             let txn = match state.db.begin().await {
                 Ok(txn) => txn,
                 Err(error) => return server_error(error.into()),
@@ -1072,10 +1100,11 @@ async fn unfollow(
             Err(error) => return server_error(error),
         };
     if let Some(following) = remote_following {
-        let job = match crate::federation::prepare_remote_unfollow(&state, following).await {
-            Ok(job) => job,
-            Err(error) => return server_error(error),
-        };
+        let job =
+            match crate::federation::prepare_remote_unfollow(&state, &state.db, following).await {
+                Ok(job) => job,
+                Err(error) => return server_error(error),
+            };
         let txn = match state.db.begin().await {
             Ok(txn) => txn,
             Err(error) => return server_error(error.into()),
@@ -1373,23 +1402,25 @@ async fn account_responses(
     state: &AppState,
     accounts: Vec<roosty_db::FollowCollectionAccount>,
 ) -> roosty_core::Result<Vec<CollectionAccountResponse>> {
+    let txn = state.begin_snapshot().await?;
     let mut responses = Vec::with_capacity(accounts.len());
     for account in accounts {
         if let roosty_db::FollowCollectionAccount::Remote(actor) = &account
-            && remote_actor_is_suspended(state, actor).await?
+            && remote_actor_is_suspended_on(&txn, actor).await?
         {
             continue;
         }
         responses.push(match account {
-            roosty_db::FollowCollectionAccount::Local(account) => {
-                CollectionAccountResponse::Local(Box::new(account_response(state, account).await?))
-            }
+            roosty_db::FollowCollectionAccount::Local(account) => CollectionAccountResponse::Local(
+                Box::new(account_response_on(state, &txn, account).await?),
+            ),
             roosty_db::FollowCollectionAccount::Remote(actor) => CollectionAccountResponse::Remote(
-                Box::new(remote_account_response(state, actor).await?),
+                Box::new(remote_account_response_on(state, &txn, actor).await?),
             ),
         });
     }
 
+    txn.commit().await?;
     Ok(responses)
 }
 
@@ -1397,25 +1428,22 @@ async fn remote_actor_is_suspended(
     state: &AppState,
     actor: &roosty_db::RemoteActor,
 ) -> roosty_core::Result<bool> {
+    let txn = state.begin_read().await?;
+    let suspended = remote_actor_is_suspended_on(&txn, actor).await?;
+    txn.commit().await?;
+    Ok(suspended)
+}
+
+async fn remote_actor_is_suspended_on(
+    db: &impl ConnectionTrait,
+    actor: &roosty_db::RemoteActor,
+) -> roosty_core::Result<bool> {
     if actor.deleted_at.is_some() || actor.suspended_at.is_some() {
         return Ok(true);
     }
-    Ok(
-        roosty_db::federation_domain_policy(&state.db, &actor.domain)
-            .await?
-            .is_suspended(),
-    )
-}
-
-async fn remote_actor_domain_is_suspended(
-    state: &AppState,
-    actor: &roosty_db::RemoteActor,
-) -> roosty_core::Result<bool> {
-    Ok(
-        roosty_db::federation_domain_policy(&state.db, &actor.domain)
-            .await?
-            .is_suspended(),
-    )
+    Ok(roosty_db::federation_domain_policy(db, &actor.domain)
+        .await?
+        .is_suspended())
 }
 
 async fn relationship_response(
@@ -1435,29 +1463,39 @@ async fn relationship_model(
     source_id: AccountId,
     target_id: AccountId,
 ) -> roosty_core::Result<RelationshipResponse> {
-    let following = roosty_db::local_follow_relationship(&state.db, source_id, target_id).await?;
-    let remote_following =
-        roosty_db::find_remote_following(&state.db, source_id, target_id).await?;
-    let followed_by = roosty_db::local_follow_relationship(&state.db, target_id, source_id).await?;
+    let txn = state.begin_snapshot().await?;
+    let relationship = relationship_model_on(&txn, source_id, target_id).await?;
+    txn.commit().await?;
+    Ok(relationship)
+}
+
+async fn relationship_model_on(
+    db: &impl ConnectionTrait,
+    source_id: AccountId,
+    target_id: AccountId,
+) -> roosty_core::Result<RelationshipResponse> {
+    let following = roosty_db::local_follow_relationship(db, source_id, target_id).await?;
+    let remote_following = roosty_db::find_remote_following(db, source_id, target_id).await?;
+    let followed_by = roosty_db::local_follow_relationship(db, target_id, source_id).await?;
     let remote_followed_by =
-        roosty_db::remote_actor_follows_local_account(&state.db, target_id, source_id).await?;
-    let remote_target = roosty_db::find_remote_actor_by_id(&state.db, target_id)
+        roosty_db::remote_actor_follows_local_account(db, target_id, source_id).await?;
+    let remote_target = roosty_db::find_remote_actor_by_id(db, target_id)
         .await?
         .is_some();
     let (blocking, blocked_by, mute, remote_mute) = if remote_target {
         (
-            roosty_db::find_local_remote_account_block(&state.db, source_id, target_id)
+            roosty_db::find_local_remote_account_block(db, source_id, target_id)
                 .await?
                 .is_some(),
-            roosty_db::remote_actor_blocks_local_account(&state.db, target_id, source_id).await?,
+            roosty_db::remote_actor_blocks_local_account(db, target_id, source_id).await?,
             None,
-            roosty_db::active_local_remote_account_mute(&state.db, source_id, target_id).await?,
+            roosty_db::active_local_remote_account_mute(db, source_id, target_id).await?,
         )
     } else {
         (
-            roosty_db::local_account_blocks(&state.db, source_id, target_id).await?,
-            roosty_db::local_account_blocks(&state.db, target_id, source_id).await?,
-            roosty_db::active_local_account_mute(&state.db, source_id, target_id).await?,
+            roosty_db::local_account_blocks(db, source_id, target_id).await?,
+            roosty_db::local_account_blocks(db, target_id, source_id).await?,
+            roosty_db::active_local_account_mute(db, source_id, target_id).await?,
             None,
         )
     };

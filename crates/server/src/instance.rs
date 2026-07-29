@@ -37,21 +37,45 @@ async fn nodeinfo(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn instance_v2(State(state): State<AppState>) -> Response {
-    match roosty_db::list_instance_rules(&state.db).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return instance_error(error.into()),
+    };
+    let result = roosty_db::list_instance_rules(&txn).await;
+    if let Err(error) = txn.commit().await {
+        return instance_error(error.into());
+    }
+    match result {
         Ok(rules) => Json(instance_v2_response(&state.config, &rules)).into_response(),
         Err(error) => instance_error(error),
     }
 }
 
 async fn instance_v1(State(state): State<AppState>) -> Response {
-    match roosty_db::list_instance_rules(&state.db).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return instance_error(error.into()),
+    };
+    let result = roosty_db::list_instance_rules(&txn).await;
+    if let Err(error) = txn.commit().await {
+        return instance_error(error.into());
+    }
+    match result {
         Ok(rules) => Json(instance_v1_response(&state.config, &rules)).into_response(),
         Err(error) => instance_error(error),
     }
 }
 
 async fn instance_rules(State(state): State<AppState>) -> Response {
-    match roosty_db::list_instance_rules(&state.db).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return instance_error(error.into()),
+    };
+    let result = roosty_db::list_instance_rules(&txn).await;
+    if let Err(error) = txn.commit().await {
+        return instance_error(error.into());
+    }
+    match result {
         Ok(rules) => Json(rule_values(&rules)).into_response(),
         Err(error) => instance_error(error),
     }

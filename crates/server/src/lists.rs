@@ -10,13 +10,12 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{AddListAccountsResult, ListRepliesPolicy, LocalList};
-use sea_orm::TransactionTrait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    accounts::{RemoteAccountResponse, remote_account_response},
-    auth::{AccountResponse, AuthenticatedAccount, account_response},
+    accounts::{RemoteAccountResponse, remote_account_response_on},
+    auth::{AccountResponse, AuthenticatedAccount, account_response_on},
     http::AppState,
     statuses::{CollectionLink, home_timeline_response, timeline_limit},
 };
@@ -106,7 +105,15 @@ async fn index(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    match roosty_db::local_lists_for_account(&state.db, account.id).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result = roosty_db::local_lists_for_account(&txn, account.id).await;
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match result {
         Ok(lists) => Json(
             lists
                 .into_iter()
@@ -123,7 +130,15 @@ async fn show(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
 ) -> Response {
-    match roosty_db::find_owned_local_list(&state.db, account.id, path.list_id).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result = roosty_db::find_owned_local_list(&txn, account.id, path.list_id).await;
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match result {
         Ok(Some(list)) => Json(ListResponse::from(list)).into_response(),
         Ok(None) => not_found(),
         Err(error) => server_error(error),
@@ -143,8 +158,12 @@ async fn create(
         Ok(title) => title,
         Err(error) => return unprocessable(error),
     };
-    match roosty_db::create_local_list(
-        &state.db,
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let list = match roosty_db::create_local_list(
+        &txn,
         account.id,
         title,
         input.replies_policy.unwrap_or(ListRepliesPolicy::List),
@@ -152,9 +171,13 @@ async fn create(
     )
     .await
     {
-        Ok(list) => Json(ListResponse::from(list)).into_response(),
-        Err(error) => server_error(error),
+        Ok(list) => list,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    Json(ListResponse::from(list)).into_response()
 }
 
 async fn update(
@@ -167,8 +190,11 @@ async fn update(
         Ok(input) => input,
         Err(error) => return unprocessable(&error),
     };
-    let current = match roosty_db::find_owned_local_list(&state.db, account.id, path.list_id).await
-    {
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let current = match roosty_db::find_owned_local_list(&txn, account.id, path.list_id).await {
         Ok(Some(list)) => list,
         Ok(None) => return not_found(),
         Err(error) => return server_error(error),
@@ -180,8 +206,8 @@ async fn update(
         },
         None => current.title,
     };
-    match roosty_db::update_local_list(
-        &state.db,
+    let result = match roosty_db::update_local_list(
+        &txn,
         account.id,
         path.list_id,
         &title,
@@ -190,9 +216,15 @@ async fn update(
     )
     .await
     {
-        Ok(Some(list)) => Json(ListResponse::from(list)).into_response(),
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
+        Ok(result) => result,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match result {
+        Some(list) => Json(ListResponse::from(list)).into_response(),
+        None => not_found(),
     }
 }
 
@@ -201,10 +233,20 @@ async fn destroy(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
 ) -> Response {
-    match roosty_db::delete_local_list(&state.db, account.id, path.list_id).await {
-        Ok(true) => Json(serde_json::json!({})).into_response(),
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let deleted = match roosty_db::delete_local_list(&txn, account.id, path.list_id).await {
+        Ok(deleted) => deleted,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match deleted {
+        true => Json(serde_json::json!({})).into_response(),
+        false => not_found(),
     }
 }
 
@@ -213,13 +255,17 @@ async fn account_lists(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
 ) -> Response {
-    match roosty_db::local_lists_containing_account(
-        &state.db,
-        account.id,
-        AccountId(path.account_id),
-    )
-    .await
-    {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result =
+        roosty_db::local_lists_containing_account(&txn, account.id, AccountId(path.account_id))
+            .await;
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match result {
         Ok(lists) => Json(
             lists
                 .into_iter()
@@ -249,10 +295,12 @@ async fn accounts(
                 .clamp(1, MAX_ACCOUNT_LIMIT),
         ),
     };
+    let txn = match state.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
     let page =
-        match roosty_db::local_list_accounts(&state.db, account.id, path.list_id, limit, cursor)
-            .await
-        {
+        match roosty_db::local_list_accounts(&txn, account.id, path.list_id, limit, cursor).await {
             Ok(Some(page)) => page,
             Ok(None) => return not_found(),
             Err(error) => return server_error(error),
@@ -270,17 +318,22 @@ async fn accounts(
     let mut responses = Vec::with_capacity(page.items.len());
     for member in page.items {
         let response = match member {
-            roosty_db::ListAccount::Local(member) => account_response(&state, member)
+            roosty_db::ListAccount::Local(member) => account_response_on(&state, &txn, member)
                 .await
                 .map(|response| ListAccountResponse::Local(Box::new(response))),
-            roosty_db::ListAccount::Remote(member) => remote_account_response(&state, member)
-                .await
-                .map(|response| ListAccountResponse::Remote(Box::new(response))),
+            roosty_db::ListAccount::Remote(member) => {
+                remote_account_response_on(&state, &txn, member)
+                    .await
+                    .map(|response| ListAccountResponse::Remote(Box::new(response)))
+            }
         };
         match response {
             Ok(response) => responses.push(response),
             Err(error) => return server_error(error),
         }
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
     let mut response = Json(responses).into_response();
     if let Some(link) = link {
@@ -302,7 +355,7 @@ async fn add_accounts(
     if input.account_ids.is_empty() {
         return unprocessable("account_ids[] must contain at least one account");
     }
-    let txn = match state.db.begin().await {
+    let txn = match state.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -336,7 +389,7 @@ async fn remove_accounts(
         Ok(input) => input,
         Err(error) => return unprocessable(&error),
     };
-    let txn = match state.db.begin().await {
+    let txn = match state.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };

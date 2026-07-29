@@ -1483,7 +1483,7 @@ enum StatusSearchKind {
 
 /// List discoverable profiles with bounded counters and stable offset ordering.
 pub async fn account_directory(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     options: AccountDirectoryOptions<'_>,
 ) -> Result<AccountDirectoryPage> {
     #[derive(Clone)]
@@ -1608,11 +1608,8 @@ pub async fn account_directory(
          ORDER BY {order}
         "#
     );
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let query_limit = options.limit.saturating_add(1).min(i64::MAX as u64) as i64;
-    let rows = txn
+    let rows = db
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             sql,
@@ -1656,9 +1653,8 @@ pub async fn account_directory(
         .filter(|row| row.kind == AccountSearchKind::Remote)
         .map(|row| row.id)
         .collect();
-    let local_accounts = local_accounts_by_id(&txn, local_ids).await?;
-    let remote_actors = remote_actors_by_id(&txn, remote_ids).await?;
-    txn.commit().await?;
+    let local_accounts = local_accounts_by_id(db, local_ids).await?;
+    let remote_actors = remote_actors_by_id(db, remote_ids).await?;
     let mut local_accounts = local_accounts
         .into_iter()
         .map(|account| (account.id, account))
@@ -1950,7 +1946,7 @@ pub async fn create_remote_following_with_job(
 
 /// Find one local-to-remote follow relationship.
 pub async fn find_remote_following(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<Option<RemoteFollowing>> {
@@ -5581,7 +5577,7 @@ pub async fn pending_remote_follow_requests(
 
 /// Return whether an accepted remote actor follows a local account.
 pub async fn remote_actor_follows_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
     local_account_id: AccountId,
 ) -> Result<bool> {
@@ -6393,7 +6389,7 @@ pub struct NewPushSubscription {
 
 /// Find a local account by username or email for password login.
 pub async fn find_local_account_by_login(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     login: &str,
 ) -> Result<Option<LocalAccount>> {
     let account = local_account::Entity::find()
@@ -6793,7 +6789,7 @@ pub async fn search_local_accounts(
 
 /// Search local and cached remote accounts with one stable Mastodon-compatible ranking.
 pub async fn search_accounts(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     options: AccountSearchOptions<'_>,
 ) -> Result<Vec<AccountSearchResult>> {
     if options.query.trim().is_empty() || options.limit == 0 {
@@ -6910,7 +6906,7 @@ pub async fn search_accounts(
 
 /// Search status documents while enforcing Mastodon's viewer interaction scope.
 pub async fn search_statuses(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     options: StatusSearchOptions<'_>,
 ) -> Result<StatusSearchPage> {
     #[derive(FromQueryResult)]
@@ -6934,9 +6930,6 @@ pub async fn search_statuses(
         .replace('_', "\\_");
     let blocked_domains = serde_json::to_string(options.blocked_remote_domains)
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let rows = Row::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"
@@ -7111,7 +7104,7 @@ pub async fn search_statuses(
             (options.offset as i64).into(),
         ],
     ))
-    .all(&txn)
+    .all(db)
     .await?;
 
     let has_more = rows.len() > options.limit as usize;
@@ -7133,13 +7126,12 @@ pub async fn search_statuses(
         .collect::<Vec<_>>();
     let local = local_status::Entity::find()
         .filter(local_status::Column::Id.is_in(local_ids))
-        .all(&txn)
+        .all(db)
         .await?;
     let remote = remote_status::Entity::find()
         .filter(remote_status::Column::Id.is_in(remote_ids))
-        .all(&txn)
+        .all(db)
         .await?;
-    txn.commit().await?;
 
     let mut local = local
         .into_iter()
@@ -7167,7 +7159,10 @@ pub async fn search_statuses(
 }
 
 /// Count local accounts following this account.
-pub async fn count_local_followers(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+pub async fn count_local_followers(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<u64> {
     Ok(local_follow::Entity::find()
         .filter(local_follow::Column::FollowedAccountId.eq(account_id.0))
         .count(db)
@@ -7175,7 +7170,10 @@ pub async fn count_local_followers(db: &DbConnection, account_id: AccountId) -> 
 }
 
 /// Count accepted remote actors following this local account.
-pub async fn count_remote_followers(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+pub async fn count_remote_followers(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<u64> {
     Ok(db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, "SELECT count(*) AS count FROM remote_follow WHERE local_account_id = $1 AND state = 'accepted'", vec![account_id.0.into()])).await?.map(|row| row.try_get::<i64>("", "count")).transpose()?.unwrap_or(0) as u64)
 }
 
@@ -7217,7 +7215,10 @@ pub async fn accepted_remote_follower_ids(
 }
 
 /// Count local accounts this account follows.
-pub async fn count_local_following(db: &DbConnection, account_id: AccountId) -> Result<u64> {
+pub async fn count_local_following(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<u64> {
     Ok(local_follow::Entity::find()
         .filter(local_follow::Column::FollowerAccountId.eq(account_id.0))
         .count(db)
@@ -7226,7 +7227,7 @@ pub async fn count_local_following(db: &DbConnection, account_id: AccountId) -> 
 
 /// Return whether one local account follows another.
 pub async fn local_follow_relationship(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     follower_account_id: AccountId,
     followed_account_id: AccountId,
 ) -> Result<Option<LocalFollow>> {
@@ -7501,7 +7502,7 @@ pub async fn local_accounts_are_blocked(
 
 /// Return whether one local account directly blocks another.
 pub async fn local_account_blocks(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     target_account_id: AccountId,
 ) -> Result<bool> {
@@ -9562,7 +9563,7 @@ pub async fn cleanup_notification_requests(db: &DbConnection, account_id: Accoun
 
 /// Return saved timeline markers for an account and a requested set of timelines.
 pub async fn local_timeline_markers_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     timelines: &[LocalTimeline],
 ) -> Result<Vec<LocalTimelineMarker>> {
@@ -9584,7 +9585,7 @@ pub async fn local_timeline_markers_for_account(
 
 /// Save a local account's read position for a Mastodon timeline.
 pub async fn save_local_timeline_marker(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     timeline: LocalTimeline,
     last_read_id: Uuid,
@@ -10191,7 +10192,7 @@ pub async fn remote_tag_follower_ids_for_status(
 
 /// Search local tags by normalized prefix with offset pagination.
 pub async fn search_local_tags(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     query: &str,
     limit: u64,
     offset: u64,
@@ -10212,7 +10213,10 @@ pub async fn search_local_tags(
 }
 
 /// Find a local tag by normalized name.
-pub async fn find_local_tag_by_name(db: &DbConnection, name: &str) -> Result<Option<LocalTag>> {
+pub async fn find_local_tag_by_name(
+    db: &impl ConnectionTrait,
+    name: &str,
+) -> Result<Option<LocalTag>> {
     let name = normalize_tag_name(name);
     if name.is_empty() {
         return Ok(None);
@@ -10227,24 +10231,23 @@ pub async fn find_local_tag_by_name(db: &DbConnection, name: &str) -> Result<Opt
 
 /// Follow a local hashtag for one account, creating the tag row when necessary.
 pub async fn follow_local_tag(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     name: &str,
 ) -> Result<LocalTag> {
-    let txn = db.begin().await?;
     let now = OffsetDateTime::now_utc();
-    let tag = find_or_create_local_tag(&txn, name, now).await?;
+    let tag = find_or_create_local_tag(db, name, now).await?;
 
     let existing = local_tag_follow::Entity::find()
         .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
         .filter(local_tag_follow::Column::TagId.eq(tag.id))
-        .one(&txn)
+        .one(db)
         .await?;
     match existing {
         Some(follow) => {
             let mut active = follow.into_active_model();
             active.updated_at = Set(now);
-            active.update(&txn).await?;
+            active.update(db).await?;
         }
         None => {
             local_tag_follow::ActiveModel {
@@ -10253,18 +10256,17 @@ pub async fn follow_local_tag(
                 created_at: Set(now),
                 updated_at: Set(now),
             }
-            .insert(&txn)
+            .insert(db)
             .await?;
         }
     }
 
-    txn.commit().await?;
     Ok(local_tag_from_model(tag))
 }
 
 /// Stop following a local hashtag for one account and return the local tag when it exists.
 pub async fn unfollow_local_tag(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     name: &str,
 ) -> Result<Option<LocalTag>> {
@@ -10282,7 +10284,7 @@ pub async fn unfollow_local_tag(
 
 /// Return hashtags followed by a local account in name order.
 pub async fn followed_local_tags(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Vec<LocalTag>> {
     let follows = local_tag_follow::Entity::find()
@@ -10302,7 +10304,7 @@ pub async fn followed_local_tags(
 
 /// Return whether a local account follows the tag.
 pub async fn is_local_tag_followed(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     tag_id: Uuid,
 ) -> Result<bool> {
@@ -10315,7 +10317,7 @@ pub async fn is_local_tag_followed(
 }
 
 /// Return public local and cached-remote usage during the latest seven UTC days.
-pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTagHistory>> {
+pub async fn tag_history(db: &impl ConnectionTrait, tag_id: Uuid) -> Result<Vec<LocalTagHistory>> {
     #[derive(Debug, FromQueryResult)]
     struct HistoryRow {
         day: i64,
@@ -10323,9 +10325,6 @@ pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTag
         accounts: i64,
     }
 
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let rows = HistoryRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"SELECT extract(epoch FROM usage_day::timestamp)::bigint AS day,
@@ -10336,9 +10335,8 @@ pub async fn tag_history(db: &DbConnection, tag_id: Uuid) -> Result<Vec<LocalTag
            ORDER BY usage_day DESC"#,
         vec![tag_id.into()],
     ))
-    .all(&txn)
+    .all(db)
     .await?;
-    txn.commit().await?;
 
     let history = rows
         .into_iter()
@@ -14268,7 +14266,7 @@ pub async fn count_public_local_statuses_by_account(
 
 /// Count active statuses authored by a local account.
 pub async fn count_local_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<u64> {
     Ok(local_status::Entity::find()
@@ -14280,7 +14278,7 @@ pub async fn count_local_statuses_by_account(
 
 /// Return the latest active status timestamp for a local account.
 pub async fn last_local_status_at(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Option<OffsetDateTime>> {
     let status = local_status::Entity::find()
@@ -18160,7 +18158,7 @@ where
 
 /// Register an OAuth application and return stored metadata plus the raw client secret.
 pub async fn create_oauth_application(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     name: &str,
     redirect_uri: &str,
     scopes: &str,
@@ -18201,7 +18199,7 @@ pub async fn create_oauth_application(
 
 /// Find an OAuth application by public client id.
 pub async fn find_oauth_application_by_client_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     client_id: &str,
 ) -> Result<Option<OAuthApplication>> {
     let app = oauth_application::Entity::find()
@@ -18242,7 +18240,7 @@ pub struct NewAuthorizationCode<'a> {
 
 /// Create a one-time OAuth authorization code.
 pub async fn create_authorization_code(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     token_pepper: &str,
     new_code: NewAuthorizationCode<'_>,
 ) -> Result<String> {
@@ -18270,7 +18268,7 @@ pub async fn create_authorization_code(
 
 /// Consume a one-time authorization code and return grant metadata when valid.
 pub async fn consume_authorization_code(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     token_pepper: &str,
     code: &str,
     application_id: Uuid,
@@ -18306,7 +18304,7 @@ pub async fn consume_authorization_code(
 
 /// Create and persist a hashed opaque OAuth access token.
 pub async fn create_access_token(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     token_pepper: &str,
     account_id: AccountId,
     application_id: Uuid,
@@ -18338,7 +18336,7 @@ pub async fn create_access_token(
 
 /// Resolve a raw OAuth access token to its local account and granted scopes.
 pub async fn find_account_by_access_token(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     token_pepper: &str,
     token: &str,
 ) -> Result<Option<(LocalAccount, String)>> {
@@ -18370,7 +18368,7 @@ pub async fn find_account_by_access_token(
 
 /// Resolve a raw access token while preserving the persisted token identifier.
 pub async fn find_access_token_grant(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     token_pepper: &str,
     raw_token: &str,
 ) -> Result<Option<AccessTokenGrant>> {
@@ -18404,7 +18402,11 @@ pub async fn find_access_token_grant(
 }
 
 /// Revoke an OAuth access token if it exists.
-pub async fn revoke_access_token(db: &DbConnection, token_pepper: &str, token: &str) -> Result<()> {
+pub async fn revoke_access_token(
+    db: &impl ConnectionTrait,
+    token_pepper: &str,
+    token: &str,
+) -> Result<()> {
     let token_hash = secret_hash(token_pepper, token)?;
     if let Some(token) = oauth_access_token::Entity::find()
         .filter(oauth_access_token::Column::TokenHash.eq(token_hash))

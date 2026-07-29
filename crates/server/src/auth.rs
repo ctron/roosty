@@ -19,7 +19,7 @@ use roosty_web_ui::{
     AuthorizationResult, LoginError, OutOfBandAuthorization, PasswordChangeResult,
     render_authorization_consent, render_out_of_band_authorization,
 };
-use sea_orm::TransactionTrait;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde::{
     Deserialize, Serialize,
     de::{self, DeserializeOwned, MapAccess, Visitor},
@@ -127,13 +127,20 @@ where
                 )
             })?
             .to_owned();
+        let txn = state
+            .begin_read()
+            .await
+            .map_err(|error| server_error(error.into()))?;
         let grant =
-            roosty_db::find_access_token_grant(&state.db, &state.config.token_pepper, &raw_token)
+            roosty_db::find_access_token_grant(&txn, &state.config.token_pepper, &raw_token)
                 .await
                 .map_err(server_error)?
                 .ok_or_else(|| {
                     oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token")
                 })?;
+        txn.commit()
+            .await
+            .map_err(|error| server_error(error.into()))?;
         Ok(Self { grant, raw_token })
     }
 }
@@ -243,12 +250,19 @@ struct ChangePasswordForm {
 
 async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     let next = sanitize_next(form.next.as_deref());
-    let account = match roosty_db::find_local_account_by_login(&state.db, &form.login).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let account = match roosty_db::find_local_account_by_login(&txn, &form.login).await {
         Ok(Some(account)) if account.suspended_at.is_none() => account,
         Ok(Some(_)) => return redirect_login_error(&state, &next, LoginError::InvalidCredentials),
         Ok(None) => return redirect_login_error(&state, &next, LoginError::InvalidCredentials),
         Err(error) => return server_error(error),
     };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
 
     match password::verify_password(&form.password, &account.password_hash) {
         Ok(true) => {
@@ -291,7 +305,11 @@ async fn change_password(
         }
         Err(error) => return server_error(error),
     };
-    let account = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let account = match roosty_db::find_local_account_by_id(&txn, account_id).await {
         Ok(Some(account)) => account,
         Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
         Err(error) => return server_error(error),
@@ -307,10 +325,12 @@ async fn change_password(
         Err(error) => return redirect_password_result(&state, error.into()),
     };
     if let Err(error) =
-        roosty_db::update_local_account_password_hash_by_id(&state.db, account_id, &password_hash)
-            .await
+        roosty_db::update_local_account_password_hash_by_id(&txn, account_id, &password_hash).await
     {
         return server_error(error);
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
 
     redirect_password_result(&state, PasswordChangeResult::PasswordChanged)
@@ -402,8 +422,12 @@ async fn register_app(
     }
 
     let scopes = form.scopes.as_deref().unwrap_or("read write follow push");
-    match roosty_db::create_oauth_application(
-        &state.db,
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result = match roosty_db::create_oauth_application(
+        &txn,
         &form.client_name,
         &form.redirect_uris,
         scopes,
@@ -412,18 +436,23 @@ async fn register_app(
     )
     .await
     {
-        Ok((app, client_secret)) => Json(CreateAppResponse {
-            id: app.id.to_string(),
-            name: app.name,
-            website: app.website,
-            redirect_uri: app.redirect_uri,
-            client_id: app.client_id,
-            client_secret,
-            vapid_key: state.push.public_key().unwrap_or_default(),
-        })
-        .into_response(),
-        Err(error) => server_error(error),
+        Ok(result) => result,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    let (app, client_secret) = result;
+    Json(CreateAppResponse {
+        id: app.id.to_string(),
+        name: app.name,
+        website: app.website,
+        redirect_uri: app.redirect_uri,
+        client_id: app.client_id,
+        client_secret,
+        vapid_key: state.push.public_key().unwrap_or_default(),
+    })
+    .into_response()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -546,11 +575,18 @@ async fn authorize_form(
     };
     let app = validated.app;
 
-    let account = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let account = match roosty_db::find_local_account_by_id(&txn, account_id).await {
         Ok(Some(account)) => account,
         Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
         Err(error) => return server_error(error),
     };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
 
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let state_value = params.state.as_deref().unwrap_or_default();
@@ -590,11 +626,18 @@ async fn authorize(
         Err(error) => return server_error(error),
     };
 
-    let account = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let account = match roosty_db::find_local_account_by_id(&txn, account_id).await {
         Ok(Some(account)) => account,
         Ok(None) => return Redirect::to(&public_url(&state, "/login")).into_response(),
         Err(error) => return server_error(error),
     };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
 
     let validated = match validate_authorize_request(&state, &params).await {
         Ok(validated) => validated,
@@ -625,8 +668,12 @@ async fn authorize(
     } else {
         roosty_db::PkceCodeChallengeMethod::S256
     };
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
     let code = match roosty_db::create_authorization_code(
-        &state.db,
+        &txn,
         &state.config.token_pepper,
         roosty_db::NewAuthorizationCode {
             account_id,
@@ -642,6 +689,9 @@ async fn authorize(
         Ok(code) => code,
         Err(error) => return server_error(error),
     };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
 
     if validated.redirect_uri == OOB_REDIRECT_URI {
         return Html(render_out_of_band_authorization(OutOfBandAuthorization {
@@ -680,7 +730,11 @@ async fn validate_authorize_request(
         ));
     }
 
-    let app = roosty_db::find_oauth_application_by_client_id(&state.db, &params.client_id)
+    let txn = state
+        .begin_read()
+        .await
+        .map_err(|error| server_error(error.into()))?;
+    let app = roosty_db::find_oauth_application_by_client_id(&txn, &params.client_id)
         .await
         .map_err(server_error)?
         .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client"))?;
@@ -694,6 +748,9 @@ async fn validate_authorize_request(
         ));
     };
 
+    txn.commit()
+        .await
+        .map_err(|error| server_error(error.into()))?;
     Ok(ValidatedAuthorizeRequest { app, redirect_uri })
 }
 
@@ -766,8 +823,11 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         );
     }
 
-    let app = match roosty_db::find_oauth_application_by_client_id(&state.db, &form.client_id).await
-    {
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let app = match roosty_db::find_oauth_application_by_client_id(&txn, &form.client_id).await {
         Ok(Some(app)) => app,
         Ok(None) => {
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client");
@@ -797,7 +857,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
 
     let Some((account_id, scopes, challenge, method)) =
         (match roosty_db::consume_authorization_code(
-            &state.db,
+            &txn,
             &state.config.token_pepper,
             &form.code,
             app.id,
@@ -823,6 +883,9 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
                 .as_deref()
                 .is_none_or(|verifier| roosty_db::pkce_s256_challenge(verifier) != challenge))
     {
+        if let Err(error) = txn.commit().await {
+            return server_error(error.into());
+        }
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -830,24 +893,28 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         );
     }
 
-    match roosty_db::create_access_token(
-        &state.db,
+    let result = roosty_db::create_access_token(
+        &txn,
         &state.config.token_pepper,
         account_id,
         app.id,
         &scopes,
     )
-    .await
-    {
-        Ok(token) => Json(TokenResponse {
-            access_token: token.token,
-            token_type: token.token_type,
-            scope: token.scope,
-            created_at: token.created_at,
-        })
-        .into_response(),
-        Err(error) => server_error(error),
+    .await;
+    let token = match result {
+        Ok(token) => token,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    Json(TokenResponse {
+        access_token: token.token,
+        token_type: token.token_type,
+        scope: token.scope,
+        created_at: token.created_at,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -859,8 +926,15 @@ async fn revoke(
     State(state): State<AppState>,
     FormOrJson(form): FormOrJson<RevokeForm>,
 ) -> Response {
-    match roosty_db::revoke_access_token(&state.db, &state.config.token_pepper, &form.token).await {
-        Ok(()) => StatusCode::OK.into_response(),
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::revoke_access_token(&txn, &state.config.token_pepper, &form.token).await {
+        Ok(()) => match txn.commit().await {
+            Ok(()) => StatusCode::OK.into_response(),
+            Err(error) => server_error(error.into()),
+        },
         Err(error) => server_error(error),
     }
 }
@@ -1189,11 +1263,19 @@ pub(crate) async fn account_from_bearer_token(
     state: &AppState,
     bearer: &str,
 ) -> Result<roosty_db::LocalAccount, Response> {
-    roosty_db::find_account_by_access_token(&state.db, &state.config.token_pepper, bearer)
+    let txn = state
+        .begin_read()
+        .await
+        .map_err(|error| server_error(error.into()))?;
+    let account = roosty_db::find_account_by_access_token(&txn, &state.config.token_pepper, bearer)
         .await
         .map_err(server_error)?
         .map(|(account, _scopes)| account)
-        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token"))
+        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token"))?;
+    txn.commit()
+        .await
+        .map_err(|error| server_error(error.into()))?;
+    Ok(account)
 }
 
 /// Build the Mastodon-compatible credential account response.
@@ -1201,12 +1283,24 @@ pub(crate) async fn account_response(
     state: &AppState,
     account: roosty_db::LocalAccount,
 ) -> Result<AccountResponse, RoostyError> {
-    let statuses_count = roosty_db::count_local_statuses_by_account(&state.db, account.id).await?;
-    let followers_count = roosty_db::count_local_followers(&state.db, account.id).await?
-        + roosty_db::count_remote_followers(&state.db, account.id).await?;
-    let following_count = roosty_db::count_local_following(&state.db, account.id).await?
-        + roosty_db::count_remote_following(&state.db, account.id).await?;
-    let last_status_at = roosty_db::last_local_status_at(&state.db, account.id).await?;
+    let txn = state.begin_snapshot().await?;
+    let response = account_response_on(state, &txn, account).await?;
+    txn.commit().await?;
+    Ok(response)
+}
+
+/// Build an account response within a containing database snapshot.
+pub(crate) async fn account_response_on(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account: roosty_db::LocalAccount,
+) -> Result<AccountResponse, RoostyError> {
+    let statuses_count = roosty_db::count_local_statuses_by_account(db, account.id).await?;
+    let followers_count = roosty_db::count_local_followers(db, account.id).await?
+        + roosty_db::count_remote_followers(db, account.id).await?;
+    let following_count = roosty_db::count_local_following(db, account.id).await?
+        + roosty_db::count_remote_following(db, account.id).await?;
+    let last_status_at = roosty_db::last_local_status_at(db, account.id).await?;
     Ok(account_response_with_stats(
         state,
         account,

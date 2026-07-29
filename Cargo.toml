@@ -83,6 +83,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+[profile.dev]
+debug = 1
+split-debuginfo = "unpacked"
+
 [[workspace.metadata.leptos]]
 name = "roosty-web"
 bin-package = "roosty"

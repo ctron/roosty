@@ -64,7 +64,15 @@ async fn markers(
         .filter_map(|timeline| parse_timeline(timeline))
         .collect::<Vec<_>>();
 
-    match roosty_db::local_timeline_markers_for_account(&state.db, account.id, &timelines).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result = roosty_db::local_timeline_markers_for_account(&txn, account.id, &timelines).await;
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match result {
         Ok(markers) => Json(marker_response_map(markers)).into_response(),
         Err(error) => server_error(error),
     }
@@ -80,14 +88,20 @@ async fn save_markers(
         Ok(updates) => updates,
         Err(()) => return bad_request(),
     };
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
     let mut markers = Vec::with_capacity(updates.len());
     for (timeline, last_read_id) in updates {
-        match roosty_db::save_local_timeline_marker(&state.db, account.id, timeline, last_read_id)
-            .await
+        match roosty_db::save_local_timeline_marker(&txn, account.id, timeline, last_read_id).await
         {
             Ok(marker) => markers.push(marker),
             Err(error) => return server_error(error),
         }
+    }
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
 
     Json(marker_response_map(markers)).into_response()

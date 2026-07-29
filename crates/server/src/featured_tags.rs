@@ -10,7 +10,6 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError};
 use roosty_db::{FeatureTagResult, FeaturedTag};
-use sea_orm::TransactionTrait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -53,7 +52,15 @@ async fn index(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    match roosty_db::local_featured_tags(&state.db, account.id).await {
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let result = roosty_db::local_featured_tags(&txn, account.id).await;
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
+    match result {
         Ok(tags) => Json(local_responses(&state, &account.username, tags)).into_response(),
         Err(error) => server_error(error),
     }
@@ -71,7 +78,7 @@ async fn create(
     let Some(name) = roosty_db::normalize_featured_tag_name(&input.name) else {
         return unprocessable("Featured tag name is invalid");
     };
-    let txn = match state.db.begin().await {
+    let txn = match state.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -104,7 +111,7 @@ async fn destroy(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(featured_tag_id): Path<Uuid>,
 ) -> Response {
-    let txn = match state.db.begin().await {
+    let txn = match state.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -129,11 +136,17 @@ async fn suggestions(
     State(state): State<AppState>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    let tags =
-        match roosty_db::suggested_featured_tags(&state.db, account.id, MAX_SUGGESTIONS).await {
-            Ok(tags) => tags,
-            Err(error) => return server_error(error),
-        };
+    let txn = match state.begin_read().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let tags = match roosty_db::suggested_featured_tags(&txn, account.id, MAX_SUGGESTIONS).await {
+        Ok(tags) => tags,
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
+    }
     let responses = tags
         .into_iter()
         .map(|tag| TagResponse::new(&state, tag, Vec::new(), None))
@@ -146,24 +159,31 @@ async fn account_featured_tags(
     Path(account_id): Path<Uuid>,
 ) -> Response {
     let account_id = AccountId(account_id);
-    match roosty_db::find_local_account_by_id(&state.db, account_id).await {
-        Ok(Some(account)) => match roosty_db::local_featured_tags(&state.db, account_id).await {
+    let txn = match state.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let response = match roosty_db::find_local_account_by_id(&txn, account_id).await {
+        Ok(Some(account)) => match roosty_db::local_featured_tags(&txn, account_id).await {
             Ok(tags) => Json(local_responses(&state, &account.username, tags)).into_response(),
-            Err(error) => server_error(error),
+            Err(error) => return server_error(error),
         },
-        Ok(None) => match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
-            Ok(Some(_actor)) => {
-                match roosty_db::remote_featured_tags(&state.db, account_id).await {
-                    Ok(tags) => Json(tags.into_iter().map(remote_response).collect::<Vec<_>>())
-                        .into_response(),
-                    Err(error) => server_error(error),
+        Ok(None) => match roosty_db::find_remote_actor_by_id(&txn, account_id).await {
+            Ok(Some(_actor)) => match roosty_db::remote_featured_tags(&txn, account_id).await {
+                Ok(tags) => {
+                    Json(tags.into_iter().map(remote_response).collect::<Vec<_>>()).into_response()
                 }
-            }
+                Err(error) => return server_error(error),
+            },
             Ok(None) => not_found(),
-            Err(error) => server_error(error),
+            Err(error) => return server_error(error),
         },
-        Err(error) => server_error(error),
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    response
 }
 
 fn local_responses(

@@ -3061,14 +3061,24 @@ async fn show_tag(
     OptionalAuthenticatedAccount(account): OptionalAuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
+    let txn = match state.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
     match tag_response_by_name(
         &state,
+        &txn,
         &path.hashtag,
         account.as_ref().map(|account| account.id),
     )
     .await
     {
-        Ok(Some(tag)) => Json(tag).into_response(),
+        Ok(Some(tag)) => {
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
+            }
+            Json(tag).into_response()
+        }
         Ok(None) => tag_not_found(),
         Err(error) => server_error(error),
     }
@@ -3079,8 +3089,21 @@ async fn follow_tag(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    match roosty_db::follow_local_tag(&state.db, account.id, &path.hashtag).await {
-        Ok(tag) => tag_response(&state, tag, Some(true)).await,
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::follow_local_tag(&txn, account.id, &path.hashtag).await {
+        Ok(tag) => {
+            let response = match tag_response_model(&state, &txn, tag, Some(true)).await {
+                Ok(response) => response,
+                Err(error) => return server_error(error),
+            };
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
+            }
+            Json(response).into_response()
+        }
         Err(error) => server_error(error),
     }
 }
@@ -3090,8 +3113,21 @@ async fn unfollow_tag(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    match roosty_db::unfollow_local_tag(&state.db, account.id, &path.hashtag).await {
-        Ok(Some(tag)) => tag_response(&state, tag, Some(false)).await,
+    let txn = match state.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    match roosty_db::unfollow_local_tag(&txn, account.id, &path.hashtag).await {
+        Ok(Some(tag)) => {
+            let response = match tag_response_model(&state, &txn, tag, Some(false)).await {
+                Ok(response) => response,
+                Err(error) => return server_error(error),
+            };
+            if let Err(error) = txn.commit().await {
+                return server_error(error.into());
+            }
+            Json(response).into_response()
+        }
         Ok(None) => tag_not_found(),
         Err(error) => server_error(error),
     }
@@ -3100,41 +3136,30 @@ async fn unfollow_tag(
 /// Build a Mastodon tag response for one locally known hashtag.
 async fn tag_response_by_name(
     state: &AppState,
+    db: &impl ConnectionTrait,
     name: &str,
     viewer: Option<AccountId>,
 ) -> Result<Option<TagResponse>, RoostyError> {
-    let Some(tag) = roosty_db::find_local_tag_by_name(&state.db, name).await? else {
+    let Some(tag) = roosty_db::find_local_tag_by_name(db, name).await? else {
         return Ok(None);
     };
     let following = match viewer {
-        Some(account_id) => {
-            Some(roosty_db::is_local_tag_followed(&state.db, account_id, tag.id).await?)
-        }
+        Some(account_id) => Some(roosty_db::is_local_tag_followed(db, account_id, tag.id).await?),
         None => None,
     };
 
-    Ok(Some(tag_response_model(state, tag, following).await?))
+    Ok(Some(tag_response_model(state, db, tag, following).await?))
 }
 
 /// Convert stored local tag metadata into a Mastodon tag response.
 pub(crate) async fn tag_response_model(
     state: &AppState,
+    db: &impl ConnectionTrait,
     tag: roosty_db::LocalTag,
     following: Option<bool>,
 ) -> Result<TagResponse, RoostyError> {
-    let history = roosty_db::tag_history(&state.db, tag.id).await?;
+    let history = roosty_db::tag_history(db, tag.id).await?;
     Ok(TagResponse::new(state, tag, history, following))
-}
-
-async fn tag_response(
-    state: &AppState,
-    tag: roosty_db::LocalTag,
-    following: Option<bool>,
-) -> Response {
-    match tag_response_model(state, tag, following).await {
-        Ok(tag) => Json(tag).into_response(),
-        Err(error) => server_error(error),
-    }
 }
 
 fn tag_timeline_params(query: Option<&str>) -> Result<TagTimelineParams, ()> {
@@ -3452,7 +3477,9 @@ async fn status_collection_action(
                     };
                     match favourite {
                         Some(favourite) => {
-                            let job = match prepare_remote_unfavourite(state, favourite).await {
+                            let job = match prepare_remote_unfavourite(state, &state.db, favourite)
+                                .await
+                            {
                                 Ok(job) => job,
                                 Err(error) => return server_error(error),
                             };
@@ -3505,11 +3532,14 @@ async fn status_collection_action(
                             Err(error) => return server_error(error),
                         }
                     } else {
-                        let (activity_id, job) =
-                            match prepare_remote_reblog(state, account_id, &remote).await {
-                                Ok(id) => id,
-                                Err(error) => return server_error(error),
-                            };
+                        let (activity_id, job) = match prepare_remote_reblog(
+                            state, &state.db, account_id, &remote,
+                        )
+                        .await
+                        {
+                            Ok(id) => id,
+                            Err(error) => return server_error(error),
+                        };
                         let txn = match state.db.begin().await {
                             Ok(txn) => txn,
                             Err(error) => return server_error(error.into()),
@@ -3555,7 +3585,7 @@ async fn status_collection_action(
                     };
                     if let Some(reblog) = reblog {
                         let reblog_id = reblog.id;
-                        let job = match prepare_remote_unreblog(state, reblog).await {
+                        let job = match prepare_remote_unreblog(state, &state.db, reblog).await {
                             Ok(job) => job,
                             Err(error) => return server_error(error),
                         };
