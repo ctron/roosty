@@ -23,10 +23,10 @@ use rand_core::{OsRng, RngCore};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    FeaturedTag, JobKind, LocalStatus, NewModerationReport, NewRemoteCustomEmoji, RemoteActor,
-    RemoteConversationParticipant, RemoteFeaturedTagInput, ReportAccount, ReportCategory,
-    ReportStatus, StatusVisibility, create_moderation_report, federation_domain_policy,
-    find_local_status_by_id, notify_administrators_of_report,
+    FeaturedTag, JobKind, LocalStatus, NewModerationReport, NewRemoteCustomEmoji, PollStatus,
+    RemoteActor, RemoteConversationParticipant, RemoteFeaturedTagInput, RemoteStatusPoll,
+    ReportAccount, ReportCategory, ReportStatus, StatusVisibility, create_moderation_report,
+    federation_domain_policy, find_local_status_by_id, notify_administrators_of_report,
 };
 use rsa::{
     RsaPrivateKey,
@@ -35,7 +35,7 @@ use rsa::{
     pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
     signature::{SignatureEncoding, Signer, Verifier},
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -128,6 +128,7 @@ enum ActorType {
 #[derive(Clone, Serialize)]
 enum NoteType {
     Note,
+    Question,
 }
 
 /// ActivityStreams activity types emitted for local status publication.
@@ -212,6 +213,24 @@ struct InboundStatusActivity {
     r#type: InboundStatusType,
     actor: String,
     object: InboundNote,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundPollVoteActivity {
+    actor: String,
+    object: InboundPollVote,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundPollVote {
+    r#type: InboundNoteType,
+    name: String,
+    attributed_to: String,
+    in_reply_to: String,
+    #[serde(default)]
+    to: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -512,11 +531,44 @@ struct InboundNote {
     quote: Option<String>,
     #[serde(default)]
     quote_authorization: Option<String>,
+    #[serde(flatten)]
+    poll: Box<InboundPollFields>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundPollFields {
+    #[serde(default)]
+    one_of: Vec<InboundPollOption>,
+    #[serde(default)]
+    any_of: Vec<InboundPollOption>,
+    #[serde(default)]
+    end_time: Option<String>,
+    #[serde(default)]
+    closed: Option<String>,
+    #[serde(default)]
+    voters_count: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq)]
 enum InboundNoteType {
     Note,
+    Question,
+}
+
+/// A closed ActivityStreams poll choice and its aggregate reply count.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundPollOption {
+    name: String,
+    replies: InboundPollReplies,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundPollReplies {
+    #[serde(default)]
+    total_items: u64,
 }
 
 /// ActivityPub reply collection forms retained for bounded thread discovery.
@@ -566,6 +618,60 @@ struct ResolvedInboundQuote {
     state: roosty_db::QuoteState,
     authorization_id: Option<String>,
     local_author_id: Option<AccountId>,
+}
+
+/// Validate Mastodon's ActivityStreams `Question` projection at the wire boundary.
+fn remote_poll_from_note(note: &InboundNote) -> Result<Option<RemoteStatusPoll>, RoostyError> {
+    if note.r#type == InboundNoteType::Note {
+        return Ok(None);
+    }
+    let (multiple, options) = match (note.poll.one_of.is_empty(), note.poll.any_of.is_empty()) {
+        (false, true) => (false, &note.poll.one_of),
+        (true, false) => (true, &note.poll.any_of),
+        _ => {
+            return Err(RoostyError::InvalidInput(
+                "remote Question must contain exactly one of oneOf or anyOf".to_owned(),
+            ));
+        }
+    };
+    let options = options
+        .iter()
+        .map(|option| (option.name.trim().to_owned(), option.replies.total_items))
+        .collect::<Vec<_>>();
+    if options.iter().any(|(title, _)| title.is_empty()) {
+        return Err(RoostyError::InvalidInput(
+            "remote Question contains an empty option".to_owned(),
+        ));
+    }
+    let mut titles = options
+        .iter()
+        .map(|(title, _)| title.as_str())
+        .collect::<Vec<_>>();
+    titles.sort_unstable();
+    titles.dedup();
+    if titles.len() != options.len() {
+        return Err(RoostyError::InvalidInput(
+            "remote Question contains duplicate options".to_owned(),
+        ));
+    }
+    let parse_time = |value: Option<&str>, field: &str| {
+        value
+            .map(|value| {
+                OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+                    RoostyError::InvalidInput(format!(
+                        "remote Question {field} timestamp is invalid"
+                    ))
+                })
+            })
+            .transpose()
+    };
+    Ok(Some(RemoteStatusPoll {
+        options,
+        multiple,
+        expires_at: parse_time(note.poll.end_time.as_deref(), "endTime")?,
+        closed_at: parse_time(note.poll.closed.as_deref(), "closed")?,
+        voters_count: note.poll.voters_count,
+    }))
 }
 
 async fn resolve_inbound_quote(
@@ -1029,6 +1135,39 @@ struct Note {
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_authorization: Option<String>,
     interaction_policy: InboundInteractionPolicy,
+    #[serde(flatten)]
+    poll: Box<OutboundPollFields>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutboundPollFields {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    one_of: Vec<OutboundPollOption>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    any_of: Vec<OutboundPollOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voters_count: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct OutboundPollOption {
+    #[serde(rename = "type")]
+    r#type: NoteType,
+    name: String,
+    replies: OutboundPollReplies,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutboundPollReplies {
+    #[serde(rename = "type")]
+    r#type: &'static str,
+    total_items: u64,
 }
 
 /// JSON-LD context needed for FEP-044f quote properties.
@@ -2151,28 +2290,39 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             };
         }
     }
+    if activity_type == Some(InboundActivityType::Create)
+        && activity
+            .get("object")
+            .and_then(|object| object.get("name"))
+            .and_then(JsonValue::as_str)
+            .is_some()
+        && let Ok(vote) = serde_json::from_value::<InboundPollVoteActivity>(activity.clone())
+        && vote.object.r#type == InboundNoteType::Note
+        && vote.actor == remote_actor.activitypub_id
+        && vote.object.attributed_to == remote_actor.activitypub_id
+    {
+        return Box::pin(process_inbound_poll_vote(
+            state,
+            &activity,
+            &activity_id,
+            &remote_actor,
+            vote,
+        ))
+        .await;
+    }
     if matches!(
         activity_type,
         Some(
             InboundActivityType::Create | InboundActivityType::Update | InboundActivityType::Delete
         )
     ) {
-        return match process_remote_status_activity(state, &activity_id, &activity, &remote_actor)
-            .await
-        {
-            Ok(change) => {
-                if let Err(error) =
-                    publish_remote_status_change(state, remote_actor.id, change).await
-                {
-                    tracing::warn!(%error, activity_id, "could not stream remote status activity");
-                }
-                StatusCode::ACCEPTED.into_response()
-            }
-            Err(error) => {
-                tracing::warn!(%error, activity_id, "rejected remote status activity");
-                StatusCode::ACCEPTED.into_response()
-            }
-        };
+        return Box::pin(process_and_publish_remote_status_activity(
+            state,
+            &activity_id,
+            &activity,
+            &remote_actor,
+        ))
+        .await;
     }
     if matches!(
         activity_type,
@@ -2737,6 +2887,112 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     }
 }
 
+/// Apply one verified Mastodon-style `Create(Note)` vote outside the large inbox future.
+async fn process_inbound_poll_vote(
+    state: &AppState,
+    activity: &JsonValue,
+    activity_id: &str,
+    remote_actor: &roosty_db::RemoteActor,
+    vote: InboundPollVoteActivity,
+) -> Response {
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(error) => return internal_error(error),
+    };
+    let target_id = match local_status_id_from_url_on(state, &txn, &vote.object.in_reply_to).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            drop(txn);
+            return finish_ignored_inbox_activity(state, activity, remote_actor).await;
+        }
+        Err(error) => return internal_error(error),
+    };
+    let status = match roosty_db::find_local_status_by_id(&txn, target_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            drop(txn);
+            return finish_ignored_inbox_activity(state, activity, remote_actor).await;
+        }
+        Err(error) => return internal_error(error),
+    };
+    let author = match roosty_db::find_local_account_by_id(&txn, status.account_id).await {
+        Ok(Some(author)) => author,
+        Ok(None) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(error) => return internal_error(error),
+    };
+    if !vote
+        .object
+        .to
+        .iter()
+        .any(|recipient| recipient == &actor_url(state, &author.username))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let poll = match roosty_db::find_poll_for_status(&txn, PollStatus::Local(status.id)).await {
+        Ok(Some(poll)) => poll,
+        Ok(None) => {
+            drop(txn);
+            return finish_ignored_inbox_activity(state, activity, remote_actor).await;
+        }
+        Err(error) => return internal_error(error),
+    };
+    let Some(choice) = poll
+        .options
+        .iter()
+        .find(|option| option.title == vote.object.name)
+        .map(|option| option.position)
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let is_new = match is_new_inbox_activity(&txn, activity, remote_actor).await {
+        Ok(is_new) => is_new,
+        Err(error) => return internal_error(error),
+    };
+    if is_new {
+        if let Err(error) =
+            roosty_db::record_remote_poll_vote(&txn, poll.id, remote_actor.id, choice, activity_id)
+                .await
+        {
+            tracing::warn!(%error, activity_id, "rejected remote poll vote");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        if !poll.hide_totals
+            && let Err(error) = roosty_db::enqueue_poll_update(
+                &txn,
+                poll.id,
+                OffsetDateTime::now_utc() + time::Duration::minutes(3),
+            )
+            .await
+        {
+            return internal_error(error);
+        }
+    }
+    match txn.commit().await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+/// Keep the large remote status lifecycle future behind one heap allocation at the inbox boundary.
+async fn process_and_publish_remote_status_activity(
+    state: &AppState,
+    activity_id: &str,
+    activity: &JsonValue,
+    remote_actor: &roosty_db::RemoteActor,
+) -> Response {
+    match process_remote_status_activity(state, activity_id, activity, remote_actor).await {
+        Ok(change) => {
+            if let Err(error) = publish_remote_status_change(state, remote_actor.id, change).await {
+                tracing::warn!(%error, activity_id, "could not stream remote status activity");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, activity_id, "rejected remote status activity");
+        }
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
 /// Hash compact canonical JSON with recursively sorted object keys.
 fn canonical_activity_digest(activity: &JsonValue) -> Result<[u8; 32], RoostyError> {
     fn canonicalize(value: &JsonValue) -> JsonValue {
@@ -3004,6 +3260,20 @@ async fn local_status_id_from_url(
     state: &AppState,
     activitypub_id: &str,
 ) -> Result<Option<StatusId>, RoostyError> {
+    let txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let status_id = local_status_id_from_url_on(state, &txn, activitypub_id).await?;
+    txn.commit().await?;
+    Ok(status_id)
+}
+
+async fn local_status_id_from_url_on(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    activitypub_id: &str,
+) -> Result<Option<StatusId>, RoostyError> {
     let prefix = format!(
         "{}/users/",
         state.config.public_base_url.as_str().trim_end_matches('/')
@@ -3020,12 +3290,10 @@ async fn local_status_id_from_url(
     let Ok(status_id) = Uuid::parse_str(status_id) else {
         return Ok(None);
     };
-    let Some(status) = roosty_db::find_local_status_by_id(&state.db, StatusId(status_id)).await?
-    else {
+    let Some(status) = roosty_db::find_local_status_by_id(db, StatusId(status_id)).await? else {
         return Ok(None);
     };
-    let Some(account) = roosty_db::find_local_account_by_id(&state.db, status.account_id).await?
-    else {
+    let Some(account) = roosty_db::find_local_account_by_id(db, status.account_id).await? else {
         return Ok(None);
     };
     Ok((account.username == username).then_some(status.id))
@@ -3063,6 +3331,7 @@ async fn process_remote_status_activity(
             let object = serde_json::to_value(&inbound.object)
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
             let note = inbound.object;
+            let poll = remote_poll_from_note(&note)?;
             let attachments = note
                 .attachment
                 .iter()
@@ -3087,7 +3356,6 @@ async fn process_remote_status_activity(
                 .collect::<Vec<_>>();
             if inbound.actor != remote_actor.activitypub_id
                 || note.attributed_to != remote_actor.activitypub_id
-                || note.r#type != InboundNoteType::Note
                 || !note.id.starts_with("https://")
                 || !same_url_origin(&note.id, &remote_actor.activitypub_id)
             {
@@ -3174,6 +3442,9 @@ async fn process_remote_status_activity(
                 roosty_db::RemoteStatusUpsertResult::Updated(status) => (status, true, false),
                 roosty_db::RemoteStatusUpsertResult::Unchanged(status) => (status, false, true),
             };
+            if let Some(poll) = poll {
+                roosty_db::upsert_remote_poll(&txn, status.id, poll).await?;
+            }
             roosty_db::link_unresolved_remote_replies_to_parent(&txn, &status).await?;
             enqueue_remote_thread_jobs(&txn, &status).await?;
             if unchanged {
@@ -3446,8 +3717,8 @@ async fn fetch_public_remote_status(
         .unwrap_or(document);
     let note: InboundNote = serde_json::from_value(object.clone())
         .map_err(|_| permanent_fetch_failure("remote status is not a supported Note"))?;
+    let poll = remote_poll_from_note(&note)?;
     if note.id != requested_url
-        || note.r#type != InboundNoteType::Note
         || !same_url_origin(&note.id, &note.attributed_to)
         || expected_parent.is_some_and(|parent| note.in_reply_to.as_deref() != Some(parent))
     {
@@ -3553,6 +3824,9 @@ async fn fetch_public_remote_status(
         | roosty_db::RemoteStatusUpsertResult::Updated(status)
         | roosty_db::RemoteStatusUpsertResult::Unchanged(status) => status,
     };
+    if let Some(poll) = poll {
+        roosty_db::upsert_remote_poll(&txn, status.id, poll).await?;
+    }
     roosty_db::upsert_remote_custom_emojis(&txn, &emojis).await?;
     roosty_db::link_unresolved_remote_replies_to_parent(&txn, &status).await?;
     enqueue_remote_thread_jobs(&txn, &status).await?;
@@ -4831,6 +5105,14 @@ struct FavouriteDelivery {
     activity: JsonValue,
 }
 
+/// Durable delivery of one or more ActivityPub poll-choice Notes.
+#[derive(Deserialize, Serialize)]
+struct PollVoteDelivery {
+    local_account_id: AccountId,
+    remote_actor_id: AccountId,
+    activities: Vec<JsonValue>,
+}
+
 /// Durable payload for a local Announce or Undo(Announce) delivery.
 #[derive(Deserialize, Serialize)]
 struct ReblogDelivery {
@@ -5004,6 +5286,92 @@ pub(crate) async fn deliver_favourite_activity(
         false,
     )
     .await
+}
+
+/// Build the durable `Create(Note)` vote activities Mastodon expects for a remote Question.
+pub(crate) async fn prepare_poll_vote(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    local_account_id: AccountId,
+    poll: &roosty_db::StatusPoll,
+    choices: &[u32],
+) -> Result<roosty_db::NewJob, RoostyError> {
+    let PollStatus::Remote(status_id) = poll.status else {
+        return Err(RoostyError::InvalidInput(
+            "poll vote delivery requires a remote poll".to_owned(),
+        ));
+    };
+    let local = roosty_db::find_local_account_by_id(db, local_account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local poll voter does not exist".to_owned()))?;
+    let status = roosty_db::find_remote_status_by_id(db, status_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("remote poll status does not exist".to_owned()))?;
+    let remote = roosty_db::find_remote_actor_by_id(db, status.remote_actor_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("remote poll author does not exist".to_owned()))?;
+    let actor = actor_url(state, &local.username);
+    let mut choices = choices.to_vec();
+    choices.sort_unstable();
+    choices.dedup();
+    let batch_id = Uuid::now_v7();
+    let mut activities = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let title = poll
+            .options
+            .iter()
+            .find(|option| option.position == choice)
+            .map(|option| option.title.clone())
+            .ok_or_else(|| RoostyError::InvalidInput("poll choice is invalid".to_owned()))?;
+        let id = format!("{actor}#poll-vote-{batch_id}-{choice}");
+        activities.push(serde_json::json!({
+            "@context": ACTIVITYSTREAMS_CONTEXT,
+            "id": id,
+            "type": "Create",
+            "actor": actor,
+            "to": [remote.activitypub_id],
+            "object": {
+                "id": format!("{id}/object"),
+                "type": "Note",
+                "name": title,
+                "attributedTo": actor,
+                "to": [remote.activitypub_id],
+                "inReplyTo": status.activitypub_id,
+            }
+        }));
+    }
+    let payload = serde_json::to_value(PollVoteDelivery {
+        local_account_id,
+        remote_actor_id: remote.id,
+        activities,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    Ok(roosty_db::NewJob {
+        kind: JobKind::FederationPollVoteDelivery,
+        payload,
+        deduplication_key: Some(format!("{local_account_id:?}:{batch_id}")),
+        run_after: OffsetDateTime::now_utc(),
+    })
+}
+
+/// Deliver every choice in one multiple-choice vote to the poll author's inbox.
+pub(crate) async fn deliver_poll_vote(
+    state: &AppState,
+    payload: JsonValue,
+) -> Result<(), RoostyError> {
+    let payload: PollVoteDelivery = serde_json::from_value(payload)
+        .map_err(|_| RoostyError::InvalidInput("invalid poll vote payload".to_owned()))?;
+    for activity in payload.activities {
+        deliver_activity(
+            state,
+            payload.local_account_id,
+            payload.remote_actor_id,
+            &activity,
+            true,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Queue a signed Announce activity for a cached remote Note.
@@ -5869,43 +6237,46 @@ async fn deliver_activity(
     activity: &JsonValue,
     personal_inbox: bool,
 ) -> Result<(), RoostyError> {
-    let local = roosty_db::find_local_account_by_id(&state.db, local_account_id)
+    let txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let local = roosty_db::find_local_account_by_id(&txn, local_account_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("local delivery actor does not exist".to_owned())
         })?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(&txn, remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote delivery actor does not exist".to_owned())
         })?;
     if !state.config.federation_domain_is_allowed(&remote.domain)
         || remote.suspended_at.is_some()
-        || roosty_db::federation_domain_policy(&state.db, &remote.domain)
+        || roosty_db::federation_domain_policy(&txn, &remote.domain)
             .await?
             .is_suspended()
     {
         // Domain suspension intentionally drops already queued work without retrying.
+        txn.commit().await?;
         return Ok(());
     }
     let moderation_activity = inbound_activity_type(activity) == Some(InboundActivityType::Block)
         || activity.get("object").and_then(inbound_activity_type)
             == Some(InboundActivityType::Block);
     if !moderation_activity
-        && roosty_db::local_remote_accounts_are_blocked(
-            &state.db,
-            local_account_id,
-            remote_actor_id,
-        )
-        .await?
+        && roosty_db::local_remote_accounts_are_blocked(&txn, local_account_id, remote_actor_id)
+            .await?
     {
+        txn.commit().await?;
         return Ok(());
     }
-    let key = roosty_db::find_local_actor_key(&state.db, local.id)
+    let key = roosty_db::find_local_actor_key(&txn, local.id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("local delivery actor has no signing key".to_owned())
         })?;
+    txn.commit().await?;
     let private_key = decrypt_private_key(state, &key)?;
     signed_post(
         state,
@@ -6222,6 +6593,37 @@ async fn note_object_with_remote_audience(
     let quote_id = quote
         .as_ref()
         .map(|quote| quote.quoted_activitypub_id.clone());
+    let poll = roosty_db::find_poll_for_status(db, PollStatus::Local(status.id)).await?;
+    let (note_type, one_of, any_of, end_time, closed, voters_count) = if let Some(poll) = poll {
+        let hide_totals = poll.hide_totals && !poll.expired(OffsetDateTime::now_utc());
+        let options = poll
+            .options
+            .into_iter()
+            .map(|option| OutboundPollOption {
+                r#type: NoteType::Note,
+                name: option.title,
+                replies: OutboundPollReplies {
+                    r#type: "Collection",
+                    total_items: if hide_totals { 0 } else { option.votes_count },
+                },
+            })
+            .collect::<Vec<_>>();
+        let (one_of, any_of) = if poll.multiple {
+            (Vec::new(), options)
+        } else {
+            (options, Vec::new())
+        };
+        (
+            NoteType::Question,
+            one_of,
+            any_of,
+            poll.expires_at.map(crate::statuses::format_timestamp),
+            poll.closed_at.map(crate::statuses::format_timestamp),
+            (!hide_totals).then_some(poll.voters_count).flatten(),
+        )
+    } else {
+        (NoteType::Note, Vec::new(), Vec::new(), None, None, None)
+    };
     Ok(Note {
         context: NoteContext((
             ACTIVITYSTREAMS_CONTEXT.to_owned(),
@@ -6236,7 +6638,7 @@ async fn note_object_with_remote_audience(
             },
         )),
         id,
-        r#type: NoteType::Note,
+        r#type: note_type,
         attributed_to: actor_url(state, username),
         content,
         published: crate::statuses::format_timestamp(status.created_at),
@@ -6255,6 +6657,13 @@ async fn note_object_with_remote_audience(
                 manual_approval: InboundAudienceValues::Many(Vec::new()),
             }),
         },
+        poll: Box::new(OutboundPollFields {
+            one_of,
+            any_of,
+            end_time,
+            closed,
+            voters_count,
+        }),
     })
 }
 
@@ -6409,12 +6818,12 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundInteractionPolicy, InboundReplies, InboundTag,
+        InboundFollowActivity, InboundInteractionPolicy, InboundNote, InboundReplies, InboundTag,
         InboundUndoAnnounceActivity, InboundUndoBlockActivity, InboundUndoFollowActivity,
         MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note, NoteContext, NoteExtensionsContext,
         NoteType, OrderedCollection, PublicKey, actor_context, actor_profile_fields,
         canonical_activity_digest, is_remote_actor_lifecycle_activity, local_actor_type,
-        parse_acct, remote_hashtag_names, same_url_origin,
+        parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
     };
     use crate::{config::Config, federation::test_transport, http::AppState};
 
@@ -6437,6 +6846,35 @@ mod tests {
             canonical_activity_digest(&left).unwrap(),
             canonical_activity_digest(&array_changed).unwrap()
         );
+    }
+
+    /// A Mastodon Question maps oneOf tallies and closure metadata into typed poll state.
+    #[test]
+    fn parses_activitypub_question_poll_state() {
+        let note: InboundNote = serde_json::from_value(json!({
+            "id": "https://remote.test/statuses/1",
+            "type": "Question",
+            "attributedTo": "https://remote.test/users/alice",
+            "content": "Choose",
+            "published": "2026-07-29T10:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "oneOf": [
+                {"type": "Note", "name": "Tea", "replies": {"type": "Collection", "totalItems": 3}},
+                {"type": "Note", "name": "Coffee", "replies": {"type": "Collection", "totalItems": 2}}
+            ],
+            "endTime": "2026-07-29T11:00:00Z",
+            "votersCount": 5
+        }))
+        .unwrap();
+
+        let poll = remote_poll_from_note(&note).unwrap().unwrap();
+        assert!(!poll.multiple);
+        assert_eq!(
+            poll.options,
+            vec![("Tea".to_owned(), 3), ("Coffee".to_owned(), 2)]
+        );
+        assert_eq!(poll.voters_count, Some(5));
+        assert!(poll.expires_at.is_some());
     }
 
     /// Typed remote hashtag extraction accepts compact and expanded ActivityStreams names.
@@ -6986,6 +7424,7 @@ mod tests {
                 sensitive: None,
                 spoiler_text: None,
                 language: None,
+                poll: None,
             },
             None,
             &[],
@@ -7587,6 +8026,13 @@ mod tests {
             quote_uri: None,
             quote_authorization: None,
             interaction_policy: InboundInteractionPolicy::default(),
+            poll: Box::new(super::OutboundPollFields {
+                one_of: Vec::new(),
+                any_of: Vec::new(),
+                end_time: None,
+                closed: None,
+                voters_count: None,
+            }),
         };
         let collection = OrderedCollection {
             context: "https://www.w3.org/ns/activitystreams",
@@ -7952,6 +8398,11 @@ mod tests {
                     .await
                     .unwrap();
             }
+            roosty_db::JobKind::FederationPollVoteDelivery => {
+                super::deliver_poll_vote(state, job.payload.clone())
+                    .await
+                    .unwrap();
+            }
             roosty_db::JobKind::FederationActorUpdateDelivery => {
                 super::deliver_actor_update(state, job.payload.clone())
                     .await
@@ -7994,6 +8445,8 @@ mod tests {
             | roosty_db::JobKind::NotificationRequestMerge
             | roosty_db::JobKind::NotificationRequestCleanup
             | roosty_db::JobKind::ScheduledStatusPublish
+            | roosty_db::JobKind::PollExpiration
+            | roosty_db::JobKind::PollUpdate
             | roosty_db::JobKind::TrendMaintenance
             | roosty_db::JobKind::AccountPurge
             | roosty_db::JobKind::DomainModerationReconcile

@@ -19,6 +19,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 strum = { workspace = true }
 time = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+unicode-segmentation = { workspace = true }
 uuid = { workspace = true }

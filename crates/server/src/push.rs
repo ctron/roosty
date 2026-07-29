@@ -401,6 +401,7 @@ struct PushAlertChanges {
     update: Option<bool>,
     quote: Option<bool>,
     quoted_update: Option<bool>,
+    poll: Option<bool>,
     #[serde(rename = "admin.report")]
     admin_report: Option<bool>,
 }
@@ -423,6 +424,7 @@ impl PushAlertChanges {
         apply!(update);
         apply!(quote);
         apply!(quoted_update);
+        apply!(poll);
         apply!(admin_report);
     }
 }
@@ -715,6 +717,7 @@ fn alerts_with_defaults(
             LocalNotificationType::Update => alerts.update = enabled,
             LocalNotificationType::Quote => alerts.quote = enabled,
             LocalNotificationType::QuotedUpdate => alerts.quoted_update = enabled,
+            LocalNotificationType::Poll => alerts.poll = enabled,
             LocalNotificationType::AdminReport => alerts.admin_report = enabled,
         }
     }

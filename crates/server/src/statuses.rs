@@ -11,9 +11,9 @@ use axum::{
 use linkify::{LinkFinder, LinkKind};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus, PreviewCard,
-    QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus, ReportStatus,
-    ScheduleStatusResult, ScheduledStatus, StatusContextItem, StatusContextParent,
+    ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus, NewStatusPoll,
+    PollStatus, PreviewCard, QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus,
+    ReportStatus, ScheduleStatusResult, ScheduledStatus, StatusContextItem, StatusContextParent,
     StatusCreationReservation, StatusReference, StatusVisibility,
 };
 use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
@@ -43,6 +43,7 @@ use crate::{
         status_edit_media_response,
     },
     notifications::{create_and_stream_notification, publish_committed_notification},
+    polls::{PollResponse, poll_response},
 };
 
 const DEFAULT_LIMIT: u64 = 20;
@@ -127,7 +128,7 @@ pub fn router() -> Router<AppState> {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum StatusInputError {
+pub(crate) enum StatusInputError {
     #[error("invalid JSON: {0}")]
     Json(serde_json::Error),
     #[error("invalid form body: {0}")]
@@ -248,6 +249,7 @@ struct StatusInput {
     quote_approval_policy: Option<QuoteApprovalPolicy>,
     #[serde(alias = "scheduledAt")]
     scheduled_at: Option<String>,
+    poll: Option<NewStatusPoll>,
 }
 
 #[derive(Deserialize)]
@@ -272,7 +274,7 @@ struct ScheduledStatusParamsResponse {
     visibility: StatusVisibility,
     language: Option<String>,
     scheduled_at: Option<String>,
-    poll: Option<Value>,
+    poll: Option<NewStatusPoll>,
     idempotency: Option<String>,
     with_rate_limit: bool,
     in_reply_to_id: Option<String>,
@@ -321,6 +323,7 @@ pub(crate) struct StatusResponse {
     quote: Option<QuoteResponse>,
     quote_approval: QuoteApprovalResponse,
     application: Option<Value>,
+    poll: Option<PollResponse>,
 }
 
 enum PreviewCardSource {
@@ -423,7 +426,27 @@ struct StatusEditResponse {
     account: StatusAccountResponse,
     media_attachments: Vec<MediaAttachmentResponse>,
     emojis: Vec<Value>,
+    poll: Option<StatusEditPollResponse>,
     quote: Option<QuoteResponse>,
+}
+
+#[derive(Serialize)]
+struct StatusEditPollResponse {
+    options: Vec<StatusEditPollOptionResponse>,
+}
+
+#[derive(Serialize)]
+struct StatusEditPollOptionResponse {
+    title: String,
+}
+
+fn status_edit_poll(options: Option<Vec<String>>) -> Option<StatusEditPollResponse> {
+    options.map(|options| StatusEditPollResponse {
+        options: options
+            .into_iter()
+            .map(|title| StatusEditPollOptionResponse { title })
+            .collect(),
+    })
 }
 
 /// Mastodon account projection for either a local or cached remote status author.
@@ -838,6 +861,7 @@ async fn create_status_from_input(
     scheduled_status_id: Option<Uuid>,
     publication_status_id: Option<StatusId>,
 ) -> Response {
+    let poll_input = input.poll.clone();
     let media_ids = match parse_media_ids(input.media_ids.as_deref().unwrap_or_default()) {
         Ok(media_ids) => media_ids,
         Err(error) => return bad_request(&error.to_string()),
@@ -845,9 +869,17 @@ async fn create_status_from_input(
     if input.quoted_status_id.is_some() && !media_ids.is_empty() {
         return bad_request("quote posts cannot include media attachments");
     }
+    if poll_input.is_some() && !media_ids.is_empty() {
+        return unprocessable("polls cannot be combined with media attachments");
+    }
+    if let Some(poll) = &poll_input
+        && let Err(RoostyError::InvalidInput(error)) = roosty_db::validate_poll(poll)
+    {
+        return unprocessable(&error);
+    }
     if let Err(error) = validate_status_text(
         input.status.as_deref().unwrap_or_default(),
-        !media_ids.is_empty(),
+        !media_ids.is_empty() || poll_input.is_some(),
     ) {
         return bad_request(&error.to_string());
     }
@@ -997,6 +1029,11 @@ async fn create_status_from_input(
     {
         Ok(mut status) => {
             let mut notifications = Vec::new();
+            if let Some(poll) = &poll_input
+                && let Err(error) = roosty_db::create_local_poll(&txn, status.id, poll).await
+            {
+                return server_error(error);
+            }
             for account_id in notification_recipients
                 .iter()
                 .filter(|recipient| recipient.id != author_id)
@@ -1166,6 +1203,14 @@ async fn create_scheduled_status(
     if input.quoted_status_id.is_some() && !media_ids.is_empty() {
         return bad_request("quote posts cannot include media attachments");
     }
+    if input.poll.is_some() && !media_ids.is_empty() {
+        return unprocessable("polls cannot be combined with media attachments");
+    }
+    if let Some(poll) = &input.poll
+        && let Err(RoostyError::InvalidInput(error)) = roosty_db::validate_poll(poll)
+    {
+        return unprocessable(&error);
+    }
     if let Err(error) = validate_status_text(
         input.status.as_deref().unwrap_or_default(),
         !media_ids.is_empty(),
@@ -1253,6 +1298,7 @@ async fn create_scheduled_status(
             quote_approval_policy,
             scheduled_at,
             media_ids,
+            poll: input.poll,
         },
         state.config.scheduled_statuses.total_limit,
         state.config.scheduled_statuses.daily_limit,
@@ -1394,7 +1440,13 @@ async fn scheduled_status_response_value(
     state: &AppState,
     status: ScheduledStatus,
 ) -> Result<ScheduledStatusResponse, RoostyError> {
-    let media = roosty_db::media_attachments_for_scheduled_status(&state.db, status.id).await?;
+    let txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let media = roosty_db::media_attachments_for_scheduled_status(&txn, status.id).await?;
+    let poll = roosty_db::scheduled_poll(&txn, status.id).await?;
+    txn.commit().await?;
     Ok(ScheduledStatusResponse {
         id: status.id.to_string(),
         scheduled_at: format_timestamp(status.scheduled_at),
@@ -1407,7 +1459,7 @@ async fn scheduled_status_response_value(
             visibility: status.visibility,
             language: status.language,
             scheduled_at: None,
-            poll: None,
+            poll,
             idempotency: None,
             with_rate_limit: false,
             in_reply_to_id: status
@@ -1434,7 +1486,7 @@ fn parse_scheduled_at(value: Option<&str>) -> Result<OffsetDateTime, &'static st
         .map_err(|_| "scheduled_at must be an RFC 3339 timestamp")
 }
 
-async fn parse_request_body<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn parse_request_body<T: for<'de> Deserialize<'de>>(
     request: axum::extract::Request,
 ) -> Result<T, StatusInputError> {
     let content_type = request
@@ -1468,7 +1520,12 @@ pub(crate) async fn publish_scheduled_status(
         .ok_or_else(|| RoostyError::InvalidInput("scheduled status id is missing".to_owned()))?
         .parse::<Uuid>()
         .map_err(|_| RoostyError::InvalidInput("scheduled status id is invalid".to_owned()))?;
-    let Some(status) = roosty_db::find_scheduled_status_by_id(&state.db, id).await? else {
+    let txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let Some(status) = roosty_db::find_scheduled_status_by_id(&txn, id).await? else {
+        txn.commit().await?;
         return Ok(());
     };
     if status.scheduled_at > OffsetDateTime::now_utc() {
@@ -1476,18 +1533,21 @@ pub(crate) async fn publish_scheduled_status(
             "scheduled status is not due yet".to_owned(),
         ));
     }
-    if roosty_db::find_local_status_by_id(&state.db, status.publication_status_id)
+    if roosty_db::find_local_status_by_id(&txn, status.publication_status_id)
         .await?
         .is_some()
     {
+        txn.commit().await?;
         roosty_db::cancel_scheduled_status(&state.db, status.account_id, status.id).await?;
         return Ok(());
     }
-    let Some(account) = roosty_db::find_local_account_by_id(&state.db, status.account_id).await?
-    else {
+    let Some(account) = roosty_db::find_local_account_by_id(&txn, status.account_id).await? else {
+        txn.commit().await?;
         return Ok(());
     };
-    let media = roosty_db::media_attachments_for_scheduled_status(&state.db, status.id).await?;
+    let media = roosty_db::media_attachments_for_scheduled_status(&txn, status.id).await?;
+    let poll = roosty_db::scheduled_poll(&txn, status.id).await?;
+    txn.commit().await?;
     let input = StatusInput {
         status: Some(status.content),
         visibility: Some(status.visibility),
@@ -1503,6 +1563,7 @@ pub(crate) async fn publish_scheduled_status(
         quoted_status_id: status.quoted_status_id.map(|id| id.0.to_string()),
         quote_approval_policy: Some(status.quote_approval_policy),
         scheduled_at: None,
+        poll,
     };
     let response = create_status_from_input(
         state,
@@ -1679,16 +1740,36 @@ async fn status_history(
         Ok(history) => history,
         Err(error) => return server_error(error),
     };
+    let poll_options = if history.is_empty() {
+        let status = match &item {
+            StatusContextItem::Local(status) => PollStatus::Local(status.id),
+            StatusContextItem::Remote(status) => PollStatus::Remote(status.id),
+        };
+        match roosty_db::find_poll_for_status(&txn, status).await {
+            Ok(poll) => poll.map(|poll| {
+                poll.options
+                    .into_iter()
+                    .map(|option| option.title)
+                    .collect()
+            }),
+            Err(error) => return server_error(error),
+        }
+    } else {
+        None
+    };
     if let Err(error) = txn.commit().await {
         return server_error(error.into());
     }
     let response = match (item, history) {
         (StatusContextItem::Local(status), StoredStatusEdits::Local(edits)) => {
-            local_status_history_response(&state, status, edits, viewer_id).await
+            local_status_history_response(&state, status, edits, poll_options, viewer_id).await
         }
         (StatusContextItem::Remote(status), StoredStatusEdits::Remote(edits)) => {
             match remote_status_available(&state, &status).await {
-                Ok(true) => remote_status_history_response(&state, status, edits, viewer_id).await,
+                Ok(true) => {
+                    remote_status_history_response(&state, status, edits, poll_options, viewer_id)
+                        .await
+                }
                 Ok(false) => return not_found(),
                 Err(error) => return server_error(error),
             }
@@ -1706,10 +1787,20 @@ enum StoredStatusEdits {
     Remote(Vec<roosty_db::RemoteStatusEdit>),
 }
 
+impl StoredStatusEdits {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Local(edits) => edits.is_empty(),
+            Self::Remote(edits) => edits.is_empty(),
+        }
+    }
+}
+
 async fn local_status_history_response(
     state: &AppState,
     status: roosty_db::LocalStatus,
     edits: Vec<roosty_db::LocalStatusEdit>,
+    poll_options: Option<Vec<String>>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusEditResponse>, RoostyError> {
     if edits.is_empty() {
@@ -1736,6 +1827,7 @@ async fn local_status_history_response(
             account: current.account,
             media_attachments: current.media_attachments,
             emojis: current.emojis,
+            poll: status_edit_poll(poll_options),
             quote: current.quote,
         }]);
     }
@@ -1789,6 +1881,7 @@ async fn local_status_history_response(
                 .map(|media| status_edit_media_response(state, media))
                 .collect(),
             emojis: Vec::new(),
+            poll: status_edit_poll(edit.poll_options),
             quote: status_quote_response(
                 state,
                 roosty_db::StatusReference::Local(status.id),
@@ -1804,6 +1897,7 @@ async fn remote_status_history_response(
     state: &AppState,
     status: roosty_db::RemoteStatus,
     edits: Vec<roosty_db::RemoteStatusEdit>,
+    poll_options: Option<Vec<String>>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusEditResponse>, RoostyError> {
     if edits.is_empty() {
@@ -1820,6 +1914,7 @@ async fn remote_status_history_response(
             account: current.account,
             media_attachments: current.media_attachments,
             emojis: current.emojis,
+            poll: status_edit_poll(poll_options),
             quote: current.quote,
         }]);
     }
@@ -1844,6 +1939,7 @@ async fn remote_status_history_response(
                 .map(|media| status_edit_media_response(state, media))
                 .collect(),
             emojis: remote_custom_emojis(&edit.object),
+            poll: status_edit_poll(edit.poll_options),
             quote: status_quote_response(
                 state,
                 roosty_db::StatusReference::Remote(status.id),
@@ -1918,8 +2014,16 @@ async fn update_status(
             Err(error) => return server_error(error),
         },
     };
+    if let Some(poll) = &input.poll {
+        if has_media {
+            return bad_request("a status cannot contain both media and a poll");
+        }
+        if let Err(error) = roosty_db::validate_poll(poll) {
+            return bad_request(&error.to_string());
+        }
+    }
     if let Some(status) = input.status.as_deref()
-        && let Err(error) = validate_status_text(status, has_media)
+        && let Err(error) = validate_status_text(status, has_media || input.poll.is_some())
     {
         return bad_request(&error.to_string());
     }
@@ -1929,6 +2033,7 @@ async fn update_status(
         sensitive: input.sensitive,
         spoiler_text: input.spoiler_text,
         language: input.language.map(Some),
+        poll: input.poll,
     };
     let final_content = update
         .content
@@ -4267,6 +4372,7 @@ pub(crate) async fn remote_reblog_response(
             current_user: QuoteApprovalDecision::Denied,
         },
         application: None,
+        poll: None,
     }))
 }
 
@@ -4408,6 +4514,16 @@ async fn remote_status_response_base(
         .load(state, StatusReference::Remote(status.id))
         .await?
         .map(|card| Box::new(PreviewCardResponse::new(state, *card, None)));
+    let poll_txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let poll =
+        match roosty_db::find_poll_for_status(&poll_txn, PollStatus::Remote(status.id)).await? {
+            Some(poll) => Some(poll_response(&poll_txn, poll, viewer).await?),
+            None => None,
+        };
+    poll_txn.commit().await?;
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.published_at),
@@ -4466,6 +4582,7 @@ async fn remote_status_response_base(
         quote: None,
         quote_approval,
         application: None,
+        poll,
     })
 }
 
@@ -4605,6 +4722,7 @@ async fn reblog_response(
             current_user: QuoteApprovalDecision::Denied,
         },
         application: None,
+        poll: None,
     }))
 }
 
@@ -4665,6 +4783,7 @@ async fn local_remote_reblog_response(
             current_user: QuoteApprovalDecision::Denied,
         },
         application: None,
+        poll: None,
     }))
 }
 
@@ -4819,6 +4938,16 @@ async fn status_response_base(
         roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Local(status.id))
             .await?;
     let quote_approval = local_quote_approval(state, &status, viewer).await?;
+    let poll_txn = state
+        .db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    let poll =
+        match roosty_db::find_poll_for_status(&poll_txn, PollStatus::Local(status.id)).await? {
+            Some(poll) => Some(poll_response(&poll_txn, poll, viewer).await?),
+            None => None,
+        };
+    poll_txn.commit().await?;
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.created_at),
@@ -4858,6 +4987,7 @@ async fn status_response_base(
         quote: None,
         quote_approval,
         application: None,
+        poll,
     })
 }
 
@@ -5648,7 +5778,7 @@ pub(crate) async fn status_visible_to_viewer(
     status_visible_to_viewer_on(&state.db, status, viewer).await
 }
 
-async fn status_visible_to_viewer_on(
+pub(crate) async fn status_visible_to_viewer_on(
     db: &impl ConnectionTrait,
     status: &roosty_db::LocalStatus,
     viewer: Option<AccountId>,
@@ -6197,7 +6327,7 @@ mod tests {
         RemoteStatusReblogTarget, StatusContextParent, StatusVisibility,
     };
     use roosty_migration::Migrator;
-    use sea_orm::TransactionTrait;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -6280,6 +6410,168 @@ mod tests {
         let public = context.get("/api/v1/timelines/public?limit=30").await;
         assert_eq!(public.status(), StatusCode::OK);
         assert_eq!(json_body(public).await.as_array().unwrap().len(), 1);
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// Given a local poll, another account can vote once and edits retain option history.
+    async fn poll_creation_voting_and_edit_history_are_mastodon_compatible(
+        context: &mut StatusContext,
+    ) {
+        let author_token = context.access_token().await;
+        let voter_token = context
+            .access_token_for("pollvoter", "poll-voter@example.com")
+            .await;
+        let created = context
+            .authenticated_json(
+                "POST",
+                "/api/v1/statuses",
+                &author_token,
+                json!({
+                    "status": "Choose",
+                    "poll": {
+                        "options": ["Tea", "Coffee"],
+                        "expires_in": 300,
+                        "multiple": false,
+                        "hide_totals": false
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = json_body(created).await;
+        let status_id = created["id"].as_str().unwrap();
+        let poll_id = created["poll"]["id"].as_str().unwrap();
+        assert_eq!(created["poll"]["options"][0]["title"], "Tea");
+
+        let voted = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/polls/{poll_id}/votes"),
+                &voter_token,
+                json!({"choices": [1]}),
+            )
+            .await;
+        assert_eq!(voted.status(), StatusCode::OK);
+        let voted = json_body(voted).await;
+        assert_eq!(voted["voted"], true);
+        assert_eq!(voted["own_votes"], json!([1]));
+        assert_eq!(voted["options"][1]["votes_count"], 1);
+
+        let repeated = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/polls/{poll_id}/votes"),
+                &voter_token,
+                json!({"choices": [0]}),
+            )
+            .await;
+        assert_eq!(repeated.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let edited = context
+            .authenticated_json(
+                "PUT",
+                &format!("/api/v1/statuses/{status_id}"),
+                &author_token,
+                json!({
+                    "status": "Choose again",
+                    "poll": {
+                        "options": ["Water", "Juice"],
+                        "expires_in": 300,
+                        "multiple": false,
+                        "hide_totals": false
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(edited.status(), StatusCode::OK);
+        let edited = json_body(edited).await;
+        assert_eq!(edited["poll"]["options"][0]["title"], "Water");
+        assert_eq!(edited["poll"]["votes_count"], 0);
+
+        let history = json_body(
+            context
+                .get(&format!("/api/v1/statuses/{status_id}/history"))
+                .await,
+        )
+        .await;
+        assert_eq!(history[0]["poll"]["options"][0]["title"], "Tea");
+        assert_eq!(history[1]["poll"]["options"][0]["title"], "Water");
+    }
+
+    #[test_context(StatusContext)]
+    #[tokio::test]
+    /// When a poll expires, its author and local voters receive one durable poll notification.
+    async fn poll_expiration_notifies_participants_exactly_once(context: &mut StatusContext) {
+        let author_token = context.access_token().await;
+        let voter_token = context
+            .access_token_for("pollnotify", "poll-notify@example.com")
+            .await;
+        let voter = roosty_db::find_local_account_by_username(&context.db, "pollnotify")
+            .await
+            .unwrap()
+            .unwrap();
+        let created = json_body(
+            context
+                .authenticated_json(
+                    "POST",
+                    "/api/v1/statuses",
+                    &author_token,
+                    json!({
+                        "status": "Choose",
+                        "poll": {
+                            "options": ["One", "Two"],
+                            "expires_in": 300
+                        }
+                    }),
+                )
+                .await,
+        )
+        .await;
+        let poll_id = created["poll"]["id"].as_str().unwrap();
+        let vote = context
+            .authenticated_json(
+                "POST",
+                &format!("/api/v1/polls/{poll_id}/votes"),
+                &voter_token,
+                json!({"choices": [0]}),
+            )
+            .await;
+        assert_eq!(vote.status(), StatusCode::OK);
+
+        context
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE status_poll SET expires_at = now() - interval '1 second' WHERE id = $1",
+                vec![Uuid::parse_str(poll_id).unwrap().into()],
+            ))
+            .await
+            .unwrap();
+        let payload = json!({"poll_id": poll_id});
+        crate::polls::expire_poll_job(&context.state, payload.clone())
+            .await
+            .unwrap();
+        crate::polls::expire_poll_job(&context.state, payload)
+            .await
+            .unwrap();
+
+        for account_id in [context.account_id, voter.id] {
+            let notifications = roosty_db::local_notifications_for_account(
+                &context.db,
+                account_id,
+                30,
+                roosty_db::CollectionCursor::default(),
+                roosty_db::NotificationFilter::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(notifications.items.len(), 1);
+            assert_eq!(
+                notifications.items[0].notification_type,
+                roosty_db::LocalNotificationType::Poll
+            );
+        }
     }
 
     #[test_context(StatusContext)]

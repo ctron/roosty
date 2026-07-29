@@ -15,6 +15,9 @@
 - Local and remote follow delivery preferences, including boost suppression, new-post notifications, and live delivery for followed local hashtags.
 - Mastodon-compatible private lists with local/remote membership, reply policies, exclusive home-feed filtering, and cursor-paginated list timelines.
 - Mastodon-compatible local status editing, including authenticated plain-text source lookup for populating editors.
+- Mastodon-compatible local, scheduled, and federated polls with transactional voting, edit
+  history, durable expiration, participant notifications, Web Push/streaming delivery, and
+  ActivityStreams `Question` plus `Create(Note)` vote interoperability.
 - Mastodon-compatible favourite and boost actor lists for local and cached-remote statuses, with visibility enforcement and cursor pagination over locally known interactions.
 - Mastodon-compatible trending hashtags and statuses use transactionally maintained,
   cross-process PostgreSQL caches, with seven-day tag history and Rust-owned scheduled refreshes.
@@ -59,6 +62,8 @@
 - [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
 - [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
 - [x] Federate the underlying Follow, addressed Create/Update/Delete, Like/Undo, and Announce/Undo activities that produce remote follow, mention, reply, favourite, and boost notifications. Replies always address and reach a cached remote parent author even when the text omits an explicit mention.
+- [x] Deliver and ingest ActivityStreams `Question` polls, tally `Update` activities, and
+  Mastodon-compatible `Create(Note)` votes, including final updates to remote voters.
 - [x] Add Mastodon-compatible Web Push subscriptions and durable delivery with standard and legacy payload encryption; grouped, poll, and administrative notifications remain separate.
 - [x] Apply local mute/block and suspend-level domain-policy decisions to discovery, inbox processing, delivery, timelines, conversations, streams, and notifications.
 - [x] Deliver remote Block/Undo activities, accept validated inbound Block/Undo, and project remote mute/block relationship state.
@@ -85,8 +90,8 @@
 
 - Social graph APIs: remote follow delivery, follow requests, and remote mute/block delivery.
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
-- Notifications: poll notification events remain. Administrative report notifications are available
-  through the REST API, streaming, and Web Push.
+- Notifications: poll and administrative report notifications are available through the REST API,
+  streaming, and Web Push.
 - Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 

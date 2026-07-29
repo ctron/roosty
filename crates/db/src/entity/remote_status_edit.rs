@@ -12,6 +12,7 @@ pub struct Model {
     pub spoiler_text: String,
     pub sensitive: bool,
     pub object: Json,
+    pub poll_options: Option<Json>,
     pub created_at: OffsetDateTime,
 }
 

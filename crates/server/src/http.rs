@@ -90,6 +90,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::media::router())
         .merge(crate::markers::router())
         .merge(crate::notifications::router())
+        .merge(crate::polls::router())
         .merge(crate::push::router())
         .merge(crate::reports::router())
         .merge(crate::search::router())

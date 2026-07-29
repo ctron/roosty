@@ -1,20 +1,17 @@
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
-/// Immutable content and rendering metadata for one local status revision.
+/// One selected option by a local account or verified remote actor.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "local_status_edit")]
+#[sea_orm(table_name = "status_poll_vote")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub local_status_id: Uuid,
-    pub content: String,
-    pub spoiler_text: String,
-    pub sensitive: bool,
-    pub local_mention_ids: Json,
-    pub remote_mention_ids: Json,
-    pub tag_names: Json,
-    pub poll_options: Option<Json>,
+    pub poll_id: Uuid,
+    pub choice_position: i32,
+    pub local_account_id: Option<Uuid>,
+    pub remote_actor_id: Option<Uuid>,
+    pub activitypub_id: Option<String>,
     pub created_at: OffsetDateTime,
 }
 

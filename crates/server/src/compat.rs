@@ -962,7 +962,7 @@ mod tests {
         assert_eq!(created["policy"], "all");
         assert_eq!(created["alerts"]["mention"], true);
         assert_eq!(created["alerts"]["follow"], true);
-        assert!(created["alerts"].get("poll").is_none());
+        assert_eq!(created["alerts"]["poll"], true);
 
         let response = context
             .authenticated_json_request(

@@ -211,6 +211,9 @@ use entity::{
     status_search_document, streaming_event,
 };
 
+mod polls;
+pub use polls::*;
+
 /// Quote policy values authored by Mastodon-compatible clients.
 #[derive(
     Clone,
@@ -507,6 +510,7 @@ pub struct LocalStatusEdit {
     pub local_mention_ids: Vec<AccountId>,
     pub remote_mention_ids: Vec<AccountId>,
     pub tag_names: Vec<String>,
+    pub poll_options: Option<Vec<String>>,
     pub created_at: OffsetDateTime,
     pub media: Vec<StatusEditMedia>,
 }
@@ -518,6 +522,7 @@ pub struct RemoteStatusEdit {
     pub spoiler_text: String,
     pub sensitive: bool,
     pub object: JsonValue,
+    pub poll_options: Option<Vec<String>>,
     pub created_at: OffsetDateTime,
     pub media: Vec<StatusEditMedia>,
 }
@@ -3128,6 +3133,18 @@ async fn remote_status_snapshot(
     created_at: OffsetDateTime,
 ) -> Result<()> {
     let edit_id = Uuid::now_v7();
+    let poll_options = status
+        .object
+        .get("oneOf")
+        .or_else(|| status.object.get("anyOf"))
+        .and_then(JsonValue::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| option.get("name").and_then(JsonValue::as_str))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
     remote_status_edit::ActiveModel {
         id: Set(edit_id),
         remote_status_id: Set(status.id),
@@ -3135,6 +3152,7 @@ async fn remote_status_snapshot(
         spoiler_text: Set(remote_object_spoiler_text(&status.object)),
         sensitive: Set(remote_object_sensitive(&status.object)),
         object: Set(status.object.clone()),
+        poll_options: Set(poll_options.map(|options| serde_json::json!(options))),
         created_at: Set(created_at),
     }
     .insert(txn)
@@ -3652,7 +3670,7 @@ pub async fn mark_remote_custom_emoji_failed(
 
 /// Look up the persisted ActivityPub signing key for a local account.
 pub async fn find_local_actor_key(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Option<LocalActorKey>> {
     let key = local_actor_key::Entity::find_by_id(account_id.0)
@@ -4517,6 +4535,7 @@ pub struct NewScheduledStatus {
     pub quote_approval_policy: QuoteApprovalPolicy,
     pub scheduled_at: OffsetDateTime,
     pub media_ids: Vec<Uuid>,
+    pub poll: Option<NewStatusPoll>,
 }
 
 /// Existing result protected by an account-scoped status idempotency key.
@@ -4734,6 +4753,8 @@ pub struct LocalStatusUpdate {
     pub spoiler_text: Option<String>,
     /// Optional replacement language tag.
     pub language: Option<Option<String>>,
+    /// Replacement poll state; absence removes an existing poll.
+    pub poll: Option<NewStatusPoll>,
 }
 
 /// Stored local media attachment metadata.
@@ -4973,6 +4994,7 @@ pub enum LocalNotificationType {
     Update,
     Quote,
     QuotedUpdate,
+    Poll,
     #[strum(serialize = "admin.report")]
     #[serde(rename = "admin.report")]
     AdminReport,
@@ -5264,6 +5286,9 @@ pub enum JobKind {
     AccountPurge,
     DomainModerationReconcile,
     ScheduledStatusPublish,
+    PollExpiration,
+    PollUpdate,
+    FederationPollVoteDelivery,
     TrendMaintenance,
     PreviewCardFetch,
     PreviewCardBackfill,
@@ -6273,6 +6298,8 @@ pub struct PushAlerts {
     pub quote: bool,
     #[serde(default)]
     pub quoted_update: bool,
+    #[serde(default)]
+    pub poll: bool,
     #[serde(default, rename = "admin.report")]
     pub admin_report: bool,
 }
@@ -6289,6 +6316,7 @@ impl PushAlerts {
             LocalNotificationType::Update => self.update,
             LocalNotificationType::Quote => self.quote,
             LocalNotificationType::QuotedUpdate => self.quoted_update,
+            LocalNotificationType::Poll => self.poll,
             LocalNotificationType::AdminReport => self.admin_report,
         }
     }
@@ -12330,6 +12358,14 @@ async fn local_status_snapshot(
     local_mention_ids.sort();
     remote_mention_ids.sort();
     tag_names.sort();
+    let poll_options = find_poll_for_status(txn, PollStatus::Local(StatusId(status.id)))
+        .await?
+        .map(|poll| {
+            poll.options
+                .into_iter()
+                .map(|option| option.title)
+                .collect::<Vec<_>>()
+        });
     local_status_edit::ActiveModel {
         id: Set(edit_id),
         local_status_id: Set(status.id),
@@ -12339,6 +12375,7 @@ async fn local_status_snapshot(
         local_mention_ids: Set(serde_json::json!(local_mention_ids)),
         remote_mention_ids: Set(serde_json::json!(remote_mention_ids)),
         tag_names: Set(serde_json::json!(tag_names)),
+        poll_options: Set(poll_options.map(|options| serde_json::json!(options))),
         created_at: Set(created_at),
     }
     .insert(txn)
@@ -12377,7 +12414,7 @@ pub async fn update_owned_local_status(
     txn: &sea_orm::DatabaseTransaction,
     status_id: StatusId,
     account_id: AccountId,
-    update: LocalStatusUpdate,
+    mut update: LocalStatusUpdate,
     media_ids: Option<&[Uuid]>,
     media_attributes: &[LocalStatusMediaAttributeUpdate],
     metadata: LocalStatusMetadata,
@@ -12391,6 +12428,7 @@ pub async fn update_owned_local_status(
     else {
         return Ok(None);
     };
+    let poll = update.poll.take();
 
     let current_media = local_media_attachment::Entity::find()
         .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
@@ -12434,6 +12472,8 @@ pub async fn update_owned_local_status(
                         .is_some_and(|(x, y)| media.focus_x != Some(x) || media.focus_y != Some(y))
             })
     });
+    let current_poll = find_poll_for_status(txn, PollStatus::Local(status_id)).await?;
+    let poll_changed = current_poll.is_some() || poll.is_some();
     let mut desired_tags = metadata
         .tag_names
         .iter()
@@ -12472,7 +12512,12 @@ pub async fn update_owned_local_status(
         .collect::<Vec<_>>();
     current_remote.sort();
     let metadata_changed = desired_tags != current_tags || desired_remote != current_remote;
-    if !scalar_changed && !media_set_changed && !media_attributes_changed && !metadata_changed {
+    if !scalar_changed
+        && !media_set_changed
+        && !media_attributes_changed
+        && !metadata_changed
+        && !poll_changed
+    {
         return Ok(Some(LocalStatusUpdateResult::Unchanged(
             local_status_from_model(status)?,
         )));
@@ -12575,6 +12620,7 @@ pub async fn update_owned_local_status(
     let revision_timestamp = OffsetDateTime::now_utc();
     active.updated_at = Set(revision_timestamp);
     let status = active.update(txn).await?;
+    replace_local_poll(txn, status_id, poll.as_ref()).await?;
     mark_trend_dirty(txn, "local_status", status_id.0).await?;
     Box::pin(replace_status_preview_card(
         txn,
@@ -12903,6 +12949,9 @@ pub async fn create_scheduled_status(
     }
     .insert(&txn)
     .await?;
+    if let Some(poll) = &input.poll {
+        create_scheduled_poll(&txn, id, poll).await?;
+    }
     for (position, media_id) in input.media_ids.iter().enumerate() {
         let media = local_media_attachment::Entity::find_by_id(*media_id)
             .lock_exclusive()
@@ -13263,6 +13312,11 @@ pub async fn local_status_edits(
             remote_mention_ids: remote_ids.into_iter().map(AccountId).collect(),
             tag_names: serde_json::from_value(edit.tag_names)
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
+            poll_options: edit
+                .poll_options
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
             created_at: edit.created_at,
             media,
         });
@@ -13310,6 +13364,11 @@ pub async fn remote_status_edits(
             spoiler_text: edit.spoiler_text,
             sensitive: edit.sensitive,
             object: edit.object,
+            poll_options: edit
+                .poll_options
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| RoostyError::InvalidInput(error.to_string()))?,
             created_at: edit.created_at,
             media,
         });
@@ -16409,7 +16468,7 @@ async fn local_accounts_by_id(
 }
 
 /// Return remote actors in the same order as the provided ids.
-async fn remote_actors_by_id(
+pub async fn remote_actors_by_id(
     db: &impl ConnectionTrait,
     actor_ids: Vec<AccountId>,
 ) -> Result<Vec<RemoteActor>> {
@@ -19690,6 +19749,7 @@ mod tests {
             update: true,
             quote: true,
             quoted_update: true,
+            poll: true,
             admin_report: true,
         };
         for notification_type in [
@@ -19702,6 +19762,7 @@ mod tests {
             LocalNotificationType::Update,
             LocalNotificationType::Quote,
             LocalNotificationType::QuotedUpdate,
+            LocalNotificationType::Poll,
             LocalNotificationType::AdminReport,
         ] {
             assert!(enabled.enabled(notification_type));

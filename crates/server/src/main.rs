@@ -30,6 +30,7 @@ mod markers;
 mod media;
 mod notifications;
 mod password;
+mod polls;
 mod preview_cards;
 mod push;
 mod reports;
@@ -606,6 +607,15 @@ async fn worker_iteration(
         }
         roosty_db::JobKind::ScheduledStatusPublish => {
             statuses::publish_scheduled_status(&state, job.payload.clone()).await
+        }
+        roosty_db::JobKind::PollExpiration => {
+            polls::expire_poll_job(&state, job.payload.clone()).await
+        }
+        roosty_db::JobKind::PollUpdate => {
+            polls::publish_poll_update_job(&state, job.payload.clone()).await
+        }
+        roosty_db::JobKind::FederationPollVoteDelivery => {
+            federation::deliver_poll_vote(&state, job.payload.clone()).await
         }
         roosty_db::JobKind::TrendMaintenance => {
             let outcome = roosty_db::maintain_trends(db).await?;

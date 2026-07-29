@@ -48,6 +48,11 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 |
 
 |🟢
+|ActivityStreams polls
+|Local and cached-remote `Question` objects support `oneOf`/`anyOf`, aggregate tallies,
+expiration/closure, tally `Update` delivery, and Mastodon-compatible `Create(Note)` votes.
+
+|🟢
 |Featured posts
 |
 
@@ -292,7 +297,7 @@ anonymous status results remain empty for Mastodon-compatible privacy.
 
 |🟢
 |`POST /api/v1/statuses`
-|
+|Supports immediate and scheduled polls with Mastodon's option and expiry limits.
 
 |🟢
 |Scheduled statuses
@@ -314,9 +319,14 @@ anonymous status results remain empty for Mastodon-compatible privacy.
 |`GET /api/v1/statuses/:id/context`
 |
 
-|🟡
+|🟢
 |`PUT /api/v1/statuses/:id`
-|Poll editing is missing.
+|Poll option/multiple changes reset votes; expiry-only changes retain them.
+
+|🟢
+|Polls
+|`GET /api/v1/polls/:id` and `POST /api/v1/polls/:id/votes` enforce status visibility,
+single-vote semantics, hidden totals, and `write:statuses` scope.
 
 |🟢
 |`DELETE /api/v1/statuses/:id`
@@ -425,9 +435,9 @@ Bare domains without a URL scheme remain plain text.
 |Area
 |Notes
 
-|🟡
+|🟢
 |`GET /api/v1/notifications`
-|Poll notification types are missing. `admin.report` is available to administrators.
+|Includes poll-completion and administrator report notifications.
 
 |🟢
 |Notification policies and requests
@@ -476,9 +486,9 @@ Bare domains without a URL scheme remain plain text.
 |`POST /api/v1/tags/:name/follow`, `POST /api/v1/tags/:name/unfollow`
 |
 
-|🟡
+|🟢
 |`/api/v1/push/subscription`
-|Poll and administrative alert switches are unsupported.
+|Includes poll and `admin.report` alert switches.
 
 |🟢
 |Push delivery
@@ -527,9 +537,9 @@ Bare domains without a URL scheme remain plain text.
 |Subscribe controls
 |Hashtag and list subscriptions, including their required parameters, are unsupported.
 
-|🟡
+|🟢
 |`notification` events
-|Poll notification events are unavailable. `admin.report` uses the normal notification stream.
+|Poll completion and `admin.report` use the normal notification stream.
 
 |🟡
 |`delete` events

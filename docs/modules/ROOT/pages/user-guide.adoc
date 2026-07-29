@@ -40,7 +40,7 @@ The exact controls depend on the client.
 Supported clients can work with Roosty's implemented social features, including:
 
 * Home, public, hashtag, and list timelines.
-* Posts, replies, edits, favourites, boosts, bookmarks, quotes, and scheduled posts.
+* Posts, replies, edits, favourites, boosts, bookmarks, quotes, polls, and scheduled posts.
 * Local and remote follows, follow requests, mutes, blocks, and private lists.
 * Notifications, conversations, media attachments, followed hashtags, and push notifications.
 

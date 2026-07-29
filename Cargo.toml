@@ -72,6 +72,7 @@ tower-http = { version = "0.6.11", features = ["cors", "fs", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 url = { version = "2.5.4", features = ["serde"] }
+unicode-segmentation = "1.13.3"
 uuid = { version = "1.17.0", features = ["serde", "v7"] }
 wasm-bindgen = "0.2.126"
 

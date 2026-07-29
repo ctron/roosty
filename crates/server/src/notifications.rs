@@ -1231,6 +1231,7 @@ pub(crate) async fn push_payload(
             "A related post was edited".to_owned()
         }
         LocalNotificationType::Quote => format!("{actor} quoted your post"),
+        LocalNotificationType::Poll => "A poll you participated in has ended".to_owned(),
         LocalNotificationType::AdminReport => "A new moderation report was filed".to_owned(),
     };
     Ok(MastodonPushPayload {
