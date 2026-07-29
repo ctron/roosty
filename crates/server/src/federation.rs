@@ -8355,75 +8355,86 @@ mod tests {
         assert_eq!(job.kind, kind);
         match kind {
             roosty_db::JobKind::FederationFollowResponse => {
-                super::deliver_follow_response(state, job.payload.clone())
+                Box::pin(super::deliver_follow_response(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationStatusDelivery => {
-                super::deliver_status_activity(state, job.payload.clone())
+                Box::pin(super::deliver_status_activity(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationQuoteDelivery => {
-                super::deliver_quote_activity(state, job.payload.clone())
+                Box::pin(super::deliver_quote_activity(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationFollowDelivery => {
-                super::deliver_follow_activity(state, job.payload.clone())
+                Box::pin(super::deliver_follow_activity(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationFavouriteDelivery => {
-                super::deliver_favourite_activity(state, job.payload.clone())
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_favourite_activity(
+                    state,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationReblogDelivery => {
-                super::deliver_reblog_activity(state, job.payload.clone())
+                Box::pin(super::deliver_reblog_activity(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationPollVoteDelivery => {
-                super::deliver_poll_vote(state, job.payload.clone())
+                Box::pin(super::deliver_poll_vote(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationActorUpdateDelivery => {
-                super::deliver_actor_update(state, job.payload.clone())
+                Box::pin(super::deliver_actor_update(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationModerationDelivery => {
-                super::deliver_moderation_activity(state, job.payload.clone())
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_moderation_activity(
+                    state,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationRemoteMediaFetch => {
-                crate::media::fetch_remote_media(state, job.payload.clone())
+                Box::pin(crate::media::fetch_remote_media(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
             roosty_db::JobKind::FederationFeaturedRefresh => {
-                super::refresh_remote_featured(state, job.payload.clone())
+                Box::pin(super::refresh_remote_featured(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
-            // Featured-tag refresh tests invoke the worker directly; keeping its large future out
-            // of this shared two-instance delivery helper avoids inflating every scenario future.
+            // Featured-tag refresh tests invoke their worker directly.
             roosty_db::JobKind::FederationFeaturedTagsRefresh => {}
             roosty_db::JobKind::FederationThreadResolve => {
-                super::resolve_remote_status_thread(state, job.payload.clone())
-                    .await
-                    .unwrap();
+                Box::pin(super::resolve_remote_status_thread(
+                    state,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationRepliesFetch => {
-                super::fetch_remote_status_replies(state, job.payload.clone())
-                    .await
-                    .unwrap();
+                Box::pin(super::fetch_remote_status_replies(
+                    state,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationReplyFetch => {
-                super::fetch_remote_status_reply(state, job.payload.clone())
+                Box::pin(super::fetch_remote_status_reply(state, job.payload.clone()))
                     .await
                     .unwrap();
             }
