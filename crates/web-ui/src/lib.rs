@@ -7,6 +7,7 @@ mod app;
 mod authorization;
 mod bootstrap;
 mod forms;
+mod public_pages;
 mod ui;
 
 #[cfg(feature = "ssr")]
@@ -25,6 +26,11 @@ pub use bootstrap::{
     UiModerationReport, UiServerContext,
 };
 pub use forms::{LoginError, PasswordChangeResult};
+pub use public_pages::{
+    AtUsernameSegment, UiFeaturedTag, UiMedia, UiMediaKind, UiPoll, UiPollOption, UiPreviewCard,
+    UiProfileField, UiProfilePage, UiProfileTab, UiPublicAccount, UiPublicPageError, UiStatus,
+    UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility,
+};
 
 #[cfg(feature = "hydrate")]
 fn panic_body(_: browser_panic_hook::PanicDetails<'_>) -> String {

@@ -4576,7 +4576,7 @@ async fn remote_status_response_base(
         language: None,
         uri: status.activitypub_id.clone(),
         url: status.activitypub_id,
-        content: status.content,
+        content: sanitize_remote_status_html(&status.content),
         account: StatusAccountResponse::Remote(Box::new(
             remote_account_response(state, actor).await?,
         )),
@@ -5447,7 +5447,7 @@ async fn find_status_context_parent(
     }
 }
 
-async fn status_context_item_visible(
+pub(crate) async fn status_context_item_visible(
     db: &impl ConnectionTrait,
     item: &StatusContextItem,
     viewer: Option<AccountId>,
@@ -5460,14 +5460,57 @@ async fn status_context_item_visible(
             }
             status_visible_to_viewer_on(db, status, viewer).await
         }
-        StatusContextItem::Remote(status) => match viewer {
-            Some(viewer) => roosty_db::remote_status_visible_to_account(db, status, viewer).await,
-            None => Ok(matches!(
-                status.visibility,
-                StatusVisibility::Public | StatusVisibility::Unlisted
-            )),
-        },
+        StatusContextItem::Remote(status) => {
+            let Some(author) =
+                roosty_db::find_remote_actor_by_id(db, status.remote_actor_id).await?
+            else {
+                return Ok(false);
+            };
+            if author.deleted_at.is_some()
+                || author.suspended_at.is_some()
+                || author.data_purged_at.is_some()
+                || roosty_db::federation_domain_policy(db, &author.domain)
+                    .await?
+                    .is_suspended()
+            {
+                return Ok(false);
+            }
+            match viewer {
+                Some(viewer) => {
+                    roosty_db::remote_status_visible_to_account(db, status, viewer).await
+                }
+                None => Ok(matches!(
+                    status.visibility,
+                    StatusVisibility::Public | StatusVisibility::Unlisted
+                )),
+            }
+        }
     }
+}
+
+/// Load one visible status and its bounded context inside a caller-owned snapshot.
+pub(crate) async fn visible_status_thread_on(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+    viewer: Option<AccountId>,
+) -> Result<
+    Option<(
+        StatusContextItem,
+        Vec<StatusContextItem>,
+        Vec<StatusContextItem>,
+    )>,
+    RoostyError,
+> {
+    let Some(status) = find_status_context_item(db, status_id).await? else {
+        return Ok(None);
+    };
+    if !status_context_item_visible(db, &status, viewer).await? {
+        return Ok(None);
+    }
+    let limits = StatusContextLimits::for_viewer(viewer);
+    let ancestors = status_ancestors(db, &status, viewer, limits).await?;
+    let descendants = status_descendants(db, &status, viewer, limits).await?;
+    Ok(Some((status, ancestors, descendants)))
 }
 
 async fn status_context_models(
@@ -5833,6 +5876,43 @@ fn status_content_html(content: &str) -> String {
     let mut escaped = String::new();
     push_escaped_html_with_breaks(&mut escaped, content);
     format!("<p>{escaped}</p>")
+}
+
+/// Sanitize cached remote HTML at the shared API/UI projection boundary.
+///
+/// Remote Notes may contain basic rich text, but never active content, embedded
+/// images, inline styling, event handlers, or non-web link schemes.
+pub(crate) fn sanitize_remote_status_html(content: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+
+    let tags = HashSet::from([
+        "a",
+        "b",
+        "blockquote",
+        "br",
+        "code",
+        "del",
+        "em",
+        "i",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "span",
+        "strong",
+        "u",
+        "ul",
+    ]);
+    let tag_attributes = HashMap::from([("a", HashSet::from(["href", "title"]))]);
+    ammonia::Builder::default()
+        .tags(tags)
+        .generic_attributes(HashSet::from(["class", "lang"]))
+        .tag_attributes(tag_attributes)
+        .url_schemes(HashSet::from(["http", "https"]))
+        .link_rel(Some("nofollow noopener noreferrer"))
+        .clean(content)
+        .to_string()
 }
 
 pub(crate) fn status_content_html_with_mentions_and_tags(
@@ -6370,9 +6450,27 @@ mod tests {
     use super::{
         StatusContextLimits, StatusPermission, escape_html, has_status_scope, hashtag_names,
         interaction_accounts_limit, mention_usernames, push_url_html, remote_mention_matches,
-        status_content_html, timeline_limit, url_matches,
+        sanitize_remote_status_html, status_content_html, timeline_limit, url_matches,
     };
     use crate::{config::Config, http::AppState, password};
+
+    #[test]
+    fn remote_status_html_keeps_safe_structure_and_strips_active_content() {
+        let html = sanitize_remote_status_html(
+            r#"<p onclick="steal()">Hello <strong>world</strong>
+            <a href="https://example.test" style="color:red">link</a>
+            <a href="javascript:steal()">bad</a>
+            <img src="https://tracker.test/pixel"><script>steal()</script></p>"#,
+        );
+        assert!(html.contains("<strong>world</strong>"));
+        assert!(html.contains("href=\"https://example.test\""));
+        assert!(html.contains("rel=\"nofollow noopener noreferrer\""));
+        assert!(!html.contains("onclick"));
+        assert!(!html.contains("style="));
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("<img"));
+        assert!(!html.contains("<script"));
+    }
 
     #[test]
     /// Anonymous and authenticated context traversal retain Mastodon's distinct bounds.

@@ -16,8 +16,8 @@ notifications, moderation, OAuth, streaming, and Web Push are available across a
 surface.
 
 Compatibility is not complete. Explore and trends, scheduled posts, public registration, and parts of the
-administration API are still missing. The first-party frontend covers instance information, account flows, and an
-operations-first administrator dashboard; public profile and status views are planned. APIs and deployment
+administration API are still missing. The first-party frontend covers instance information, account flows, an
+operations-first administrator dashboard, and server-rendered public profiles and status threads. APIs and deployment
 expectations may still change between releases.
 
 See the [documentation](https://ctron.github.io/roosty/) and

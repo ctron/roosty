@@ -7461,7 +7461,10 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
         assert_eq!(message["event"], "status.update");
-        assert_eq!(payload["content"], cached_edit.content);
+        assert_eq!(
+            payload["content"],
+            crate::statuses::sanitize_remote_status_html(&cached_edit.content)
+        );
         let notifications = roosty_db::local_notifications_for_account(
             &context.beta.db,
             follower.id,

@@ -13553,7 +13553,7 @@ pub async fn pinned_remote_status_ids(
 
 /// List local pins newest-first using pin identities as Mastodon cursors.
 pub async fn pinned_local_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
@@ -14359,39 +14359,35 @@ pub async fn count_local_replies(db: &DbConnection, status_id: StatusId) -> Resu
 
 /// Count active cached local and remote direct replies to one status.
 pub async fn count_status_context_replies(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     parent: StatusContextParent,
 ) -> Result<u64> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let count = match parent {
         StatusContextParent::Local(status_id) => {
             local_status::Entity::find()
                 .filter(local_status::Column::InReplyToId.eq(status_id.0))
                 .filter(local_status::Column::DeletedAt.is_null())
-                .count(&txn)
+                .count(db)
                 .await?
                 + remote_status::Entity::find()
                     .filter(remote_status::Column::InReplyToLocalStatusId.eq(status_id.0))
                     .filter(remote_status::Column::DeletedAt.is_null())
-                    .count(&txn)
+                    .count(db)
                     .await?
         }
         StatusContextParent::Remote(status_id) => {
             local_status::Entity::find()
                 .filter(local_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
                 .filter(local_status::Column::DeletedAt.is_null())
-                .count(&txn)
+                .count(db)
                 .await?
                 + remote_status::Entity::find()
                     .filter(remote_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
                     .filter(remote_status::Column::DeletedAt.is_null())
-                    .count(&txn)
+                    .count(db)
                     .await?
         }
     };
-    txn.commit().await?;
     Ok(count)
 }
 
@@ -15652,7 +15648,7 @@ pub async fn unfavourite_local_status(
 }
 
 /// Count active local favourites on a status.
-pub async fn count_local_favourites(db: &DbConnection, status_id: StatusId) -> Result<u64> {
+pub async fn count_local_favourites(db: &impl ConnectionTrait, status_id: StatusId) -> Result<u64> {
     let local = local_status_favourite::Entity::find()
         .filter(local_status_favourite::Column::StatusId.eq(status_id.0))
         .count(db)
@@ -16147,7 +16143,7 @@ pub async fn find_remote_status_reblog_by_activity_id(
 }
 
 /// Count active local boosts on a status.
-pub async fn count_local_reblogs(db: &DbConnection, status_id: StatusId) -> Result<u64> {
+pub async fn count_local_reblogs(db: &impl ConnectionTrait, status_id: StatusId) -> Result<u64> {
     let local = local_status_reblog::Entity::find()
         .filter(local_status_reblog::Column::StatusId.eq(status_id.0))
         .count(db)
@@ -16712,7 +16708,7 @@ pub async fn public_timeline_with_options(
 
 /// List statuses visible on an account's profile timeline.
 pub async fn local_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     viewer: Option<AccountId>,
     limit: u64,
@@ -16757,11 +16753,28 @@ pub async fn local_statuses_by_account(
                             ),
                     ),
             );
+            visible = visible.add(
+                Condition::all()
+                    .add(local_status::Column::Visibility.eq(StatusVisibility::Direct))
+                    .add(
+                        local_status::Column::Id.in_subquery(
+                            Query::select()
+                                .column(local_status_local_recipient::Column::StatusId)
+                                .from(local_status_local_recipient::Entity)
+                                .and_where(
+                                    local_status_local_recipient::Column::AccountId.eq(viewer.0),
+                                )
+                                .to_owned(),
+                        ),
+                    ),
+            );
         }
         query = query.filter(visible);
     }
     if options.exclude_replies {
-        query = query.filter(local_status::Column::InReplyToId.is_null());
+        query = query
+            .filter(local_status::Column::InReplyToId.is_null())
+            .filter(local_status::Column::InReplyToRemoteStatusId.is_null());
     }
     if options.only_media {
         query = query.filter(local_status::Column::Id.in_subquery(media_status_subquery()));

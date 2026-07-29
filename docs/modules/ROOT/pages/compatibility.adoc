@@ -572,9 +572,10 @@ Bare domains without a URL scheme remain plain text.
 |Authentication
 |
 
-|⚪
+|🟢
 |Profile and status pages
-|Human-facing pages are a Roosty UI feature, not an ActivityPub or Mastodon API requirement.
+|Local profile tabs and bounded status threads are server rendered, session-aware, and
+UUID-cursor paginated. ActivityPub actor and Note endpoints remain JSON-only.
 
 |===
 

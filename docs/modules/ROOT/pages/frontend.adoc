@@ -22,15 +22,17 @@ together when upgrading daisyUI.
 
 == Route ownership
 
-UI routes are registered explicitly from the Leptos route list. The initial routes are `/` and
-`/about`; direct requests and browser refreshes therefore use the same server renderer as client
-navigation. Generated assets live below `/pkg`, and internal UI server functions live below
-`/api/web`. Roosty deliberately has no global single-page-app fallback so missing Mastodon API and
-ActivityPub routes keep their existing response semantics.
+UI routes are registered explicitly from the Leptos route list. In addition to `/` and `/about`,
+local accounts have `/@username`, `/@username/with_replies`, `/@username/media`, and
+`/@username/tagged/hashtag` profile timelines. Local status permalinks use
+`/@username/status-id`. Direct requests and browser refreshes therefore use the same server
+renderer as client navigation. Generated assets live below `/pkg`, and internal UI server
+functions live below `/api/web`. Roosty deliberately has no global single-page-app fallback so
+missing Mastodon API and ActivityPub routes keep their existing response semantics.
 
-Future public profile and status pages should use human-facing `/@username` routes. Existing
-ActivityPub actor and Note URLs remain protocol endpoints and should not depend on browser content
-negotiation.
+The browser routes are separate from the JSON-only ActivityPub actor and Note identifiers at
+`/users/username` and `/users/username/statuses/status-id`; those protocol routes do not use
+content negotiation.
 
 == Rendering and SEO
 
@@ -38,6 +40,24 @@ SEO-relevant content must be present in the initial response. Each public route 
 description, canonical URL, and Open Graph metadata through Leptos Meta. Route data should use a
 blocking SSR resource when it affects visible content or metadata; hydration reuses the serialized
 resource result instead of replacing server-rendered content after startup.
+
+Profile pages include profile metadata, fields, counts, featured tags, pins, and 20-post
+UUID-cursor pages. “Load more” appends and deduplicates posts after hydration and replaces the
+cursor query in browser history. Profile roots omit replies; the replies, media, and tagged tabs
+apply their named filters. Status pages render the visible bounded mixed local/remote thread,
+content warnings, sensitive media, accessible descriptions, polls, quotes, and preview cards.
+
+Anonymous documents expose public and unlisted posts. A signed-in local account can additionally
+see follower-only and direct posts permitted by its follow, recipient, conversation, ownership,
+and block state. These reads use a read-only database snapshot. Session-aware documents and
+loaders are private, uncached, and vary on the session cookie. Missing, deleted, suspended,
+inaccessible, and author-mismatched resources all return the same not-found response.
+
+Profile and article documents include canonical URLs without cursor queries, Open Graph data,
+ActivityPub alternate links, `fediverse:creator`, and Mastodon-compatible `h-card`/`h-entry`
+microformats. Private pages, later cursor pages, limited accounts, and non-discoverable profiles
+are marked `noindex`. Sensitive status metadata contains only the content warning and never a
+preview image.
 
 The welcome and about pages present the operator-configured instance name and description rather
 than Roosty project marketing. A missing or blank description uses neutral social-web copy. Roosty

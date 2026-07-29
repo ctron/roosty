@@ -17,6 +17,7 @@ use axum::{
 };
 use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
+use roosty_core::{AccountId, StatusId};
 use roosty_db::{
     AdminAuditAction, AdminAuditEntry, AdminAuditSource, AdminAuditTargetKind, JobKind,
     ReportAccount, ReportListOptions, ReportStatus,
@@ -24,10 +25,12 @@ use roosty_db::{
 use roosty_web_ui::{
     App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
     UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
-    UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiInstanceRule,
-    UiModerationReport, UiServerContext, shell,
+    UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiFeaturedTag, UiInstanceRule,
+    UiMedia, UiMediaKind, UiModerationReport, UiPoll, UiPollOption, UiPreviewCard, UiProfileField,
+    UiProfilePage, UiProfileTab, UiPublicAccount, UiPublicPageError, UiServerContext, UiStatus,
+    UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility, shell,
 };
-use sea_orm::{DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -205,6 +208,217 @@ impl UiBackend for RoostyUiBackend {
         })
     }
 
+    fn profile_page(
+        &self,
+        cookie_header: Option<String>,
+        username: String,
+        tab: UiProfileTab,
+        hashtag: Option<String>,
+        max_id: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<UiProfilePage, UiPublicPageError>> + Send + 'static>>
+    {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let cursor = parse_ui_cursor(max_id.as_deref())?;
+            let txn = state
+                .begin_snapshot()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            let viewer = ui_viewer(&state, &txn, cookie_header).await?;
+            let account = active_local_profile(&txn, &username).await?;
+            let account_dto = ui_public_account(&state, &txn, &account).await?;
+            let blocked = match viewer {
+                Some(viewer) if viewer != account.id => {
+                    roosty_db::local_accounts_are_blocked(&txn, viewer, account.id)
+                        .await
+                        .map_err(|_| UiPublicPageError::Internal)?
+                }
+                _ => false,
+            };
+            let timeline = if blocked {
+                UiStatusPage {
+                    statuses: Vec::new(),
+                    next_cursor: None,
+                }
+            } else {
+                ui_profile_status_page(
+                    &state,
+                    &txn,
+                    &account,
+                    viewer,
+                    &tab,
+                    hashtag.as_deref(),
+                    cursor,
+                )
+                .await?
+            };
+            let pins = roosty_db::pinned_local_statuses_by_account(
+                &txn,
+                account.id,
+                crate::statuses::MAX_PINNED_STATUSES,
+                roosty_db::TimelineCursor::default(),
+            )
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?;
+            let pinned_statuses = if blocked {
+                Vec::new()
+            } else {
+                ui_local_statuses(&state, &txn, pins.items, &account, viewer, true).await?
+            };
+            let featured_tags = roosty_db::local_featured_tags(&txn, account.id)
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?
+                .into_iter()
+                .map(|tag| UiFeaturedTag {
+                    name: tag.name,
+                    statuses_count: u64::try_from(tag.statuses_count).unwrap_or_default(),
+                })
+                .collect();
+            txn.commit()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+
+            let canonical_url =
+                public_page_url(&state, &profile_path(&username, &tab, hashtag.as_deref()));
+            Ok(UiProfilePage {
+                noindex: cursor.max_id.is_some()
+                    || account.limited_at.is_some()
+                    || !account.discoverable,
+                activitypub_url: public_page_url(&state, &format!("/users/{username}")),
+                canonical_url,
+                account: account_dto,
+                tab,
+                hashtag,
+                featured_tags,
+                pinned_statuses,
+                timeline,
+            })
+        })
+    }
+
+    fn profile_statuses(
+        &self,
+        cookie_header: Option<String>,
+        username: String,
+        tab: UiProfileTab,
+        hashtag: Option<String>,
+        max_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<UiStatusPage, UiPublicPageError>> + Send + 'static>>
+    {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let cursor = parse_ui_cursor(Some(&max_id))?;
+            let txn = state
+                .begin_snapshot()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            let viewer = ui_viewer(&state, &txn, cookie_header).await?;
+            let account = active_local_profile(&txn, &username).await?;
+            if viewer.is_some_and(|viewer| viewer != account.id)
+                && roosty_db::local_accounts_are_blocked(
+                    &txn,
+                    viewer.unwrap_or(account.id),
+                    account.id,
+                )
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?
+            {
+                return Ok(UiStatusPage {
+                    statuses: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+            let page = ui_profile_status_page(
+                &state,
+                &txn,
+                &account,
+                viewer,
+                &tab,
+                hashtag.as_deref(),
+                cursor,
+            )
+            .await?;
+            txn.commit()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            Ok(page)
+        })
+    }
+
+    fn status_thread(
+        &self,
+        cookie_header: Option<String>,
+        username: String,
+        status_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<UiStatusThread, UiPublicPageError>> + Send + 'static>>
+    {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let status_id = Uuid::parse_str(&status_id)
+                .map(StatusId)
+                .map_err(|_| UiPublicPageError::NotFound)?;
+            let txn = state
+                .begin_snapshot()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            let viewer = ui_viewer(&state, &txn, cookie_header).await?;
+            let account = active_local_profile(&txn, &username).await?;
+            let Some((focus, ancestors, descendants)) =
+                crate::statuses::visible_status_thread_on(&txn, status_id, viewer)
+                    .await
+                    .map_err(|_| UiPublicPageError::Internal)?
+            else {
+                return Err(UiPublicPageError::NotFound);
+            };
+            let roosty_db::StatusContextItem::Local(local_focus) = &focus else {
+                return Err(UiPublicPageError::NotFound);
+            };
+            if local_focus.account_id != account.id {
+                return Err(UiPublicPageError::NotFound);
+            }
+            if viewer.is_some_and(|viewer| viewer != account.id)
+                && roosty_db::local_accounts_are_blocked(
+                    &txn,
+                    viewer.unwrap_or(account.id),
+                    account.id,
+                )
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?
+            {
+                return Err(UiPublicPageError::NotFound);
+            }
+            let account_dto = ui_public_account(&state, &txn, &account).await?;
+            let focus = ui_context_status(&state, &txn, focus, viewer, true).await?;
+            let mut ancestor_dtos = Vec::with_capacity(ancestors.len());
+            for item in ancestors {
+                ancestor_dtos.push(ui_context_status(&state, &txn, item, viewer, true).await?);
+            }
+            let mut descendant_dtos = Vec::with_capacity(descendants.len());
+            for item in descendants {
+                descendant_dtos.push(ui_context_status(&state, &txn, item, viewer, true).await?);
+            }
+            txn.commit()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            let canonical_url = public_page_url(&state, &format!("/@{username}/{}", status_id.0));
+            Ok(UiStatusThread {
+                noindex: !matches!(
+                    focus.visibility,
+                    UiStatusVisibility::Public | UiStatusVisibility::Unlisted
+                ),
+                activitypub_url: public_page_url(
+                    &state,
+                    &format!("/users/{username}/statuses/{}", status_id.0),
+                ),
+                canonical_url,
+                account: account_dto,
+                ancestors: ancestor_dtos,
+                status: focus,
+                descendants: descendant_dtos,
+            })
+        })
+    }
+
     fn admin_work_queue(
         &self,
         cookie_header: Option<String>,
@@ -352,6 +566,510 @@ impl UiBackend for RoostyUiBackend {
             })
         })
     }
+}
+
+fn parse_ui_cursor(value: Option<&str>) -> Result<roosty_db::TimelineCursor, UiPublicPageError> {
+    let max_id = value
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| UiPublicPageError::BadRequest)?
+        .map(StatusId);
+    Ok(roosty_db::TimelineCursor {
+        max_id,
+        ..Default::default()
+    })
+}
+
+async fn ui_viewer(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    cookie_header: Option<String>,
+) -> Result<Option<AccountId>, UiPublicPageError> {
+    let headers = cookie_headers(cookie_header).map_err(|_| UiPublicPageError::BadRequest)?;
+    let viewer =
+        account_id_from_session(state, &headers).map_err(|_| UiPublicPageError::Internal)?;
+    match viewer {
+        Some(account_id) => Ok(roosty_db::find_local_account_by_id(db, account_id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?
+            .filter(|account| account.suspended_at.is_none())
+            .map(|account| account.id)),
+        None => Ok(None),
+    }
+}
+
+async fn active_local_profile(
+    db: &impl ConnectionTrait,
+    username: &str,
+) -> Result<roosty_db::LocalAccount, UiPublicPageError> {
+    roosty_db::find_local_account_by_username(db, username)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        .filter(|account| account.suspended_at.is_none() && account.data_purged_at.is_none())
+        .ok_or(UiPublicPageError::NotFound)
+}
+
+async fn ui_public_account(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account: &roosty_db::LocalAccount,
+) -> Result<UiPublicAccount, UiPublicPageError> {
+    let followers_count = roosty_db::count_local_followers(db, account.id)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        + roosty_db::count_remote_followers(db, account.id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?;
+    let following_count = roosty_db::count_local_following(db, account.id)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        + roosty_db::count_remote_following(db, account.id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?;
+    let statuses_count = roosty_db::count_local_statuses_by_account(db, account.id)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?;
+    let fields = account
+        .profile_fields
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|field| {
+            Some(UiProfileField {
+                name: field.get("name")?.as_str()?.to_owned(),
+                value: field.get("value")?.as_str()?.to_owned(),
+            })
+        })
+        .collect();
+    Ok(UiPublicAccount {
+        id: account.id.0,
+        username: account.username.clone(),
+        display_name: if account.display_name.is_empty() {
+            account.username.clone()
+        } else {
+            account.display_name.clone()
+        },
+        bio: account.note.clone(),
+        avatar_url: account
+            .avatar_file_path
+            .as_deref()
+            .map(|path| crate::media::media_url(state, path)),
+        header_url: account
+            .header_file_path
+            .as_deref()
+            .map(|path| crate::media::media_url(state, path)),
+        fields,
+        created_at: format_timestamp(account.created_at),
+        followers_count,
+        following_count,
+        statuses_count,
+        limited: account.limited_at.is_some(),
+        discoverable: account.discoverable,
+    })
+}
+
+async fn ui_profile_status_page(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account: &roosty_db::LocalAccount,
+    viewer: Option<AccountId>,
+    tab: &UiProfileTab,
+    hashtag: Option<&str>,
+    cursor: roosty_db::TimelineCursor,
+) -> Result<UiStatusPage, UiPublicPageError> {
+    let tagged = match tab {
+        UiProfileTab::Tagged => Some(
+            roosty_db::normalize_featured_tag_name(hashtag.unwrap_or_default())
+                .ok_or(UiPublicPageError::NotFound)?,
+        ),
+        _ => None,
+    };
+    let page = roosty_db::local_statuses_by_account(
+        db,
+        account.id,
+        viewer,
+        20,
+        cursor,
+        roosty_db::AccountStatusTimelineOptions {
+            exclude_replies: matches!(tab, UiProfileTab::Posts),
+            only_media: matches!(tab, UiProfileTab::Media),
+            tagged,
+        },
+    )
+    .await
+    .map_err(|_| UiPublicPageError::Internal)?;
+    let next_cursor = page.has_more.then_some(page.last_cursor).flatten();
+    let statuses = ui_local_statuses(state, db, page.items, account, viewer, false).await?;
+    Ok(UiStatusPage {
+        statuses,
+        next_cursor,
+    })
+}
+
+async fn ui_local_statuses(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    statuses: Vec<roosty_db::LocalStatus>,
+    account: &roosty_db::LocalAccount,
+    viewer: Option<AccountId>,
+    pinned: bool,
+) -> Result<Vec<UiStatus>, UiPublicPageError> {
+    let mut result = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        if crate::statuses::status_visible_to_viewer_on(db, &status, viewer)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?
+        {
+            result.push(ui_local_status(state, db, status, account, viewer, pinned, true).await?);
+        }
+    }
+    Ok(result)
+}
+
+fn ui_visibility(visibility: roosty_db::StatusVisibility) -> UiStatusVisibility {
+    match visibility {
+        roosty_db::StatusVisibility::Public => UiStatusVisibility::Public,
+        roosty_db::StatusVisibility::Unlisted => UiStatusVisibility::Unlisted,
+        roosty_db::StatusVisibility::Private => UiStatusVisibility::Private,
+        roosty_db::StatusVisibility::Direct => UiStatusVisibility::Direct,
+    }
+}
+
+fn ui_media_kind(content_type: Option<&str>) -> UiMediaKind {
+    match content_type.unwrap_or_default().split('/').next() {
+        Some("image") => UiMediaKind::Image,
+        Some("video") => UiMediaKind::Video,
+        Some("audio") => UiMediaKind::Audio,
+        _ => UiMediaKind::Unknown,
+    }
+}
+
+async fn ui_local_status(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    status: roosty_db::LocalStatus,
+    account: &roosty_db::LocalAccount,
+    viewer: Option<AccountId>,
+    pinned: bool,
+    include_quote: bool,
+) -> Result<UiStatus, UiPublicPageError> {
+    let id = status.id;
+    let path = format!("/@{}/{}", account.username, id.0);
+    let activitypub_url = public_page_url(
+        state,
+        &format!("/users/{}/statuses/{}", account.username, id.0),
+    );
+    let media = roosty_db::local_media_attachments_for_status(db, id)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        .into_iter()
+        .map(|media| UiMedia {
+            kind: ui_media_kind(Some(&media.content_type)),
+            url: crate::media::media_url(state, &media.file_path),
+            preview_url: media
+                .preview_file_path
+                .as_deref()
+                .map(|path| crate::media::media_url(state, path)),
+            description: media.description,
+        })
+        .collect();
+    let poll = ui_poll(db, roosty_db::PollStatus::Local(id)).await?;
+    let card = ui_preview_card(state, db, roosty_db::StatusReference::Local(id)).await?;
+    let quote = if include_quote {
+        Box::pin(ui_status_quote(
+            state,
+            db,
+            roosty_db::StatusReference::Local(id),
+            viewer,
+        ))
+        .await?
+    } else {
+        None
+    };
+    Ok(UiStatus {
+        id: id.0,
+        author: UiStatusAuthor {
+            display_name: if account.display_name.is_empty() {
+                account.username.clone()
+            } else {
+                account.display_name.clone()
+            },
+            handle: format!("@{}", account.username),
+            url: public_page_url(state, &format!("/@{}", account.username)),
+            avatar_url: account
+                .avatar_file_path
+                .as_deref()
+                .map(|path| crate::media::media_url(state, path)),
+            local: true,
+        },
+        url: public_page_url(state, &path),
+        activitypub_url,
+        content_html: crate::statuses::status_content_html_with_mentions_and_tags(
+            state,
+            &status.content,
+            &[],
+            &[],
+            &[],
+        ),
+        spoiler_text: status.spoiler_text,
+        sensitive: status.sensitive,
+        visibility: ui_visibility(status.visibility),
+        created_at: format_timestamp(status.created_at),
+        edited_at: (status.updated_at != status.created_at)
+            .then(|| format_timestamp(status.updated_at)),
+        media,
+        poll,
+        card,
+        quote,
+        replies_count: roosty_db::count_status_context_replies(
+            db,
+            roosty_db::StatusContextParent::Local(id),
+        )
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?,
+        reblogs_count: roosty_db::count_local_reblogs(db, id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?,
+        favourites_count: roosty_db::count_local_favourites(db, id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?,
+        pinned,
+    })
+}
+
+async fn ui_remote_status(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    status: roosty_db::RemoteStatus,
+    viewer: Option<AccountId>,
+    include_quote: bool,
+) -> Result<UiStatus, UiPublicPageError> {
+    let actor = roosty_db::find_remote_actor_by_id(db, status.remote_actor_id)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        .filter(|actor| {
+            actor.deleted_at.is_none()
+                && actor.suspended_at.is_none()
+                && actor.data_purged_at.is_none()
+        })
+        .ok_or(UiPublicPageError::NotFound)?;
+    let id = status.id;
+    let media = roosty_db::remote_media_attachments_for_status(db, id)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        .into_iter()
+        .map(|media| UiMedia {
+            kind: ui_media_kind(media.content_type.as_deref()),
+            url: media
+                .file_path
+                .as_deref()
+                .map(|path| crate::media::media_url(state, path))
+                .unwrap_or(media.remote_url),
+            preview_url: media
+                .preview_file_path
+                .as_deref()
+                .map(|path| crate::media::media_url(state, path)),
+            description: media.description,
+        })
+        .collect();
+    let sensitive = status
+        .object
+        .get("sensitive")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let spoiler_text = status
+        .object
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let quote = if include_quote {
+        Box::pin(ui_status_quote(
+            state,
+            db,
+            roosty_db::StatusReference::Remote(id),
+            viewer,
+        ))
+        .await?
+    } else {
+        None
+    };
+    Ok(UiStatus {
+        id: id.0,
+        author: UiStatusAuthor {
+            display_name: if actor.display_name.is_empty() {
+                actor.username.clone()
+            } else {
+                actor.display_name.clone()
+            },
+            handle: format!("@{}@{}", actor.username, actor.domain),
+            url: actor.activitypub_id.clone(),
+            avatar_url: None,
+            local: false,
+        },
+        url: status.activitypub_id.clone(),
+        activitypub_url: status.activitypub_id,
+        content_html: crate::statuses::sanitize_remote_status_html(&status.content),
+        spoiler_text,
+        sensitive,
+        visibility: ui_visibility(status.visibility),
+        created_at: format_timestamp(status.published_at),
+        edited_at: (status.updated_at != status.published_at)
+            .then(|| format_timestamp(status.updated_at)),
+        media,
+        poll: ui_poll(db, roosty_db::PollStatus::Remote(id)).await?,
+        card: ui_preview_card(state, db, roosty_db::StatusReference::Remote(id)).await?,
+        quote,
+        replies_count: roosty_db::count_status_context_replies(
+            db,
+            roosty_db::StatusContextParent::Remote(id),
+        )
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?,
+        reblogs_count: 0,
+        favourites_count: 0,
+        pinned: roosty_db::is_remote_status_pinned(db, id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?,
+    })
+}
+
+async fn ui_context_status(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    item: roosty_db::StatusContextItem,
+    viewer: Option<AccountId>,
+    include_quote: bool,
+) -> Result<UiStatus, UiPublicPageError> {
+    match item {
+        roosty_db::StatusContextItem::Local(status) => {
+            let account = roosty_db::find_local_account_by_id(db, status.account_id)
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?
+                .ok_or(UiPublicPageError::NotFound)?;
+            let pinned = roosty_db::is_local_status_pinned(db, status.id)
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            ui_local_status(state, db, status, &account, viewer, pinned, include_quote).await
+        }
+        roosty_db::StatusContextItem::Remote(status) => {
+            ui_remote_status(state, db, status, viewer, include_quote).await
+        }
+    }
+}
+
+async fn ui_poll(
+    db: &impl ConnectionTrait,
+    status: roosty_db::PollStatus,
+) -> Result<Option<UiPoll>, UiPublicPageError> {
+    Ok(roosty_db::find_poll_for_status(db, status)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        .map(|poll| {
+            let hide_totals = poll.hide_totals && !poll.expired(OffsetDateTime::now_utc());
+            UiPoll {
+                multiple: poll.multiple,
+                expired: poll.expired(OffsetDateTime::now_utc()),
+                voters_count: (!hide_totals).then_some(poll.voters_count).flatten(),
+                options: poll
+                    .options
+                    .into_iter()
+                    .map(|option| UiPollOption {
+                        title: option.title,
+                        votes_count: (!hide_totals).then_some(option.votes_count),
+                    })
+                    .collect(),
+            }
+        }))
+}
+
+async fn ui_preview_card(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    status: roosty_db::StatusReference,
+) -> Result<Option<UiPreviewCard>, UiPublicPageError> {
+    Ok(roosty_db::preview_card_for_status(db, status)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+        .map(|card| UiPreviewCard {
+            url: card.url,
+            title: card.title,
+            description: card.description,
+            provider_name: card.provider_name,
+            image_url: card
+                .image_file_path
+                .as_deref()
+                .map(|path| crate::media::media_url(state, path)),
+        }))
+}
+
+async fn ui_status_quote(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    status: roosty_db::StatusReference,
+    viewer: Option<AccountId>,
+) -> Result<Option<Box<UiStatus>>, UiPublicPageError> {
+    let Some(quote) = roosty_db::quote_for_status(db, status)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+    else {
+        return Ok(None);
+    };
+    if quote.state != roosty_db::QuoteState::Accepted {
+        return Ok(None);
+    }
+    let Some(target) = quote.quoted_status else {
+        return Ok(None);
+    };
+    let item = match target {
+        roosty_db::StatusReference::Local(id) => roosty_db::find_local_status_by_id(db, id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?
+            .map(roosty_db::StatusContextItem::Local),
+        roosty_db::StatusReference::Remote(id) => roosty_db::find_remote_status_by_id(db, id)
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?
+            .map(roosty_db::StatusContextItem::Remote),
+    };
+    let Some(item) = item else {
+        return Ok(None);
+    };
+    if !crate::statuses::status_context_item_visible(db, &item, viewer)
+        .await
+        .map_err(|_| UiPublicPageError::Internal)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(
+        ui_context_status(state, db, item, viewer, false).await?,
+    )))
+}
+
+fn profile_path(username: &str, tab: &UiProfileTab, hashtag: Option<&str>) -> String {
+    match tab {
+        UiProfileTab::Tagged => format!(
+            "/@{username}/tagged/{}",
+            hashtag.unwrap_or_default().trim_start_matches('#')
+        ),
+        _ => format!("/@{username}{}", tab.path_suffix()),
+    }
+}
+
+fn public_page_url(state: &AppState, path: &str) -> String {
+    state
+        .config
+        .public_base_url
+        .join(path.trim_start_matches('/'))
+        .map_or_else(
+            |_| {
+                format!(
+                    "{}/{}",
+                    state.config.public_base_url.as_str().trim_end_matches('/'),
+                    path.trim_start_matches('/')
+                )
+            },
+            |url| url.to_string(),
+        )
 }
 
 fn report_account_label(account: ReportAccount) -> String {
@@ -1088,7 +1806,11 @@ mod tests {
     };
     use leptos::{config::LeptosOptions, prelude::provide_context};
     use leptos_axum::LeptosRoutes;
-    use roosty_web_ui::{UiAccount, UiBackend, UiBootstrap, UiServerContext, shell};
+    use roosty_web_ui::{
+        UiAccount, UiBackend, UiBootstrap, UiProfilePage, UiProfileTab, UiPublicAccount,
+        UiPublicPageError, UiServerContext, UiStatus, UiStatusAuthor, UiStatusPage, UiStatusThread,
+        UiStatusVisibility, shell,
+    };
     use tower::ServiceExt;
     use tower_http::services::ServeDir;
     use uuid::Uuid;
@@ -1111,6 +1833,18 @@ mod tests {
         assert!(paths.iter().any(|path| path == "/admin/accounts"));
         assert!(paths.iter().any(|path| path == "/admin/remote-accounts"));
         assert!(paths.iter().any(|path| path == "/admin/audit-log"));
+        assert!(paths.iter().any(|path| path == "/@{username}"));
+        assert!(paths.iter().any(|path| path == "/@{username}/with_replies"));
+        assert!(paths.iter().any(|path| path == "/@{username}/media"));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "/@{username}/tagged/{hashtag}")
+        );
+        assert!(paths.iter().any(|path| path == "/@{username}/{status_id}"));
+        assert!(!paths.iter().any(|path| path.starts_with("/api/")));
+        assert!(!paths.iter().any(|path| path.starts_with("/oauth/")));
+        assert!(!paths.iter().any(|path| path.starts_with("/users/")));
     }
 
     #[test]
@@ -1341,6 +2075,68 @@ mod tests {
         assert!(!html.contains("/login?next="));
     }
 
+    #[tokio::test]
+    async fn renders_public_profile_and_status_metadata_with_private_cache_policy() {
+        for (path, marker, canonical, og_type) in [
+            (
+                "/@alice",
+                "Profile post",
+                "https://roosty.test/@alice",
+                "profile",
+            ),
+            (
+                "/@alice/0198a31c-2c00-7000-8000-000000000001",
+                "Focused status",
+                "https://roosty.test/@alice/0198a31c-2c00-7000-8000-000000000001",
+                "article",
+            ),
+        ] {
+            let response = test_router()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::COOKIE, "roosty_session=test-session")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "private, no-store"
+            );
+            assert_eq!(response.headers().get(header::VARY).unwrap(), "Cookie");
+            let html = String::from_utf8(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains(marker));
+            assert!(html.contains(&format!("href=\"{canonical}\" rel=\"canonical\"")));
+            assert!(html.contains("property=\"og:type\""));
+            assert!(html.contains(&format!("content=\"{og_type}\"")));
+            assert!(html.contains("application/activity+json"));
+            assert!(html.contains("fediverse:creator"));
+            assert!(html.contains("h-card"));
+            assert!(html.contains("h-entry"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_profile_cursor_returns_bad_request_document() {
+        let response = test_router()
+            .oneshot(
+                Request::get("/@alice?max_id=invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[derive(Clone)]
     struct TestState {
         options: LeptosOptions,
@@ -1382,6 +2178,115 @@ mod tests {
                     csrf_token: None,
                 })
             })
+        }
+
+        fn profile_page(
+            &self,
+            _cookie_header: Option<String>,
+            username: String,
+            tab: UiProfileTab,
+            hashtag: Option<String>,
+            max_id: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<UiProfilePage, UiPublicPageError>> + Send + 'static>>
+        {
+            Box::pin(async move {
+                if max_id
+                    .as_deref()
+                    .is_some_and(|cursor| Uuid::parse_str(cursor).is_err())
+                {
+                    return Err(UiPublicPageError::BadRequest);
+                }
+                if username != "alice" {
+                    return Err(UiPublicPageError::NotFound);
+                }
+                Ok(UiProfilePage {
+                    account: public_account(),
+                    tab,
+                    hashtag,
+                    featured_tags: Vec::new(),
+                    pinned_statuses: Vec::new(),
+                    timeline: UiStatusPage {
+                        statuses: vec![public_status("Profile post")],
+                        next_cursor: None,
+                    },
+                    canonical_url: "https://roosty.test/@alice".to_owned(),
+                    activitypub_url: "https://roosty.test/users/alice".to_owned(),
+                    noindex: false,
+                })
+            })
+        }
+
+        fn status_thread(
+            &self,
+            _cookie_header: Option<String>,
+            username: String,
+            status_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<UiStatusThread, UiPublicPageError>> + Send + 'static>>
+        {
+            Box::pin(async move {
+                if username != "alice" || status_id != "0198a31c-2c00-7000-8000-000000000001" {
+                    return Err(UiPublicPageError::NotFound);
+                }
+                Ok(UiStatusThread {
+                    account: public_account(),
+                    ancestors: Vec::new(),
+                    status: public_status("Focused status"),
+                    descendants: Vec::new(),
+                    canonical_url: format!("https://roosty.test/@alice/{status_id}"),
+                    activitypub_url: format!(
+                        "https://roosty.test/users/alice/statuses/{status_id}"
+                    ),
+                    noindex: false,
+                })
+            })
+        }
+    }
+
+    fn public_account() -> UiPublicAccount {
+        UiPublicAccount {
+            id: Uuid::nil(),
+            username: "alice".to_owned(),
+            display_name: "Alice".to_owned(),
+            bio: "A test profile".to_owned(),
+            avatar_url: None,
+            header_url: None,
+            fields: Vec::new(),
+            created_at: "2026-07-29T00:00:00Z".to_owned(),
+            followers_count: 1,
+            following_count: 2,
+            statuses_count: 3,
+            limited: false,
+            discoverable: true,
+        }
+    }
+
+    fn public_status(content: &str) -> UiStatus {
+        let id = Uuid::parse_str("0198a31c-2c00-7000-8000-000000000001").unwrap();
+        UiStatus {
+            id,
+            author: UiStatusAuthor {
+                display_name: "Alice".to_owned(),
+                handle: "@alice".to_owned(),
+                url: "https://roosty.test/@alice".to_owned(),
+                avatar_url: None,
+                local: true,
+            },
+            url: format!("https://roosty.test/@alice/{id}"),
+            activitypub_url: format!("https://roosty.test/users/alice/statuses/{id}"),
+            content_html: format!("<p>{content}</p>"),
+            spoiler_text: String::new(),
+            sensitive: false,
+            visibility: UiStatusVisibility::Public,
+            created_at: "2026-07-29T00:00:00Z".to_owned(),
+            edited_at: None,
+            media: Vec::new(),
+            poll: None,
+            card: None,
+            quote: None,
+            replies_count: 0,
+            reblogs_count: 0,
+            favourites_count: 0,
+            pinned: false,
         }
     }
 

@@ -10,6 +10,10 @@ use leptos::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::public_pages::{
+    ProfileFuture, StatusPageFuture, ThreadFuture, UiProfileTab, UiPublicPageError,
+};
+
 /// Public instance and session data needed to render the application shell.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UiBootstrap {
@@ -162,6 +166,37 @@ pub trait UiBackend: Send + Sync {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiBootstrap, String>> + Send + 'static>>;
 
+    fn profile_page(
+        &self,
+        _cookie_header: Option<String>,
+        _username: String,
+        _tab: UiProfileTab,
+        _hashtag: Option<String>,
+        _max_id: Option<String>,
+    ) -> ProfileFuture {
+        Box::pin(async { Err(UiPublicPageError::NotFound) })
+    }
+
+    fn profile_statuses(
+        &self,
+        _cookie_header: Option<String>,
+        _username: String,
+        _tab: UiProfileTab,
+        _hashtag: Option<String>,
+        _max_id: String,
+    ) -> StatusPageFuture {
+        Box::pin(async { Err(UiPublicPageError::NotFound) })
+    }
+
+    fn status_thread(
+        &self,
+        _cookie_header: Option<String>,
+        _username: String,
+        _status_id: String,
+    ) -> ThreadFuture {
+        Box::pin(async { Err(UiPublicPageError::NotFound) })
+    }
+
     fn admin_work_queue(
         &self,
         _cookie_header: Option<String>,
@@ -284,12 +319,16 @@ pub async fn load_admin_moderation() -> Result<UiAdminModeration, ServerFnError>
 }
 
 #[cfg(feature = "ssr")]
-async fn request_cookie() -> Result<Option<String>, ServerFnError> {
+pub(crate) async fn request_cookie() -> Result<Option<String>, ServerFnError> {
     use axum::http::{HeaderMap, HeaderValue, header};
 
     let headers: HeaderMap = leptos_axum::extract().await?;
+    expect_context::<leptos_axum::ResponseOptions>().insert_header(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
     expect_context::<leptos_axum::ResponseOptions>()
-        .insert_header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert_header(header::VARY, HeaderValue::from_static("Cookie"));
     Ok(headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -305,9 +344,15 @@ pub struct UiServerContext(pub Arc<dyn UiBackend>);
 pub async fn load_bootstrap() -> Result<UiBootstrap, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
-        use axum::http::{HeaderMap, header};
+        use axum::http::{HeaderMap, HeaderValue, header};
 
         let headers: HeaderMap = leptos_axum::extract().await?;
+        let response = expect_context::<leptos_axum::ResponseOptions>();
+        response.insert_header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        response.insert_header(header::VARY, HeaderValue::from_static("Cookie"));
         let cookie_header = headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok())

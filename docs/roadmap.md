@@ -27,7 +27,9 @@
 - Mastodon-compatible public/unlisted status pins with a five-pin transactional limit, pinned account collections, ActivityPub featured collections, durable Add/Remove delivery, and bounded remote featured caching.
 - Mastodon-compatible notification policies and sender-scoped requests, with durable multi-process merges/cleanup, completion streaming, unread counts, and operator-managed local/remote account limits that leave ActivityPub ingestion intact.
 - Mastodon-compatible browser OAuth, including PKCE, forced reauthentication for multi-account clients, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
-- A first-party Rust/WebAssembly frontend foundation with server-rendered welcome, about, login, password, and OAuth views; public pages hydrate with SEO metadata, deep-link support, and session-aware navigation served by the backend.
+- A first-party Rust/WebAssembly frontend with server-rendered welcome, about, login, password,
+  OAuth, local profile timelines, and bounded status-thread views; public pages hydrate with SEO
+  metadata, cursor loading, deep-link support, and session-aware visibility served by the backend.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
@@ -92,7 +94,8 @@
 - Status interactions: replies, favourites, bookmarks, boosts, and delete streaming events.
 - Notifications: poll and administrative report notifications are available through the REST API,
   streaming, and Web Push.
-- Account/profile APIs beyond current credentials: public account lookup, profile pages, and status collections.
+- Account/profile APIs beyond current credentials: public account lookup and status collections
+  are available; broader account-management compatibility remains.
 - Streaming channels: federated/local/remote public and media streams, `user`, `user:notification`, and bounded slow-client handling.
 
 ## Short Term
@@ -113,7 +116,8 @@
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
-- [ ] Add SEO-friendly first-party profile and status pages. Welcome, about, login, password settings, OAuth consent, and out-of-band authorization results now use Leptos; no Askama views remain.
+- [x] Add SEO-friendly first-party local profile tabs and status-thread pages with session-aware
+  visibility, cursor hydration, metadata, microformats, and separate ActivityPub identifiers.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
 - [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags, statuses, rich link cards, link timelines, and the offset-paginated local/remote profile directory are available; account suggestions remain.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account

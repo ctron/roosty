@@ -1,11 +1,13 @@
 use leptos::prelude::*;
 use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, Title, provide_meta_context};
 use leptos_router::{
+    ParamSegment, StaticSegment,
     components::{A, Route, Router, Routes},
-    hooks::use_query_map,
+    hooks::{use_params_map, use_query_map},
     path,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use uuid::Uuid;
 
 use crate::{
     bootstrap::{
@@ -15,6 +17,10 @@ use crate::{
         load_admin_work_queue, load_bootstrap,
     },
     forms::{LoginError, PasswordChangeResult},
+    public_pages::{
+        AtUsernameSegment, UiMediaKind, UiProfilePage, UiProfileTab, UiStatus, UiStatusThread,
+        UiStatusVisibility, load_profile_page, load_profile_statuses, load_status_thread,
+    },
     ui::{
         AccountMenu, AdminActionModal, AdminLayout, AdminPanel, AdminSection, FormField, Hero,
         Notice, NoticeKind, Page, PageCard, PageCardKind, PageCardTitle, PageTitle, SiteFooter,
@@ -89,8 +95,587 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("admin/federation") view=AdminFederationPage/>
                 <Route path=path!("admin/moderation") view=AdminModerationPage/>
                 <Route path=path!("admin/audit-log") view=AdminAuditLogPage/>
+                <Route path=AtUsernameSegment("username") view=PublicProfilePostsPage/>
+                <Route
+                    path=(AtUsernameSegment("username"), StaticSegment("with_replies"))
+                    view=PublicProfileRepliesPage
+                />
+                <Route
+                    path=(AtUsernameSegment("username"), StaticSegment("media"))
+                    view=PublicProfileMediaPage
+                />
+                <Route
+                    path=(
+                        AtUsernameSegment("username"),
+                        StaticSegment("tagged"),
+                        ParamSegment("hashtag"),
+                    )
+                    view=PublicProfileTaggedPage
+                />
+                <Route
+                    path=(AtUsernameSegment("username"), ParamSegment("status_id"))
+                    view=PublicStatusPage
+                />
             </Routes>
         </Router>
+    }
+}
+
+#[component]
+fn PublicProfilePostsPage() -> impl IntoView {
+    view! { <PublicProfilePage tab=UiProfileTab::Posts/> }
+}
+
+#[component]
+fn PublicProfileRepliesPage() -> impl IntoView {
+    view! { <PublicProfilePage tab=UiProfileTab::WithReplies/> }
+}
+
+#[component]
+fn PublicProfileMediaPage() -> impl IntoView {
+    view! { <PublicProfilePage tab=UiProfileTab::Media/> }
+}
+
+#[component]
+fn PublicProfileTaggedPage() -> impl IntoView {
+    view! { <PublicProfilePage tab=UiProfileTab::Tagged/> }
+}
+
+#[component]
+fn PublicProfilePage(tab: UiProfileTab) -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let params = use_params_map().get();
+    let username = params.get("username").unwrap_or_default();
+    let hashtag = matches!(tab, UiProfileTab::Tagged)
+        .then(|| params.get("hashtag"))
+        .flatten();
+    let max_id = use_query_map().get().get("max_id");
+    let profile = Resource::new_blocking(
+        move || {
+            (
+                username.clone(),
+                hashtag.clone(),
+                max_id.clone(),
+                tab.clone(),
+            )
+        },
+        |(username, hashtag, max_id, tab)| load_profile_page(username, tab, hashtag, max_id),
+    );
+
+    view! {
+        <PageFrame bootstrap login_next="/">
+            <Transition fallback=|| public_page_loading("Loading profile…")>
+                {Suspend::new(async move {
+                    match profile.await {
+                        Ok(page) => public_profile_content(page),
+                        Err(_) => public_page_not_found("Profile not found"),
+                    }
+                })}
+            </Transition>
+        </PageFrame>
+    }
+}
+
+#[component]
+fn PublicStatusPage() -> impl IntoView {
+    let bootstrap = expect_context::<BootstrapResource>();
+    let params = use_params_map().get();
+    let username = params.get("username").unwrap_or_default();
+    let status_id = params.get("status_id").unwrap_or_default();
+    let thread = Resource::new_blocking(
+        move || (username.clone(), status_id.clone()),
+        |(username, status_id)| load_status_thread(username, status_id),
+    );
+
+    view! {
+        <PageFrame bootstrap login_next="/">
+            <Transition fallback=|| public_page_loading("Loading conversation…")>
+                {Suspend::new(async move {
+                    match thread.await {
+                        Ok(thread) => public_thread_content(thread),
+                        Err(_) => public_page_not_found("Status not found"),
+                    }
+                })}
+            </Transition>
+        </PageFrame>
+    }
+}
+
+fn public_page_loading(message: &'static str) -> AnyView {
+    view! {
+        <div class="mx-auto grid max-w-3xl gap-4 py-12" aria-live="polite">
+            <span class="loading loading-spinner" aria-hidden="true"></span>
+            <span>{message}</span>
+        </div>
+    }
+    .into_any()
+}
+
+fn public_page_not_found(title: &'static str) -> AnyView {
+    view! {
+        <section class="card border-base-300 bg-base-100 mx-auto my-12 max-w-3xl border shadow">
+            <div class="card-body">
+                <Title text=format!("{title} · Roosty")/>
+                <h1 class="card-title text-2xl">{title}</h1>
+                <p>"This resource does not exist or is not visible to you."</p>
+            </div>
+        </section>
+    }
+    .into_any()
+}
+
+fn public_profile_content(page: UiProfilePage) -> AnyView {
+    let username = page.account.username.clone();
+    let hashtag = page.hashtag.clone();
+    let tab = page.tab.clone();
+    let initial_next = page.timeline.next_cursor;
+    let statuses = RwSignal::new(page.timeline.statuses.clone());
+    let next_cursor = RwSignal::new(initial_next);
+    let load_more = Action::new(move |cursor: &Uuid| {
+        let cursor = *cursor;
+        let username = username.clone();
+        let hashtag = hashtag.clone();
+        let tab = tab.clone();
+        async move {
+            (
+                cursor,
+                load_profile_statuses(username, tab, hashtag, cursor.to_string()).await,
+            )
+        }
+    });
+    let load_error = RwSignal::new(false);
+    Effect::new(move |_| {
+        load_more.value().with(|value| {
+            let Some((cursor, result)) = value else {
+                return;
+            };
+            match result {
+                Ok(page) => {
+                    statuses.update(|current| append_unique_statuses(current, &page.statuses));
+                    next_cursor.set(page.next_cursor);
+                    load_error.set(false);
+                    replace_cursor_query(*cursor);
+                }
+                Err(_) => load_error.set(true),
+            }
+        });
+    });
+
+    let account = page.account.clone();
+    let profile_path = format!("/@{}", account.username);
+    let selected = page.tab.clone();
+    let posts_class = if matches!(selected, UiProfileTab::Posts) {
+        "tab tab-active"
+    } else {
+        "tab"
+    };
+    let replies_class = if matches!(selected, UiProfileTab::WithReplies) {
+        "tab tab-active"
+    } else {
+        "tab"
+    };
+    let media_class = if matches!(selected, UiProfileTab::Media) {
+        "tab tab-active"
+    } else {
+        "tab"
+    };
+    view! {
+        <PublicProfileMetadata page=page.clone()/>
+        <main class="mx-auto grid w-full max-w-3xl gap-6 py-8">
+            <section class="card border-base-300 bg-base-100 overflow-hidden border shadow h-card">
+                {account.header_url.clone().map(|url| view! {
+                    <img class="h-48 w-full object-cover" src=url alt=""/>
+                })}
+                <div class="card-body">
+                    <div class="flex items-end gap-4">
+                        {account.avatar_url.clone().map(|url| view! {
+                            <img
+                                class="h-24 w-24 rounded-full border-4 border-base-100 object-cover u-photo"
+                                src=url
+                                alt=format!("{}’s avatar", account.display_name)
+                            />
+                        })}
+                        <div>
+                            <h1 class="card-title text-3xl p-name">{account.display_name.clone()}</h1>
+                            <a class="link link-hover u-url" href=profile_path.clone()>
+                                "@" {account.username.clone()}
+                            </a>
+                        </div>
+                    </div>
+                    <p class="whitespace-pre-wrap p-note">{account.bio.clone()}</p>
+                    {(!account.fields.is_empty()).then(|| view! {
+                        <dl class="grid gap-2 sm:grid-cols-2">
+                            {account.fields.clone().into_iter().map(|field| view! {
+                                <div class="rounded-box bg-base-200 p-3">
+                                    <dt class="font-semibold">{field.name}</dt>
+                                    <dd class="break-words">{field.value}</dd>
+                                </div>
+                            }).collect_view()}
+                        </dl>
+                    })}
+                    <dl class="stats stats-vertical bg-base-200 sm:stats-horizontal">
+                        <div class="stat"><dt class="stat-title">"Posts"</dt><dd class="stat-value text-2xl">{account.statuses_count}</dd></div>
+                        <div class="stat"><dt class="stat-title">"Following"</dt><dd class="stat-value text-2xl">{account.following_count}</dd></div>
+                        <div class="stat"><dt class="stat-title">"Followers"</dt><dd class="stat-value text-2xl">{account.followers_count}</dd></div>
+                    </dl>
+                    <p class="text-base-content/70">
+                        "Joined " <time datetime=account.created_at.clone()>{account.created_at.clone()}</time>
+                    </p>
+                    {(!page.featured_tags.is_empty()).then(|| view! {
+                        <nav aria-label="Featured hashtags" class="flex flex-wrap gap-2">
+                            {page.featured_tags.clone().into_iter().map(|tag| view! {
+                                <a
+                                    class="badge badge-outline"
+                                    href=format!("/@{}/tagged/{}", account.username, tag.name)
+                                >
+                                    "#" {tag.name.clone()} " · " {tag.statuses_count}
+                                </a>
+                            }).collect_view()}
+                        </nav>
+                    })}
+                </div>
+            </section>
+
+            <nav class="tabs tabs-box" aria-label="Profile timelines">
+                <a class=posts_class href=profile_path.clone()>"Posts"</a>
+                <a class=replies_class href=format!("{profile_path}/with_replies")>"Posts and replies"</a>
+                <a class=media_class href=format!("{profile_path}/media")>"Media"</a>
+            </nav>
+
+            {(!page.pinned_statuses.is_empty() && matches!(page.tab, UiProfileTab::Posts)).then(|| view! {
+                <section class="grid gap-4" aria-labelledby="pinned-heading">
+                    <h2 id="pinned-heading" class="text-xl font-semibold">"Pinned posts"</h2>
+                    {page.pinned_statuses.clone().into_iter().map(public_status_card).collect_view()}
+                </section>
+            })}
+
+            <section class="grid gap-4" aria-label="Profile posts">
+                <Show when=move || statuses.with(Vec::is_empty)>
+                    <div class="card border-base-300 bg-base-100 border"><div class="card-body">"No posts to show."</div></div>
+                </Show>
+                <For
+                    each=move || statuses.get()
+                    key=|status| status.id
+                    children=public_status_card
+                />
+            </section>
+            <Show when=move || load_error.get()>
+                <div class="alert alert-error" role="alert">
+                    "Could not load more posts. You can retry."
+                </div>
+            </Show>
+            <Show when=move || next_cursor.get().is_some()>
+                <button
+                    class="btn btn-outline"
+                    type="button"
+                    disabled=move || load_more.pending().get()
+                    on:click=move |_| {
+                        if let Some(cursor) = next_cursor.get_untracked() {
+                            load_error.set(false);
+                            load_more.dispatch(cursor);
+                        }
+                    }
+                >
+                    {move || if load_more.pending().get() { "Loading…" } else { "Load more" }}
+                </button>
+            </Show>
+        </main>
+    }
+    .into_any()
+}
+
+fn append_unique_statuses(current: &mut Vec<UiStatus>, incoming: &[UiStatus]) {
+    let existing = current
+        .iter()
+        .map(|status| status.id)
+        .collect::<std::collections::HashSet<_>>();
+    current.extend(
+        incoming
+            .iter()
+            .filter(|status| !existing.contains(&status.id))
+            .cloned(),
+    );
+}
+
+#[cfg(feature = "hydrate")]
+fn replace_cursor_query(cursor: Uuid) {
+    let location = window().location();
+    let path = location.pathname().unwrap_or_default();
+    let url = format!("{path}?max_id={cursor}");
+    let _ = window().history().and_then(|history| {
+        history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url))
+    });
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn replace_cursor_query(_cursor: Uuid) {}
+
+fn public_thread_content(thread: UiStatusThread) -> AnyView {
+    view! {
+        <PublicStatusMetadata thread=thread.clone()/>
+        <main class="mx-auto grid w-full max-w-3xl gap-4 py-8">
+            <nav aria-label="Profile">
+                <a class="btn btn-ghost" href=format!("/@{}", thread.account.username)>
+                    "← " {thread.account.display_name.clone()}
+                </a>
+            </nav>
+            {thread.ancestors.into_iter().map(public_status_card).collect_view()}
+            <div class="ring-primary rounded-box ring-2">
+                {public_status_card(thread.status)}
+            </div>
+            {thread.descendants.into_iter().map(public_status_card).collect_view()}
+        </main>
+    }
+    .into_any()
+}
+
+fn public_status_card(status: UiStatus) -> AnyView {
+    let content = status.content_html.clone();
+    let media = status.media.clone();
+    let sensitive = status.sensitive;
+    let spoiler = status.spoiler_text.clone();
+    let body = view! {
+        <div class="grid gap-4">
+            <div class="prose max-w-none e-content" inner_html=content></div>
+            {(!media.is_empty()).then(|| public_status_media(media))}
+            {status.poll.clone().map(|poll| view! {
+                <section class="grid gap-2" aria-label="Poll">
+                    {poll.options.into_iter().map(|option| view! {
+                        <div class="rounded-box bg-base-200 flex justify-between p-3">
+                            <span>{option.title}</span>
+                            {option.votes_count.map(|count| view! { <span>{count} " votes"</span> })}
+                        </div>
+                    }).collect_view()}
+                    <small>{if poll.expired { "Poll closed" } else { "Poll open (read-only)" }}</small>
+                </section>
+            })}
+            {status.card.clone().map(|card| view! {
+                <a class="card card-side border-base-300 overflow-hidden border" href=card.url rel="nofollow noopener noreferrer">
+                    {card.image_url.map(|url| view! { <img class="w-32 object-cover" src=url alt=""/> })}
+                    <div class="card-body p-4">
+                        <strong>{card.title}</strong>
+                        <span>{card.description}</span>
+                        <small>{card.provider_name}</small>
+                    </div>
+                </a>
+            })}
+            {status.quote.clone().map(|quote| view! {
+                <blockquote class="border-base-300 border-l-4 pl-4">
+                    {public_status_card(*quote)}
+                </blockquote>
+            })}
+        </div>
+    };
+    let status_body = if sensitive || !spoiler.is_empty() {
+        view! {
+            <details class="collapse collapse-arrow bg-base-200">
+                <summary class="collapse-title font-semibold">
+                    {if spoiler.is_empty() { "Sensitive content".to_owned() } else { spoiler }}
+                </summary>
+                <div class="collapse-content">{body}</div>
+            </details>
+        }
+        .into_any()
+    } else {
+        body.into_any()
+    };
+    let visibility = match status.visibility {
+        UiStatusVisibility::Public => "Public",
+        UiStatusVisibility::Unlisted => "Unlisted",
+        UiStatusVisibility::Private => "Followers only",
+        UiStatusVisibility::Direct => "Direct",
+    };
+    view! {
+        <article class="card border-base-300 bg-base-100 border shadow-sm h-entry">
+            <div class="card-body gap-4">
+                <header class="flex items-center gap-3 h-card p-author">
+                    {status.author.avatar_url.clone().map(|url| view! {
+                        <img class="h-12 w-12 rounded-full object-cover u-photo" src=url alt=""/>
+                    })}
+                    <div class="min-w-0">
+                        <a class="font-semibold link link-hover p-name u-url" href=status.author.url.clone()>
+                            {status.author.display_name}
+                        </a>
+                        <div class="text-base-content/70 truncate">{status.author.handle}</div>
+                    </div>
+                    {status.pinned.then(|| view! { <span class="badge badge-primary ml-auto">"Pinned"</span> })}
+                </header>
+                {status_body}
+                <footer class="text-base-content/70 flex flex-wrap gap-3 text-sm">
+                    <a class="u-url" href=status.url>
+                        <time class="dt-published" datetime=status.created_at.clone()>{status.created_at.clone()}</time>
+                    </a>
+                    <span>{visibility}</span>
+                    <span>{status.replies_count} " replies"</span>
+                    <span>{status.reblogs_count} " boosts"</span>
+                    <span>{status.favourites_count} " favourites"</span>
+                </footer>
+            </div>
+        </article>
+    }
+    .into_any()
+}
+
+fn public_status_media(media: Vec<crate::public_pages::UiMedia>) -> AnyView {
+    view! {
+        <div class="grid gap-2 sm:grid-cols-2">
+            {media.into_iter().map(|item| {
+                let description = item.description.unwrap_or_default();
+                let url = item.url;
+                let preview_url = item.preview_url.unwrap_or_else(|| url.clone());
+                match item.kind {
+                    UiMediaKind::Image | UiMediaKind::Unknown => view! {
+                        <a href=url>
+                            <img class="rounded-box max-h-96 w-full object-cover" src=preview_url alt=description/>
+                        </a>
+                    }.into_any(),
+                    UiMediaKind::Video => view! {
+                        <video class="rounded-box w-full" controls preload="metadata">
+                            <source src=url/>
+                            {description}
+                        </video>
+                    }.into_any(),
+                    UiMediaKind::Audio => view! {
+                        <div>
+                            <audio class="w-full" controls preload="metadata" src=url></audio>
+                            <p>{description}</p>
+                        </div>
+                    }.into_any(),
+                }
+            }).collect_view()}
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn PublicProfileMetadata(page: UiProfilePage) -> impl IntoView {
+    let title = format!("{} (@{})", page.account.display_name, page.account.username);
+    let description = if page.account.bio.trim().is_empty() {
+        format!("Posts by @{}", page.account.username)
+    } else {
+        page.account.bio.clone()
+    };
+    let image = page.account.avatar_url.clone();
+    view! {
+        <Title text=title.clone()/>
+        <Meta name="description" content=description.clone()/>
+        <Meta name="robots" content=if page.noindex { "noindex, nofollow" } else { "index, follow" }/>
+        <Meta property="og:type" content="profile"/>
+        <Meta property="og:title" content=title/>
+        <Meta property="og:description" content=description/>
+        <Meta property="og:url" content=page.canonical_url.clone()/>
+        {image.map(|image| view! { <Meta property="og:image" content=image/> })}
+        <Meta name="fediverse:creator" content=format!("@{}", page.account.username)/>
+        <Link rel="canonical" href=page.canonical_url/>
+        <Link rel="alternate" type_="application/activity+json" href=page.activitypub_url/>
+    }
+}
+
+#[component]
+fn PublicStatusMetadata(thread: UiStatusThread) -> impl IntoView {
+    let sensitive = thread.status.sensitive;
+    let description = if sensitive {
+        thread.status.spoiler_text.clone()
+    } else {
+        strip_html(&thread.status.content_html)
+    };
+    let title = format!(
+        "{} (@{}) on Roosty",
+        thread.account.display_name, thread.account.username
+    );
+    let image = (!sensitive)
+        .then(|| thread.status.media.first())
+        .flatten()
+        .map(|media| {
+            media
+                .preview_url
+                .clone()
+                .unwrap_or_else(|| media.url.clone())
+        });
+    view! {
+        <Title text=title.clone()/>
+        <Meta name="description" content=description.clone()/>
+        <Meta name="robots" content=if thread.noindex { "noindex, nofollow" } else { "index, follow" }/>
+        <Meta property="og:type" content="article"/>
+        <Meta property="og:title" content=title/>
+        <Meta property="og:description" content=description/>
+        <Meta property="og:url" content=thread.canonical_url.clone()/>
+        {image.map(|image| view! { <Meta property="og:image" content=image/> })}
+        <Meta name="fediverse:creator" content=format!("@{}", thread.account.username)/>
+        <Link rel="canonical" href=thread.canonical_url/>
+        <Link rel="alternate" type_="application/activity+json" href=thread.activitypub_url/>
+    }
+}
+
+fn strip_html(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for character in html.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(character),
+            _ => {}
+        }
+    }
+    text.trim().chars().take(300).collect()
+}
+
+#[cfg(test)]
+mod public_page_tests {
+    use uuid::Uuid;
+
+    use super::{append_unique_statuses, strip_html};
+    use crate::public_pages::{UiStatus, UiStatusAuthor, UiStatusVisibility};
+
+    fn status(id: Uuid) -> UiStatus {
+        UiStatus {
+            id,
+            author: UiStatusAuthor {
+                display_name: "Alice".to_owned(),
+                handle: "@alice".to_owned(),
+                url: "/@alice".to_owned(),
+                avatar_url: None,
+                local: true,
+            },
+            url: format!("/@alice/{id}"),
+            activitypub_url: format!("/users/alice/statuses/{id}"),
+            content_html: "<p>Hello</p>".to_owned(),
+            spoiler_text: String::new(),
+            sensitive: false,
+            visibility: UiStatusVisibility::Public,
+            created_at: "2026-07-29T00:00:00Z".to_owned(),
+            edited_at: None,
+            media: Vec::new(),
+            poll: None,
+            card: None,
+            quote: None,
+            replies_count: 0,
+            reblogs_count: 0,
+            favourites_count: 0,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn load_more_append_deduplicates_status_ids() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let mut current = vec![status(first)];
+        append_unique_statuses(&mut current, &[status(first), status(second)]);
+        assert_eq!(
+            current.iter().map(|status| status.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn metadata_description_removes_markup() {
+        assert_eq!(
+            strip_html("<p>Hello <strong>world</strong></p>"),
+            "Hello world"
+        );
     }
 }
 

@@ -24,6 +24,7 @@ roosty-web-ui = { path = "crates/web-ui" }
 roosty-web-push = { path = "crates/web-push" }
 
 aes-gcm = "0.11.0"
+ammonia = "4.1.4"
 argon2 = "0.5.3"
 axum = { version = "0.8.4", features = ["macros", "ws"] }
 axum-params = "0.4.1"
