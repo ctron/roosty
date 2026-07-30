@@ -1,5 +1,4 @@
 target/
-.git/
 .gitignore
 .dockerignore
 README.md
