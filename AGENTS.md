@@ -38,7 +38,7 @@ Keep this as the default verification command for changes in this repository.
 - Prefer strongly typed Rust structs with Serde derives over manual JSON processing. Avoid using `serde_json::Value`
   unless the JSON shape is genuinely dynamic or unknown.
 - Prefer importing types over repeatedly using fully qualified type paths, except where importing would make the code
-  ambiguous or less clear.
+  ambiguous or less clear. In case of a name clash, using a type prefix (e.g. `uuid::Error`) is acceptable.
 - Avoid unnecessary cloning; prefer borrowing, moving, or restructuring ownership when it keeps the code clear.
 - Prefer file-backed Rust modules over nested inline modules. Use nested inline modules only when they are very small
   and local to their parent.
