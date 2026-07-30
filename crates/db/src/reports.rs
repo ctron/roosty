@@ -1,8 +1,7 @@
 //! Durable instance rules and Mastodon-compatible moderation reports.
 
-use crate::{
-    DbConnection,
-    entity::{instance_rule, moderation_report, moderation_report_rule, moderation_report_status},
+use crate::entity::{
+    instance_rule, moderation_report, moderation_report_rule, moderation_report_status,
 };
 use roosty_core::{AccountId, Result, RoostyError, StatusId};
 use sea_orm::{
@@ -296,7 +295,7 @@ pub async fn find_moderation_report(
 
 /// Return administrator reports newest-first with Mastodon-compatible cursor filters.
 pub async fn list_moderation_reports(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     options: ReportListOptions,
 ) -> Result<Vec<ModerationReport>> {
     let mut query = moderation_report::Entity::find()

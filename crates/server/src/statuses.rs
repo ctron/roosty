@@ -1,26 +1,37 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet, VecDeque},
+};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::to_bytes,
-    extract::{Path, Query, RawQuery, State},
+    extract::{Path, Query, RawQuery, Request, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use linkify::{LinkFinder, LinkKind};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    ExistingStatusCreation, LocalAccount, LocalNotificationType, NewScheduledStatus, NewStatusPoll,
-    PollStatus, PreviewCard, QuoteApprovalPolicy, RemoteConversationParticipant, RemoteStatus,
-    ReportStatus, ScheduleStatusResult, ScheduledStatus, StatusContextItem, StatusContextParent,
-    StatusCreationReservation, StatusReference, StatusVisibility,
+    CollectionCursor, CollectionPage, ExistingStatusCreation, FavouriteStatus, HomeTimelineItem,
+    LocalAccount, LocalNotificationType, LocalRemoteStatusReblog, LocalStatus, LocalStatusEdit,
+    LocalStatusMediaAttributeUpdate, LocalStatusMetadata, LocalStatusReblog, LocalStatusUpdate,
+    LocalStatusUpdateResult, LocalTag, LocalTagHistory, NewLocalStatus, NewScheduledStatus,
+    NewStatusPoll, PinStatusResult, PollStatus, PreviewCard, PublicTimelineItem,
+    PublicTimelineOptions, PublicTimelineOrigin, QuoteApprovalPolicy, QuoteState, RemoteActor,
+    RemoteConversationParticipant, RemoteFollowState, RemoteStatus, RemoteStatusEdit,
+    RemoteStatusReblog, RemoteStatusReblogTarget, ReportStatus, ScheduleStatusResult,
+    ScheduledStatus, StatusContextItem, StatusContextParent, StatusCreationReservation,
+    StatusInteractionAccount, StatusInteractionTarget, StatusReference, StatusVisibility,
+    TagTimelineOptions, TimelineCursor, TimelinePage, TrendingStatus,
 };
-use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Error as JsonError, Value};
 use time::OffsetDateTime;
 use tracing::warn;
+use url::Url;
 use uuid::Uuid;
 
 use crate::{
@@ -37,7 +48,7 @@ use crate::{
         prepare_remote_favourite, prepare_remote_reblog, prepare_remote_unfavourite,
         prepare_remote_unreblog, resolve_remote_mentions,
     },
-    http::AppState,
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
     media::{
         MediaAttachmentResponse, media_response, remote_media_attachment_response,
         status_edit_media_response,
@@ -45,6 +56,8 @@ use crate::{
     notifications::{create_and_stream_notification, publish_committed_notification},
     polls::{PollResponse, poll_response},
 };
+
+pub(crate) use crate::http::TransactionContext as StatusRenderContext;
 
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 40;
@@ -77,7 +90,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/statuses/{status_id}/history", get(status_history))
         .route(
             "/api/v1/statuses/{status_id}/interaction_policy",
-            axum::routing::put(update_interaction_policy),
+            put(update_interaction_policy),
         )
         .route("/api/v1/statuses/{status_id}/quotes", get(status_quotes))
         .route(
@@ -130,9 +143,9 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StatusInputError {
     #[error("invalid JSON: {0}")]
-    Json(serde_json::Error),
+    Json(JsonError),
     #[error("invalid form body: {0}")]
-    Form(String),
+    Form(Cow<'static, str>),
     #[error("status must not be empty")]
     Empty,
     #[error("status is too long")]
@@ -166,7 +179,7 @@ struct TagPath {
 #[derive(Clone, Copy, Debug)]
 struct TimelineQuery {
     limit: u64,
-    cursor: roosty_db::TimelineCursor,
+    cursor: TimelineCursor,
 }
 
 #[derive(Deserialize)]
@@ -340,11 +353,11 @@ impl From<Option<PreviewCard>> for PreviewCardSource {
 impl PreviewCardSource {
     async fn load(
         self,
-        state: &AppState,
+        state: &StatusRenderContext<'_, impl ConnectionTrait>,
         status: StatusReference,
     ) -> Result<Option<Box<PreviewCard>>, RoostyError> {
         match self {
-            Self::Load => Ok(roosty_db::preview_card_for_status(&state.db, status)
+            Self::Load => Ok(roosty_db::preview_card_for_status(state.db, status)
                 .await?
                 .map(Box::new)),
             Self::Preloaded(card) => Ok(card),
@@ -379,14 +392,14 @@ enum QuoteResponseState {
     MutedAccount,
 }
 
-impl From<roosty_db::QuoteState> for QuoteResponseState {
-    fn from(value: roosty_db::QuoteState) -> Self {
+impl From<QuoteState> for QuoteResponseState {
+    fn from(value: QuoteState) -> Self {
         match value {
-            roosty_db::QuoteState::Pending => Self::Pending,
-            roosty_db::QuoteState::Accepted => Self::Accepted,
-            roosty_db::QuoteState::Rejected => Self::Rejected,
-            roosty_db::QuoteState::Revoked => Self::Revoked,
-            roosty_db::QuoteState::Deleted => Self::Deleted,
+            QuoteState::Pending => Self::Pending,
+            QuoteState::Accepted => Self::Accepted,
+            QuoteState::Rejected => Self::Rejected,
+            QuoteState::Revoked => Self::Revoked,
+            QuoteState::Deleted => Self::Deleted,
         }
     }
 }
@@ -479,8 +492,8 @@ impl TagResponse {
     /// Build the public tag response for a local tag and computed usage history.
     pub(crate) fn new(
         state: &AppState,
-        tag: roosty_db::LocalTag,
-        history: Vec<roosty_db::LocalTagHistory>,
+        tag: LocalTag,
+        history: Vec<LocalTagHistory>,
         following: Option<bool>,
     ) -> Self {
         Self {
@@ -516,7 +529,7 @@ struct MentionResponse {
 
 impl MentionResponse {
     /// Build the Mastodon mention shape for a local account referenced by a reply.
-    fn new(state: &AppState, account: &LocalAccount) -> Self {
+    fn new(state: &StatusRenderContext<'_, impl ConnectionTrait>, account: &LocalAccount) -> Self {
         Self {
             id: account.id.0.to_string(),
             username: account.username.clone(),
@@ -526,7 +539,7 @@ impl MentionResponse {
     }
 
     /// Build the Mastodon mention shape for a cached remote actor.
-    fn remote(actor: &roosty_db::RemoteActor) -> Self {
+    fn remote(actor: &RemoteActor) -> Self {
         Self {
             id: actor.id.0.to_string(),
             username: actor.username.clone(),
@@ -564,16 +577,16 @@ struct ReplyTarget {
 }
 
 struct ResolvedQuoteTarget {
-    target: roosty_db::StatusReference,
+    target: StatusReference,
     activitypub_id: String,
-    state: roosty_db::QuoteState,
+    state: QuoteState,
     local_author_id: Option<AccountId>,
     authorization_id: Option<String>,
     quote_request_id: Option<String>,
 }
 
 async fn resolve_quote_target(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     quoting_account: &LocalAccount,
     raw_id: &str,
     requested_visibility: StatusVisibility,
@@ -582,11 +595,11 @@ async fn resolve_quote_target(
     let target_id = Uuid::parse_str(raw_id)
         .map(StatusId)
         .map_err(|_| RoostyError::InvalidInput("quoted status does not exist".to_owned()))?;
-    if let Some(target) = roosty_db::find_local_status_by_id(&state.db, target_id).await? {
-        if !status_visible_to_viewer(state, &target, Some(quoting_account.id)).await?
+    if let Some(target) = roosty_db::find_local_status_by_id(state.db, target_id).await? {
+        if !status_visible_to_viewer(state.db, &target, Some(quoting_account.id)).await?
             || target.visibility == StatusVisibility::Direct
             || roosty_db::local_accounts_are_blocked(
-                &state.db,
+                state.db,
                 quoting_account.id,
                 target.account_id,
             )
@@ -596,7 +609,7 @@ async fn resolve_quote_target(
                 "quoted status does not exist or quoting is denied".to_owned(),
             ));
         }
-        let author = roosty_db::find_local_account_by_id(&state.db, target.account_id)
+        let author = roosty_db::find_local_account_by_id(state.db, target.account_id)
             .await?
             .ok_or_else(|| {
                 RoostyError::InvalidInput("quoted status author does not exist".to_owned())
@@ -607,7 +620,7 @@ async fn resolve_quote_target(
             match target.quote_approval_policy {
                 QuoteApprovalPolicy::Public => true,
                 QuoteApprovalPolicy::Followers => roosty_db::local_follow_relationship(
-                    &state.db,
+                    state.db,
                     quoting_account.id,
                     target.account_id,
                 )
@@ -648,9 +661,9 @@ async fn resolve_quote_target(
             .then(|| public_url(state, &format!("quote-authorizations/{}", Uuid::now_v7())));
         return Ok((
             ResolvedQuoteTarget {
-                target: roosty_db::StatusReference::Local(target.id),
+                target: StatusReference::Local(target.id),
                 activitypub_id,
-                state: roosty_db::QuoteState::Accepted,
+                state: QuoteState::Accepted,
                 local_author_id: Some(target.account_id),
                 authorization_id,
                 quote_request_id: None,
@@ -658,15 +671,15 @@ async fn resolve_quote_target(
             effective_visibility,
         ));
     }
-    let Some(target) = roosty_db::find_remote_status_by_id(&state.db, target_id).await? else {
+    let Some(target) = roosty_db::find_remote_status_by_id(state.db, target_id).await? else {
         return Err(RoostyError::InvalidInput(
             "quoted status does not exist".to_owned(),
         ));
     };
-    if !roosty_db::remote_status_visible_to_account(&state.db, &target, quoting_account.id).await?
+    if !roosty_db::remote_status_visible_to_account(state.db, &target, quoting_account.id).await?
         || target.visibility == StatusVisibility::Direct
         || roosty_db::local_remote_accounts_are_blocked(
-            &state.db,
+            state.db,
             quoting_account.id,
             target.remote_actor_id,
         )
@@ -676,7 +689,7 @@ async fn resolve_quote_target(
             "quoted status does not exist or quoting is denied".to_owned(),
         ));
     }
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, target.remote_actor_id)
+    let actor = roosty_db::find_remote_actor_by_id(state.db, target.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("quoted status author does not exist".to_owned())
@@ -691,9 +704,9 @@ async fn resolve_quote_target(
     }
     const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
     let follows =
-        roosty_db::find_remote_following(&state.db, quoting_account.id, target.remote_actor_id)
+        roosty_db::find_remote_following(state.db, quoting_account.id, target.remote_actor_id)
             .await?
-            .is_some_and(|follow| follow.state == roosty_db::RemoteFollowState::Accepted);
+            .is_some_and(|follow| follow.state == RemoteFollowState::Accepted);
     let audience_matches = |values: &[String]| {
         values.iter().any(|value| {
             value == PUBLIC
@@ -707,7 +720,7 @@ async fn resolve_quote_target(
         || audience_matches(&target.quote_manual_policy)
         || !target.quote_manual_policy.is_empty()
     {
-        roosty_db::QuoteState::Pending
+        QuoteState::Pending
     } else {
         return Err(RoostyError::InvalidInput(
             "quoted status does not allow this quote".to_owned(),
@@ -724,7 +737,7 @@ async fn resolve_quote_target(
     };
     Ok((
         ResolvedQuoteTarget {
-            target: roosty_db::StatusReference::Remote(target.id),
+            target: StatusReference::Remote(target.id),
             activitypub_id: target.activitypub_id,
             state: quote_state,
             local_author_id: None,
@@ -740,11 +753,14 @@ async fn resolve_quote_target(
 
 async fn create_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
-    request: axum::extract::Request,
-) -> Response {
+    request: Request,
+) -> ApiResult<Response> {
     if !has_status_scope(&token.grant.scopes, StatusPermission::Write) {
-        return forbidden("This action is outside the authorized scopes");
+        return Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ));
     }
     let account = token.grant.account;
     let idempotency_key = request
@@ -752,30 +768,31 @@ async fn create_status(
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let input = match parse_status_input(request).await {
-        Ok(input) => input,
-        Err(error) => return bad_request(&error.to_string()),
-    };
+    let input = parse_status_input(request).await?;
     let reservation = match idempotency_key.as_deref() {
         Some(key) if key.is_empty() || key.len() > 1024 => {
-            return bad_request("Idempotency-Key must contain between 1 and 1024 bytes");
+            return Err(ApiError::BadRequest(
+                "Idempotency-Key must contain between 1 and 1024 bytes".into(),
+            ));
         }
-        Some(key) => match roosty_db::begin_status_creation(&state.db, account.id, key).await {
-            Ok(reservation) => Some(reservation),
-            Err(error) => return server_error(error),
-        },
+        Some(key) => Some(database.begin_status_creation(account.id, key).await?),
         None => None,
     };
     if let Some(StatusCreationReservation::Existing(existing)) = reservation {
-        return existing_status_creation_response(&state, &account, existing).await;
+        let txn = database.begin_snapshot().await?;
+        let context = StatusRenderContext::new(&state, &txn);
+        let response = existing_status_creation_response(&context, &account, existing).await?;
+        txn.commit().await?;
+        return Ok(response);
     }
     let result_id = Uuid::now_v7();
     let is_scheduled = input.scheduled_at.is_some();
     let response = if is_scheduled {
-        create_scheduled_status(&state, &account, input, Some(result_id)).await
+        create_scheduled_status(&state, &database, &account, input, Some(result_id)).await
     } else {
         create_status_from_input(
             &state,
+            &database,
             account.clone(),
             input,
             None,
@@ -791,11 +808,9 @@ async fn create_status(
         } else {
             ExistingStatusCreation::Status(StatusId(result_id))
         };
-        if let Err(error) = guard.complete(result).await {
-            return server_error(error);
-        }
+        guard.complete(result).await?;
     }
-    response
+    Ok(response)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,40 +842,48 @@ fn has_status_scope(scopes: &str, permission: StatusPermission) -> bool {
 }
 
 async fn existing_status_creation_response(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     account: &LocalAccount,
     existing: ExistingStatusCreation,
-) -> Response {
+) -> ApiResult<Response> {
     match existing {
         ExistingStatusCreation::Status(id) => {
-            match roosty_db::find_local_status_by_id(&state.db, id).await {
-                Ok(Some(status)) if status.account_id == account.id => {
-                    match status_response(state, status, account.clone()).await {
-                        Ok(response) => Json(response).into_response(),
-                        Err(error) => server_error(error),
-                    }
-                }
-                Ok(_) => not_found(),
-                Err(error) => server_error(error),
-            }
+            let status = roosty_db::find_local_status_by_id(state.db, id)
+                .await?
+                .filter(|status| status.account_id == account.id)
+                .ok_or(ApiError::NotFound("status not found".into()))?;
+            Ok(Json(status_response(state, status, account.clone()).await?).into_response())
         }
         ExistingStatusCreation::ScheduledStatus(id) => {
-            match roosty_db::find_scheduled_status(&state.db, account.id, id).await {
-                Ok(Some(status)) => scheduled_status_response(state, status).await,
-                Ok(None) => not_found(),
-                Err(error) => server_error(error),
-            }
+            let status = roosty_db::find_scheduled_status(state.db, account.id, id)
+                .await?
+                .ok_or(ApiError::NotFound("status not found".into()))?;
+            Ok(scheduled_status_response(state, status).await)
         }
+    }
+}
+
+impl From<StatusInputError> for ApiError {
+    fn from(error: StatusInputError) -> Self {
+        Self::BadRequest(Cow::Owned(error.to_string()))
     }
 }
 
 async fn create_status_from_input(
     state: &AppState,
+    database: &DatabaseContext,
     account: LocalAccount,
     input: StatusInput,
     scheduled_status_id: Option<Uuid>,
     publication_status_id: Option<StatusId>,
 ) -> Response {
+    let app_state = state;
+    let txn = match database.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let context = StatusRenderContext::new(state, &txn);
+    let state = &context;
     let poll_input = input.poll.clone();
     let media_ids = match parse_media_ids(input.media_ids.as_deref().unwrap_or_default()) {
         Ok(media_ids) => media_ids,
@@ -921,16 +944,16 @@ async fn create_status_from_input(
     let mut in_reply_to_remote_status_id = None;
     let mut notifiable_reply = true;
     if let Some(parent_id) = in_reply_to_id {
-        match roosty_db::find_local_status_by_id(&state.db, parent_id).await {
+        match roosty_db::find_local_status_by_id(state.db, parent_id).await {
             Ok(Some(parent)) => {
                 notifiable_reply = parent.account_id == account.id;
-                match status_visible_to_viewer(state, &parent, Some(account.id)).await {
+                match status_visible_to_viewer(state.db, &parent, Some(account.id)).await {
                     Ok(true) => {}
                     Ok(false) => return bad_request("reply target status does not exist"),
                     Err(error) => return server_error(error),
                 }
             }
-            Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, parent_id).await {
+            Ok(None) => match roosty_db::find_remote_status_by_id(state.db, parent_id).await {
                 Ok(Some(parent)) => {
                     notifiable_reply = false;
                     let visible = if matches!(
@@ -939,7 +962,7 @@ async fn create_status_from_input(
                     ) {
                         Ok(true)
                     } else {
-                        roosty_db::remote_status_visible_to_account(&state.db, &parent, account.id)
+                        roosty_db::remote_status_visible_to_account(state.db, &parent, account.id)
                             .await
                     };
                     match visible {
@@ -958,7 +981,7 @@ async fn create_status_from_input(
         }
     }
 
-    let new_status = roosty_db::NewLocalStatus {
+    let new_status = NewLocalStatus {
         id: publication_status_id,
         account_id: account.id,
         content: input.status.unwrap_or_default().trim().to_owned(),
@@ -985,7 +1008,7 @@ async fn create_status_from_input(
                 | StatusVisibility::Private
                 | StatusVisibility::Direct
         ) {
-        resolve_remote_mentions(state, &new_status.content).await
+        resolve_remote_mentions(state, database, &new_status.content).await
     } else {
         Vec::new()
     };
@@ -998,15 +1021,11 @@ async fn create_status_from_input(
         Ok(accounts) => accounts,
         Err(error) => return server_error(error),
     };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
     match roosty_db::create_local_status_with_media(
         &txn,
         new_status,
         &media_ids,
-        roosty_db::LocalStatusMetadata {
+        LocalStatusMetadata {
             scheduled_status_id,
             tag_names,
             remote_actor_ids: remote_mention_ids,
@@ -1116,7 +1135,7 @@ async fn create_status_from_input(
                 {
                     return server_error(error);
                 }
-                if target.state == roosty_db::QuoteState::Accepted
+                if target.state == QuoteState::Accepted
                     && let Some(recipient) = target.local_author_id
                     && recipient != author_id
                 {
@@ -1138,11 +1157,19 @@ async fn create_status_from_input(
             {
                 return server_error(error);
             }
+            drop(context);
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
+            let read = match database.begin_snapshot().await {
+                Ok(read) => read,
+                Err(error) => return server_error(error.into()),
+            };
+            let context = StatusRenderContext::new(app_state, &read);
+            let state = &context;
             if let Some(conversation_id) = status.conversation_id
-                && let Err(error) = publish_conversation_update(state, conversation_id).await
+                && let Err(error) =
+                    publish_conversation_update(state, state.db, conversation_id).await
             {
                 warn!(%error, "failed to publish conversation update");
             }
@@ -1152,6 +1179,7 @@ async fn create_status_from_input(
                     for notification in notifications {
                         if let Err(error) = publish_committed_notification(
                             state,
+                            database,
                             notification.account_id,
                             notification,
                         )
@@ -1185,10 +1213,17 @@ async fn create_status_from_input(
 
 async fn create_scheduled_status(
     state: &AppState,
+    database: &DatabaseContext,
     account: &LocalAccount,
     input: StatusInput,
     id: Option<Uuid>,
 ) -> Response {
+    let txn = match database.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let context = StatusRenderContext::new(state, &txn);
+    let state = &context;
     let scheduled_at = match parse_scheduled_at(input.scheduled_at.as_deref()) {
         Ok(value) => value,
         Err(error) => return unprocessable(error),
@@ -1245,20 +1280,18 @@ async fn create_scheduled_status(
         Err(error) => return bad_request(&error.to_string()),
     };
     let (in_reply_to_id, in_reply_to_remote_status_id) = match reply_id {
-        Some(id) => match roosty_db::find_local_status_by_id(&state.db, id).await {
+        Some(id) => match roosty_db::find_local_status_by_id(state.db, id).await {
             Ok(Some(status)) => {
-                match status_visible_to_viewer(state, &status, Some(account.id)).await {
+                match status_visible_to_viewer(state.db, &status, Some(account.id)).await {
                     Ok(true) => (Some(id), None),
                     Ok(false) => return bad_request("reply target status does not exist"),
                     Err(error) => return server_error(error),
                 }
             }
-            Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, id).await {
+            Ok(None) => match roosty_db::find_remote_status_by_id(state.db, id).await {
                 Ok(Some(status)) => {
-                    match roosty_db::remote_status_visible_to_account(
-                        &state.db, &status, account.id,
-                    )
-                    .await
+                    match roosty_db::remote_status_visible_to_account(state.db, &status, account.id)
+                        .await
                     {
                         Ok(true) => (None, Some(id)),
                         Ok(false) => return bad_request("reply target status does not exist"),
@@ -1283,7 +1316,7 @@ async fn create_scheduled_status(
             .unwrap_or(account.default_quote_policy)
     };
     let result = roosty_db::create_scheduled_status(
-        &state.db,
+        state.db,
         NewScheduledStatus {
             id,
             account_id: account.id,
@@ -1304,7 +1337,8 @@ async fn create_scheduled_status(
         state.config.scheduled_statuses.daily_limit,
     )
     .await;
-    match result {
+    let should_commit = result.is_ok();
+    let response = match result {
         Ok((ScheduleStatusResult::Created, Some(status))) => {
             scheduled_status_response(state, status).await
         }
@@ -1319,117 +1353,136 @@ async fn create_scheduled_status(
         )),
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
+    };
+    drop(context);
+    if should_commit && let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    response
 }
 
 async fn list_scheduled_statuses(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Query(params): Query<CollectionParams>,
-) -> Response {
+) -> ApiResult<Response> {
     if !has_status_scope(&token.grant.scopes, StatusPermission::Read) {
-        return forbidden("This action is outside the authorized scopes");
+        return Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ));
     }
     let account = token.grant.account;
     let limit = timeline_limit(params.limit);
     let cursor = match collection_cursor(&params) {
-        Ok(cursor) => roosty_db::TimelineCursor {
+        Ok(cursor) => TimelineCursor {
             max_id: cursor.max_id.map(StatusId),
             since_id: cursor.since_id.map(StatusId),
             min_id: cursor.min_id.map(StatusId),
         },
-        Err(()) => return bad_request("invalid pagination cursor"),
+        Err(()) => return Err(ApiError::BadRequest("invalid pagination cursor".into())),
     };
-    match roosty_db::scheduled_statuses(&state.db, account.id, limit, cursor).await {
-        Ok(page) => {
-            let link = timeline_link_header(&page, limit, "/api/v1/scheduled_statuses");
-            let mut responses = Vec::with_capacity(page.items.len());
-            for status in page.items {
-                match scheduled_status_response_value(&state, status).await {
-                    Ok(response) => responses.push(response),
-                    Err(error) => return server_error(error),
-                }
-            }
-            let mut response = Json(responses).into_response();
-            if let Some(link) = link {
-                response.headers_mut().insert(header::LINK, link);
-            }
-            response
-        }
-        Err(error) => server_error(error),
+    let txn = database.begin_snapshot().await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let page = roosty_db::scheduled_statuses(context.db, account.id, limit, cursor).await?;
+    let link = timeline_link_header(&page, limit, "/api/v1/scheduled_statuses");
+    let mut responses = Vec::with_capacity(page.items.len());
+    for status in page.items {
+        responses.push(scheduled_status_response_value(&context, status).await?);
     }
+    txn.commit().await?;
+    let mut response = Json(responses).into_response();
+    if let Some(link) = link {
+        response.headers_mut().insert(header::LINK, link);
+    }
+    Ok(response)
 }
 
 async fn show_scheduled_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<StatusPath>,
-) -> Response {
+) -> ApiResult<Response> {
     if !has_status_scope(&token.grant.scopes, StatusPermission::Read) {
-        return forbidden("This action is outside the authorized scopes");
+        return Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ));
     }
     let account = token.grant.account;
-    match roosty_db::find_scheduled_status(&state.db, account.id, path.status_id).await {
-        Ok(Some(status)) => scheduled_status_response(&state, status).await,
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+    let txn = database.begin_snapshot().await?;
+    let status = roosty_db::find_scheduled_status(&txn, account.id, path.status_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = scheduled_status_response(&context, status).await;
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn update_scheduled_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<StatusPath>,
-    request: axum::extract::Request,
-) -> Response {
+    request: Request,
+) -> ApiResult<Response> {
     if !has_status_scope(&token.grant.scopes, StatusPermission::Write) {
-        return forbidden("This action is outside the authorized scopes");
+        return Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ));
     }
     let account = token.grant.account;
     let update: ScheduledStatusUpdate = match parse_request_body(request).await {
         Ok(update) => update,
-        Err(error) => return bad_request(&error.to_string()),
+        Err(error) => return Err(ApiError::BadRequest(error.to_string().into())),
     };
     let scheduled_at = match parse_scheduled_at(Some(&update.scheduled_at)) {
         Ok(value) => value,
-        Err(error) => return unprocessable(error),
+        Err(error) => return Err(ApiError::Unprocessable(error.into())),
     };
     if scheduled_at <= OffsetDateTime::now_utc() + state.config.scheduled_statuses.minimum_offset {
-        return unprocessable("scheduled_at is too soon");
+        return Err(ApiError::Unprocessable("scheduled_at is too soon".into()));
     }
-    match roosty_db::reschedule_status(
-        &state.db,
+    let txn = database.begin_write().await?;
+    let status = roosty_db::reschedule_status(
+        &txn,
         account.id,
         path.status_id,
         scheduled_at,
         state.config.scheduled_statuses.daily_limit,
     )
-    .await
-    {
-        Ok(Some(status)) => scheduled_status_response(&state, status).await,
-        Ok(None) => not_found(),
-        Err(RoostyError::InvalidInput(error)) => unprocessable(&error),
-        Err(error) => server_error(error),
-    }
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = scheduled_status_response(&context, status).await;
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn delete_scheduled_status(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<StatusPath>,
-) -> Response {
+) -> ApiResult<Response> {
     if !has_status_scope(&token.grant.scopes, StatusPermission::Write) {
-        return forbidden("This action is outside the authorized scopes");
+        return Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ));
     }
     let account = token.grant.account;
-    match roosty_db::cancel_scheduled_status(&state.db, account.id, path.status_id).await {
-        Ok(true) => Json(serde_json::json!({})).into_response(),
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+    let txn = database.begin_write().await?;
+    if !roosty_db::cancel_scheduled_status(&txn, account.id, path.status_id).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    txn.commit().await?;
+    Ok(Json(serde_json::json!({})).into_response())
 }
 
-async fn scheduled_status_response(state: &AppState, status: ScheduledStatus) -> Response {
+async fn scheduled_status_response(
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: ScheduledStatus,
+) -> Response {
     match scheduled_status_response_value(state, status).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => server_error(error),
@@ -1437,16 +1490,11 @@ async fn scheduled_status_response(state: &AppState, status: ScheduledStatus) ->
 }
 
 async fn scheduled_status_response_value(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     status: ScheduledStatus,
 ) -> Result<ScheduledStatusResponse, RoostyError> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let media = roosty_db::media_attachments_for_scheduled_status(&txn, status.id).await?;
-    let poll = roosty_db::scheduled_poll(&txn, status.id).await?;
-    txn.commit().await?;
+    let media = roosty_db::media_attachments_for_scheduled_status(state.db, status.id).await?;
+    let poll = roosty_db::scheduled_poll(state.db, status.id).await?;
     Ok(ScheduledStatusResponse {
         id: status.id.to_string(),
         scheduled_at: format_timestamp(status.scheduled_at),
@@ -1487,7 +1535,7 @@ fn parse_scheduled_at(value: Option<&str>) -> Result<OffsetDateTime, &'static st
 }
 
 pub(crate) async fn parse_request_body<T: for<'de> Deserialize<'de>>(
-    request: axum::extract::Request,
+    request: Request,
 ) -> Result<T, StatusInputError> {
     let content_type = request
         .headers()
@@ -1505,13 +1553,14 @@ pub(crate) async fn parse_request_body<T: for<'de> Deserialize<'de>>(
             .array_format(serde_qs::ArrayFormat::EmptyIndexed)
             .use_form_encoding(true)
             .deserialize_str(&String::from_utf8_lossy(&body))
-            .map_err(|error| StatusInputError::Form(error.to_string()))
+            .map_err(|error| StatusInputError::Form(Cow::Owned(error.to_string())))
     }
 }
 
 /// Publish one durable schedule, treating permanent validation failures like Mastodon cancellation.
 pub(crate) async fn publish_scheduled_status(
     state: &AppState,
+    database: &DatabaseContext,
     payload: Value,
 ) -> Result<(), RoostyError> {
     let id = payload
@@ -1520,10 +1569,7 @@ pub(crate) async fn publish_scheduled_status(
         .ok_or_else(|| RoostyError::InvalidInput("scheduled status id is missing".to_owned()))?
         .parse::<Uuid>()
         .map_err(|_| RoostyError::InvalidInput("scheduled status id is invalid".to_owned()))?;
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+    let txn = database.begin_snapshot().await?;
     let Some(status) = roosty_db::find_scheduled_status_by_id(&txn, id).await? else {
         txn.commit().await?;
         return Ok(());
@@ -1538,7 +1584,9 @@ pub(crate) async fn publish_scheduled_status(
         .is_some()
     {
         txn.commit().await?;
-        roosty_db::cancel_scheduled_status(&state.db, status.account_id, status.id).await?;
+        let write = database.begin_write().await?;
+        roosty_db::cancel_scheduled_status(&write, status.account_id, status.id).await?;
+        write.commit().await?;
         return Ok(());
     }
     let Some(account) = roosty_db::find_local_account_by_id(&txn, status.account_id).await? else {
@@ -1567,6 +1615,7 @@ pub(crate) async fn publish_scheduled_status(
     };
     let response = create_status_from_input(
         state,
+        database,
         account,
         input,
         Some(status.id),
@@ -1576,7 +1625,9 @@ pub(crate) async fn publish_scheduled_status(
     match response.status() {
         StatusCode::OK => Ok(()),
         status_code if status_code.is_client_error() => {
-            roosty_db::cancel_scheduled_status(&state.db, status.account_id, status.id).await?;
+            let txn = database.begin_write().await?;
+            roosty_db::cancel_scheduled_status(&txn, status.account_id, status.id).await?;
+            txn.commit().await?;
             Ok(())
         }
         _ => Err(RoostyError::InvalidInput(
@@ -1587,204 +1638,171 @@ pub(crate) async fn publish_scheduled_status(
 
 async fn show_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let viewer_id = viewer.as_ref().map(|account| account.id);
-    let txn = match state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await
-    {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let item = match find_status_context_item(&txn, StatusId(path.status_id)).await {
-        Ok(Some(item)) => item,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    match status_context_item_visible(&txn, &item, viewer_id).await {
-        Ok(true) => {}
-        Ok(false) => return not_found(),
-        Err(error) => return server_error(error),
+    let txn = database.begin_snapshot().await?;
+    let item = find_status_context_item(&txn, StatusId(path.status_id))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if !status_context_item_visible(&txn, &item, viewer_id).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match item {
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = match item {
         StatusContextItem::Local(status) => {
-            status_with_author_response(&state, status, viewer_id).await
+            Json(status_with_author(&context, status, viewer_id).await?).into_response()
         }
         StatusContextItem::Remote(status) => {
-            match remote_status_available(&state, &status).await {
-                Ok(true) => {}
-                Ok(false) => return not_found(),
-                Err(error) => return server_error(error),
+            if !remote_status_available(&context, &status).await? {
+                return Err(ApiError::NotFound("Record not found".into()));
             }
-            match remote_status_response_for_viewer(&state, status, viewer_id).await {
-                Ok(status) => Json(status).into_response(),
-                Err(error) => server_error(error),
-            }
+            Json(remote_status_response_for_viewer(&context, status, viewer_id).await?)
+                .into_response()
         }
-    }
+    };
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Pin an owned public or unlisted status, idempotently.
 async fn pin_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    mutate_status_pin(&state, account, StatusId(path.status_id), true).await
+) -> ApiResult<Response> {
+    let txn = database.begin_write().await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = mutate_status_pin(&context, account, StatusId(path.status_id), true).await?;
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Remove an owned status pin, idempotently.
 async fn unpin_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    mutate_status_pin(&state, account, StatusId(path.status_id), false).await
+) -> ApiResult<Response> {
+    let txn = database.begin_write().await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = mutate_status_pin(&context, account, StatusId(path.status_id), false).await?;
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn mutate_status_pin(
-    state: &AppState,
+    state: &StatusRenderContext<'_, DatabaseTransaction>,
     account: LocalAccount,
     status_id: StatusId,
     pin: bool,
-) -> Response {
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
+) -> ApiResult<Response> {
+    let txn = state.db;
     let result = if pin {
-        roosty_db::pin_local_status(&txn, status_id, account.id, MAX_PINNED_STATUSES).await
+        roosty_db::pin_local_status(txn, status_id, account.id, MAX_PINNED_STATUSES).await?
     } else {
-        roosty_db::unpin_local_status(&txn, status_id, account.id).await
+        roosty_db::unpin_local_status(txn, status_id, account.id).await?
     };
     let changed = match result {
-        Ok(roosty_db::PinStatusResult::Pinned) | Ok(roosty_db::PinStatusResult::Unpinned) => true,
-        Ok(roosty_db::PinStatusResult::AlreadyPinned)
-        | Ok(roosty_db::PinStatusResult::AlreadyUnpinned) => false,
-        Ok(roosty_db::PinStatusResult::NotFound) => return not_found(),
-        Ok(roosty_db::PinStatusResult::NotOwned) => {
-            return unprocessable("You can only pin your own statuses");
+        PinStatusResult::Pinned | PinStatusResult::Unpinned => true,
+        PinStatusResult::AlreadyPinned | PinStatusResult::AlreadyUnpinned => false,
+        PinStatusResult::NotFound => {
+            return Err(ApiError::NotFound("Record not found".into()));
         }
-        Ok(roosty_db::PinStatusResult::UnsupportedVisibility) => {
-            return unprocessable("Only public and unlisted statuses can be pinned");
+        PinStatusResult::NotOwned => {
+            return Err(ApiError::Unprocessable(
+                "You can only pin your own statuses".into(),
+            ));
         }
-        Ok(roosty_db::PinStatusResult::LimitReached) => {
-            return unprocessable("You have already pinned the maximum number of statuses");
+        PinStatusResult::UnsupportedVisibility => {
+            return Err(ApiError::Unprocessable(
+                "Only public and unlisted statuses can be pinned".into(),
+            ));
         }
-        Err(error) => return server_error(error),
+        PinStatusResult::LimitReached => {
+            return Err(ApiError::Unprocessable(
+                "You have already pinned the maximum number of statuses".into(),
+            ));
+        }
     };
     if changed {
-        let status = match roosty_db::find_local_status_by_id(&txn, status_id).await {
-            Ok(Some(status)) => status,
-            Ok(None) => return not_found(),
-            Err(error) => return server_error(error),
-        };
-        if let Err(error) =
-            crate::federation::enqueue_pin_activity_in_transaction(state, &txn, &status, pin).await
-        {
-            return server_error(error);
-        }
+        let status = roosty_db::find_local_status_by_id(txn, status_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+        crate::federation::enqueue_pin_activity_in_transaction(state, txn, &status, pin).await?;
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) => match status_response(state, status, account).await {
-            Ok(response) => Json(response).into_response(),
-            Err(error) => server_error(error),
-        },
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+    let status = roosty_db::find_local_status_by_id(txn, status_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    Ok(Json(status_response(state, status, account).await?).into_response())
 }
 
 async fn status_history(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let viewer_id = viewer.as_ref().map(|account| account.id);
-    let txn = match state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await
-    {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let item = match find_status_context_item(&txn, StatusId(path.status_id)).await {
-        Ok(Some(item)) => item,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    match status_context_item_visible(&txn, &item, viewer_id).await {
-        Ok(true) => {}
-        Ok(false) => return not_found(),
-        Err(error) => return server_error(error),
+    let txn = database.begin_snapshot().await?;
+    let item = find_status_context_item(&txn, StatusId(path.status_id))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if !status_context_item_visible(&txn, &item, viewer_id).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
     let history = match &item {
         StatusContextItem::Local(status) => roosty_db::local_status_edits(&txn, status.id)
             .await
-            .map(StoredStatusEdits::Local),
+            .map(StoredStatusEdits::Local)?,
         StatusContextItem::Remote(status) => roosty_db::remote_status_edits(&txn, status.id)
             .await
-            .map(StoredStatusEdits::Remote),
-    };
-    let history = match history {
-        Ok(history) => history,
-        Err(error) => return server_error(error),
+            .map(StoredStatusEdits::Remote)?,
     };
     let poll_options = if history.is_empty() {
         let status = match &item {
             StatusContextItem::Local(status) => PollStatus::Local(status.id),
             StatusContextItem::Remote(status) => PollStatus::Remote(status.id),
         };
-        match roosty_db::find_poll_for_status(&txn, status).await {
-            Ok(poll) => poll.map(|poll| {
+        roosty_db::find_poll_for_status(&txn, status)
+            .await?
+            .map(|poll| {
                 poll.options
                     .into_iter()
                     .map(|option| option.title)
                     .collect()
-            }),
-            Err(error) => return server_error(error),
-        }
+            })
     } else {
         None
     };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
+    let context = StatusRenderContext::new(&state, &txn);
     let response = match (item, history) {
         (StatusContextItem::Local(status), StoredStatusEdits::Local(edits)) => {
-            local_status_history_response(&state, status, edits, poll_options, viewer_id).await
+            local_status_history_response(&context, status, edits, poll_options, viewer_id).await?
         }
         (StatusContextItem::Remote(status), StoredStatusEdits::Remote(edits)) => {
-            match remote_status_available(&state, &status).await {
-                Ok(true) => {
-                    remote_status_history_response(&state, status, edits, poll_options, viewer_id)
-                        .await
-                }
-                Ok(false) => return not_found(),
-                Err(error) => return server_error(error),
+            if !remote_status_available(&context, &status).await? {
+                return Err(ApiError::NotFound("Record not found".into()));
             }
+            remote_status_history_response(&context, status, edits, poll_options, viewer_id).await?
         }
-        _ => unreachable!("status and revision kinds are paired"),
+        _ => {
+            return Err(ApiError::Internal(RoostyError::InvalidInput(
+                "status and revision kinds do not match".to_owned(),
+            )));
+        }
     };
-    match response {
-        Ok(history) => Json(history).into_response(),
-        Err(error) => server_error(error),
-    }
+    txn.commit().await?;
+    Ok(Json(response).into_response())
 }
 
 enum StoredStatusEdits {
-    Local(Vec<roosty_db::LocalStatusEdit>),
-    Remote(Vec<roosty_db::RemoteStatusEdit>),
+    Local(Vec<LocalStatusEdit>),
+    Remote(Vec<RemoteStatusEdit>),
 }
 
 impl StoredStatusEdits {
@@ -1797,9 +1815,9 @@ impl StoredStatusEdits {
 }
 
 async fn local_status_history_response(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
-    edits: Vec<roosty_db::LocalStatusEdit>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
+    edits: Vec<LocalStatusEdit>,
     poll_options: Option<Vec<String>>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusEditResponse>, RoostyError> {
@@ -1807,7 +1825,7 @@ async fn local_status_history_response(
         let current = status_response_for_viewer(
             state,
             status.clone(),
-            roosty_db::find_local_account_by_id(&state.db, status.account_id)
+            roosty_db::find_local_account_by_id(state.db, status.account_id)
                 .await?
                 .ok_or_else(|| {
                     RoostyError::InvalidInput("status author does not exist".to_owned())
@@ -1831,22 +1849,21 @@ async fn local_status_history_response(
             quote: current.quote,
         }]);
     }
-    let author = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+    let author = roosty_db::find_local_account_by_id(state.db, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("status author does not exist".to_owned()))?;
     let mut responses = Vec::with_capacity(edits.len());
     for edit in edits {
         let mut local_mentions = Vec::new();
         for account_id in edit.local_mention_ids {
-            if let Some(account) =
-                roosty_db::find_local_account_by_id(&state.db, account_id).await?
+            if let Some(account) = roosty_db::find_local_account_by_id(state.db, account_id).await?
             {
                 local_mentions.push(account);
             }
         }
         let mut remote_mentions = Vec::new();
         for actor_id in edit.remote_mention_ids {
-            if let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, actor_id).await? {
+            if let Some(actor) = roosty_db::find_remote_actor_by_id(state.db, actor_id).await? {
                 remote_mentions.push(actor);
             }
         }
@@ -1873,7 +1890,7 @@ async fn local_status_history_response(
             sensitive: edit.sensitive,
             created_at: format_timestamp(edit.created_at),
             account: StatusAccountResponse::Local(Box::new(
-                account_response(state, author.clone()).await?,
+                account_response(state, state.db, author.clone()).await?,
             )),
             media_attachments: edit
                 .media
@@ -1882,21 +1899,16 @@ async fn local_status_history_response(
                 .collect(),
             emojis: Vec::new(),
             poll: status_edit_poll(edit.poll_options),
-            quote: status_quote_response(
-                state,
-                roosty_db::StatusReference::Local(status.id),
-                viewer,
-            )
-            .await?,
+            quote: status_quote_response(state, StatusReference::Local(status.id), viewer).await?,
         });
     }
     Ok(responses)
 }
 
 async fn remote_status_history_response(
-    state: &AppState,
-    status: roosty_db::RemoteStatus,
-    edits: Vec<roosty_db::RemoteStatusEdit>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: RemoteStatus,
+    edits: Vec<RemoteStatusEdit>,
     poll_options: Option<Vec<String>>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusEditResponse>, RoostyError> {
@@ -1918,7 +1930,7 @@ async fn remote_status_history_response(
             quote: current.quote,
         }]);
     }
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
+    let actor = roosty_db::find_remote_actor_by_id(state.db, status.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote status author does not exist".to_owned())
@@ -1940,48 +1952,47 @@ async fn remote_status_history_response(
                 .collect(),
             emojis: remote_custom_emojis(&edit.object),
             poll: status_edit_poll(edit.poll_options),
-            quote: status_quote_response(
-                state,
-                roosty_db::StatusReference::Remote(status.id),
-                viewer,
-            )
-            .await?,
+            quote: status_quote_response(state, StatusReference::Remote(status.id), viewer).await?,
         });
     }
     Ok(responses)
 }
 
 async fn status_source(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    let status = match roosty_db::find_local_status_by_id(&state.db, StatusId(path.status_id)).await
-    {
-        Ok(Some(status)) => status,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    match status_visible_to_viewer(&state, &status, Some(account.id)).await {
-        Ok(true) => Json(StatusSourceResponse {
-            id: status.id.0.to_string(),
-            text: status.content,
-            spoiler_text: status.spoiler_text,
-        })
-        .into_response(),
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let status = roosty_db::find_local_status_by_id(&txn, StatusId(path.status_id))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if !status_visible_to_viewer(&txn, &status, Some(account.id)).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    txn.commit().await?;
+    Ok(Json(StatusSourceResponse {
+        id: status.id.0.to_string(),
+        text: status.content,
+        spoiler_text: status.spoiler_text,
+    })
+    .into_response())
 }
 
 async fn update_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-    request: axum::extract::Request,
+    request: Request,
 ) -> Response {
+    let txn = match database.begin_write().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let context = StatusRenderContext::new(&state, &txn);
     let status_id = StatusId(path.status_id);
-    let existing = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+    let existing = match roosty_db::find_local_status_by_id(&txn, status_id).await {
         Ok(Some(status)) if status.account_id == account.id && status.deleted_at.is_none() => {
             status
         }
@@ -2009,7 +2020,7 @@ async fn update_status(
     };
     let has_media = match media_ids.as_ref() {
         Some(media_ids) => !media_ids.is_empty(),
-        None => match roosty_db::local_status_has_media(&state.db, status_id).await {
+        None => match roosty_db::local_status_has_media(&txn, status_id).await {
             Ok(has_media) => has_media,
             Err(error) => return server_error(error),
         },
@@ -2028,7 +2039,7 @@ async fn update_status(
         return bad_request(&error.to_string());
     }
 
-    let update = roosty_db::LocalStatusUpdate {
+    let update = LocalStatusUpdate {
         content: input.status.map(|status| status.trim().to_owned()),
         sensitive: input.sensitive,
         spoiler_text: input.spoiler_text,
@@ -2047,7 +2058,7 @@ async fn update_status(
                 | StatusVisibility::Private
                 | StatusVisibility::Direct
         ) {
-        resolve_remote_mentions(&state, &final_content).await
+        resolve_remote_mentions(&context, &database, &final_content).await
     } else {
         Vec::new()
     };
@@ -2055,7 +2066,7 @@ async fn update_status(
         .iter()
         .map(|actor| actor.id)
         .collect::<Vec<_>>();
-    let local_mentions = match local_text_mentions(&state, &final_content).await {
+    let local_mentions = match local_text_mentions(&context, &final_content).await {
         Ok(accounts) => accounts
             .into_iter()
             .filter(|mentioned| mentioned.id != account.id)
@@ -2070,14 +2081,10 @@ async fn update_status(
     .then(|| local_mentions.clone())
     .unwrap_or_default();
     let previous_remote_recipients =
-        match roosty_db::remote_mentions_for_local_status(&state.db, existing.id).await {
+        match roosty_db::remote_mentions_for_local_status(&txn, existing.id).await {
             Ok(recipients) => recipients,
             Err(error) => return server_error(error),
         };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
     match roosty_db::update_owned_local_status(
         &txn,
         status_id,
@@ -2085,7 +2092,7 @@ async fn update_status(
         update,
         media_ids.as_deref(),
         &media_attributes,
-        roosty_db::LocalStatusMetadata {
+        LocalStatusMetadata {
             scheduled_status_id: None,
             tag_names: hashtag_names(&final_content),
             remote_actor_ids: remote_mention_ids,
@@ -2095,7 +2102,7 @@ async fn update_status(
     )
     .await
     {
-        Ok(Some(roosty_db::LocalStatusUpdateResult::Updated(mut status))) => {
+        Ok(Some(LocalStatusUpdateResult::Updated(mut status))) => {
             if let Some(policy) = quote_policy_update {
                 status = match roosty_db::update_local_status_quote_policy(
                     &txn, status.id, account.id, policy,
@@ -2133,7 +2140,7 @@ async fn update_status(
                 Err(error) => return server_error(error),
             }
             if status.visibility == StatusVisibility::Direct
-                && let Err(error) = sync_edited_direct_conversation(&state, &txn, &status).await
+                && let Err(error) = sync_edited_direct_conversation(&context, &txn, &status).await
             {
                 return server_error(error);
             }
@@ -2147,7 +2154,7 @@ async fn update_status(
                 Err(error) => return server_error(error),
             };
             if let Err(error) = enqueue_status_activity_in_transaction(
-                &state,
+                &context,
                 &txn,
                 &status,
                 StatusActivityKind::Update,
@@ -2157,6 +2164,35 @@ async fn update_status(
             {
                 return server_error(error);
             }
+            let conversation_update = if let Some(refresh) = &refresh {
+                match roosty_db::local_conversation_accounts_for_last_status(
+                    &txn,
+                    refresh.conversation_id,
+                    status.id,
+                )
+                .await
+                {
+                    Ok(last_status_account_ids) => {
+                        let mut account_ids = refresh.updated_account_ids.clone();
+                        account_ids.extend(last_status_account_ids);
+                        account_ids.sort_by_key(|id| id.0);
+                        account_ids.dedup();
+                        Some((refresh.conversation_id, account_ids))
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to resolve changed conversation views after status edit");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let response = match status_response(&context, status.clone(), account).await {
+                Ok(response) => response,
+                Err(error) => return server_error(error),
+            };
+            let recipients = status_stream_recipients(&context, &status).await;
+            drop(context);
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
@@ -2168,68 +2204,49 @@ async fn update_status(
                     &refresh.removed_account_ids,
                 );
             }
-            if let Some(refresh) = refresh {
-                let mut account_ids = refresh.updated_account_ids;
-                match roosty_db::local_conversation_accounts_for_last_status(
-                    &state.db,
-                    refresh.conversation_id,
-                    status.id,
+            if let Some((conversation_id, account_ids)) = conversation_update {
+                let read = match database.begin_snapshot().await {
+                    Ok(read) => read,
+                    Err(error) => return server_error(error.into()),
+                };
+                if let Err(error) =
+                    publish_conversation_updates(&state, &read, conversation_id, &account_ids).await
+                {
+                    warn!(%error, "failed to publish conversation update after status edit");
+                }
+                if let Err(error) = read.commit().await {
+                    return server_error(error.into());
+                }
+            }
+            for notification in notifications {
+                if let Err(error) = publish_committed_notification(
+                    &state,
+                    &database,
+                    notification.account_id,
+                    notification,
                 )
                 .await
                 {
-                    Ok(last_status_account_ids) => {
-                        account_ids.extend(last_status_account_ids);
-                        account_ids.sort_by_key(|id| id.0);
-                        account_ids.dedup();
-                        if let Err(error) = publish_conversation_updates(
-                            &state,
-                            refresh.conversation_id,
-                            &account_ids,
-                        )
-                        .await
-                        {
-                            warn!(%error, "failed to publish conversation update after status edit");
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "failed to resolve changed conversation views after status edit")
-                    }
+                    warn!(%error, "failed to publish status edit notification");
                 }
             }
-            match status_response(&state, status.clone(), account).await {
-                Ok(response) => {
-                    for notification in notifications {
-                        if let Err(error) = publish_committed_notification(
-                            &state,
-                            notification.account_id,
-                            notification,
-                        )
-                        .await
-                        {
-                            warn!(%error, "failed to publish status edit notification");
-                        }
-                    }
-                    let recipients = status_stream_recipients(&state, &status).await;
-                    let stream_visibility = if status.in_reply_to_id.is_some()
-                        || status.in_reply_to_remote_status_id.is_some()
-                    {
-                        StatusVisibility::Unlisted
-                    } else {
-                        status.visibility
-                    };
-                    state.streaming_events.publish_status_edit(
-                        &response,
-                        status.account_id,
-                        stream_visibility,
-                        &recipients,
-                        &local_mentions,
-                    );
-                    Json(response).into_response()
-                }
-                Err(error) => server_error(error),
-            }
+            let stream_visibility = if status.in_reply_to_id.is_some()
+                || status.in_reply_to_remote_status_id.is_some()
+            {
+                StatusVisibility::Unlisted
+            } else {
+                status.visibility
+            };
+            state.streaming_events.publish_status_edit(
+                &response,
+                status.account_id,
+                stream_visibility,
+                &recipients,
+                &local_mentions,
+            );
+            Json(response).into_response()
         }
-        Ok(Some(roosty_db::LocalStatusUpdateResult::Unchanged(mut status))) => {
+        Ok(Some(LocalStatusUpdateResult::Unchanged(mut status))) => {
             let policy_changed =
                 quote_policy_update.is_some_and(|policy| policy != status.quote_approval_policy);
             if let Some(policy) = quote_policy_update {
@@ -2245,7 +2262,7 @@ async fn update_status(
             }
             if policy_changed
                 && let Err(error) = enqueue_status_activity_in_transaction(
-                    &state,
+                    &context,
                     &txn,
                     &status,
                     StatusActivityKind::Update,
@@ -2255,11 +2272,14 @@ async fn update_status(
             {
                 return server_error(error);
             }
-            if let Err(error) = txn.commit().await {
-                return server_error(error.into());
-            }
-            match status_response(&state, status, account).await {
-                Ok(response) => Json(response).into_response(),
+            match status_response(&context, status, account).await {
+                Ok(response) => {
+                    drop(context);
+                    if let Err(error) = txn.commit().await {
+                        return server_error(error.into());
+                    }
+                    Json(response).into_response()
+                }
                 Err(error) => server_error(error),
             }
         }
@@ -2271,22 +2291,22 @@ async fn update_status(
 
 async fn delete_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
 ) -> Response {
     let status_id = StatusId(path.status_id);
-    let txn = match state.db.begin().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
+    let context = StatusRenderContext::new(&state, &txn);
     match roosty_db::delete_owned_local_status(&txn, status_id, account.id).await {
-        Ok(Some(status)) => match status_response(&state, status.clone(), account).await {
+        Ok(Some(status)) => match status_response(&context, status.clone(), account).await {
             Ok(response) => {
-                if let Err(error) = roosty_db::mark_quotes_target_deleted(
-                    &txn,
-                    roosty_db::StatusReference::Local(status.id),
-                )
-                .await
+                if let Err(error) =
+                    roosty_db::mark_quotes_target_deleted(&txn, StatusReference::Local(status.id))
+                        .await
                 {
                     return server_error(error);
                 }
@@ -2300,7 +2320,7 @@ async fn delete_status(
                     Err(error) => return server_error(error),
                 };
                 if let Err(error) = enqueue_status_activity_in_transaction(
-                    &state,
+                    &context,
                     &txn,
                     &status,
                     StatusActivityKind::Delete,
@@ -2310,16 +2330,21 @@ async fn delete_status(
                 {
                     return server_error(error);
                 }
+                drop(context);
                 if let Err(error) = txn.commit().await {
                     return server_error(error.into());
                 }
-                let reblogs = match roosty_db::local_reblogs_for_status(&state.db, status_id).await
-                {
+                let read = match database.begin_snapshot().await {
+                    Ok(read) => read,
+                    Err(error) => return server_error(error.into()),
+                };
+                let read_context = StatusRenderContext::new(&state, &read);
+                let reblogs = match roosty_db::local_reblogs_for_status(&read, status_id).await {
                     Ok(reblogs) => reblogs,
                     Err(error) => return server_error(error),
                 };
                 publish_status_delete(
-                    &state,
+                    &read_context,
                     &status,
                     &reblogs,
                     !response.media_attachments.is_empty(),
@@ -2336,12 +2361,16 @@ async fn delete_status(
                 if let Some(refresh) = refresh
                     && let Err(error) = publish_conversation_updates(
                         &state,
+                        &read,
                         refresh.conversation_id,
                         &refresh.updated_account_ids,
                     )
                     .await
                 {
                     warn!(%error, "failed to publish conversation update after status deletion");
+                }
+                if let Err(error) = read.commit().await {
+                    return server_error(error.into());
                 }
                 Json(response).into_response()
             }
@@ -2355,49 +2384,45 @@ async fn delete_status(
 
 /// Remove report evidence as an administrator while preserving normal federation side effects.
 pub(crate) async fn delete_reported_status(
-    state: &AppState,
+    state: &StatusRenderContext<'_, DatabaseTransaction>,
     reference: ReportStatus,
 ) -> Result<bool, RoostyError> {
     match reference {
         ReportStatus::Local(status_id) => {
-            let Some(existing) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
+            let Some(existing) = roosty_db::find_local_status_by_id(state.db, status_id).await?
             else {
                 return Ok(false);
             };
-            let had_media = roosty_db::local_status_has_media(&state.db, status_id).await?;
-            let txn = state.db.begin().await?;
+            let had_media = roosty_db::local_status_has_media(state.db, status_id).await?;
             let Some(status) =
-                roosty_db::delete_owned_local_status(&txn, status_id, existing.account_id).await?
+                roosty_db::delete_owned_local_status(state.db, status_id, existing.account_id)
+                    .await?
             else {
                 return Ok(false);
             };
-            roosty_db::mark_quotes_target_deleted(
-                &txn,
-                roosty_db::StatusReference::Local(status.id),
-            )
-            .await?;
-            roosty_db::repair_direct_conversation_after_delete(&txn, status.conversation_id)
+            roosty_db::mark_quotes_target_deleted(state.db, StatusReference::Local(status.id))
+                .await?;
+            roosty_db::repair_direct_conversation_after_delete(state.db, status.conversation_id)
                 .await?;
             enqueue_status_activity_in_transaction(
                 state,
-                &txn,
+                state.db,
                 &status,
                 StatusActivityKind::Delete,
                 &[],
             )
             .await?;
-            txn.commit().await?;
-            let reblogs = roosty_db::local_reblogs_for_status(&state.db, status_id).await?;
+            let reblogs = roosty_db::local_reblogs_for_status(state.db, status_id).await?;
             publish_status_delete(state, &status, &reblogs, had_media).await;
             Ok(true)
         }
         ReportStatus::Remote(status_id) => {
-            let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await?
+            let Some(status) = roosty_db::find_remote_status_by_id(state.db, status_id).await?
             else {
                 return Ok(false);
             };
             roosty_db::delete_remote_status(
-                &state.db,
+                state.db,
                 &status.activitypub_id,
                 status.remote_actor_id,
             )
@@ -2408,102 +2433,84 @@ pub(crate) async fn delete_reported_status(
 
 async fn update_interaction_policy(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-    request: axum::extract::Request,
-) -> Response {
+    request: Request,
+) -> ApiResult<Response> {
     let input = match parse_status_input(request).await {
         Ok(input) => input,
-        Err(error) => return bad_request(&error.to_string()),
+        Err(error) => return Err(ApiError::BadRequest(error.to_string().into())),
     };
     let Some(policy) = input.quote_approval_policy else {
-        return bad_request("quote_approval_policy is required");
+        return Err(ApiError::BadRequest(
+            "quote_approval_policy is required".into(),
+        ));
     };
+    let txn = database.begin_write().await?;
+    let context = StatusRenderContext::new(&state, &txn);
     let status_id = StatusId(path.status_id);
-    let existing = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) if status.account_id == account.id => status,
-        Ok(_) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let updated = match roosty_db::update_local_status_quote_policy(
-        &txn, status_id, account.id, policy,
-    )
-    .await
-    {
-        Ok(Some(status)) => status,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    if updated.quote_approval_policy != existing.quote_approval_policy
-        && let Err(error) = enqueue_status_activity_in_transaction(
-            &state,
+    let existing = roosty_db::find_local_status_by_id(&txn, status_id)
+        .await?
+        .filter(|status| status.account_id == account.id)
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let updated = roosty_db::update_local_status_quote_policy(&txn, status_id, account.id, policy)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if updated.quote_approval_policy != existing.quote_approval_policy {
+        enqueue_status_activity_in_transaction(
+            &context,
             &txn,
             &updated,
             StatusActivityKind::Update,
             &[],
         )
-        .await
-    {
-        return server_error(error);
+        .await?;
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match status_response(&state, updated, account).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => server_error(error),
-    }
+    let response = status_response(&context, updated, account).await?;
+    drop(context);
+    txn.commit().await?;
+    Ok(Json(response).into_response())
 }
 
 async fn status_quotes(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
     Query(params): Query<CollectionParams>,
-) -> Response {
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let context = StatusRenderContext::new(&state, &txn);
     let status_id = StatusId(path.status_id);
-    let target = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-        Ok(Some(status)) => match status_visible_to_viewer(&state, &status, Some(account.id)).await
-        {
-            Ok(true) => roosty_db::StatusReference::Local(status.id),
-            Ok(false) => return not_found(),
-            Err(error) => return server_error(error),
-        },
-        Ok(None) => match roosty_db::find_remote_status_by_id(&state.db, status_id).await {
-            Ok(Some(status)) => {
-                match roosty_db::remote_status_visible_to_account(&state.db, &status, account.id)
-                    .await
-                {
-                    Ok(true) => roosty_db::StatusReference::Remote(status.id),
-                    Ok(false) => return not_found(),
-                    Err(error) => return server_error(error),
-                }
+    let target = match roosty_db::find_local_status_by_id(&txn, status_id).await? {
+        Some(status) => {
+            if !status_visible_to_viewer(&txn, &status, Some(account.id)).await? {
+                return Err(ApiError::NotFound("Record not found".into()));
             }
-            Ok(None) => return not_found(),
-            Err(error) => return server_error(error),
-        },
-        Err(error) => return server_error(error),
+            StatusReference::Local(status.id)
+        }
+        None => {
+            let status = roosty_db::find_remote_status_by_id(&txn, status_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+            if !roosty_db::remote_status_visible_to_account(&txn, &status, account.id).await? {
+                return Err(ApiError::NotFound("Record not found".into()));
+            }
+            StatusReference::Remote(status.id)
+        }
     };
     let limit = timeline_limit(params.limit);
     let max_id = match parse_optional_uuid(params.max_id.as_deref()) {
         Ok(value) => value,
-        Err(()) => return bad_request("collection cursor is invalid"),
+        Err(()) => return Err(ApiError::BadRequest("collection cursor is invalid".into())),
     };
     let since_id = match parse_optional_uuid(params.since_id.as_deref()) {
         Ok(value) => value,
-        Err(()) => return bad_request("collection cursor is invalid"),
+        Err(()) => return Err(ApiError::BadRequest("collection cursor is invalid".into())),
     };
     let mut quotes =
-        match roosty_db::accepted_quotes_for_status(&state.db, target, max_id, since_id, limit + 1)
-            .await
-        {
-            Ok(quotes) => quotes,
-            Err(error) => return server_error(error),
-        };
+        roosty_db::accepted_quotes_for_status(&txn, target, max_id, since_id, limit + 1).await?;
     let has_more = quotes.len() > limit as usize;
     quotes.truncate(limit as usize);
     let first_cursor = quotes.first().map(|quote| quote.id);
@@ -2511,30 +2518,21 @@ async fn status_quotes(
     let mut responses = Vec::with_capacity(quotes.len());
     for quote in quotes {
         let response = match quote.quoting_status {
-            roosty_db::StatusReference::Local(id) => {
-                match roosty_db::find_local_status_by_id(&state.db, id).await {
-                    Ok(Some(status)) => {
-                        match status_with_author(&state, status, Some(account.id)).await {
-                            Ok(response) => Some(response),
-                            Err(error) => return server_error(error),
-                        }
+            StatusReference::Local(id) => {
+                match roosty_db::find_local_status_by_id(&txn, id).await? {
+                    Some(status) => {
+                        Some(status_with_author(&context, status, Some(account.id)).await?)
                     }
-                    Ok(None) => None,
-                    Err(error) => return server_error(error),
+                    None => None,
                 }
             }
-            roosty_db::StatusReference::Remote(id) => {
-                match roosty_db::find_remote_status_by_id(&state.db, id).await {
-                    Ok(Some(status)) => {
-                        match remote_status_response_for_viewer(&state, status, Some(account.id))
-                            .await
-                        {
-                            Ok(response) => Some(response),
-                            Err(error) => return server_error(error),
-                        }
-                    }
-                    Ok(None) => None,
-                    Err(error) => return server_error(error),
+            StatusReference::Remote(id) => {
+                match roosty_db::find_remote_status_by_id(&txn, id).await? {
+                    Some(status) => Some(
+                        remote_status_response_for_viewer(&context, status, Some(account.id))
+                            .await?,
+                    ),
+                    None => None,
                 }
             }
         };
@@ -2554,88 +2552,68 @@ async fn status_quotes(
     {
         response.headers_mut().insert(header::LINK, value);
     }
-    response
+    drop(context);
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn revoke_quote(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<QuotePath>,
-) -> Response {
+) -> ApiResult<Response> {
+    let txn = database.begin_write().await?;
+    let context = StatusRenderContext::new(&state, &txn);
     let quoted_id = StatusId(path.status_id);
-    let quoted = match roosty_db::find_local_status_by_id(&state.db, quoted_id).await {
-        Ok(Some(status)) if status.account_id == account.id => status,
-        Ok(Some(_)) => return forbidden("This action is not allowed"),
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
+    let quoted = match roosty_db::find_local_status_by_id(&txn, quoted_id).await? {
+        Some(status) if status.account_id == account.id => status,
+        Some(_) => {
+            return Err(ApiError::Forbidden("This action is not allowed".into()));
+        }
+        None => return Err(ApiError::NotFound("Record not found".into())),
     };
     let quoting_id = StatusId(path.quoting_status_id);
-    let quoting =
-        if let Ok(Some(status)) = roosty_db::find_local_status_by_id(&state.db, quoting_id).await {
-            (
-                roosty_db::StatusReference::Local(status.id),
-                Some(StatusContextItem::Local(status)),
-            )
-        } else if let Ok(Some(status)) =
-            roosty_db::find_remote_status_by_id(&state.db, quoting_id).await
-        {
-            (
-                roosty_db::StatusReference::Remote(status.id),
-                Some(StatusContextItem::Remote(status)),
-            )
-        } else {
-            return not_found();
-        };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    match roosty_db::revoke_status_quote(
-        &txn,
-        roosty_db::StatusReference::Local(quoted.id),
-        quoting.0,
-    )
-    .await
+    let quoting = if let Some(status) = roosty_db::find_local_status_by_id(&txn, quoting_id).await?
     {
-        Ok(Some(quote)) => {
-            if let Err(error) =
-                enqueue_quote_revocation_in_transaction(&state, &txn, &quoted, &quote).await
-            {
-                return server_error(error);
-            }
+        (
+            StatusReference::Local(status.id),
+            StatusContextItem::Local(status),
+        )
+    } else if let Some(status) = roosty_db::find_remote_status_by_id(&txn, quoting_id).await? {
+        (
+            StatusReference::Remote(status.id),
+            StatusContextItem::Remote(status),
+        )
+    } else {
+        return Err(ApiError::NotFound("Record not found".into()));
+    };
+    let quote = roosty_db::revoke_status_quote(&txn, StatusReference::Local(quoted.id), quoting.0)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    enqueue_quote_revocation_in_transaction(&context, &txn, &quoted, &quote).await?;
+    let response = match quoting.1 {
+        StatusContextItem::Local(status) => {
+            status_with_author(&context, status, Some(account.id)).await?
         }
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match quoting.1 {
-        Some(StatusContextItem::Local(status)) => {
-            match status_with_author(&state, status, Some(account.id)).await {
-                Ok(response) => Json(response).into_response(),
-                Err(error) => server_error(error),
-            }
+        StatusContextItem::Remote(status) => {
+            remote_status_response_for_viewer(&context, status, Some(account.id)).await?
         }
-        Some(StatusContextItem::Remote(status)) => {
-            match remote_status_response_for_viewer(&state, status, Some(account.id)).await {
-                Ok(response) => Json(response).into_response(),
-                Err(error) => server_error(error),
-            }
-        }
-        None => not_found(),
-    }
+    };
+    drop(context);
+    txn.commit().await?;
+    Ok(Json(response).into_response())
 }
 
 /// Publish delete events for a removed original status and its local boost wrappers.
 async fn publish_status_delete(
-    state: &AppState,
-    status: &roosty_db::LocalStatus,
-    reblogs: &[roosty_db::LocalStatusReblog],
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: &LocalStatus,
+    reblogs: &[LocalStatusReblog],
     has_media: bool,
 ) {
     let mut recipients = status_stream_recipients(state, status).await;
-    match roosty_db::active_local_mentions_for_local_status(&state.db, status.id).await {
+    match roosty_db::active_local_mentions_for_local_status(state.db, status.id).await {
         Ok(mentions) => recipients.extend(mentions),
         Err(error) => warn!(%error, "failed to resolve mentioned delete recipients"),
     }
@@ -2667,73 +2645,60 @@ async fn publish_status_delete(
 
 async fn status_context(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let status_id = StatusId(path.status_id);
     let viewer = viewer.as_ref().map(|account| account.id);
-    let txn = match state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await
-    {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let status = match find_status_context_item(&txn, status_id).await {
-        Ok(Some(status)) => status,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    match status_context_item_visible(&txn, &status, viewer).await {
-        Ok(true) => {}
-        Ok(false) => return not_found(),
-        Err(error) => return server_error(error),
+    let txn = database.begin_snapshot().await?;
+    let status = find_status_context_item(&txn, status_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if !status_context_item_visible(&txn, &status, viewer).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
 
     let limits = StatusContextLimits::for_viewer(viewer);
-    let ancestors = match status_ancestors(&txn, &status, viewer, limits).await {
-        Ok(ancestors) => ancestors,
-        Err(error) => return server_error(error),
-    };
-    let descendants = match status_descendants(&txn, &status, viewer, limits).await {
-        Ok(descendants) => descendants,
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    let ancestors = match status_context_models(&state, ancestors, viewer).await {
-        Ok(ancestors) => ancestors,
-        Err(error) => return server_error(error),
-    };
-    let descendants = match status_context_models(&state, descendants, viewer).await {
-        Ok(descendants) => descendants,
-        Err(error) => return server_error(error),
-    };
-
-    Json(ContextResponse {
+    let ancestors = status_ancestors(&txn, &status, viewer, limits).await?;
+    let descendants = status_descendants(&txn, &status, viewer, limits).await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let ancestors = status_context_models(&context, ancestors, viewer).await?;
+    let descendants = status_context_models(&context, descendants, viewer).await?;
+    drop(context);
+    txn.commit().await?;
+    Ok(Json(ContextResponse {
         ancestors,
         descendants,
     })
-    .into_response()
+    .into_response())
 }
 
 async fn favourite_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    status_collection_action(&state, account.id, path, StatusCollectionAction::Favourite).await
+) -> ApiResult<Response> {
+    status_collection_action_with_database(
+        &state,
+        &database,
+        account.id,
+        path,
+        StatusCollectionAction::Favourite,
+    )
+    .await
 }
 
 async fn unfavourite_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    status_collection_action(
+) -> ApiResult<Response> {
+    status_collection_action_with_database(
         &state,
+        &database,
         account.id,
         path,
         StatusCollectionAction::Unfavourite,
@@ -2743,53 +2708,96 @@ async fn unfavourite_status(
 
 async fn bookmark_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    status_collection_action(&state, account.id, path, StatusCollectionAction::Bookmark).await
+) -> ApiResult<Response> {
+    status_collection_action_with_database(
+        &state,
+        &database,
+        account.id,
+        path,
+        StatusCollectionAction::Bookmark,
+    )
+    .await
 }
 
 async fn unbookmark_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    status_collection_action(&state, account.id, path, StatusCollectionAction::Unbookmark).await
+) -> ApiResult<Response> {
+    status_collection_action_with_database(
+        &state,
+        &database,
+        account.id,
+        path,
+        StatusCollectionAction::Unbookmark,
+    )
+    .await
 }
 
 async fn reblog_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    status_collection_action(&state, account.id, path, StatusCollectionAction::Reblog).await
+) -> ApiResult<Response> {
+    status_collection_action_with_database(
+        &state,
+        &database,
+        account.id,
+        path,
+        StatusCollectionAction::Reblog,
+    )
+    .await
 }
 
 async fn unreblog_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<StatusPath>,
-) -> Response {
-    status_collection_action(&state, account.id, path, StatusCollectionAction::Unreblog).await
+) -> ApiResult<Response> {
+    status_collection_action_with_database(
+        &state,
+        &database,
+        account.id,
+        path,
+        StatusCollectionAction::Unreblog,
+    )
+    .await
 }
 
 async fn reblogged_by(
     State(state): State<AppState>,
-    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
-    Path(path): Path<StatusPath>,
-    Query(params): Query<CollectionParams>,
-) -> Response {
-    status_interaction_accounts(state, viewer, path, params, StatusInteractionKind::Reblog).await
-}
-
-async fn favourited_by(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<StatusPath>,
     Query(params): Query<CollectionParams>,
 ) -> Response {
     status_interaction_accounts(
         state,
+        database,
+        viewer,
+        path,
+        params,
+        StatusInteractionKind::Reblog,
+    )
+    .await
+}
+
+async fn favourited_by(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
+    Path(path): Path<StatusPath>,
+    Query(params): Query<CollectionParams>,
+) -> Response {
+    status_interaction_accounts(
+        state,
+        database,
         viewer,
         path,
         params,
@@ -2806,20 +2814,24 @@ enum StatusInteractionKind {
 
 async fn status_interaction_accounts(
     state: AppState,
-    viewer: Option<roosty_db::LocalAccount>,
+    database: DatabaseContext,
+    viewer: Option<LocalAccount>,
     path: StatusPath,
     params: CollectionParams,
     interaction: StatusInteractionKind,
 ) -> Response {
+    let txn = match database.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let context = StatusRenderContext::new(&state, &txn);
     let viewer_id = viewer.as_ref().map(|account| account.id);
     let status_id = StatusId(path.status_id);
-    let target = match find_status_context_item(&state.db, status_id).await {
-        Ok(Some(item)) => match status_context_item_visible(&state.db, &item, viewer_id).await {
+    let target = match find_status_context_item(&txn, status_id).await {
+        Ok(Some(item)) => match status_context_item_visible(&txn, &item, viewer_id).await {
             Ok(true) => match item {
-                StatusContextItem::Local(_) => roosty_db::StatusInteractionTarget::Local(status_id),
-                StatusContextItem::Remote(_) => {
-                    roosty_db::StatusInteractionTarget::Remote(status_id)
-                }
+                StatusContextItem::Local(_) => StatusInteractionTarget::Local(status_id),
+                StatusContextItem::Remote(_) => StatusInteractionTarget::Remote(status_id),
             },
             Ok(false) => return not_found(),
             Err(error) => return server_error(error),
@@ -2835,10 +2847,10 @@ async fn status_interaction_accounts(
     };
     let result = match interaction {
         StatusInteractionKind::Favourite => {
-            roosty_db::favourited_by_for_status(&state.db, target, limit, cursor).await
+            roosty_db::favourited_by_for_status(&txn, target, limit, cursor).await
         }
         StatusInteractionKind::Reblog => {
-            roosty_db::reblogged_by_for_status(&state.db, target, limit, cursor).await
+            roosty_db::reblogged_by_for_status(&txn, target, limit, cursor).await
         }
     };
     match result {
@@ -2848,7 +2860,7 @@ async fn status_interaction_accounts(
                 StatusInteractionKind::Reblog => "reblogged_by",
             };
             interaction_accounts_response(
-                &state,
+                &context,
                 page,
                 limit,
                 &format!("/api/v1/statuses/{}/{suffix}", path.status_id),
@@ -2861,51 +2873,67 @@ async fn status_interaction_accounts(
 
 async fn favourites(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<CollectionParams>,
 ) -> Response {
-    status_collection_list(&state, account.id, params, StatusCollectionList::Favourites).await
+    status_collection_list_with_database(
+        &state,
+        &database,
+        account.id,
+        params,
+        StatusCollectionList::Favourites,
+    )
+    .await
 }
 
 async fn bookmarks(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<CollectionParams>,
 ) -> Response {
-    status_collection_list(&state, account.id, params, StatusCollectionList::Bookmarks).await
+    status_collection_list_with_database(
+        &state,
+        &database,
+        account.id,
+        params,
+        StatusCollectionList::Bookmarks,
+    )
+    .await
 }
 
 async fn home_timeline(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<TimelineParams>,
-) -> Response {
-    let query = match timeline_query(params) {
-        Ok(query) => query,
-        Err(error) => return bad_request(&error.to_string()),
-    };
-    match roosty_db::home_timeline_for_account(&state.db, account.id, query.limit, query.cursor)
-        .await
-    {
-        Ok(items) => {
-            home_timeline_response(
-                &state,
-                items,
-                query.limit,
-                "/api/v1/timelines/home",
-                account.id,
-            )
-            .await
-        }
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Response> {
+    let query =
+        timeline_query(params).map_err(|error| ApiError::BadRequest(error.to_string().into()))?;
+    let txn = database.begin_snapshot().await?;
+    let items =
+        roosty_db::home_timeline_for_account(&txn, account.id, query.limit, query.cursor).await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = home_timeline_response(
+        &context,
+        items,
+        query.limit,
+        "/api/v1/timelines/home",
+        account.id,
+    )
+    .await;
+    drop(context);
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn public_timeline(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Query(params): Query<PublicTimelineParams>,
-) -> Response {
+) -> ApiResult<Response> {
     let filters = PublicTimelineFilters {
         local: params.local,
         remote: params.remote,
@@ -2918,46 +2946,44 @@ async fn public_timeline(
         min_id: params.min_id,
     }) {
         Ok(query) => query,
-        Err(error) => return bad_request(&error.to_string()),
+        Err(error) => return Err(ApiError::BadRequest(error.to_string().into())),
     };
     let origin = match (filters.local == Some(true), filters.remote == Some(true)) {
-        (true, false) => roosty_db::PublicTimelineOrigin::Local,
-        (false, true) => roosty_db::PublicTimelineOrigin::Remote,
-        _ => roosty_db::PublicTimelineOrigin::Federated,
+        (true, false) => PublicTimelineOrigin::Local,
+        (false, true) => PublicTimelineOrigin::Remote,
+        _ => PublicTimelineOrigin::Federated,
     };
-    let hidden_domains = match roosty_db::hidden_federation_domains(&state.db).await {
-        Ok(domains) => domains,
-        Err(error) => return server_error(error),
-    };
-    let options = roosty_db::PublicTimelineOptions {
+    let txn = database.begin_snapshot().await?;
+    let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
+    let options = PublicTimelineOptions {
         origin,
         only_media: filters.only_media == Some(true),
         viewer: viewer.as_ref().map(|account| account.id),
         allowed_remote_domains: state.config.federation_allowed_domains.clone(),
         blocked_remote_domains: hidden_domains,
     };
-    match roosty_db::public_timeline_with_options(&state.db, query.limit, query.cursor, options)
-        .await
-    {
-        Ok(statuses) => {
-            public_timeline_response(
-                &state,
-                statuses,
-                query.limit,
-                viewer.as_ref().map(|account| account.id),
-                filters,
-            )
-            .await
-        }
-        Err(error) => server_error(error),
-    }
+    let statuses =
+        roosty_db::public_timeline_with_options(&txn, query.limit, query.cursor, options).await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = public_timeline_response(
+        &context,
+        statuses,
+        query.limit,
+        viewer.as_ref().map(|account| account.id),
+        filters,
+    )
+    .await;
+    drop(context);
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn link_timeline(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Query(params): Query<LinkTimelineParams>,
-) -> Response {
+) -> ApiResult<Response> {
     let url = params.url;
     let query = match timeline_query(TimelineParams {
         limit: params.limit,
@@ -2966,44 +2992,39 @@ async fn link_timeline(
         min_id: params.min_id,
     }) {
         Ok(query) => query,
-        Err(error) => return bad_request(&error.to_string()),
+        Err(error) => return Err(ApiError::BadRequest(error.to_string().into())),
     };
-    match roosty_db::link_timeline(&state.db, &url, query.limit, query.cursor).await {
-        Ok(page) => {
-            let encoded =
-                percent_encoding::utf8_percent_encode(&url, percent_encoding::NON_ALPHANUMERIC);
-            let path = format!("/api/v1/timelines/link?url={encoded}");
-            let link = timeline_link_header(&page, query.limit, &path);
-            match public_timeline_models(
-                &state,
-                page.items,
-                viewer.as_ref().map(|account| account.id),
-            )
-            .await
-            {
-                Ok(items) => {
-                    let mut response = Json(items).into_response();
-                    if let Some(link) = link {
-                        response.headers_mut().insert(header::LINK, link);
-                    }
-                    response
-                }
-                Err(error) => server_error(error),
-            }
-        }
-        Err(error) => server_error(error),
+    let txn = database.begin_snapshot().await?;
+    let page = roosty_db::link_timeline(&txn, &url, query.limit, query.cursor).await?;
+    let encoded = percent_encoding::utf8_percent_encode(&url, percent_encoding::NON_ALPHANUMERIC);
+    let path = format!("/api/v1/timelines/link?url={encoded}");
+    let link = timeline_link_header(&page, query.limit, &path);
+    let context = StatusRenderContext::new(&state, &txn);
+    let items = public_timeline_models(
+        &context,
+        page.items,
+        viewer.as_ref().map(|account| account.id),
+    )
+    .await?;
+    let mut response = Json(items).into_response();
+    if let Some(link) = link {
+        response.headers_mut().insert(header::LINK, link);
     }
+    drop(context);
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn tag_timeline(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<TagPath>,
     RawQuery(query): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = match tag_timeline_params(query.as_deref()) {
         Ok(params) => params,
-        Err(()) => return bad_request("tag timeline query is invalid"),
+        Err(()) => return Err(ApiError::BadRequest("tag timeline query is invalid".into())),
     };
     let query = match timeline_query(TimelineParams {
         limit: params.limit,
@@ -3012,21 +3033,19 @@ async fn tag_timeline(
         min_id: params.min_id.clone(),
     }) {
         Ok(query) => query,
-        Err(error) => return bad_request(&error.to_string()),
+        Err(error) => return Err(ApiError::BadRequest(error.to_string().into())),
     };
     let origin = match (params.local == Some(true), params.remote == Some(true)) {
-        (true, false) => roosty_db::PublicTimelineOrigin::Local,
-        (false, true) => roosty_db::PublicTimelineOrigin::Remote,
-        _ => roosty_db::PublicTimelineOrigin::Federated,
+        (true, false) => PublicTimelineOrigin::Local,
+        (false, true) => PublicTimelineOrigin::Remote,
+        _ => PublicTimelineOrigin::Federated,
     };
-    let hidden_domains = match roosty_db::hidden_federation_domains(&state.db).await {
-        Ok(domains) => domains,
-        Err(error) => return server_error(error),
-    };
-    match roosty_db::tag_timeline(
-        &state.db,
+    let txn = database.begin_snapshot().await?;
+    let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
+    let statuses = roosty_db::tag_timeline(
+        &txn,
         &path.hashtag,
-        roosty_db::TagTimelineOptions {
+        TagTimelineOptions {
             any: params.any.clone(),
             all: params.all.clone(),
             none: params.none.clone(),
@@ -3039,34 +3058,35 @@ async fn tag_timeline(
         query.limit,
         query.cursor,
     )
-    .await
-    {
-        Ok(statuses) => {
-            tag_timeline_response(
-                &state,
-                statuses,
-                query.limit,
-                &format!("/api/v1/timelines/tag/{}", path.hashtag),
-                viewer.as_ref().map(|account| account.id),
-                &params,
-            )
-            .await
-        }
-        Err(error) => server_error(error),
-    }
+    .await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = tag_timeline_response(
+        &context,
+        statuses,
+        query.limit,
+        &format!("/api/v1/timelines/tag/{}", path.hashtag),
+        viewer.as_ref().map(|account| account.id),
+        &params,
+    )
+    .await;
+    drop(context);
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn show_tag(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(account): OptionalAuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    let txn = match state.begin_snapshot().await {
+    let txn = match database.begin_snapshot().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
+    let context = StatusRenderContext::new(&state, &txn);
     match tag_response_by_name(
-        &state,
+        &context,
         &txn,
         &path.hashtag,
         account.as_ref().map(|account| account.id),
@@ -3086,16 +3106,18 @@ async fn show_tag(
 
 async fn follow_tag(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
     match roosty_db::follow_local_tag(&txn, account.id, &path.hashtag).await {
         Ok(tag) => {
-            let response = match tag_response_model(&state, &txn, tag, Some(true)).await {
+            let context = StatusRenderContext::new(&state, &txn);
+            let response = match tag_response_model(&context, &txn, tag, Some(true)).await {
                 Ok(response) => response,
                 Err(error) => return server_error(error),
             };
@@ -3110,16 +3132,18 @@ async fn follow_tag(
 
 async fn unfollow_tag(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<TagPath>,
 ) -> Response {
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
     match roosty_db::unfollow_local_tag(&txn, account.id, &path.hashtag).await {
         Ok(Some(tag)) => {
-            let response = match tag_response_model(&state, &txn, tag, Some(false)).await {
+            let context = StatusRenderContext::new(&state, &txn);
+            let response = match tag_response_model(&context, &txn, tag, Some(false)).await {
                 Ok(response) => response,
                 Err(error) => return server_error(error),
             };
@@ -3135,7 +3159,7 @@ async fn unfollow_tag(
 
 /// Build a Mastodon tag response for one locally known hashtag.
 async fn tag_response_by_name(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     db: &impl ConnectionTrait,
     name: &str,
     viewer: Option<AccountId>,
@@ -3153,9 +3177,9 @@ async fn tag_response_by_name(
 
 /// Convert stored local tag metadata into a Mastodon tag response.
 pub(crate) async fn tag_response_model(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     db: &impl ConnectionTrait,
-    tag: roosty_db::LocalTag,
+    tag: LocalTag,
     following: Option<bool>,
 ) -> Result<TagResponse, RoostyError> {
     let history = roosty_db::tag_history(db, tag.id).await?;
@@ -3175,9 +3199,7 @@ fn tag_timeline_params(query: Option<&str>) -> Result<TagTimelineParams, ()> {
 }
 
 /// Parse either JSON or form-encoded Mastodon status creation input.
-async fn parse_status_input(
-    request: axum::extract::Request,
-) -> Result<StatusInput, StatusInputError> {
+async fn parse_status_input(request: Request) -> Result<StatusInput, StatusInputError> {
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -3196,7 +3218,7 @@ async fn parse_status_input(
             .array_format(serde_qs::ArrayFormat::EmptyIndexed)
             .use_form_encoding(true)
             .deserialize_str(&body)
-            .map_err(|error| StatusInputError::Form(error.to_string()))?
+            .map_err(|error| StatusInputError::Form(Cow::Owned(error.to_string())))?
     };
 
     Ok(input)
@@ -3216,9 +3238,9 @@ fn validate_status_text(status: &str, has_media: bool) -> Result<(), StatusInput
 
 /// Attach newly created direct statuses to a local Mastodon conversation.
 async fn attach_direct_conversation(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     txn: &DatabaseTransaction,
-    status: &mut roosty_db::LocalStatus,
+    status: &mut LocalStatus,
     author_id: AccountId,
 ) -> Result<(), RoostyError> {
     if status.visibility != StatusVisibility::Direct {
@@ -3261,9 +3283,9 @@ async fn attach_direct_conversation(
 /// Add recipients introduced by a direct-status edit without promoting an historical edit
 /// over a newer visible status in any existing account's conversation view.
 async fn sync_edited_direct_conversation(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     txn: &DatabaseTransaction,
-    status: &roosty_db::LocalStatus,
+    status: &LocalStatus,
 ) -> Result<(), RoostyError> {
     let mut participant_ids = local_text_mentions(state, &status.content)
         .await?
@@ -3315,7 +3337,7 @@ fn parse_media_ids(values: &[String]) -> Result<Vec<Uuid>, StatusInputError> {
 /// Parse media metadata updates accepted by Mastodon status edit requests.
 fn parse_media_attributes(
     values: &[MediaAttributeInput],
-) -> Result<Vec<roosty_db::LocalStatusMediaAttributeUpdate>, StatusInputError> {
+) -> Result<Vec<LocalStatusMediaAttributeUpdate>, StatusInputError> {
     let mut seen = HashSet::new();
     let mut attributes = Vec::with_capacity(values.len());
     for value in values {
@@ -3336,7 +3358,7 @@ fn parse_media_attributes(
         };
         let focus = parse_media_focus(value.focus.as_deref())
             .map_err(|_| StatusInputError::MediaAttribute)?;
-        attributes.push(roosty_db::LocalStatusMediaAttributeUpdate {
+        attributes.push(LocalStatusMediaAttributeUpdate {
             media_id,
             description,
             focus,
@@ -3390,8 +3412,8 @@ fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, Sta
 }
 
 async fn statuses_response(
-    state: &AppState,
-    statuses: Vec<roosty_db::LocalStatus>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    statuses: Vec<LocalStatus>,
     viewer: Option<AccountId>,
 ) -> Response {
     match status_models(state, statuses, viewer).await {
@@ -3402,225 +3424,206 @@ async fn statuses_response(
 
 /// Persist a remote favourite and its federated delivery job atomically.
 async fn favourite_remote_status(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     account_id: AccountId,
     status: &RemoteStatus,
 ) -> roosty_core::Result<()> {
-    let txn = state.db.begin().await?;
-    if roosty_db::is_remote_status_favourited(&txn, account_id, status.id).await? {
-        txn.commit().await?;
+    if roosty_db::is_remote_status_favourited(state.db, account_id, status.id).await? {
         return Ok(());
     }
 
-    let (activity_id, job) = prepare_remote_favourite(state, &txn, account_id, status).await?;
-    roosty_db::favourite_remote_status_with_job(&txn, account_id, status.id, &activity_id, job)
+    let (activity_id, job) = prepare_remote_favourite(state, state.db, account_id, status).await?;
+    roosty_db::favourite_remote_status_with_job(state.db, account_id, status.id, &activity_id, job)
         .await?;
-    txn.commit().await?;
     Ok(())
+}
+
+async fn status_collection_action_with_database(
+    state: &AppState,
+    database: &DatabaseContext,
+    account_id: AccountId,
+    path: StatusPath,
+    action: StatusCollectionAction,
+) -> ApiResult<Response> {
+    let txn = database.begin_write().await?;
+    let context = StatusRenderContext::new(state, &txn);
+    let outcome = status_collection_action(&context, account_id, path, action).await?;
+    drop(context);
+    txn.commit().await?;
+    for notification in outcome.notifications {
+        create_and_stream_notification(
+            state,
+            database,
+            notification.account_id,
+            notification.notification_type,
+            account_id,
+            Some(notification.status_id),
+        )
+        .await
+        .inspect_err(|error| warn!(%error, "failed to create status interaction notification"))
+        .ok();
+    }
+    for event in outcome.stream_events {
+        match event {
+            CommittedStatusEvent::Update { status, recipients } => state
+                .streaming_events
+                .publish_home_update(&status, account_id, &recipients),
+            CommittedStatusEvent::Delete {
+                status_id,
+                visibility,
+                recipients,
+            } => state.streaming_events.publish_delete(
+                &status_id,
+                account_id,
+                visibility,
+                &recipients,
+            ),
+        }
+    }
+    Ok(outcome.response)
+}
+
+struct PendingStatusNotification {
+    account_id: AccountId,
+    notification_type: LocalNotificationType,
+    status_id: StatusId,
+}
+
+enum CommittedStatusEvent {
+    Update {
+        status: Value,
+        recipients: Vec<AccountId>,
+    },
+    Delete {
+        status_id: String,
+        visibility: StatusVisibility,
+        recipients: Vec<AccountId>,
+    },
+}
+
+struct StatusCollectionOutcome {
+    response: Response,
+    notifications: Vec<PendingStatusNotification>,
+    stream_events: Vec<CommittedStatusEvent>,
+}
+
+impl StatusCollectionOutcome {
+    fn response(response: Response) -> Self {
+        Self {
+            response,
+            notifications: Vec::new(),
+            stream_events: Vec::new(),
+        }
+    }
 }
 
 /// Apply a local status collection mutation and return the updated status.
 async fn status_collection_action(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     account_id: AccountId,
     path: StatusPath,
     action: StatusCollectionAction,
-) -> Response {
+) -> ApiResult<StatusCollectionOutcome> {
     let status_id = StatusId(path.status_id);
-    let status = match visible_status_for_account(state, status_id, account_id).await {
-        Ok(Some(status)) => status,
-        Ok(None) => {
-            let remote = match roosty_db::find_remote_status_by_id(&state.db, status_id).await {
-                Ok(Some(status)) => match roosty_db::remote_status_visible_to_account(
-                    &state.db, &status, account_id,
-                )
-                .await
-                {
-                    Ok(true) => status,
-                    Ok(false) => return not_found(),
-                    Err(error) => return server_error(error),
-                },
-                Ok(None) => return not_found(),
-                Err(error) => return server_error(error),
-            };
-            if remote.visibility == StatusVisibility::Private
-                && matches!(
-                    action,
-                    StatusCollectionAction::Reblog | StatusCollectionAction::Unreblog
-                )
-            {
-                return bad_request("private statuses cannot be boosted");
+    let local_status = visible_status_for_account(state, status_id, account_id).await?;
+    let Some(status) = local_status else {
+        let remote = roosty_db::find_remote_status_by_id(state.db, status_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+        if !roosty_db::remote_status_visible_to_account(state.db, &remote, account_id).await? {
+            return Err(ApiError::NotFound("Record not found".into()));
+        }
+        if remote.visibility == StatusVisibility::Private
+            && matches!(
+                action,
+                StatusCollectionAction::Reblog | StatusCollectionAction::Unreblog
+            )
+        {
+            return Err(ApiError::BadRequest(
+                "private statuses cannot be boosted".into(),
+            ));
+        }
+        let outcome = match action {
+            StatusCollectionAction::Favourite => {
+                favourite_remote_status(state, account_id, &remote).await?;
+                let response =
+                    remote_status_response_for_viewer(state, remote, Some(account_id)).await?;
+                StatusCollectionOutcome::response(Json(response).into_response())
             }
-            return match action {
-                StatusCollectionAction::Favourite => {
-                    let result = favourite_remote_status(state, account_id, &remote).await;
-                    match result {
-                        Ok(()) => {
-                            match remote_status_response_for_viewer(state, remote, Some(account_id))
-                                .await
-                            {
-                                Ok(response) => Json(response).into_response(),
-                                Err(error) => server_error(error),
-                            }
-                        }
-                        Err(error) => server_error(error),
-                    }
-                }
-                StatusCollectionAction::Unfavourite => {
-                    let favourite = match roosty_db::find_remote_status_favourite(
-                        &state.db, account_id, remote.id,
+            StatusCollectionAction::Unfavourite => {
+                let favourite =
+                    roosty_db::find_remote_status_favourite(state.db, account_id, remote.id)
+                        .await?;
+                if let Some(favourite) = favourite {
+                    let job = prepare_remote_unfavourite(state, state.db, favourite).await?;
+                    roosty_db::unfavourite_remote_status_with_job(
+                        state.db, account_id, remote.id, job,
                     )
-                    .await
-                    {
-                        Ok(favourite) => favourite,
-                        Err(error) => return server_error(error),
-                    };
-                    match favourite {
-                        Some(favourite) => {
-                            let job = match prepare_remote_unfavourite(state, &state.db, favourite)
-                                .await
-                            {
-                                Ok(job) => job,
-                                Err(error) => return server_error(error),
-                            };
-                            let txn = match state.db.begin().await {
-                                Ok(txn) => txn,
-                                Err(error) => return server_error(error.into()),
-                            };
-                            match roosty_db::unfavourite_remote_status_with_job(
-                                &txn, account_id, remote.id, job,
-                            )
-                            .await
-                            {
-                                Ok(Some(_)) | Ok(None) => match txn.commit().await {
-                                    Ok(()) => {}
-                                    Err(error) => return server_error(error.into()),
-                                },
-                                Err(error) => return server_error(error),
-                            }
-                            match remote_status_response_for_viewer(state, remote, Some(account_id))
-                                .await
-                            {
-                                Ok(response) => Json(response).into_response(),
-                                Err(error) => server_error(error),
-                            }
-                        }
-                        None => {
-                            match remote_status_response_for_viewer(state, remote, Some(account_id))
-                                .await
-                            {
-                                Ok(response) => Json(response).into_response(),
-                                Err(error) => server_error(error),
-                            }
-                        }
-                    }
+                    .await?;
                 }
-                StatusCollectionAction::Reblog => {
-                    let already_reblogged = match roosty_db::is_remote_status_reblogged(
-                        &state.db, account_id, remote.id,
-                    )
-                    .await
+                let response =
+                    remote_status_response_for_viewer(state, remote, Some(account_id)).await?;
+                StatusCollectionOutcome::response(Json(response).into_response())
+            }
+            StatusCollectionAction::Reblog => {
+                let reblog =
+                    if roosty_db::is_remote_status_reblogged(state.db, account_id, remote.id)
+                        .await?
                     {
-                        Ok(value) => value,
-                        Err(error) => return server_error(error),
-                    };
-                    let reblog = if already_reblogged {
-                        match roosty_db::reblog_remote_status(&state.db, account_id, remote.id, "")
-                            .await
-                        {
-                            Ok(reblog) => reblog,
-                            Err(error) => return server_error(error),
-                        }
+                        roosty_db::reblog_remote_status(state.db, account_id, remote.id, "").await?
                     } else {
-                        let (activity_id, job) = match prepare_remote_reblog(
-                            state, &state.db, account_id, &remote,
-                        )
-                        .await
-                        {
-                            Ok(id) => id,
-                            Err(error) => return server_error(error),
-                        };
-                        let txn = match state.db.begin().await {
-                            Ok(txn) => txn,
-                            Err(error) => return server_error(error.into()),
-                        };
-                        match roosty_db::reblog_remote_status_with_job(
-                            &txn,
+                        let (activity_id, job) =
+                            prepare_remote_reblog(state, state.db, account_id, &remote).await?;
+                        roosty_db::reblog_remote_status_with_job(
+                            state.db,
                             account_id,
                             remote.id,
                             &activity_id,
                             job,
                         )
-                        .await
-                        {
-                            Ok(reblog) => match txn.commit().await {
-                                Ok(()) => reblog,
-                                Err(error) => return server_error(error.into()),
-                            },
-                            Err(error) => return server_error(error),
-                        }
+                        .await?
                     };
-                    match local_remote_reblog_response(state, reblog, Some(account_id)).await {
-                        Ok(Some(response)) => {
-                            let recipients = reblog_stream_recipients(state, account_id).await;
-                            state.streaming_events.publish_home_update(
-                                &response,
-                                account_id,
-                                &recipients,
-                            );
-                            Json(response).into_response()
-                        }
-                        Ok(None) => not_found(),
-                        Err(error) => server_error(error),
-                    }
+                let response = local_remote_reblog_response(state, reblog, Some(account_id))
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+                let status = serde_json::to_value(&response)?;
+                let recipients = reblog_stream_recipients(state, account_id).await;
+                StatusCollectionOutcome {
+                    response: Json(response).into_response(),
+                    notifications: Vec::new(),
+                    stream_events: vec![CommittedStatusEvent::Update { status, recipients }],
                 }
-                StatusCollectionAction::Unreblog => {
-                    let reblog = match roosty_db::find_remote_status_reblog(
-                        &state.db, account_id, remote.id,
+            }
+            StatusCollectionAction::Unreblog => {
+                let reblog =
+                    roosty_db::find_remote_status_reblog(state.db, account_id, remote.id).await?;
+                let mut stream_events = Vec::new();
+                if let Some(reblog) = reblog {
+                    let reblog_id = reblog.id;
+                    let job = prepare_remote_unreblog(state, state.db, reblog).await?;
+                    roosty_db::unreblog_remote_status_with_job(
+                        state.db, account_id, remote.id, job,
                     )
-                    .await
-                    {
-                        Ok(reblog) => reblog,
-                        Err(error) => return server_error(error),
-                    };
-                    if let Some(reblog) = reblog {
-                        let reblog_id = reblog.id;
-                        let job = match prepare_remote_unreblog(state, &state.db, reblog).await {
-                            Ok(job) => job,
-                            Err(error) => return server_error(error),
-                        };
-                        let txn = match state.db.begin().await {
-                            Ok(txn) => txn,
-                            Err(error) => return server_error(error.into()),
-                        };
-                        match roosty_db::unreblog_remote_status_with_job(
-                            &txn, account_id, remote.id, job,
-                        )
-                        .await
-                        {
-                            Ok(Some(_)) | Ok(None) => match txn.commit().await {
-                                Ok(()) => {}
-                                Err(error) => return server_error(error.into()),
-                            },
-                            Err(error) => return server_error(error),
-                        }
-                        let recipients = reblog_stream_recipients(state, account_id).await;
-                        state.streaming_events.publish_delete(
-                            &reblog_id.to_string(),
-                            account_id,
-                            StatusVisibility::Unlisted,
-                            &recipients,
-                        );
-                    }
-                    match remote_status_response_for_viewer(state, remote, Some(account_id)).await {
-                        Ok(response) => Json(response).into_response(),
-                        Err(error) => server_error(error),
-                    }
+                    .await?;
+                    stream_events.push(CommittedStatusEvent::Delete {
+                        status_id: reblog_id.to_string(),
+                        visibility: StatusVisibility::Unlisted,
+                        recipients: reblog_stream_recipients(state, account_id).await,
+                    });
                 }
-                _ => not_found(),
-            };
-        }
-        Err(error) => return server_error(error),
+                let response =
+                    remote_status_response_for_viewer(state, remote, Some(account_id)).await?;
+                StatusCollectionOutcome {
+                    response: Json(response).into_response(),
+                    notifications: Vec::new(),
+                    stream_events,
+                }
+            }
+            StatusCollectionAction::Bookmark | StatusCollectionAction::Unbookmark => {
+                return Err(ApiError::NotFound("Record not found".into()));
+            }
+        };
+        return Ok(outcome);
     };
 
     if status.visibility == StatusVisibility::Private
@@ -3630,124 +3633,97 @@ async fn status_collection_action(
             StatusCollectionAction::Reblog | StatusCollectionAction::Unreblog
         )
     {
-        return bad_request("private statuses cannot be boosted");
+        return Err(ApiError::BadRequest(
+            "private statuses cannot be boosted".into(),
+        ));
     }
 
     let reblog = if matches!(action, StatusCollectionAction::Reblog) {
-        match roosty_db::reblog_local_status(&state.db, account_id, status_id).await {
-            Ok(reblog) => Some(reblog),
-            Err(error) => return server_error(error),
-        }
+        Some(roosty_db::reblog_local_status(state.db, account_id, status_id).await?)
     } else {
         None
     };
     let removed_reblog = if matches!(action, StatusCollectionAction::Unreblog) {
-        match roosty_db::unreblog_local_status(&state.db, account_id, status_id).await {
-            Ok(reblog) => reblog,
-            Err(error) => return server_error(error),
-        }
+        roosty_db::unreblog_local_status(state.db, account_id, status_id).await?
     } else {
         None
     };
-    let result = match action {
+    match action {
         StatusCollectionAction::Favourite => {
-            roosty_db::favourite_local_status(&state.db, account_id, status_id).await
+            roosty_db::favourite_local_status(state.db, account_id, status_id).await?
         }
         StatusCollectionAction::Unfavourite => {
-            roosty_db::unfavourite_local_status(&state.db, account_id, status_id).await
+            roosty_db::unfavourite_local_status(state.db, account_id, status_id).await?
         }
         StatusCollectionAction::Bookmark => {
-            roosty_db::bookmark_local_status(&state.db, account_id, status_id).await
+            roosty_db::bookmark_local_status(state.db, account_id, status_id).await?
         }
         StatusCollectionAction::Unbookmark => {
-            roosty_db::unbookmark_local_status(&state.db, account_id, status_id).await
+            roosty_db::unbookmark_local_status(state.db, account_id, status_id).await?
         }
-        StatusCollectionAction::Reblog => Ok(()),
-        StatusCollectionAction::Unreblog => Ok(()),
-    };
-
-    match result {
-        Ok(()) => {
-            if matches!(action, StatusCollectionAction::Favourite)
-                && status.account_id != account_id
-                && let Err(error) = create_and_stream_notification(
-                    state,
-                    status.account_id,
-                    LocalNotificationType::Favourite,
-                    account_id,
-                    Some(status.id),
-                )
-                .await
-            {
-                warn!(%error, "failed to create favourite notification");
-            }
-            if matches!(action, StatusCollectionAction::Reblog) {
-                return match reblog {
-                    Some(reblog) => {
-                        if status.account_id != account_id
-                            && let Err(error) = create_and_stream_notification(
-                                state,
-                                status.account_id,
-                                LocalNotificationType::Reblog,
-                                account_id,
-                                Some(status.id),
-                            )
-                            .await
-                        {
-                            warn!(%error, "failed to create reblog notification");
-                        }
-                        match reblog_response(state, reblog, Some(account_id)).await {
-                            Ok(Some(response)) => {
-                                let recipients = reblog_stream_recipients(state, account_id).await;
-                                state.streaming_events.publish_home_update(
-                                    &response,
-                                    account_id,
-                                    &recipients,
-                                );
-                                Json(response).into_response()
-                            }
-                            Ok(None) => not_found(),
-                            Err(error) => server_error(error),
-                        }
-                    }
-                    None => server_error(RoostyError::InvalidInput(
-                        "boost was not created".to_owned(),
-                    )),
-                };
-            }
-            if let Some(removed_reblog) = removed_reblog {
-                let recipients = reblog_stream_recipients(state, account_id).await;
-                state.streaming_events.publish_delete(
-                    &removed_reblog.id.to_string(),
-                    account_id,
-                    StatusVisibility::Direct,
-                    &recipients,
-                );
-            }
-            status_with_author_response(state, status, Some(account_id)).await
-        }
-        Err(error) => server_error(error),
+        StatusCollectionAction::Reblog | StatusCollectionAction::Unreblog => {}
     }
+    let mut notifications = Vec::new();
+    let mut stream_events = Vec::new();
+    if status.account_id != account_id {
+        let notification_type = match action {
+            StatusCollectionAction::Favourite => Some(LocalNotificationType::Favourite),
+            StatusCollectionAction::Reblog => Some(LocalNotificationType::Reblog),
+            _ => None,
+        };
+        if let Some(notification_type) = notification_type {
+            notifications.push(PendingStatusNotification {
+                account_id: status.account_id,
+                notification_type,
+                status_id: status.id,
+            });
+        }
+    }
+    let response = if let Some(reblog) = reblog {
+        let response = reblog_response(state, reblog, Some(account_id))
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+        let serialized = serde_json::to_value(&response)?;
+        stream_events.push(CommittedStatusEvent::Update {
+            status: serialized,
+            recipients: reblog_stream_recipients(state, account_id).await,
+        });
+        Json(response).into_response()
+    } else {
+        if let Some(removed_reblog) = removed_reblog {
+            stream_events.push(CommittedStatusEvent::Delete {
+                status_id: removed_reblog.id.to_string(),
+                visibility: StatusVisibility::Direct,
+                recipients: reblog_stream_recipients(state, account_id).await,
+            });
+        }
+        Json(status_with_author(state, status, Some(account_id)).await?).into_response()
+    };
+    Ok(StatusCollectionOutcome {
+        response,
+        notifications,
+        stream_events,
+    })
 }
 
 /// Return followers that should receive this status in their home stream.
 async fn status_stream_recipients(
-    state: &AppState,
-    status: &roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: &LocalStatus,
 ) -> Vec<AccountId> {
     if status.visibility == StatusVisibility::Direct {
         return Vec::new();
     }
-    match roosty_db::local_follower_ids_for_account(&state.db, status.account_id, true).await {
+    match roosty_db::local_follower_ids_for_account(state.db, status.account_id, true).await {
         Ok(mut recipients) => {
             if status.visibility == StatusVisibility::Public {
-                match roosty_db::local_tag_follower_ids_for_status(&state.db, status.id).await {
+                match roosty_db::local_tag_follower_ids_for_status(state.db, status.id).await {
                     Ok(tag_followers) => recipients.extend(tag_followers),
                     Err(error) => warn!(%error, "failed to resolve followed-tag stream recipients"),
                 }
             }
             if status.visibility == StatusVisibility::Private {
-                match roosty_db::local_status_local_recipients(&state.db, status.id).await {
+                match roosty_db::local_status_local_recipients(state.db, status.id).await {
                     Ok(explicit) => recipients.extend(explicit),
                     Err(error) => warn!(%error, "failed to resolve explicit status recipients"),
                 }
@@ -3764,8 +3740,11 @@ async fn status_stream_recipients(
 }
 
 /// Return followers that should receive this account's boost in their home stream.
-async fn reblog_stream_recipients(state: &AppState, account_id: AccountId) -> Vec<AccountId> {
-    match roosty_db::local_follower_ids_for_account(&state.db, account_id, false).await {
+async fn reblog_stream_recipients(
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    account_id: AccountId,
+) -> Vec<AccountId> {
+    match roosty_db::local_follower_ids_for_account(state.db, account_id, false).await {
         Ok(recipients) => filter_stream_recipients(state, account_id, recipients).await,
         Err(error) => {
             warn!(%error, "failed to resolve reblog stream recipients");
@@ -3776,13 +3755,13 @@ async fn reblog_stream_recipients(state: &AppState, account_id: AccountId) -> Ve
 
 /// Remove followers who have muted or blocked the account producing a stream event.
 async fn filter_stream_recipients(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     author_id: AccountId,
     recipients: Vec<AccountId>,
 ) -> Vec<AccountId> {
     let mut visible = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        match roosty_db::local_account_is_hidden_for_viewer(&state.db, recipient, author_id).await {
+        match roosty_db::local_account_is_hidden_for_viewer(state.db, recipient, author_id).await {
             Ok(false) => visible.push(recipient),
             Ok(true) => {}
             Err(error) => warn!(%error, "failed to filter muted or blocked stream recipient"),
@@ -3794,13 +3773,13 @@ async fn filter_stream_recipients(
 
 /// Remove viewers who mute or block the remote actor producing a stream event.
 async fn filter_remote_stream_recipients(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     actor_id: AccountId,
     recipients: Vec<AccountId>,
 ) -> Vec<AccountId> {
     let mut visible = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        match roosty_db::remote_account_is_hidden_for_viewer(&state.db, recipient, actor_id).await {
+        match roosty_db::remote_account_is_hidden_for_viewer(state.db, recipient, actor_id).await {
             Ok(false) => visible.push(recipient),
             Ok(true) => {}
             Err(error) => warn!(%error, "failed to filter moderated remote stream recipient"),
@@ -3811,8 +3790,8 @@ async fn filter_remote_stream_recipients(
 
 /// Return mixed local and remote interaction actors with Mastodon cursor pagination.
 async fn interaction_accounts_response(
-    state: &AppState,
-    page: roosty_db::CollectionPage<roosty_db::StatusInteractionAccount>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    page: CollectionPage<StatusInteractionAccount>,
     limit: u64,
     path: &str,
 ) -> Response {
@@ -3820,13 +3799,13 @@ async fn interaction_accounts_response(
     let mut accounts = Vec::with_capacity(page.items.len());
     for account in page.items {
         match account {
-            roosty_db::StatusInteractionAccount::Local(account) => {
-                match account_response(state, account).await {
+            StatusInteractionAccount::Local(account) => {
+                match account_response(state, state.db, account).await {
                     Ok(account) => accounts.push(StatusAccountResponse::Local(Box::new(account))),
                     Err(error) => return server_error(error),
                 }
             }
-            roosty_db::StatusInteractionAccount::Remote(actor) => {
+            StatusInteractionAccount::Remote(actor) => {
                 match remote_account_response(state, actor).await {
                     Ok(account) => accounts.push(StatusAccountResponse::Remote(Box::new(account))),
                     Err(error) => return server_error(error),
@@ -3842,8 +3821,24 @@ async fn interaction_accounts_response(
 }
 
 /// Return a local status collection for an authenticated account.
-async fn status_collection_list(
+async fn status_collection_list_with_database(
     state: &AppState,
+    database: &DatabaseContext,
+    account_id: AccountId,
+    params: CollectionParams,
+    collection: StatusCollectionList,
+) -> Response {
+    let txn = match database.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let context = StatusRenderContext::new(state, &txn);
+    status_collection_list(&context, account_id, params, collection).await
+}
+
+/// Return a local status collection for an authenticated account.
+async fn status_collection_list(
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     account_id: AccountId,
     params: CollectionParams,
     collection: StatusCollectionList,
@@ -3858,7 +3853,7 @@ async fn status_collection_list(
             return favourites_response(state, account_id, limit, cursor).await;
         }
         StatusCollectionList::Bookmarks => {
-            roosty_db::local_bookmarks_for_account(&state.db, account_id, limit, cursor).await
+            roosty_db::local_bookmarks_for_account(state.db, account_id, limit, cursor).await
         }
     };
 
@@ -3888,12 +3883,12 @@ async fn status_collection_list(
 
 /// Return the authenticated user's mixed local and cached-remote favourites collection.
 async fn favourites_response(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     account_id: AccountId,
     limit: u64,
-    cursor: roosty_db::CollectionCursor,
+    cursor: CollectionCursor,
 ) -> Response {
-    match roosty_db::favourites_for_account(&state.db, account_id, limit, cursor).await {
+    match roosty_db::favourites_for_account(state.db, account_id, limit, cursor).await {
         Ok(page) => {
             let link_header = CollectionLink::new(
                 limit,
@@ -3922,19 +3917,19 @@ async fn favourites_response(
 }
 
 async fn favourite_status_response(
-    state: &AppState,
-    status: roosty_db::FavouriteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: FavouriteStatus,
     viewer: AccountId,
 ) -> Result<Option<StatusResponse>, RoostyError> {
     match status {
-        roosty_db::FavouriteStatus::Local(status) => {
-            if !status_visible_to_viewer(state, &status, Some(viewer)).await? {
+        FavouriteStatus::Local(status) => {
+            if !status_visible_to_viewer(state.db, &status, Some(viewer)).await? {
                 return Ok(None);
             }
             Ok(Some(status_with_author(state, status, Some(viewer)).await?))
         }
-        roosty_db::FavouriteStatus::Remote(status) => {
-            if !roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await? {
+        FavouriteStatus::Remote(status) => {
+            if !roosty_db::remote_status_visible_to_account(state.db, &status, viewer).await? {
                 return Ok(None);
             }
             Ok(Some(
@@ -3945,18 +3940,18 @@ async fn favourite_status_response(
 }
 
 async fn status_models(
-    state: &AppState,
-    statuses: Vec<roosty_db::LocalStatus>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    statuses: Vec<LocalStatus>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let pinned = roosty_db::pinned_local_status_ids(
-        &state.db,
+        state.db,
         &statuses.iter().map(|status| status.id).collect::<Vec<_>>(),
     )
     .await?;
     let mut response = Vec::with_capacity(statuses.len());
     for status in statuses {
-        if status_visible_to_viewer(state, &status, viewer).await? {
+        if status_visible_to_viewer(state.db, &status, viewer).await? {
             let is_pinned = pinned.contains(&status.id);
             response.push(status_with_author_and_pin(state, status, viewer, is_pinned).await?);
         }
@@ -3966,40 +3961,40 @@ async fn status_models(
 }
 
 async fn home_timeline_models(
-    state: &AppState,
-    items: Vec<roosty_db::HomeTimelineItem>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    items: Vec<HomeTimelineItem>,
     viewer: AccountId,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let local_ids = items
         .iter()
         .filter_map(|item| match item {
-            roosty_db::HomeTimelineItem::Status(status) => Some(status.id),
+            HomeTimelineItem::Status(status) => Some(status.id),
             _ => None,
         })
         .collect::<Vec<_>>();
     let remote_ids = items
         .iter()
         .filter_map(|item| match item {
-            roosty_db::HomeTimelineItem::RemoteStatus(status) => Some(status.id),
+            HomeTimelineItem::RemoteStatus(status) => Some(status.id),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let local_pins = roosty_db::pinned_local_status_ids(&state.db, &local_ids).await?;
-    let remote_pins = roosty_db::pinned_remote_status_ids(&state.db, &remote_ids).await?;
+    let local_pins = roosty_db::pinned_local_status_ids(state.db, &local_ids).await?;
+    let remote_pins = roosty_db::pinned_remote_status_ids(state.db, &remote_ids).await?;
     let mut response = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            roosty_db::HomeTimelineItem::Status(status) => {
+            HomeTimelineItem::Status(status) => {
                 let pinned = local_pins.contains(&status.id);
                 response
                     .push(status_with_author_and_pin(state, status, Some(viewer), pinned).await?);
             }
-            roosty_db::HomeTimelineItem::Reblog(reblog) => {
+            HomeTimelineItem::Reblog(reblog) => {
                 if let Some(reblog) = reblog_response(state, reblog, Some(viewer)).await? {
                     response.push(reblog);
                 }
             }
-            roosty_db::HomeTimelineItem::RemoteStatus(status) => {
+            HomeTimelineItem::RemoteStatus(status) => {
                 if !remote_status_available(state, &status).await? {
                     continue;
                 }
@@ -4009,15 +4004,15 @@ async fn home_timeline_models(
                         .await?,
                 );
             }
-            roosty_db::HomeTimelineItem::LocalRemoteReblog(reblog) => {
+            HomeTimelineItem::LocalRemoteReblog(reblog) => {
                 let Some(original) =
-                    roosty_db::find_remote_status_by_id(&state.db, reblog.remote_status_id).await?
+                    roosty_db::find_remote_status_by_id(state.db, reblog.remote_status_id).await?
                 else {
                     continue;
                 };
                 if !remote_status_available(state, &original).await?
                     || roosty_db::remote_account_is_hidden_for_viewer(
-                        &state.db,
+                        state.db,
                         viewer,
                         original.remote_actor_id,
                     )
@@ -4031,7 +4026,7 @@ async fn home_timeline_models(
                     response.push(reblog_response);
                 }
             }
-            roosty_db::HomeTimelineItem::RemoteReblog(reblog) => {
+            HomeTimelineItem::RemoteReblog(reblog) => {
                 if let Some(reblog_response) =
                     remote_reblog_response(state, reblog, Some(viewer)).await?
                 {
@@ -4046,8 +4041,8 @@ async fn home_timeline_models(
 
 /// Build a Mastodon home timeline response from statuses and boosts.
 pub(crate) async fn home_timeline_response(
-    state: &AppState,
-    page: roosty_db::TimelinePage<roosty_db::HomeTimelineItem>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    page: TimelinePage<HomeTimelineItem>,
     limit: u64,
     path: &str,
     viewer: AccountId,
@@ -4065,8 +4060,8 @@ pub(crate) async fn home_timeline_response(
 
 /// Build a mixed local/remote public timeline response.
 async fn public_timeline_response(
-    state: &AppState,
-    page: roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    page: TimelinePage<PublicTimelineItem>,
     limit: u64,
     viewer: Option<AccountId>,
     filters: PublicTimelineFilters,
@@ -4085,8 +4080,8 @@ async fn public_timeline_response(
 
 /// Build a mixed local/remote hashtag timeline response.
 async fn tag_timeline_response(
-    state: &AppState,
-    page: roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    page: TimelinePage<PublicTimelineItem>,
     limit: u64,
     path: &str,
     viewer: Option<AccountId>,
@@ -4105,43 +4100,43 @@ async fn tag_timeline_response(
 }
 
 async fn public_timeline_models(
-    state: &AppState,
-    timeline: Vec<roosty_db::PublicTimelineItem>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    timeline: Vec<PublicTimelineItem>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let local_ids = timeline
         .iter()
         .filter_map(|item| match item {
-            roosty_db::PublicTimelineItem::Local(status) => Some(status.id),
+            PublicTimelineItem::Local(status) => Some(status.id),
             _ => None,
         })
         .collect::<Vec<_>>();
     let remote_ids = timeline
         .iter()
         .filter_map(|item| match item {
-            roosty_db::PublicTimelineItem::Remote(status) => Some(status.id),
+            PublicTimelineItem::Remote(status) => Some(status.id),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let local_pins = roosty_db::pinned_local_status_ids(&state.db, &local_ids).await?;
-    let remote_pins = roosty_db::pinned_remote_status_ids(&state.db, &remote_ids).await?;
+    let local_pins = roosty_db::pinned_local_status_ids(state.db, &local_ids).await?;
+    let remote_pins = roosty_db::pinned_remote_status_ids(state.db, &remote_ids).await?;
     let status_references = timeline
         .iter()
         .map(|item| match item {
-            roosty_db::PublicTimelineItem::Local(status) => StatusReference::Local(status.id),
-            roosty_db::PublicTimelineItem::Remote(status) => StatusReference::Remote(status.id),
+            PublicTimelineItem::Local(status) => StatusReference::Local(status.id),
+            PublicTimelineItem::Remote(status) => StatusReference::Remote(status.id),
         })
         .collect::<Vec<_>>();
-    let mut cards = roosty_db::preview_cards_for_statuses(&state.db, &status_references).await?;
+    let mut cards = roosty_db::preview_cards_for_statuses(state.db, &status_references).await?;
     let mut items = Vec::with_capacity(timeline.len());
     for item in timeline {
         let result = match item {
-            roosty_db::PublicTimelineItem::Local(status) => {
+            PublicTimelineItem::Local(status) => {
                 let pinned = local_pins.contains(&status.id);
                 let card = cards.remove(&StatusReference::Local(status.id));
                 status_with_author_and_pin_and_card(state, status, viewer, pinned, card).await
             }
-            roosty_db::PublicTimelineItem::Remote(status) => {
+            PublicTimelineItem::Remote(status) => {
                 let pinned = remote_pins.contains(&status.id);
                 let card = cards.remove(&StatusReference::Remote(status.id));
                 remote_status_response_for_viewer_with_pin_and_card(
@@ -4157,8 +4152,8 @@ async fn public_timeline_models(
 
 /// Project cached trend results through the normal status serializer.
 pub(crate) async fn trending_status_models(
-    state: &AppState,
-    trends: Vec<roosty_db::TrendingStatus>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    trends: Vec<TrendingStatus>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let metrics = trends
@@ -4176,8 +4171,8 @@ pub(crate) async fn trending_status_models(
 
 /// Build a Mastodon timeline response from local statuses and optional viewer state.
 pub(crate) async fn timeline_response(
-    state: &AppState,
-    page: roosty_db::TimelinePage<roosty_db::LocalStatus>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    page: TimelinePage<LocalStatus>,
     limit: u64,
     path: &str,
     viewer: Option<AccountId>,
@@ -4192,15 +4187,15 @@ pub(crate) async fn timeline_response(
 
 /// Build a Mastodon timeline response from cached remote statuses and viewer state.
 pub(crate) async fn remote_timeline_response(
-    state: &AppState,
-    page: roosty_db::TimelinePage<roosty_db::RemoteStatus>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    page: TimelinePage<RemoteStatus>,
     limit: u64,
     path: &str,
     viewer: Option<AccountId>,
 ) -> Response {
     let link_header = timeline_link_header(&page, limit, path);
     let pinned = match roosty_db::pinned_remote_status_ids(
-        &state.db,
+        state.db,
         &page
             .items
             .iter()
@@ -4216,7 +4211,7 @@ pub(crate) async fn remote_timeline_response(
     for status in page.items {
         let visible = match viewer {
             Some(viewer) => {
-                roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await
+                roosty_db::remote_status_visible_to_account(state.db, &status, viewer).await
             }
             None => Ok(matches!(
                 status.visibility,
@@ -4242,8 +4237,8 @@ pub(crate) async fn remote_timeline_response(
 }
 
 async fn status_with_author_response(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     viewer: Option<AccountId>,
 ) -> Response {
     match status_with_author(state, status, viewer).await {
@@ -4253,17 +4248,17 @@ async fn status_with_author_response(
 }
 
 pub(crate) async fn status_with_author(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
-    let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
+    let pinned = roosty_db::is_local_status_pinned(state.db, status.id).await?;
     status_with_author_and_pin(state, status, viewer, pinned).await
 }
 
 async fn status_with_author_and_pin(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
@@ -4272,8 +4267,8 @@ async fn status_with_author_and_pin(
 }
 
 async fn status_with_author_and_pin_and_card(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     viewer: Option<AccountId>,
     pinned: bool,
     card: Option<PreviewCard>,
@@ -4282,13 +4277,13 @@ async fn status_with_author_and_pin_and_card(
 }
 
 async fn status_with_author_and_pin_with_source(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     viewer: Option<AccountId>,
     pinned: bool,
     card: PreviewCardSource,
 ) -> Result<StatusResponse, RoostyError> {
-    let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+    let account = roosty_db::find_local_account_by_id(state.db, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("status author does not exist".to_owned()))?;
 
@@ -4296,8 +4291,8 @@ async fn status_with_author_and_pin_with_source(
 }
 
 async fn status_response(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     account: LocalAccount,
 ) -> Result<StatusResponse, RoostyError> {
     status_response_for_viewer(state, status, account.clone(), Some(account.id)).await
@@ -4305,53 +4300,53 @@ async fn status_response(
 
 /// Build the limited Mastodon status projection supported for a cached remote Note.
 pub(crate) async fn remote_status_response(
-    state: &AppState,
-    status: roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: RemoteStatus,
 ) -> Result<StatusResponse, RoostyError> {
     remote_status_response_for_viewer(state, status, None).await
 }
 
 /// Build a Mastodon boost wrapper for an Announce received from a remote actor.
 pub(crate) async fn remote_reblog_response(
-    state: &AppState,
-    reblog: roosty_db::RemoteStatusReblog,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    reblog: RemoteStatusReblog,
     viewer: Option<AccountId>,
 ) -> Result<Option<StatusResponse>, RoostyError> {
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, reblog.remote_actor_id)
+    let actor = roosty_db::find_remote_actor_by_id(state.db, reblog.remote_actor_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("remote boost actor does not exist".to_owned()))?;
     if actor.suspended_at.is_some()
-        || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+        || roosty_db::federation_domain_policy(state.db, &actor.domain)
             .await?
             .is_suspended()
     {
         return Ok(None);
     }
     if let Some(viewer) = viewer
-        && roosty_db::remote_account_is_hidden_for_viewer(&state.db, viewer, reblog.remote_actor_id)
+        && roosty_db::remote_account_is_hidden_for_viewer(state.db, viewer, reblog.remote_actor_id)
             .await?
     {
         return Ok(None);
     }
     let original = match reblog.target {
-        roosty_db::RemoteStatusReblogTarget::Local(status_id) => {
-            let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await?
+        RemoteStatusReblogTarget::Local(status_id) => {
+            let Some(status) = roosty_db::find_local_status_by_id(state.db, status_id).await?
             else {
                 return Ok(None);
             };
-            if !status_visible_to_viewer(state, &status, viewer).await? {
+            if !status_visible_to_viewer(state.db, &status, viewer).await? {
                 return Ok(None);
             }
             Box::new(status_with_author(state, status, viewer).await?)
         }
-        roosty_db::RemoteStatusReblogTarget::Remote(status_id) => {
-            let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await?
+        RemoteStatusReblogTarget::Remote(status_id) => {
+            let Some(status) = roosty_db::find_remote_status_by_id(state.db, status_id).await?
             else {
                 return Ok(None);
             };
             let visible = match viewer {
                 Some(viewer) => {
-                    roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await?
+                    roosty_db::remote_status_visible_to_account(state.db, &status, viewer).await?
                 }
                 None => matches!(
                     status.visibility,
@@ -4408,21 +4403,18 @@ pub(crate) async fn remote_reblog_response(
 
 /// Publish a remote actor's newly stored boost to accounts following that actor.
 pub(crate) async fn publish_remote_reblog_update(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     remote_actor_id: AccountId,
     activity_id: &str,
 ) -> Result<(), RoostyError> {
-    let Some(reblog) = roosty_db::find_remote_status_reblog_by_activity_id(
-        &state.db,
-        remote_actor_id,
-        activity_id,
-    )
-    .await?
+    let Some(reblog) =
+        roosty_db::find_remote_status_reblog_by_activity_id(state.db, remote_actor_id, activity_id)
+            .await?
     else {
         return Ok(());
     };
     let recipients =
-        roosty_db::accepted_local_reblog_followers_of_remote_actor(&state.db, remote_actor_id)
+        roosty_db::accepted_local_reblog_followers_of_remote_actor(state.db, remote_actor_id)
             .await?;
     let recipients = filter_remote_stream_recipients(state, remote_actor_id, recipients).await;
     if let Some(response) =
@@ -4437,12 +4429,12 @@ pub(crate) async fn publish_remote_reblog_update(
 
 /// Publish deletion of a remote actor's undone boost to its local followers.
 pub(crate) async fn publish_remote_reblog_delete(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     remote_actor_id: AccountId,
-    reblog_id: uuid::Uuid,
+    reblog_id: Uuid,
 ) -> Result<(), RoostyError> {
     let recipients =
-        roosty_db::accepted_local_reblog_followers_of_remote_actor(&state.db, remote_actor_id)
+        roosty_db::accepted_local_reblog_followers_of_remote_actor(state.db, remote_actor_id)
             .await?;
     let recipients = filter_remote_stream_recipients(state, remote_actor_id, recipients).await;
     state.streaming_events.publish_home_delete(
@@ -4455,17 +4447,17 @@ pub(crate) async fn publish_remote_reblog_delete(
 
 /// Build a cached remote Note projection with viewer-specific favourite state.
 pub(crate) async fn remote_status_response_for_viewer(
-    state: &AppState,
-    status: roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: RemoteStatus,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
-    let pinned = roosty_db::is_remote_status_pinned(&state.db, status.id).await?;
+    let pinned = roosty_db::is_remote_status_pinned(state.db, status.id).await?;
     remote_status_response_for_viewer_with_pin(state, status, viewer, pinned).await
 }
 
 async fn remote_status_response_for_viewer_with_pin(
-    state: &AppState,
-    status: roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: RemoteStatus,
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<StatusResponse, RoostyError> {
@@ -4480,13 +4472,13 @@ async fn remote_status_response_for_viewer_with_pin(
 }
 
 async fn remote_status_response_for_viewer_with_pin_and_card(
-    state: &AppState,
-    status: roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: RemoteStatus,
     viewer: Option<AccountId>,
     pinned: bool,
     card: impl Into<PreviewCardSource>,
 ) -> Result<StatusResponse, RoostyError> {
-    let status_ref = roosty_db::StatusReference::Remote(status.id);
+    let status_ref = StatusReference::Remote(status.id);
     let mut response = Box::pin(remote_status_response_base(
         state,
         status,
@@ -4500,16 +4492,16 @@ async fn remote_status_response_for_viewer_with_pin_and_card(
 }
 
 async fn remote_status_response_base(
-    state: &AppState,
-    status: roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: RemoteStatus,
     viewer: Option<AccountId>,
     pinned: bool,
     card: PreviewCardSource,
 ) -> Result<StatusResponse, RoostyError> {
     let replies_count =
-        roosty_db::count_status_context_replies(&state.db, StatusContextParent::Remote(status.id))
+        roosty_db::count_status_context_replies(state.db, StatusContextParent::Remote(status.id))
             .await?;
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id)
+    let actor = roosty_db::find_remote_actor_by_id(state.db, status.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote status author does not exist".to_owned())
@@ -4517,7 +4509,7 @@ async fn remote_status_response_base(
     let mentions = remote_status_mentions(state, &status).await?;
     let (in_reply_to_id, in_reply_to_account_id) =
         if let Some(parent_id) = status.in_reply_to_local_status_id {
-            match roosty_db::find_local_status_by_id(&state.db, parent_id).await? {
+            match roosty_db::find_local_status_by_id(state.db, parent_id).await? {
                 Some(parent) => (
                     Some(parent.id.0.to_string()),
                     Some(parent.account_id.0.to_string()),
@@ -4525,7 +4517,7 @@ async fn remote_status_response_base(
                 None => (None, None),
             }
         } else if let Some(parent_id) = status.in_reply_to_remote_status_id {
-            match roosty_db::find_remote_status_by_id(&state.db, parent_id).await? {
+            match roosty_db::find_remote_status_by_id(state.db, parent_id).await? {
                 Some(parent) => (
                     Some(parent.id.0.to_string()),
                     Some(parent.remote_actor_id.0.to_string()),
@@ -4537,23 +4529,17 @@ async fn remote_status_response_base(
         };
     let tags = remote_status_tags(state, status.id).await?;
     let quotes_count =
-        roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Remote(status.id))
-            .await?;
+        roosty_db::count_accepted_quotes(state.db, StatusReference::Remote(status.id)).await?;
     let quote_approval = remote_quote_approval(state, &status, viewer).await?;
     let card = card
         .load(state, StatusReference::Remote(status.id))
         .await?
         .map(|card| Box::new(PreviewCardResponse::new(state, *card, None)));
-    let poll_txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let poll =
-        match roosty_db::find_poll_for_status(&poll_txn, PollStatus::Remote(status.id)).await? {
-            Some(poll) => Some(poll_response(&poll_txn, poll, viewer).await?),
+        match roosty_db::find_poll_for_status(state.db, PollStatus::Remote(status.id)).await? {
+            Some(poll) => Some(poll_response(state.db, poll, viewer).await?),
             None => None,
         };
-    poll_txn.commit().await?;
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.published_at),
@@ -4580,7 +4566,7 @@ async fn remote_status_response_base(
         account: StatusAccountResponse::Remote(Box::new(
             remote_account_response(state, actor).await?,
         )),
-        media_attachments: roosty_db::remote_media_attachments_for_status(&state.db, status.id)
+        media_attachments: roosty_db::remote_media_attachments_for_status(state.db, status.id)
             .await?
             .into_iter()
             .map(|media| remote_media_attachment_response(state, media))
@@ -4595,13 +4581,13 @@ async fn remote_status_response_base(
         quotes_count,
         favourited: match viewer {
             Some(account_id) => {
-                roosty_db::is_remote_status_favourited(&state.db, account_id, status.id).await?
+                roosty_db::is_remote_status_favourited(state.db, account_id, status.id).await?
             }
             None => false,
         },
         reblogged: match viewer {
             Some(account_id) => {
-                roosty_db::is_remote_status_reblogged(&state.db, account_id, status.id).await?
+                roosty_db::is_remote_status_reblogged(state.db, account_id, status.id).await?
             }
             None => false,
         },
@@ -4617,23 +4603,23 @@ async fn remote_status_response_base(
 }
 
 async fn remote_status_available(
-    state: &AppState,
-    status: &roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: &RemoteStatus,
 ) -> Result<bool, RoostyError> {
-    let Some(actor) = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?
+    let Some(actor) = roosty_db::find_remote_actor_by_id(state.db, status.remote_actor_id).await?
     else {
         return Ok(false);
     };
     Ok(actor.suspended_at.is_none()
-        && !roosty_db::federation_domain_policy(&state.db, &actor.domain)
+        && !roosty_db::federation_domain_policy(state.db, &actor.domain)
             .await?
             .is_suspended())
 }
 
 /// Project cached ActivityPub Mention tags without resolving new remote identities.
 async fn remote_status_mentions(
-    state: &AppState,
-    status: &roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: &RemoteStatus,
 ) -> Result<Vec<MentionResponse>, RoostyError> {
     let Some(tags) = status.object.get("tag").and_then(Value::as_array) else {
         return Ok(Vec::new());
@@ -4654,12 +4640,12 @@ async fn remote_status_mentions(
         if let Some(username) = href.strip_prefix(&local_prefix)
             && !username.contains('/')
             && let Some(account) =
-                roosty_db::find_local_account_by_username(&state.db, username).await?
+                roosty_db::find_local_account_by_username(state.db, username).await?
             && seen.insert(account.id)
         {
             mentions.push(MentionResponse::new(state, &account));
         } else if let Some(actor) =
-            roosty_db::find_remote_actor_by_activitypub_id(&state.db, href).await?
+            roosty_db::find_remote_actor_by_activitypub_id(state.db, href).await?
             && seen.insert(actor.id)
         {
             mentions.push(MentionResponse::remote(&actor));
@@ -4670,10 +4656,10 @@ async fn remote_status_mentions(
 
 /// Project indexed remote hashtags through this instance's canonical tag URLs.
 async fn remote_status_tags(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     status_id: StatusId,
 ) -> Result<Vec<TagResponse>, RoostyError> {
-    Ok(roosty_db::remote_tags_for_status(&state.db, status_id)
+    Ok(roosty_db::remote_tags_for_status(state.db, status_id)
         .await?
         .into_iter()
         .map(|tag| TagResponse {
@@ -4687,18 +4673,18 @@ async fn remote_status_tags(
 }
 
 async fn reblog_response(
-    state: &AppState,
-    reblog: roosty_db::LocalStatusReblog,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    reblog: LocalStatusReblog,
     viewer: Option<AccountId>,
 ) -> Result<Option<StatusResponse>, RoostyError> {
-    let Some(original) = roosty_db::find_local_status_by_id(&state.db, reblog.status_id).await?
+    let Some(original) = roosty_db::find_local_status_by_id(state.db, reblog.status_id).await?
     else {
         return Ok(None);
     };
-    if !status_visible_to_viewer(state, &original, viewer).await? {
+    if !status_visible_to_viewer(state.db, &original, viewer).await? {
         return Ok(None);
     }
-    let Some(account) = roosty_db::find_local_account_by_id(&state.db, reblog.account_id).await?
+    let Some(account) = roosty_db::find_local_account_by_id(state.db, reblog.account_id).await?
     else {
         return Ok(None);
     };
@@ -4710,7 +4696,7 @@ async fn reblog_response(
 
     let reblogged_by_viewer = viewer.is_some_and(|viewer| viewer == reblog.account_id);
     let muted = match viewer {
-        Some(viewer) => roosty_db::active_local_account_mute(&state.db, viewer, reblog.account_id)
+        Some(viewer) => roosty_db::active_local_account_mute(state.db, viewer, reblog.account_id)
             .await?
             .is_some(),
         None => false,
@@ -4729,7 +4715,9 @@ async fn reblog_response(
         uri: url.clone(),
         url,
         content: String::new(),
-        account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
+        account: StatusAccountResponse::Local(Box::new(
+            account_response(state, state.db, account).await?,
+        )),
         media_attachments: Vec::new(),
         card: None,
         mentions: Vec::new(),
@@ -4758,17 +4746,17 @@ async fn reblog_response(
 
 /// Build a Mastodon boost wrapper for a local account's Announce of a cached remote Note.
 async fn local_remote_reblog_response(
-    state: &AppState,
-    reblog: roosty_db::LocalRemoteStatusReblog,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    reblog: LocalRemoteStatusReblog,
     viewer: Option<AccountId>,
 ) -> Result<Option<StatusResponse>, RoostyError> {
     let Some(original) =
-        roosty_db::find_remote_status_by_id(&state.db, reblog.remote_status_id).await?
+        roosty_db::find_remote_status_by_id(state.db, reblog.remote_status_id).await?
     else {
         return Ok(None);
     };
     let Some(account) =
-        roosty_db::find_local_account_by_id(&state.db, reblog.local_account_id).await?
+        roosty_db::find_local_account_by_id(state.db, reblog.local_account_id).await?
     else {
         return Ok(None);
     };
@@ -4790,7 +4778,9 @@ async fn local_remote_reblog_response(
         uri: url.clone(),
         url,
         content: String::new(),
-        account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
+        account: StatusAccountResponse::Local(Box::new(
+            account_response(state, state.db, account).await?,
+        )),
         media_attachments: Vec::new(),
         card: None,
         mentions: Vec::new(),
@@ -4818,8 +4808,8 @@ async fn local_remote_reblog_response(
 }
 
 pub(crate) async fn status_response_for_viewer(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     account: LocalAccount,
     viewer: Option<AccountId>,
 ) -> Result<StatusResponse, RoostyError> {
@@ -4828,13 +4818,13 @@ pub(crate) async fn status_response_for_viewer(
             "status author is suspended".to_owned(),
         ));
     }
-    let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
+    let pinned = roosty_db::is_local_status_pinned(state.db, status.id).await?;
     status_response_for_viewer_with_pin(state, status, account, viewer, pinned).await
 }
 
 async fn status_response_for_viewer_with_pin(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     account: LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
@@ -4851,20 +4841,20 @@ async fn status_response_for_viewer_with_pin(
 }
 
 async fn status_response_for_viewer_with_pin_and_card(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     account: LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
     card: PreviewCardSource,
 ) -> Result<StatusResponse, RoostyError> {
-    let status_ref = roosty_db::StatusReference::Local(status.id);
+    let status_ref = StatusReference::Local(status.id);
     let mut response = Box::pin(status_response_base(
         state, status, account, viewer, pinned, card,
     ))
     .await?;
     response.quote = status_quote_response(state, status_ref, viewer).await?;
-    if let Some(quote) = roosty_db::quote_for_status(&state.db, status_ref).await?
+    if let Some(quote) = roosty_db::quote_for_status(state.db, status_ref).await?
         && !response.content.contains(&quote.quoted_activitypub_id)
     {
         response.content = format!(
@@ -4878,8 +4868,8 @@ async fn status_response_for_viewer_with_pin_and_card(
 }
 
 async fn status_response_base(
-    state: &AppState,
-    status: roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: LocalStatus,
     account: LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
@@ -4889,9 +4879,9 @@ async fn status_response_base(
     let url = public_url(state, &status_path);
     let reply_target = reply_target(state, status.in_reply_to_id).await?;
     let remote_reply_actor = match status.in_reply_to_remote_status_id {
-        Some(parent_id) => match roosty_db::find_remote_status_by_id(&state.db, parent_id).await? {
+        Some(parent_id) => match roosty_db::find_remote_status_by_id(state.db, parent_id).await? {
             Some(parent) => {
-                roosty_db::find_remote_actor_by_id(&state.db, parent.remote_actor_id).await?
+                roosty_db::find_remote_actor_by_id(state.db, parent.remote_actor_id).await?
             }
             None => None,
         },
@@ -4910,7 +4900,7 @@ async fn status_response_base(
                 .map(|actor| actor.id.0.to_string())
         });
     let text_mentions = local_text_mentions(state, &status.content).await?;
-    let remote_mentions = roosty_db::remote_mentions_for_local_status(&state.db, status.id).await?;
+    let remote_mentions = roosty_db::remote_mentions_for_local_status(state.db, status.id).await?;
     let mut mentions = status_mentions(
         state,
         reply_target.as_ref(),
@@ -4926,35 +4916,35 @@ async fn status_response_base(
     }
     let tags = status_tags(state, status.id).await?;
     let replies_count =
-        roosty_db::count_status_context_replies(&state.db, StatusContextParent::Local(status.id))
+        roosty_db::count_status_context_replies(state.db, StatusContextParent::Local(status.id))
             .await?;
-    let reblogs_count = roosty_db::count_local_reblogs(&state.db, status.id).await?;
-    let favourites_count = roosty_db::count_local_favourites(&state.db, status.id).await?;
+    let reblogs_count = roosty_db::count_local_reblogs(state.db, status.id).await?;
+    let favourites_count = roosty_db::count_local_favourites(state.db, status.id).await?;
     let favourited = match viewer {
         Some(account_id) => {
-            roosty_db::is_local_status_favourited(&state.db, account_id, status.id).await?
+            roosty_db::is_local_status_favourited(state.db, account_id, status.id).await?
         }
         None => false,
     };
     let bookmarked = match viewer {
         Some(account_id) => {
-            roosty_db::is_local_status_bookmarked(&state.db, account_id, status.id).await?
+            roosty_db::is_local_status_bookmarked(state.db, account_id, status.id).await?
         }
         None => false,
     };
     let reblogged = match viewer {
         Some(account_id) => {
-            roosty_db::is_local_status_reblogged(&state.db, account_id, status.id).await?
+            roosty_db::is_local_status_reblogged(state.db, account_id, status.id).await?
         }
         None => false,
     };
     let muted = match viewer {
-        Some(viewer) => roosty_db::active_local_account_mute(&state.db, viewer, status.account_id)
+        Some(viewer) => roosty_db::active_local_account_mute(state.db, viewer, status.account_id)
             .await?
             .is_some(),
         None => false,
     };
-    let media_attachments = roosty_db::local_media_attachments_for_status(&state.db, status.id)
+    let media_attachments = roosty_db::local_media_attachments_for_status(state.db, status.id)
         .await?
         .iter()
         .map(|media| media_response(state, media))
@@ -4965,19 +4955,13 @@ async fn status_response_base(
         .map(|card| Box::new(PreviewCardResponse::new(state, *card, None)));
 
     let quotes_count =
-        roosty_db::count_accepted_quotes(&state.db, roosty_db::StatusReference::Local(status.id))
-            .await?;
+        roosty_db::count_accepted_quotes(state.db, StatusReference::Local(status.id)).await?;
     let quote_approval = local_quote_approval(state, &status, viewer).await?;
-    let poll_txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let poll =
-        match roosty_db::find_poll_for_status(&poll_txn, PollStatus::Local(status.id)).await? {
-            Some(poll) => Some(poll_response(&poll_txn, poll, viewer).await?),
-            None => None,
-        };
-    poll_txn.commit().await?;
+    let poll = match roosty_db::find_poll_for_status(state.db, PollStatus::Local(status.id)).await?
+    {
+        Some(poll) => Some(poll_response(state.db, poll, viewer).await?),
+        None => None,
+    };
     Ok(StatusResponse {
         id: status.id.0.to_string(),
         created_at: format_timestamp(status.created_at),
@@ -4998,7 +4982,9 @@ async fn status_response_base(
             &remote_mentions,
             &tags,
         ),
-        account: StatusAccountResponse::Local(Box::new(account_response(state, account).await?)),
+        account: StatusAccountResponse::Local(Box::new(
+            account_response(state, state.db, account).await?,
+        )),
         media_attachments,
         card,
         mentions,
@@ -5022,29 +5008,30 @@ async fn status_response_base(
 }
 
 async fn status_quote_response(
-    state: &AppState,
-    quoting_status: roosty_db::StatusReference,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    quoting_status: StatusReference,
     viewer: Option<AccountId>,
 ) -> Result<Option<QuoteResponse>, RoostyError> {
-    let Some(quote) = roosty_db::quote_for_status(&state.db, quoting_status).await? else {
+    let txn = state.db;
+    let Some(quote) = roosty_db::quote_for_status(txn, quoting_status).await? else {
         return Ok(None);
     };
     let mut state_name = QuoteResponseState::from(quote.state);
-    let quoted_status = if quote.state == roosty_db::QuoteState::Accepted {
+    let quoted_status = if quote.state == QuoteState::Accepted {
         match quote.quoted_status {
-            Some(roosty_db::StatusReference::Local(id)) => {
-                let Some(status) = roosty_db::find_local_status_by_id(&state.db, id).await? else {
+            Some(StatusReference::Local(id)) => {
+                let Some(status) = roosty_db::find_local_status_by_id(txn, id).await? else {
                     state_name = QuoteResponseState::Deleted;
                     return Ok(Some(QuoteResponse {
                         state: state_name,
                         quoted_status: None,
                     }));
                 };
-                if !status_visible_to_viewer(state, &status, viewer).await? {
+                if !status_visible_to_viewer(txn, &status, viewer).await? {
                     state_name = QuoteResponseState::Unauthorized;
                     None
                 } else {
-                    let account = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+                    let account = roosty_db::find_local_account_by_id(txn, status.account_id)
                         .await?
                         .ok_or_else(|| {
                             RoostyError::InvalidInput(
@@ -5052,16 +5039,12 @@ async fn status_quote_response(
                             )
                         })?;
                     if let Some(viewer) = viewer {
-                        if roosty_db::local_accounts_are_blocked(
-                            &state.db,
-                            viewer,
-                            status.account_id,
-                        )
-                        .await?
+                        if roosty_db::local_accounts_are_blocked(txn, viewer, status.account_id)
+                            .await?
                         {
                             state_name = QuoteResponseState::BlockedAccount;
                         } else if roosty_db::active_local_account_mute(
-                            &state.db,
+                            txn,
                             viewer,
                             status.account_id,
                         )
@@ -5071,7 +5054,7 @@ async fn status_quote_response(
                             state_name = QuoteResponseState::MutedAccount;
                         }
                     }
-                    let pinned = roosty_db::is_local_status_pinned(&state.db, status.id).await?;
+                    let pinned = roosty_db::is_local_status_pinned(txn, status.id).await?;
                     Some(Box::new(
                         Box::pin(status_response_base(
                             state,
@@ -5085,20 +5068,19 @@ async fn status_quote_response(
                     ))
                 }
             }
-            Some(roosty_db::StatusReference::Remote(id)) => {
-                let Some(status) = roosty_db::find_remote_status_by_id(&state.db, id).await? else {
+            Some(StatusReference::Remote(id)) => {
+                let Some(status) = roosty_db::find_remote_status_by_id(txn, id).await? else {
                     state_name = QuoteResponseState::Deleted;
                     return Ok(Some(QuoteResponse {
                         state: state_name,
                         quoted_status: None,
                     }));
                 };
-                let actor =
-                    roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?;
+                let actor = roosty_db::find_remote_actor_by_id(txn, status.remote_actor_id).await?;
                 let domain_suspended = match actor.as_ref() {
                     Some(actor) => {
                         actor.suspended_at.is_some()
-                            || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+                            || roosty_db::federation_domain_policy(txn, &actor.domain)
                                 .await?
                                 .is_suspended()
                     }
@@ -5108,7 +5090,7 @@ async fn status_quote_response(
                     state_name = QuoteResponseState::BlockedDomain;
                 } else if let Some(viewer) = viewer {
                     if roosty_db::local_remote_accounts_are_blocked(
-                        &state.db,
+                        txn,
                         viewer,
                         status.remote_actor_id,
                     )
@@ -5116,7 +5098,7 @@ async fn status_quote_response(
                     {
                         state_name = QuoteResponseState::BlockedAccount;
                     } else if roosty_db::active_local_remote_account_mute(
-                        &state.db,
+                        txn,
                         viewer,
                         status.remote_actor_id,
                     )
@@ -5128,8 +5110,7 @@ async fn status_quote_response(
                 }
                 let visible = match viewer {
                     Some(viewer) => {
-                        roosty_db::remote_status_visible_to_account(&state.db, &status, viewer)
-                            .await?
+                        roosty_db::remote_status_visible_to_account(txn, &status, viewer).await?
                     }
                     None => matches!(
                         status.visibility,
@@ -5140,7 +5121,7 @@ async fn status_quote_response(
                     state_name = QuoteResponseState::Unauthorized;
                     None
                 } else {
-                    let pinned = roosty_db::is_remote_status_pinned(&state.db, status.id).await?;
+                    let pinned = roosty_db::is_remote_status_pinned(txn, status.id).await?;
                     Some(Box::new(
                         Box::pin(remote_status_response_base(
                             state,
@@ -5168,8 +5149,8 @@ async fn status_quote_response(
 }
 
 async fn local_quote_approval(
-    state: &AppState,
-    status: &roosty_db::LocalStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: &LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<QuoteApprovalResponse, RoostyError> {
     let automatic = match status.quote_approval_policy {
@@ -5180,7 +5161,7 @@ async fn local_quote_approval(
     let current_user = match viewer {
         Some(viewer) if viewer == status.account_id => QuoteApprovalDecision::Automatic,
         Some(viewer)
-            if roosty_db::local_accounts_are_blocked(&state.db, viewer, status.account_id)
+            if roosty_db::local_accounts_are_blocked(state.db, viewer, status.account_id)
                 .await? =>
         {
             QuoteApprovalDecision::Denied
@@ -5190,7 +5171,7 @@ async fn local_quote_approval(
         }
         Some(viewer)
             if status.quote_approval_policy == QuoteApprovalPolicy::Followers
-                && roosty_db::local_follow_relationship(&state.db, viewer, status.account_id)
+                && roosty_db::local_follow_relationship(state.db, viewer, status.account_id)
                     .await?
                     .is_some() =>
         {
@@ -5206,11 +5187,11 @@ async fn local_quote_approval(
 }
 
 async fn remote_quote_approval(
-    state: &AppState,
-    status: &roosty_db::RemoteStatus,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    status: &RemoteStatus,
     viewer: Option<AccountId>,
 ) -> Result<QuoteApprovalResponse, RoostyError> {
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await?;
+    let actor = roosty_db::find_remote_actor_by_id(state.db, status.remote_actor_id).await?;
     let project = |values: &[String]| {
         let mut projected = Vec::new();
         for value in values {
@@ -5255,13 +5236,13 @@ async fn remote_quote_approval(
 
 /// Load Mastodon tag responses attached to a local status.
 async fn status_tags(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     status_id: StatusId,
 ) -> Result<Vec<TagResponse>, RoostyError> {
-    let tags = roosty_db::local_tags_for_status(&state.db, status_id).await?;
+    let tags = roosty_db::local_tags_for_status(state.db, status_id).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
-        let history = roosty_db::tag_history(&state.db, tag.id).await?;
+        let history = roosty_db::tag_history(state.db, tag.id).await?;
         responses.push(TagResponse::new(state, tag, history, None));
     }
 
@@ -5269,7 +5250,10 @@ async fn status_tags(
 }
 
 /// Build lightweight hashtag links for rendering outbound local ActivityPub content.
-pub(crate) fn local_status_content_tag_links(state: &AppState, content: &str) -> Vec<TagResponse> {
+pub(crate) fn local_status_content_tag_links(
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    content: &str,
+) -> Vec<TagResponse> {
     hashtag_names(content)
         .into_iter()
         .map(|name| TagResponse {
@@ -5284,7 +5268,7 @@ pub(crate) fn local_status_content_tag_links(state: &AppState, content: &str) ->
 
 /// Resolve local `@username` references present in status text.
 async fn local_text_mentions(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     content: &str,
 ) -> Result<Vec<LocalAccount>, RoostyError> {
     let mut accounts = Vec::new();
@@ -5295,7 +5279,7 @@ async fn local_text_mentions(
             continue;
         }
         if let Some(account) =
-            roosty_db::find_local_account_by_username(&state.db, &username).await?
+            roosty_db::find_local_account_by_username(state.db, &username).await?
         {
             accounts.push(account);
         }
@@ -5306,10 +5290,10 @@ async fn local_text_mentions(
 
 /// Build the combined Mastodon mentions array without duplicate accounts.
 fn status_mentions(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     reply_target: Option<&ReplyTarget>,
     text_mentions: &[LocalAccount],
-    remote_mentions: &[roosty_db::RemoteActor],
+    remote_mentions: &[RemoteActor],
 ) -> Vec<MentionResponse> {
     let mut mentions = Vec::new();
     let mut seen = HashSet::new();
@@ -5336,16 +5320,16 @@ fn status_mentions(
 
 /// Load the account targeted by a local reply, if the status is a reply.
 async fn reply_target(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     in_reply_to_id: Option<StatusId>,
 ) -> Result<Option<ReplyTarget>, RoostyError> {
     let Some(status_id) = in_reply_to_id else {
         return Ok(None);
     };
-    let Some(parent) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
+    let Some(parent) = roosty_db::find_local_status_by_id(state.db, status_id).await? else {
         return Ok(None);
     };
-    let account = roosty_db::find_local_account_by_id(&state.db, parent.account_id)
+    let account = roosty_db::find_local_account_by_id(state.db, parent.account_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("reply target author does not exist".to_owned())
@@ -5358,13 +5342,13 @@ async fn reply_target(
 }
 
 async fn visible_status_for_account(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     status_id: StatusId,
     account_id: AccountId,
-) -> Result<Option<roosty_db::LocalStatus>, RoostyError> {
-    let status = roosty_db::find_local_status_by_id(&state.db, status_id).await?;
+) -> Result<Option<LocalStatus>, RoostyError> {
+    let status = roosty_db::find_local_status_by_id(state.db, status_id).await?;
     match status {
-        Some(status) if status_visible_to_viewer(state, &status, Some(account_id)).await? => {
+        Some(status) if status_visible_to_viewer(state.db, &status, Some(account_id)).await? => {
             Ok(Some(status))
         }
         Some(_) | None => Ok(None),
@@ -5514,16 +5498,18 @@ pub(crate) async fn visible_status_thread_on(
 }
 
 async fn status_context_models(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     items: Vec<StatusContextItem>,
     viewer: Option<AccountId>,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let mut responses = Vec::with_capacity(items.len());
     for item in items {
         responses.push(match item {
-            StatusContextItem::Local(status) => status_with_author(state, status, viewer).await?,
+            StatusContextItem::Local(status) => {
+                status_with_author_and_pin(state, status, viewer, false).await?
+            }
             StatusContextItem::Remote(status) => {
-                remote_status_response_for_viewer(state, status, viewer).await?
+                remote_status_response_for_viewer_with_pin(state, status, viewer, false).await?
             }
         });
     }
@@ -5532,22 +5518,30 @@ async fn status_context_models(
 
 /// Serialize ordered search candidates after defensively rechecking current visibility.
 pub(crate) async fn search_status_models(
-    state: &AppState,
-    items: Vec<roosty_db::StatusContextItem>,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
+    items: Vec<StatusContextItem>,
     viewer: AccountId,
 ) -> Result<Vec<StatusResponse>, RoostyError> {
     let mut responses = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            roosty_db::StatusContextItem::Local(status) => {
-                if status_visible_to_viewer(state, &status, Some(viewer)).await? {
-                    responses.push(status_with_author(state, status, Some(viewer)).await?);
+            StatusContextItem::Local(status) => {
+                if status_visible_to_viewer(state.db, &status, Some(viewer)).await? {
+                    responses.push(
+                        status_with_author_and_pin(state, status, Some(viewer), false).await?,
+                    );
                 }
             }
-            roosty_db::StatusContextItem::Remote(status) => {
-                if roosty_db::remote_status_visible_to_account(&state.db, &status, viewer).await? {
+            StatusContextItem::Remote(status) => {
+                if roosty_db::remote_status_visible_to_account(state.db, &status, viewer).await? {
                     responses.push(
-                        remote_status_response_for_viewer(state, status, Some(viewer)).await?,
+                        remote_status_response_for_viewer_with_pin(
+                            state,
+                            status,
+                            Some(viewer),
+                            false,
+                        )
+                        .await?,
                     );
                 }
             }
@@ -5647,7 +5641,7 @@ fn interaction_accounts_limit(limit: Option<u64>) -> u64 {
 fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputError> {
     Ok(TimelineQuery {
         limit: timeline_limit(params.limit),
-        cursor: roosty_db::TimelineCursor {
+        cursor: TimelineCursor {
             max_id: parse_optional_status_id(params.max_id.as_deref())?,
             since_id: parse_optional_status_id(params.since_id.as_deref())?,
             min_id: parse_optional_status_id(params.min_id.as_deref())?,
@@ -5656,19 +5650,15 @@ fn timeline_query(params: TimelineParams) -> Result<TimelineQuery, StatusInputEr
 }
 
 /// Parse Mastodon cursor parameters from a local collection request.
-fn collection_cursor(params: &CollectionParams) -> Result<roosty_db::CollectionCursor, ()> {
-    Ok(roosty_db::CollectionCursor {
+fn collection_cursor(params: &CollectionParams) -> Result<CollectionCursor, ()> {
+    Ok(CollectionCursor {
         max_id: parse_optional_uuid(params.max_id.as_deref())?,
         since_id: parse_optional_uuid(params.since_id.as_deref())?,
         min_id: parse_optional_uuid(params.min_id.as_deref())?,
     })
 }
 
-fn timeline_link_header<T>(
-    page: &roosty_db::TimelinePage<T>,
-    limit: u64,
-    path: &str,
-) -> Option<HeaderValue> {
+fn timeline_link_header<T>(page: &TimelinePage<T>, limit: u64, path: &str) -> Option<HeaderValue> {
     if !page.has_more {
         return None;
     }
@@ -5682,7 +5672,7 @@ fn timeline_link_header<T>(
 }
 
 fn public_timeline_link_header(
-    page: &roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    page: &TimelinePage<PublicTimelineItem>,
     limit: u64,
     filters: PublicTimelineFilters,
 ) -> Option<HeaderValue> {
@@ -5708,7 +5698,7 @@ fn public_timeline_link_header(
 }
 
 fn tag_timeline_link_header(
-    page: &roosty_db::TimelinePage<roosty_db::PublicTimelineItem>,
+    page: &TimelinePage<PublicTimelineItem>,
     limit: u64,
     path: &str,
     filters: &TagTimelineParams,
@@ -5718,7 +5708,7 @@ fn tag_timeline_link_header(
     }
     let first = page.first_cursor?;
     let last = page.last_cursor?;
-    let query = |cursor: &str, id: uuid::Uuid| {
+    let query = |cursor: &str, id: Uuid| {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
         serializer.append_pair("limit", &limit.to_string());
         serializer.append_pair(cursor, &id.to_string());
@@ -5751,7 +5741,7 @@ fn tag_timeline_link_header(
 }
 
 fn home_timeline_link_header(
-    page: &roosty_db::TimelinePage<roosty_db::HomeTimelineItem>,
+    page: &TimelinePage<HomeTimelineItem>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {
@@ -5815,7 +5805,7 @@ impl<'a> CollectionLink<'a> {
 }
 
 fn interaction_accounts_link_header(
-    page: &roosty_db::CollectionPage<roosty_db::StatusInteractionAccount>,
+    page: &CollectionPage<StatusInteractionAccount>,
     limit: u64,
     path: &str,
 ) -> Option<HeaderValue> {
@@ -5835,7 +5825,7 @@ fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
     value.map(Uuid::parse_str).transpose().map_err(|_| ())
 }
 
-fn can_view_status(status: &roosty_db::LocalStatus, viewer: Option<AccountId>) -> bool {
+fn can_view_status(status: &LocalStatus, viewer: Option<AccountId>) -> bool {
     matches!(
         status.visibility,
         StatusVisibility::Public | StatusVisibility::Unlisted
@@ -5844,16 +5834,16 @@ fn can_view_status(status: &roosty_db::LocalStatus, viewer: Option<AccountId>) -
 
 /// Return whether a viewer can read a local status, including direct conversation membership.
 pub(crate) async fn status_visible_to_viewer(
-    state: &AppState,
-    status: &roosty_db::LocalStatus,
+    txn: &impl ConnectionTrait,
+    status: &LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<bool, RoostyError> {
-    status_visible_to_viewer_on(&state.db, status, viewer).await
+    status_visible_to_viewer_on(txn, status, viewer).await
 }
 
 pub(crate) async fn status_visible_to_viewer_on(
     db: &impl ConnectionTrait,
-    status: &roosty_db::LocalStatus,
+    status: &LocalStatus,
     viewer: Option<AccountId>,
 ) -> Result<bool, RoostyError> {
     let Some(viewer) = viewer else {
@@ -5916,10 +5906,10 @@ pub(crate) fn sanitize_remote_status_html(content: &str) -> String {
 }
 
 pub(crate) fn status_content_html_with_mentions_and_tags(
-    state: &AppState,
+    state: &StatusRenderContext<'_, impl ConnectionTrait>,
     content: &str,
     mentions: &[LocalAccount],
-    remote_mentions: &[roosty_db::RemoteActor],
+    remote_mentions: &[RemoteActor],
     tags: &[TagResponse],
 ) -> String {
     let mention_urls = mentions
@@ -6082,7 +6072,7 @@ fn url_matches(content: &str) -> Vec<UrlMatch> {
     finder
         .links(content)
         .filter_map(|link| {
-            let parsed = url::Url::parse(link.as_str()).ok()?;
+            let parsed = Url::parse(link.as_str()).ok()?;
             matches!(parsed.scheme(), "http" | "https").then(|| UrlMatch {
                 start: link.start(),
                 end: link.end(),
@@ -6433,8 +6423,8 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::{AccountId, StatusId};
     use roosty_db::{
-        NewRemoteMediaAttachment, NewRemoteStatus, RemoteActor, RemoteStatus,
-        RemoteStatusReblogTarget, StatusContextParent, StatusVisibility,
+        CollectionCursor, NewRemoteMediaAttachment, NewRemoteStatus, RemoteActor, RemoteStatus,
+        RemoteStatusReblogTarget, RemoteStatusUpsertResult, StatusContextParent, StatusVisibility,
     };
     use roosty_migration::Migrator;
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
@@ -6452,7 +6442,11 @@ mod tests {
         interaction_accounts_limit, mention_usernames, push_url_html, remote_mention_matches,
         sanitize_remote_status_html, status_content_html, timeline_limit, url_matches,
     };
-    use crate::{config::Config, http::AppState, password};
+    use crate::{
+        config::Config,
+        http::{AppState, DatabaseContext},
+        password,
+    };
 
     #[test]
     fn remote_status_html_keeps_safe_structure_and_strips_active_content() {
@@ -6677,10 +6671,11 @@ mod tests {
             .await
             .unwrap();
         let payload = json!({"poll_id": poll_id});
-        crate::polls::expire_poll_job(&context.state, payload.clone())
+        let database = DatabaseContext::new(context.db.clone());
+        crate::polls::expire_poll_job(&context.state, &database, payload.clone())
             .await
             .unwrap();
-        crate::polls::expire_poll_job(&context.state, payload)
+        crate::polls::expire_poll_job(&context.state, &database, payload)
             .await
             .unwrap();
 
@@ -6689,7 +6684,7 @@ mod tests {
                 &context.db,
                 account_id,
                 30,
-                roosty_db::CollectionCursor::default(),
+                CollectionCursor::default(),
                 roosty_db::NotificationFilter::default(),
             )
             .await
@@ -6917,7 +6912,7 @@ mod tests {
         assert!(status["content"].as_str().unwrap().contains(
             r#"<a href="https://localhost:4000/tags/rust" class="mention hashtag" rel="tag">#<span>rust</span></a>"#
         ));
-        assert_eq!(status["tags"][0]["following"], serde_json::Value::Null);
+        assert_eq!(status["tags"][0]["following"], Value::Null);
 
         let edit = context
             .authenticated_json(
@@ -7448,10 +7443,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            updated,
-            roosty_db::RemoteStatusUpsertResult::Updated(_)
-        ));
+        assert!(matches!(updated, RemoteStatusUpsertResult::Updated(_)));
         txn.commit().await.unwrap();
         assert!(
             json_body(context.get("/api/v1/timelines/tag/fediverse").await)
@@ -7662,7 +7654,7 @@ mod tests {
                 &token,
                 serde_json::json!({
                     "status": "missing parent",
-                    "in_reply_to_id": uuid::Uuid::now_v7().to_string(),
+                    "in_reply_to_id": Uuid::now_v7().to_string(),
                 }),
             )
             .await;
@@ -8568,10 +8560,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            outcome,
-            roosty_db::RemoteStatusUpsertResult::Updated(_)
-        ));
+        assert!(matches!(outcome, RemoteStatusUpsertResult::Updated(_)));
         txn.commit().await.unwrap();
 
         let response = context
@@ -9948,7 +9937,7 @@ mod tests {
             &context.db,
             context.account_id,
             40,
-            roosty_db::CollectionCursor::default(),
+            CollectionCursor::default(),
         )
         .await
         .unwrap();
@@ -11013,7 +11002,7 @@ mod tests {
         config: Config,
         state: AppState,
         account_id: AccountId,
-        application_id: uuid::Uuid,
+        application_id: Uuid,
         _temp_dir: TempDir,
     }
 
@@ -11112,9 +11101,7 @@ mod tests {
                 state,
                 ..
             } = self;
-            let AppState { db: state_db, .. } = state;
-
-            state_db.close().await.unwrap();
+            drop(state);
             db.close().await.unwrap();
             postgresql.stop().await.unwrap();
         }
@@ -11122,7 +11109,11 @@ mod tests {
 
     impl StatusContext {
         fn app(&self) -> Router {
-            crate::http::app_router(self.state.clone(), false)
+            crate::http::app_router(
+                self.state.clone(),
+                DatabaseContext::new(self.db.clone()),
+                false,
+            )
         }
 
         async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
@@ -11152,12 +11143,7 @@ mod tests {
             .await
         }
 
-        async fn json(
-            &self,
-            method: &str,
-            uri: &str,
-            body: serde_json::Value,
-        ) -> axum::http::Response<Body> {
+        async fn json(&self, method: &str, uri: &str, body: Value) -> axum::http::Response<Body> {
             self.request(
                 Request::builder()
                     .method(method)
@@ -11174,7 +11160,7 @@ mod tests {
             method: &str,
             uri: &str,
             token: &str,
-            body: serde_json::Value,
+            body: Value,
         ) -> axum::http::Response<Body> {
             self.request(
                 Request::builder()

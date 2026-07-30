@@ -12,14 +12,17 @@ use reqwest::{
 };
 use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
 use roosty_db::{NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor};
-use sea_orm::{AccessMode, ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{federation::ActorType, http::AppState};
+use crate::{
+    federation::ActorType,
+    http::{AppState, DatabaseContext},
+};
 
 const MAX_FEDERATION_RESPONSE_BYTES: usize = 1_048_576;
 static DISCOVERY_CACHE_HIT: AtomicU64 = AtomicU64::new(0);
@@ -111,10 +114,14 @@ enum RemoteActorStoreMode {
 }
 
 /// Resolve and cache a remote actor after applying the configured network policy.
-pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<RemoteActor> {
+pub async fn resolve_remote_actor(
+    state: &AppState,
+    database: &DatabaseContext,
+    handle: &str,
+) -> Result<RemoteActor> {
     let (username, domain) = parse_remote_handle(handle)?;
     let domain = domain.to_ascii_lowercase();
-    let lock = state.db.begin().await?;
+    let lock = database.begin_write().await?;
     lock.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -131,7 +138,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
     let webfinger_url = Url::parse(&format!("https://{domain}/.well-known/webfinger"))
         .map_err(|_| invalid("remote domain is invalid"))?;
     let webfinger: WebFingerResponse =
-        fetch_json(state, webfinger_url, Some((&resource, "resource"))).await?;
+        fetch_json(state, &lock, webfinger_url, Some((&resource, "resource"))).await?;
     if !webfinger.subject.eq_ignore_ascii_case(&resource) {
         return Err(invalid(
             "WebFinger subject does not match requested account",
@@ -141,7 +148,7 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
         .ok_or_else(|| invalid("WebFinger response does not include an ActivityPub actor link"))?;
     let actor_url =
         Url::parse(&actor_url).map_err(|_| invalid("WebFinger actor URL is invalid"))?;
-    let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
+    let document: RemoteActorDocument = fetch_json(state, &lock, actor_url.clone(), None).await?;
     validate_actor_document(&document, &actor_url, username)?;
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
@@ -182,38 +189,41 @@ pub async fn resolve_remote_actor(state: &AppState, handle: &str) -> Result<Remo
     )
     .await?;
     lock.commit().await?;
-    enqueue_profile_media_if_followed(state, actor.id).await?;
+    enqueue_profile_media_if_followed(database, actor.id).await?;
     Ok(actor)
 }
 
 /// Resolve an exact remote handle for account search with policy-aware failure semantics.
 pub async fn resolve_remote_actor_for_search(
     state: &AppState,
+    database: &DatabaseContext,
     handle: &str,
 ) -> Result<RemoteActor> {
     let Some((username, domain)) = exact_remote_handle(handle) else {
         DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
         return Err(invalid("remote account handle is invalid"));
     };
+    let txn = database.begin_snapshot().await?;
     if !state.config.federation_domain_is_allowed(&domain)
-        || roosty_db::federation_domain_policy(&state.db, &domain)
+        || roosty_db::federation_domain_policy(&txn, &domain)
             .await?
             .is_suspended()
     {
         DISCOVERY_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
         return Err(FederationDiscoveryError::PolicyRejected(domain.into()).into());
     }
-    let cached = match roosty_db::find_remote_actor_by_handle(&state.db, &username, &domain).await {
+    let cached = match roosty_db::find_remote_actor_by_handle(&txn, &username, &domain).await {
         Ok(cached) => cached,
         Err(error) => {
             DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
             return Err(error);
         }
     };
+    txn.commit().await?;
     let fresh = cached
         .as_ref()
         .is_some_and(|actor| actor.expires_at > OffsetDateTime::now_utc());
-    match resolve_remote_actor(state, &format!("{username}@{domain}")).await {
+    match resolve_remote_actor(state, database, &format!("{username}@{domain}")).await {
         Ok(actor) => {
             if fresh {
                 DISCOVERY_CACHE_HIT.fetch_add(1, Ordering::Relaxed);
@@ -278,25 +288,32 @@ pub(crate) fn metrics_text() -> String {
 /// Resolve an actor by canonical ActivityPub ID for an authenticated inbox activity.
 pub async fn resolve_remote_actor_by_id(
     state: &AppState,
+    database: &DatabaseContext,
     activitypub_id: &str,
 ) -> Result<RemoteActor> {
+    let txn = database.begin_read().await?;
     if let Some(actor) =
-        roosty_db::find_remote_actor_by_activitypub_id(&state.db, activitypub_id).await?
+        roosty_db::find_remote_actor_by_activitypub_id(&txn, activitypub_id).await?
         && actor.expires_at > OffsetDateTime::now_utc()
     {
+        txn.commit().await?;
         return Ok(actor);
     }
-    refresh_remote_actor_by_id(state, activitypub_id).await
+    txn.commit().await?;
+    refresh_remote_actor_by_id(state, database, activitypub_id).await
 }
 
 /// Re-fetch an actor document after a signed lifecycle activity.
 pub async fn refresh_remote_actor_by_id(
     state: &AppState,
+    database: &DatabaseContext,
     activitypub_id: &str,
 ) -> Result<RemoteActor> {
-    let (actor, icon, image) = fetch_remote_actor_by_id(state, activitypub_id).await?;
+    let txn = database.begin_read().await?;
+    let (actor, icon, image) = fetch_remote_actor_by_id(state, &txn, activitypub_id).await?;
+    txn.commit().await?;
     store_remote_actor(
-        state,
+        database,
         actor,
         icon,
         image,
@@ -311,7 +328,7 @@ pub async fn refresh_remote_actor_by_id_in_transaction(
     activitypub_id: &str,
     txn: &sea_orm::DatabaseTransaction,
 ) -> Result<RemoteActor> {
-    let (actor, icon, image) = fetch_remote_actor_by_id(state, activitypub_id).await?;
+    let (actor, icon, image) = fetch_remote_actor_by_id(state, txn, activitypub_id).await?;
     store_remote_actor_on(
         txn,
         actor,
@@ -324,6 +341,7 @@ pub async fn refresh_remote_actor_by_id_in_transaction(
 
 async fn fetch_remote_actor_by_id(
     state: &AppState,
+    db: &impl ConnectionTrait,
     activitypub_id: &str,
 ) -> Result<(
     RemoteActor,
@@ -336,7 +354,7 @@ async fn fetch_remote_actor_by_id(
         .host_str()
         .ok_or_else(|| invalid("remote actor ID has no host"))?
         .to_ascii_lowercase();
-    let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
+    let document: RemoteActorDocument = fetch_json(state, db, actor_url.clone(), None).await?;
     if document.r#type != ActorType::Person
         || document.id != activitypub_id
         || document.preferred_username.is_empty()
@@ -394,6 +412,7 @@ async fn fetch_remote_actor_by_id(
 /// Resolve a Move target only when it reciprocally declares the source actor.
 pub async fn resolve_remote_move_target(
     state: &AppState,
+    database: &DatabaseContext,
     target_id: &str,
     source_id: &str,
 ) -> Result<RemoteActor> {
@@ -402,7 +421,10 @@ pub async fn resolve_remote_move_target(
         .host_str()
         .ok_or_else(|| invalid("remote Move target has no host"))?
         .to_ascii_lowercase();
-    let document: RemoteActorDocument = fetch_json(state, actor_url.clone(), None).await?;
+    let read_txn = database.begin_read().await?;
+    let document: RemoteActorDocument =
+        fetch_json(state, &read_txn, actor_url.clone(), None).await?;
+    read_txn.commit().await?;
     if document.r#type != ActorType::Person
         || document.id != target_id
         || document.preferred_username.is_empty()
@@ -428,7 +450,7 @@ pub async fn resolve_remote_move_target(
     let featured_tags_url =
         validated_featured_url(&document.id, document.featured_tags.as_deref())?;
     store_remote_actor(
-        state,
+        database,
         RemoteActor {
             id: AccountId(Uuid::now_v7()),
             activitypub_id: document.id,
@@ -463,31 +485,31 @@ pub async fn resolve_remote_move_target(
 
 /// Store an actor and reconcile its optional ActivityStreams profile images.
 async fn store_remote_actor(
-    state: &AppState,
+    database: &DatabaseContext,
     actor: RemoteActor,
     icon: Option<RemoteActorImage>,
     image: Option<RemoteActorImage>,
     mode: RemoteActorStoreMode,
 ) -> Result<RemoteActor> {
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let actor = store_remote_actor_on(&txn, actor, icon, image, mode).await?;
     txn.commit().await?;
-    enqueue_profile_media_if_followed(state, actor.id).await?;
+    enqueue_profile_media_if_followed(database, actor.id).await?;
     Ok(actor)
 }
 
-async fn enqueue_profile_media_if_followed(state: &AppState, actor_id: AccountId) -> Result<()> {
-    let read_txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+async fn enqueue_profile_media_if_followed(
+    database: &DatabaseContext,
+    actor_id: AccountId,
+) -> Result<()> {
+    let read_txn = database.begin_read().await?;
     let has_accepted_followers =
         !roosty_db::accepted_local_followers_of_remote_actor(&read_txn, actor_id)
             .await?
             .is_empty();
     read_txn.commit().await?;
     if has_accepted_followers {
-        crate::media::enqueue_remote_profile_media_fetches(state, actor_id).await?;
+        crate::media::enqueue_remote_profile_media_fetches(database, actor_id).await?;
     }
     Ok(())
 }
@@ -608,6 +630,7 @@ fn validated_featured_url(actor_id: &str, featured: Option<&str>) -> Result<Opti
 /// Fetch a JSON document with policy revalidation before every request.
 pub(crate) async fn fetch_json<T: for<'de> Deserialize<'de>>(
     state: &AppState,
+    db: &impl ConnectionTrait,
     mut url: Url,
     query: Option<(&str, &str)>,
 ) -> Result<T> {
@@ -619,7 +642,7 @@ pub(crate) async fn fetch_json<T: for<'de> Deserialize<'de>>(
         return serde_json::from_value(result?)
             .map_err(|_| invalid("remote response is invalid JSON"));
     }
-    let address = validate_remote_url(state, &url).await?;
+    let address = validate_remote_url(state, db, &url).await?;
     let host = url
         .host_str()
         .ok_or_else(|| invalid("remote URL has no host"))?;
@@ -665,7 +688,11 @@ pub(crate) async fn fetch_json<T: for<'de> Deserialize<'de>>(
 }
 
 /// Enforce HTTPS, domain policy, and public DNS resolution before connecting.
-pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<SocketAddr> {
+pub(crate) async fn validate_remote_url(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    url: &Url,
+) -> Result<SocketAddr> {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return Err(invalid("remote URL must be an unauthenticated HTTPS URL"));
     }
@@ -674,7 +701,7 @@ pub(crate) async fn validate_remote_url(state: &AppState, url: &Url) -> Result<S
         .ok_or_else(|| invalid("remote URL has no host"))?
         .to_ascii_lowercase();
     if !state.config.federation_domain_is_allowed(&host)
-        || roosty_db::federation_domain_policy(&state.db, &host)
+        || roosty_db::federation_domain_policy(db, &host)
             .await?
             .is_suspended()
     {

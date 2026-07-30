@@ -1,16 +1,10 @@
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-};
+use axum::{Extension, Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
     config::{Config, RegistrationMode},
-    http::AppState,
+    http::{ApiResult, AppState, DatabaseContext},
     media,
 };
 
@@ -36,49 +30,33 @@ async fn nodeinfo(State(state): State<AppState>) -> Json<Value> {
     Json(nodeinfo_response(&state.config))
 }
 
-async fn instance_v2(State(state): State<AppState>) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return instance_error(error.into()),
-    };
-    let result = roosty_db::list_instance_rules(&txn).await;
-    if let Err(error) = txn.commit().await {
-        return instance_error(error.into());
-    }
-    match result {
-        Ok(rules) => Json(instance_v2_response(&state.config, &rules)).into_response(),
-        Err(error) => instance_error(error),
-    }
+async fn instance_v2(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+) -> ApiResult<Json<Value>> {
+    let txn = database.begin_read().await?;
+    let rules = roosty_db::list_instance_rules(&txn).await?;
+    txn.commit().await?;
+    Ok(Json(instance_v2_response(&state.config, &rules)))
 }
 
-async fn instance_v1(State(state): State<AppState>) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return instance_error(error.into()),
-    };
-    let result = roosty_db::list_instance_rules(&txn).await;
-    if let Err(error) = txn.commit().await {
-        return instance_error(error.into());
-    }
-    match result {
-        Ok(rules) => Json(instance_v1_response(&state.config, &rules)).into_response(),
-        Err(error) => instance_error(error),
-    }
+async fn instance_v1(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+) -> ApiResult<Json<Value>> {
+    let txn = database.begin_read().await?;
+    let rules = roosty_db::list_instance_rules(&txn).await?;
+    txn.commit().await?;
+    Ok(Json(instance_v1_response(&state.config, &rules)))
 }
 
-async fn instance_rules(State(state): State<AppState>) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return instance_error(error.into()),
-    };
-    let result = roosty_db::list_instance_rules(&txn).await;
-    if let Err(error) = txn.commit().await {
-        return instance_error(error.into());
-    }
-    match result {
-        Ok(rules) => Json(rule_values(&rules)).into_response(),
-        Err(error) => instance_error(error),
-    }
+async fn instance_rules(
+    Extension(database): Extension<DatabaseContext>,
+) -> ApiResult<Json<Vec<Value>>> {
+    let txn = database.begin_read().await?;
+    let rules = roosty_db::list_instance_rules(&txn).await?;
+    txn.commit().await?;
+    Ok(Json(rule_values(&rules)))
 }
 
 #[derive(Serialize)]
@@ -208,15 +186,6 @@ fn rule_values(rules: &[roosty_db::InstanceRule]) -> Vec<Value> {
         .iter()
         .map(|rule| json!({"id": rule.id.to_string(), "text": rule.text}))
         .collect()
-}
-
-fn instance_error(error: roosty_core::RoostyError) -> Response {
-    tracing::error!(%error, "instance metadata database operation failed");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "Internal server error"})),
-    )
-        .into_response()
 }
 
 /// Build shared Mastodon instance capability and limit metadata.

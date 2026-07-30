@@ -44,7 +44,7 @@ mod web;
 
 use crate::{
     config::{Config, database_url_from_env},
-    http::AppState,
+    http::{AppState, DatabaseContext},
 };
 
 #[derive(Debug, Parser)]
@@ -268,6 +268,7 @@ async fn serve(
     roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
 
     let state = AppState::new(config.clone(), db.clone());
+    let database = DatabaseContext::new(db.clone());
     let mut leptos_options = leptos::config::get_configuration(None)
         .map_err(|error| RoostyError::Configuration(error.to_string()))?
         .leptos_options;
@@ -285,7 +286,7 @@ async fn serve(
     let worker_task = if with_worker {
         info!("starting in-process durable worker");
         Some(tokio::spawn(worker_pool(
-            db,
+            db.clone(),
             config.clone(),
             shutdown_rx.clone(),
         )))
@@ -294,13 +295,13 @@ async fn serve(
     };
 
     let main_routes_include_infra = config.infra_listen_addr.is_none();
-    let app = http::app_router(state.clone(), main_routes_include_infra);
+    let app = http::app_router(state.clone(), database.clone(), main_routes_include_infra);
     let main_server = serve_router(config.listen_addr, app, shutdown_rx.clone());
 
     if let Some(infra_listen_addr) = config.infra_listen_addr {
         let infra_server = serve_router(
             infra_listen_addr,
-            http::infra_router(state.clone()),
+            http::infra_router(state.clone(), database),
             shutdown_rx.clone(),
         );
         tokio::try_join!(main_server, infra_server)?;
@@ -464,48 +465,49 @@ async fn worker_iteration(
     };
 
     let state = AppState::new(config.clone(), db.clone());
+    let database = DatabaseContext::new(db.clone());
     let result = match job.kind {
         roosty_db::JobKind::FederationFollowResponse => {
-            federation::deliver_follow_response(&state, job.payload.clone()).await
+            federation::deliver_follow_response(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationStatusDelivery => {
-            federation::deliver_status_activity(&state, job.payload.clone()).await
+            federation::deliver_status_activity(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationQuoteDelivery => {
-            federation::deliver_quote_activity(&state, job.payload.clone()).await
+            federation::deliver_quote_activity(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFollowDelivery => {
-            federation::deliver_follow_activity(&state, job.payload.clone()).await
+            federation::deliver_follow_activity(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFavouriteDelivery => {
-            federation::deliver_favourite_activity(&state, job.payload.clone()).await
+            federation::deliver_favourite_activity(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationReblogDelivery => {
-            federation::deliver_reblog_activity(&state, job.payload.clone()).await
+            federation::deliver_reblog_activity(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationActorUpdateDelivery => {
-            federation::deliver_actor_update(&state, job.payload.clone()).await
+            federation::deliver_actor_update(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationModerationDelivery => {
-            federation::deliver_moderation_activity(&state, job.payload.clone()).await
+            federation::deliver_moderation_activity(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationRemoteMediaFetch => {
-            media::fetch_remote_media(&state, job.payload.clone()).await
+            media::fetch_remote_media(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFeaturedRefresh => {
-            federation::refresh_remote_featured(&state, job.payload.clone()).await
+            federation::refresh_remote_featured(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFeaturedTagsRefresh => {
-            federation::refresh_remote_featured_tags(&state, job.payload.clone()).await
+            federation::refresh_remote_featured_tags(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationThreadResolve => {
-            federation::resolve_remote_status_thread(&state, job.payload.clone()).await
+            federation::resolve_remote_status_thread(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationRepliesFetch => {
-            federation::fetch_remote_status_replies(&state, job.payload.clone()).await
+            federation::fetch_remote_status_replies(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationReplyFetch => {
-            federation::fetch_remote_status_reply(&state, job.payload.clone()).await
+            federation::fetch_remote_status_reply(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::WebPushDelivery => state
             .push
@@ -606,16 +608,18 @@ async fn worker_iteration(
             Ok(())
         }
         roosty_db::JobKind::ScheduledStatusPublish => {
-            statuses::publish_scheduled_status(&state, job.payload.clone()).await
+            let database = DatabaseContext::new(db.clone());
+            statuses::publish_scheduled_status(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::PollExpiration => {
-            polls::expire_poll_job(&state, job.payload.clone()).await
+            let database = DatabaseContext::new(db.clone());
+            polls::expire_poll_job(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::PollUpdate => {
-            polls::publish_poll_update_job(&state, job.payload.clone()).await
+            polls::publish_poll_update_job(&state, db, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationPollVoteDelivery => {
-            federation::deliver_poll_vote(&state, job.payload.clone()).await
+            federation::deliver_poll_vote(&state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::TrendMaintenance => {
             let outcome = roosty_db::maintain_trends(db).await?;
@@ -639,7 +643,9 @@ async fn worker_iteration(
             }
         }
         roosty_db::JobKind::PreviewCardFetch => {
-            preview_cards::fetch_preview_card(&state, job.payload.clone(), job.attempts).await
+            let database = DatabaseContext::new(db.clone());
+            preview_cards::fetch_preview_card(&state, &database, job.payload.clone(), job.attempts)
+                .await
         }
         roosty_db::JobKind::PreviewCardBackfill => {
             let outcome = roosty_db::backfill_preview_cards(db).await?;

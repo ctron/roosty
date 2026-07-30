@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use axum::{
-    Json, Router,
+    Error as AxumError, Extension, Json, Router,
     body::to_bytes,
     extract::{Path, Query, RawQuery, Request, State},
     http::{HeaderValue, StatusCode, header},
@@ -7,22 +9,29 @@ use axum::{
     routing::{get, post},
 };
 use roosty_core::{
-    AccountId, AccountRelationshipError, FederationDiscoveryError, RoostyError, StatusId,
+    AccountId, AccountRelationshipError, Result as RoostyResult, RoostyError, StatusId,
 };
-use roosty_db::{LocalNotificationType, RemoteActor, RemoteProfileMediaKind};
-use sea_orm::{AccessMode, ConnectionTrait, TransactionTrait};
+use roosty_db::{
+    AccountDirectoryOptions, AccountDirectoryOrder, AccountSearchResult,
+    AccountStatusTimelineOptions, CollectionCursor, CollectionPage, FollowCollectionAccount,
+    LocalNotificationType, RemoteActor, RemoteFollowState, RemoteProfileMediaKind, TimelineCursor,
+};
+use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::{Error as JsonError, Value, json};
+use serde_qs::{ArrayFormat, Config as QueryStringConfig, Error as QueryStringError};
+use serde_urlencoded::de::Error as FormError;
+use thiserror::Error;
 use tracing::warn;
-use uuid::Uuid;
+use uuid::{Error, Uuid};
 
 use crate::{
     auth::{
         AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response,
         account_response_on, account_response_with_stats, format_account_date,
     },
-    http::AppState,
-    statuses::CollectionLink,
+    http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
+    statuses::{CollectionLink, StatusRenderContext},
 };
 
 const DEFAULT_ACCOUNT_LIMIT: u64 = 40;
@@ -109,7 +118,7 @@ impl DirectoryOrder {
     }
 }
 
-impl From<DirectoryOrder> for roosty_db::AccountDirectoryOrder {
+impl From<DirectoryOrder> for AccountDirectoryOrder {
     fn from(order: DirectoryOrder) -> Self {
         match order {
             DirectoryOrder::Active => Self::Active,
@@ -222,12 +231,43 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Error)]
+enum AccountInputError {
+    #[error("invalid request body: {0}")]
+    Body(#[from] AxumError),
+    #[error("invalid request body: {0}")]
+    Json(#[from] JsonError),
+    #[error("invalid request body: {0}")]
+    Form(#[from] FormError),
+}
+
+impl From<AccountInputError> for ApiError {
+    fn from(error: AccountInputError) -> Self {
+        Self::BadRequest(Cow::Owned(error.to_string()))
+    }
+}
+
+#[derive(Debug, Error)]
+enum AccountQueryError {
+    #[error("invalid account identifier")]
+    Identifier(#[from] Error),
+    #[error("invalid account query")]
+    Query(#[from] QueryStringError),
+}
+
+impl From<AccountQueryError> for ApiError {
+    fn from(_: AccountQueryError) -> Self {
+        Self::BadRequest(Cow::Borrowed("account id or cursor is invalid"))
+    }
+}
+
 /// Return the public Mastodon-compatible profile directory.
 async fn directory(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Query(params): Query<DirectoryParams>,
-) -> Response {
+) -> ApiResult<Response> {
     let limit = params
         .limit
         .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
@@ -235,17 +275,11 @@ async fn directory(
     let offset = params.offset.unwrap_or_default();
     let order = params.order.unwrap_or_default();
     let local_only = params.local.unwrap_or(false);
-    let txn = match state.begin_snapshot().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let hidden_domains = match roosty_db::hidden_federation_domains(&txn).await {
-        Ok(domains) => domains,
-        Err(error) => return server_error(error),
-    };
-    let page = match roosty_db::account_directory(
+    let txn = database.begin_snapshot().await?;
+    let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
+    let page = roosty_db::account_directory(
         &txn,
-        roosty_db::AccountDirectoryOptions {
+        AccountDirectoryOptions {
             viewer_account_id: viewer.as_ref().map(|account| account.id),
             order: order.into(),
             local_only,
@@ -254,27 +288,20 @@ async fn directory(
             blocked_remote_domains: &hidden_domains,
         },
     )
-    .await
-    {
-        Ok(page) => page,
-        Err(error) => return server_error(error),
-    };
+    .await?;
     let remote_ids = page
         .items
         .iter()
         .filter_map(|item| match &item.account {
-            roosty_db::AccountSearchResult::Remote(actor) => Some(actor.id),
-            roosty_db::AccountSearchResult::Local(_) => None,
+            AccountSearchResult::Remote(actor) => Some(actor.id),
+            AccountSearchResult::Local(_) => None,
         })
         .collect::<Vec<_>>();
-    let remote_media = match roosty_db::remote_profile_media_for_actors(&txn, &remote_ids).await {
-        Ok(media) => media,
-        Err(error) => return server_error(error),
-    };
+    let remote_media = roosty_db::remote_profile_media_for_actors(&txn, &remote_ids).await?;
     let mut accounts = Vec::with_capacity(page.items.len());
     for item in page.items {
         match item.account {
-            roosty_db::AccountSearchResult::Local(account) => {
+            AccountSearchResult::Local(account) => {
                 accounts.push(DirectoryAccountResponse::Local(Box::new(
                     account_response_with_stats(
                         &state,
@@ -286,7 +313,7 @@ async fn directory(
                     ),
                 )));
             }
-            roosty_db::AccountSearchResult::Remote(actor) => {
+            AccountSearchResult::Remote(actor) => {
                 let media_url = |kind| {
                     remote_media
                         .iter()
@@ -305,9 +332,7 @@ async fn directory(
             }
         }
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
+    txn.commit().await?;
 
     let mut links = Vec::with_capacity(2);
     if page.has_more {
@@ -329,12 +354,11 @@ async fn directory(
         ));
     }
     let mut response = Json(accounts).into_response();
-    if !links.is_empty()
-        && let Ok(value) = HeaderValue::from_str(&links.join(", "))
-    {
+    if !links.is_empty() {
+        let value = HeaderValue::from_str(&links.join(", "))?;
         response.headers_mut().insert(header::LINK, value);
     }
-    response
+    Ok(response)
 }
 
 fn directory_link(
@@ -353,76 +377,63 @@ fn directory_link(
 /// Return a public local account profile by local username or address.
 async fn lookup_account(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Query(params): Query<LookupParams>,
-) -> Response {
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(&state, &txn);
     if let Some(username) = local_lookup_username(&state, params.acct.as_deref()) {
-        return match roosty_db::find_local_account_by_username(&state.db, &username).await {
-            Ok(Some(account)) => match account_response(&state, account).await {
-                Ok(response) => Json(response).into_response(),
-                Err(error) => server_error(error),
-            },
-            Ok(None) => not_found(),
-            Err(error) => server_error(error),
-        };
+        let account = roosty_db::find_local_account_by_username(&txn, &username)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+        let response = account_response(&state, &txn, account).await?;
+        return Ok(Json(response).into_response());
     }
 
+    let mut cached_actor = None;
     if let Some((username, domain)) = params
         .acct
         .as_deref()
         .and_then(crate::federation::discovery::exact_remote_handle)
     {
-        match roosty_db::find_remote_actor_by_handle(&state.db, &username, &domain).await {
-            Ok(Some(actor)) => {
-                let unavailable = match remote_actor_is_suspended(&state, &actor).await {
-                    Ok(unavailable) => unavailable,
-                    Err(error) => return server_error(error),
-                };
-                if unavailable
-                    || (params.resolve.unwrap_or(false)
-                        && actor.expires_at <= time::OffsetDateTime::now_utc())
-                {
-                    // A stale actor may still be refreshed by the resolver below.
-                } else {
-                    return match remote_account_response(&state, actor).await {
-                        Ok(response) => Json(response).into_response(),
-                        Err(error) => server_error(error),
-                    };
-                }
-            }
-            Ok(_) => {}
-            Err(error) => return server_error(error),
+        cached_actor = roosty_db::find_remote_actor_by_handle(&txn, &username, &domain).await?;
+    }
+    if let Some(actor) = cached_actor {
+        let unavailable = remote_actor_is_suspended_on(&txn, &actor).await?;
+        let stale =
+            params.resolve.unwrap_or(false) && actor.expires_at <= time::OffsetDateTime::now_utc();
+        if !unavailable && !stale {
+            let response = remote_account_response(&context, actor).await?;
+            return Ok(Json(response).into_response());
         }
     }
 
     if !params.resolve.unwrap_or(false) || !state.config.federation_enabled {
-        return not_found();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    let Some(acct) = params.acct.as_deref() else {
-        return not_found();
-    };
-    match crate::federation::discovery::resolve_remote_actor(&state, acct).await {
-        Ok(actor) if actor.deleted_at.is_some() => not_found(),
-        Ok(actor) => match remote_account_response(&state, actor).await {
-            Ok(response) => Json(response).into_response(),
-            Err(error) => server_error(error),
-        },
-        Err(RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_))) => {
-            not_found()
-        }
-        Err(RoostyError::InvalidInput(error)) => bad_request(&error),
-        Err(error) => server_error(error),
+    let acct = params
+        .acct
+        .as_deref()
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    drop(context);
+    txn.commit().await?;
+    let actor = crate::federation::discovery::resolve_remote_actor(&state, &database, acct).await?;
+    if actor.deleted_at.is_some() {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(&state, &txn);
+    let response = remote_account_response(&context, actor).await?;
+    txn.commit().await?;
+    Ok(Json(response).into_response())
 }
 
 /// Convert a cached remote actor to the public Mastodon account projection.
 pub(crate) async fn remote_account_response(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     actor: RemoteActor,
-) -> roosty_core::Result<RemoteAccountResponse> {
-    let txn = state.begin_snapshot().await?;
-    let response = remote_account_response_on(state, &txn, actor).await?;
-    txn.commit().await?;
-    Ok(response)
+) -> RoostyResult<RemoteAccountResponse> {
+    remote_account_response_on(state, state.db, actor).await
 }
 
 /// Build a remote account response within a containing database snapshot.
@@ -430,7 +441,7 @@ pub(crate) async fn remote_account_response_on(
     state: &AppState,
     db: &impl ConnectionTrait,
     actor: RemoteActor,
-) -> roosty_core::Result<RemoteAccountResponse> {
+) -> RoostyResult<RemoteAccountResponse> {
     let statuses_count = roosty_db::count_remote_statuses_by_account(db, actor.id).await?;
     let last_status_at = roosty_db::last_remote_status_at(db, actor.id)
         .await?
@@ -610,217 +621,149 @@ enum RemoteEmojiType {
 }
 
 /// Return a public local account profile by account id.
-async fn show_account(State(state): State<AppState>, Path(path): Path<AccountPath>) -> Response {
+async fn show_account(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Path(path): Path<AccountPath>,
+) -> ApiResult<Response> {
     let account_id = AccountId(path.account_id);
-    let txn = match state.begin_snapshot().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let response = match roosty_db::find_local_account_by_id(&txn, account_id).await {
-        Ok(Some(account)) => match account_response_on(&state, &txn, account).await {
-            Ok(response) => Json(response).into_response(),
-            Err(error) => server_error(error),
-        },
-        Ok(None) => match roosty_db::find_remote_actor_by_id(&txn, account_id).await {
-            Ok(Some(actor)) if actor.deleted_at.is_some() => not_found(),
-            Ok(Some(actor)) => match roosty_db::federation_domain_policy(&txn, &actor.domain).await
+    let txn = database.begin_snapshot().await?;
+    let response =
+        if let Some(account) = roosty_db::find_local_account_by_id(&txn, account_id).await? {
+            Json(account_response_on(&state, &txn, account).await?).into_response()
+        } else {
+            let actor = roosty_db::find_remote_actor_by_id(&txn, account_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+            if actor.deleted_at.is_some()
+                || roosty_db::federation_domain_policy(&txn, &actor.domain)
+                    .await?
+                    .is_suspended()
             {
-                Ok(policy) if !policy.is_suspended() => {
-                    match remote_account_response_on(&state, &txn, actor).await {
-                        Ok(response) => Json(response).into_response(),
-                        Err(error) => server_error(error),
-                    }
-                }
-                Ok(_) => not_found(),
-                Err(error) => server_error(error),
-            },
-            Ok(_) => not_found(),
-            Err(error) => server_error(error),
-        },
-        Err(error) => server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    response
+                return Err(ApiError::NotFound("Record not found".into()));
+            }
+            Json(remote_account_response_on(&state, &txn, actor).await?).into_response()
+        };
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Return statuses authored by one local account.
 async fn account_statuses(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<AccountPath>,
     Query(params): Query<AccountStatusesParams>,
-) -> Response {
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let context = StatusRenderContext::new(&state, &txn);
     let account_id = AccountId(path.account_id);
-    let cursor = match timeline_cursor(&params) {
-        Ok(cursor) => cursor,
-        Err(()) => return bad_request("status id is invalid"),
-    };
+    let cursor = timeline_cursor(&params)?;
     let limit = crate::statuses::timeline_limit(params.limit);
-    let local = match roosty_db::find_local_account_by_id(&state.db, account_id).await {
-        Ok(Some(account)) if account.suspended_at.is_some() => {
-            return Json(Vec::<Value>::new()).into_response();
-        }
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(error) => return server_error(error),
-    };
+    let local_account = roosty_db::find_local_account_by_id(&txn, account_id).await?;
+    if local_account
+        .as_ref()
+        .is_some_and(|account| account.suspended_at.is_some())
+    {
+        return Ok(Json(Vec::<Value>::new()).into_response());
+    }
+    let local = local_account.is_some();
     if !local {
-        match roosty_db::find_remote_actor_by_id(&state.db, account_id).await {
-            Ok(Some(actor)) => match remote_actor_is_suspended(&state, &actor).await {
-                Ok(false) => {}
-                Ok(true) => return not_found(),
-                Err(error) => return server_error(error),
-            },
-            Ok(_) => return not_found(),
-            Err(error) => return server_error(error),
+        let actor = roosty_db::find_remote_actor_by_id(&txn, account_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+        if remote_actor_is_suspended_on(&txn, &actor).await? {
+            return Err(ApiError::NotFound("Record not found".into()));
         }
-        if params.pinned.unwrap_or(false) {
-            return match roosty_db::pinned_remote_statuses_by_account(
-                &state.db, account_id, limit, cursor,
+        let page = if params.pinned.unwrap_or(false) {
+            roosty_db::pinned_remote_statuses_by_account(&txn, account_id, limit, cursor).await?
+        } else {
+            roosty_db::remote_statuses_by_account(
+                &txn,
+                account_id,
+                viewer.as_ref().map(|account| account.id),
+                limit,
+                cursor,
+                AccountStatusTimelineOptions {
+                    exclude_replies: params.exclude_replies.unwrap_or(false),
+                    only_media: params.only_media.unwrap_or(false),
+                    tagged: params.tagged.clone().filter(|tag| !tag.trim().is_empty()),
+                },
             )
-            .await
-            {
-                Ok(page) => {
-                    crate::statuses::remote_timeline_response(
-                        &state,
-                        page,
-                        limit,
-                        &format!("/api/v1/accounts/{}/statuses?pinned=true", account_id.0),
-                        viewer.as_ref().map(|account| account.id),
-                    )
-                    .await
-                }
-                Err(error) => server_error(error),
-            };
-        }
-        return match roosty_db::remote_statuses_by_account(
-            &state.db,
+            .await?
+        };
+        let suffix = if params.pinned.unwrap_or(false) {
+            "?pinned=true"
+        } else {
+            ""
+        };
+        return Ok(crate::statuses::remote_timeline_response(
+            &context,
+            page,
+            limit,
+            &format!("/api/v1/accounts/{}/statuses{suffix}", account_id.0),
+            viewer.as_ref().map(|account| account.id),
+        )
+        .await);
+    };
+    let page = if params.pinned.unwrap_or(false) {
+        roosty_db::pinned_local_statuses_by_account(&txn, account_id, limit, cursor).await?
+    } else {
+        roosty_db::local_statuses_by_account(
+            &txn,
             account_id,
             viewer.as_ref().map(|account| account.id),
             limit,
             cursor,
-            roosty_db::AccountStatusTimelineOptions {
+            AccountStatusTimelineOptions {
                 exclude_replies: params.exclude_replies.unwrap_or(false),
                 only_media: params.only_media.unwrap_or(false),
                 tagged: params.tagged.clone().filter(|tag| !tag.trim().is_empty()),
             },
         )
-        .await
-        {
-            Ok(page) => {
-                crate::statuses::remote_timeline_response(
-                    &state,
-                    page,
-                    limit,
-                    &format!("/api/v1/accounts/{}/statuses", account_id.0),
-                    viewer.as_ref().map(|account| account.id),
-                )
-                .await
-            }
-            Err(error) => server_error(error),
-        };
-    }
-
-    if params.pinned.unwrap_or(false) {
-        return match roosty_db::pinned_local_statuses_by_account(
-            &state.db, account_id, limit, cursor,
-        )
-        .await
-        {
-            Ok(page) => {
-                crate::statuses::timeline_response(
-                    &state,
-                    page,
-                    limit,
-                    &format!("/api/v1/accounts/{}/statuses?pinned=true", account_id.0),
-                    viewer.as_ref().map(|account| account.id),
-                )
-                .await
-            }
-            Err(error) => server_error(error),
-        };
-    }
-
-    match roosty_db::local_statuses_by_account(
-        &state.db,
-        account_id,
-        viewer.as_ref().map(|account| account.id),
+        .await?
+    };
+    let suffix = if params.pinned.unwrap_or(false) {
+        "?pinned=true"
+    } else {
+        ""
+    };
+    Ok(crate::statuses::timeline_response(
+        &context,
+        page,
         limit,
-        cursor,
-        roosty_db::AccountStatusTimelineOptions {
-            exclude_replies: params.exclude_replies.unwrap_or(false),
-            only_media: params.only_media.unwrap_or(false),
-            tagged: params.tagged.clone().filter(|tag| !tag.trim().is_empty()),
-        },
+        &format!("/api/v1/accounts/{}/statuses{suffix}", account_id.0),
+        viewer.as_ref().map(|account| account.id),
     )
-    .await
-    {
-        Ok(page) => {
-            if params.exclude_reblogs.unwrap_or(false) {
-                // Account status collections currently return authored statuses only.
-            }
-            crate::statuses::timeline_response(
-                &state,
-                page,
-                limit,
-                &format!("/api/v1/accounts/{}/statuses", account_id.0),
-                viewer.as_ref().map(|account| account.id),
-            )
-            .await
-        }
-        Err(error) => server_error(error),
-    }
+    .await)
 }
 
 /// Follow a local account and return the resulting relationship.
 async fn follow(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
     request: Request,
-) -> Response {
-    let input = match follow_input(request).await {
-        Ok(input) => input,
-        Err(error) => return bad_request(&error),
-    };
+) -> ApiResult<Response> {
+    let input = follow_input(request).await?;
     let target_id = AccountId(path.account_id);
-
-    let remote_target = match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
-        Ok(actor) => actor,
-        Err(error) => return server_error(error),
-    };
-    let remote_allowed = match remote_target.as_ref() {
-        Some(actor) => {
-            state.config.federation_domain_is_allowed(&actor.domain)
-                && !remote_actor_is_suspended(&state, actor)
-                    .await
-                    .unwrap_or(true)
-        }
-        None => false,
+    let txn = database.begin_write().await?;
+    let remote_target = roosty_db::find_remote_actor_by_id(&txn, target_id).await?;
+    let remote_allowed = if let Some(actor) = remote_target.as_ref() {
+        state.config.federation_domain_is_allowed(&actor.domain)
+            && !remote_actor_is_suspended_on(&txn, actor).await?
+    } else {
+        false
     };
     if remote_allowed {
-        match roosty_db::local_remote_accounts_are_blocked(&state.db, account.id, target_id).await {
-            Ok(true) => {
-                return forbidden(&AccountRelationshipError::FollowBlocked.to_string());
-            }
-            Ok(false) => {}
-            Err(error) => return server_error(error),
+        if roosty_db::local_remote_accounts_are_blocked(&txn, account.id, target_id).await? {
+            return Err(AccountRelationshipError::FollowBlocked.into());
         }
-        let (activity_id, job) = match crate::federation::prepare_remote_follow(
-            &state, &state.db, account.id, target_id,
-        )
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return server_error(error),
-        };
-        let txn = match state.db.begin().await {
-            Ok(txn) => txn,
-            Err(error) => return server_error(error.into()),
-        };
-        return match roosty_db::create_remote_following_with_job(
+        let (activity_id, job) =
+            crate::federation::prepare_remote_follow(&state, &txn, account.id, target_id).await?;
+        roosty_db::create_remote_following_with_job(
             &txn,
             account.id,
             target_id,
@@ -829,405 +772,258 @@ async fn follow(
             input.notify.unwrap_or(false),
             job,
         )
-        .await
-        {
-            Ok(_) => match txn.commit().await {
-                Ok(()) => relationship_response(&state, account.id, target_id).await,
-                Err(error) => server_error(error.into()),
-            },
-            Err(RoostyError::AccountRelationship(AccountRelationshipError::FollowBlocked)) => {
-                forbidden(&AccountRelationshipError::FollowBlocked.to_string())
-            }
-            Err(error) => server_error(error),
-        };
+        .await?;
+        txn.commit().await?;
+        return relationship_response(&state, &database, account.id, target_id).await;
     }
 
-    match roosty_db::follow_local_account(
-        &state.db,
+    roosty_db::follow_local_account(
+        &txn,
         account.id,
         target_id,
         input.reblogs.unwrap_or(true),
         input.notify.unwrap_or(false),
     )
+    .await?;
+    txn.commit().await?;
+    crate::notifications::create_and_stream_notification(
+        &state,
+        &database,
+        target_id,
+        LocalNotificationType::Follow,
+        account.id,
+        None,
+    )
     .await
-    {
-        Ok(_) => {
-            if let Err(error) = crate::notifications::create_and_stream_notification(
-                &state,
-                target_id,
-                LocalNotificationType::Follow,
-                account.id,
-                None,
-            )
-            .await
-            {
-                warn!(%error, "failed to create follow notification");
-            }
-            relationship_response(&state, account.id, target_id).await
-        }
-        Err(RoostyError::AccountRelationship(AccountRelationshipError::FollowTargetNotFound)) => {
-            not_found()
-        }
-        Err(RoostyError::AccountRelationship(AccountRelationshipError::FollowBlocked)) => {
-            forbidden(&AccountRelationshipError::FollowBlocked.to_string())
-        }
-        Err(RoostyError::AccountRelationship(error)) => bad_request(&error.to_string()),
-        Err(RoostyError::InvalidInput(error)) => bad_request(&error),
-        Err(error) => server_error(error),
-    }
+    .inspect_err(|error| warn!(%error, "failed to create follow notification"))
+    .ok();
+    relationship_response(&state, &database, account.id, target_id).await
 }
 
 /// Block a local account and return the resulting relationship.
 async fn block(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let target_id = AccountId(path.account_id);
-    match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
-        Ok(Some(actor))
-            if !remote_actor_is_suspended(&state, &actor)
-                .await
-                .unwrap_or(true) =>
-        {
-            let (activity_id, job) = match crate::federation::prepare_remote_block(
-                &state, &state.db, account.id, target_id,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(error) => return server_error(error),
-            };
-            let txn = match state.db.begin().await {
-                Ok(txn) => txn,
-                Err(error) => return server_error(error.into()),
-            };
-            return match roosty_db::block_remote_account(
-                &txn,
-                account.id,
-                target_id,
-                &activity_id,
-                job,
-            )
-            .await
-            {
-                Ok(_) => match txn.commit().await {
-                    Ok(()) => relationship_response(&state, account.id, target_id).await,
-                    Err(error) => server_error(error.into()),
-                },
-                Err(error) => server_error(error),
-            };
+    let txn = database.begin_write().await?;
+    if let Some(actor) = roosty_db::find_remote_actor_by_id(&txn, target_id).await? {
+        if remote_actor_is_suspended_on(&txn, &actor).await? {
+            return Err(ApiError::NotFound("Record not found".into()));
         }
-        Ok(Some(_)) => return not_found(),
-        Ok(None) => {}
-        Err(error) => return server_error(error),
+        let (activity_id, job) =
+            crate::federation::prepare_remote_block(&state, &txn, account.id, target_id).await?;
+        roosty_db::block_remote_account(&txn, account.id, target_id, &activity_id, job).await?;
+        txn.commit().await?;
+        return relationship_response(&state, &database, account.id, target_id).await;
     }
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    match roosty_db::block_local_account(&txn, account.id, target_id).await {
-        Ok(()) => match txn.commit().await {
-            Ok(()) => relationship_response(&state, account.id, target_id).await,
-            Err(error) => server_error(error.into()),
-        },
-        Err(RoostyError::AccountRelationship(
-            AccountRelationshipError::ModerationTargetNotFound,
-        )) => not_found(),
-        Err(RoostyError::AccountRelationship(error)) => bad_request(&error.to_string()),
-        Err(RoostyError::InvalidInput(error)) => bad_request(&error),
-        Err(error) => server_error(error),
-    }
+    roosty_db::block_local_account(&txn, account.id, target_id).await?;
+    txn.commit().await?;
+    relationship_response(&state, &database, account.id, target_id).await
 }
 
 /// Remove a local block and return the resulting relationship.
 async fn unblock(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let target_id = AccountId(path.account_id);
-    match roosty_db::find_local_remote_account_block(&state.db, account.id, target_id).await {
-        Ok(Some(block)) => {
-            let job =
-                match crate::federation::prepare_remote_unblock(&state, &state.db, &block).await {
-                    Ok(job) => job,
-                    Err(error) => return server_error(error),
-                };
-            let txn = match state.db.begin().await {
-                Ok(txn) => txn,
-                Err(error) => return server_error(error.into()),
-            };
-            return match roosty_db::unblock_remote_account(&txn, account.id, target_id, job).await {
-                Ok(_) => match txn.commit().await {
-                    Ok(()) => relationship_response(&state, account.id, target_id).await,
-                    Err(error) => server_error(error.into()),
-                },
-                Err(error) => server_error(error),
-            };
-        }
-        Ok(None) => {}
-        Err(error) => return server_error(error),
+    let txn = database.begin_write().await?;
+    if let Some(block) =
+        roosty_db::find_local_remote_account_block(&txn, account.id, target_id).await?
+    {
+        let job = crate::federation::prepare_remote_unblock(&state, &txn, &block).await?;
+        roosty_db::unblock_remote_account(&txn, account.id, target_id, job).await?;
+        txn.commit().await?;
+        return relationship_response(&state, &database, account.id, target_id).await;
     }
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    match roosty_db::unblock_local_account(&txn, account.id, target_id).await {
-        Ok(()) => match txn.commit().await {
-            Ok(()) => relationship_response(&state, account.id, target_id).await,
-            Err(error) => server_error(error.into()),
-        },
-        Err(error) => server_error(error),
-    }
+    roosty_db::unblock_local_account(&txn, account.id, target_id).await?;
+    txn.commit().await?;
+    relationship_response(&state, &database, account.id, target_id).await
 }
 
 /// Mute a local account and return the resulting relationship.
 async fn mute(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
     request: Request,
-) -> Response {
-    let input = match mute_input(request).await {
-        Ok(input) => input,
-        Err(error) => return bad_request(&error),
-    };
+) -> ApiResult<Response> {
+    let input = mute_input(request).await?;
     let target_id = AccountId(path.account_id);
-    match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
-        Ok(Some(actor))
-            if !remote_actor_is_suspended(&state, &actor)
-                .await
-                .unwrap_or(true) =>
-        {
-            let txn = match state.db.begin().await {
-                Ok(txn) => txn,
-                Err(error) => return server_error(error.into()),
-            };
-            return match roosty_db::mute_remote_account(
-                &txn,
-                account.id,
-                target_id,
-                input.notifications.unwrap_or(true),
-                input.duration.unwrap_or(0),
-            )
-            .await
-            {
-                Ok(_) => match txn.commit().await {
-                    Ok(()) => relationship_response(&state, account.id, target_id).await,
-                    Err(error) => server_error(error.into()),
-                },
-                Err(error) => server_error(error),
-            };
+    let txn = database.begin_write().await?;
+    if let Some(actor) = roosty_db::find_remote_actor_by_id(&txn, target_id).await? {
+        if remote_actor_is_suspended_on(&txn, &actor).await? {
+            return Err(ApiError::NotFound("Record not found".into()));
         }
-        Ok(Some(_)) => return not_found(),
-        Ok(None) => {}
-        Err(error) => return server_error(error),
+        roosty_db::mute_remote_account(
+            &txn,
+            account.id,
+            target_id,
+            input.notifications.unwrap_or(true),
+            input.duration.unwrap_or(0),
+        )
+        .await?;
+        txn.commit().await?;
+        return relationship_response(&state, &database, account.id, target_id).await;
     }
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    match roosty_db::mute_local_account(
+    roosty_db::mute_local_account(
         &txn,
         account.id,
         target_id,
         input.notifications.unwrap_or(true),
         input.duration.unwrap_or(0),
     )
-    .await
-    {
-        Ok(_) => match txn.commit().await {
-            Ok(()) => relationship_response(&state, account.id, target_id).await,
-            Err(error) => server_error(error.into()),
-        },
-        Err(RoostyError::AccountRelationship(
-            AccountRelationshipError::ModerationTargetNotFound,
-        )) => not_found(),
-        Err(RoostyError::AccountRelationship(error)) => bad_request(&error.to_string()),
-        Err(RoostyError::InvalidInput(error)) => bad_request(&error),
-        Err(error) => server_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    relationship_response(&state, &database, account.id, target_id).await
 }
 
 /// Remove a local mute and return the resulting relationship.
 async fn unmute(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let target_id = AccountId(path.account_id);
-    match roosty_db::find_remote_actor_by_id(&state.db, target_id).await {
-        Ok(Some(_)) => {
-            let txn = match state.db.begin().await {
-                Ok(txn) => txn,
-                Err(error) => return server_error(error.into()),
-            };
-            return match roosty_db::unmute_remote_account(&txn, account.id, target_id).await {
-                Ok(()) => match txn.commit().await {
-                    Ok(()) => relationship_response(&state, account.id, target_id).await,
-                    Err(error) => server_error(error.into()),
-                },
-                Err(error) => server_error(error),
-            };
-        }
-        Ok(None) => {}
-        Err(error) => return server_error(error),
+    let txn = database.begin_write().await?;
+    if roosty_db::find_remote_actor_by_id(&txn, target_id)
+        .await?
+        .is_some()
+    {
+        roosty_db::unmute_remote_account(&txn, account.id, target_id).await?;
+        txn.commit().await?;
+        return relationship_response(&state, &database, account.id, target_id).await;
     }
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    match roosty_db::unmute_local_account(&txn, account.id, target_id).await {
-        Ok(()) => match txn.commit().await {
-            Ok(()) => relationship_response(&state, account.id, target_id).await,
-            Err(error) => server_error(error.into()),
-        },
-        Err(error) => server_error(error),
-    }
+    roosty_db::unmute_local_account(&txn, account.id, target_id).await?;
+    txn.commit().await?;
+    relationship_response(&state, &database, account.id, target_id).await
 }
 
 /// Unfollow a local account and return the resulting relationship.
 async fn unfollow(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let target_id = AccountId(path.account_id);
-    let remote_following =
-        match roosty_db::find_remote_following(&state.db, account.id, target_id).await {
-            Ok(following) => following,
-            Err(error) => return server_error(error),
-        };
+    let txn = database.begin_write().await?;
+    let remote_following = roosty_db::find_remote_following(&txn, account.id, target_id).await?;
     if let Some(following) = remote_following {
-        let job =
-            match crate::federation::prepare_remote_unfollow(&state, &state.db, following).await {
-                Ok(job) => job,
-                Err(error) => return server_error(error),
-            };
-        let txn = match state.db.begin().await {
-            Ok(txn) => txn,
-            Err(error) => return server_error(error.into()),
-        };
-        return match roosty_db::delete_remote_following_with_job(&txn, account.id, target_id, job)
-            .await
-        {
-            Ok(_) => match txn.commit().await {
-                Ok(()) => relationship_response(&state, account.id, target_id).await,
-                Err(error) => server_error(error.into()),
-            },
-            Err(error) => server_error(error),
-        };
+        let job = crate::federation::prepare_remote_unfollow(&state, &txn, following).await?;
+        roosty_db::delete_remote_following_with_job(&txn, account.id, target_id, job).await?;
+    } else {
+        roosty_db::unfollow_local_account(&txn, account.id, target_id).await?;
     }
-    match roosty_db::unfollow_local_account(&state.db, account.id, target_id).await {
-        Ok(()) => relationship_response(&state, account.id, target_id).await,
-        Err(error) => server_error(error),
-    }
+    txn.commit().await?;
+    relationship_response(&state, &database, account.id, target_id).await
 }
 
 /// Return Mastodon relationship objects for requested account ids.
 async fn relationships(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     RawQuery(query): RawQuery,
-) -> Response {
-    let ids = match relationship_ids(query.as_deref()) {
-        Ok(ids) => ids,
-        Err(()) => return bad_request("account id is invalid"),
-    };
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(&state, &txn);
+    let ids = relationship_ids(query.as_deref())?;
     let mut relationships = Vec::with_capacity(ids.len());
     for id in ids {
-        match relationship_model(&state, account.id, AccountId(id)).await {
-            Ok(relationship) => relationships.push(relationship),
-            Err(error) => return server_error(error),
-        }
+        relationships.push(relationship_model(&context, account.id, AccountId(id)).await?);
     }
-
-    Json(relationships).into_response()
+    txn.commit().await?;
+    Ok(Json(relationships).into_response())
 }
 
 /// List remote actors whose follow requests await this account's approval.
 async fn follow_requests(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<AccountCollectionParams>,
-) -> Response {
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(&state, &txn);
     let limit = params
         .limit
         .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
         .clamp(1, MAX_ACCOUNT_LIMIT);
-    let cursor = match collection_cursor(&params) {
-        Ok(cursor) => cursor,
-        Err(()) => return bad_request("collection cursor is invalid"),
-    };
-    match roosty_db::pending_remote_follow_requests(&state.db, account.id, limit, cursor).await {
-        Ok(page) => {
-            let mut actors = Vec::with_capacity(page.items.len());
-            for actor in page.items {
-                match remote_account_response(&state, actor).await {
-                    Ok(actor) => actors.push(actor),
-                    Err(error) => return server_error(error),
-                }
-            }
-            let link_header = CollectionLink::new(
-                limit,
-                page.first_cursor,
-                page.last_cursor,
-                page.has_more,
-                "/api/v1/follow_requests",
-            )
-            .header_value();
-            let mut response = Json(actors).into_response();
-            if let Some(link_header) = link_header {
-                response.headers_mut().insert(header::LINK, link_header);
-            }
-            response
-        }
-        Err(error) => server_error(error),
+    let cursor = collection_cursor(&params)?;
+    let page = roosty_db::pending_remote_follow_requests(&txn, account.id, limit, cursor).await?;
+    let mut actors = Vec::with_capacity(page.items.len());
+    for actor in page.items {
+        actors.push(remote_account_response(&context, actor).await?);
     }
+    let link_header = CollectionLink::new(
+        limit,
+        page.first_cursor,
+        page.last_cursor,
+        page.has_more,
+        "/api/v1/follow_requests",
+    )
+    .header_value();
+    let mut response = Json(actors).into_response();
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
+    }
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Approve a pending remote follow request for the authenticated local account.
 async fn authorize_follow_request(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
-    match crate::federation::accept_remote_follow_request(
-        &state,
+) -> ApiResult<Response> {
+    let accepted = crate::federation::accept_remote_follow_request(
+        &database,
         account.id,
         AccountId(path.account_id),
     )
-    .await
-    {
-        Ok(true) => relationship_response(&state, account.id, AccountId(path.account_id)).await,
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+    .await?;
+    if !accepted {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    relationship_response(&state, &database, account.id, AccountId(path.account_id)).await
 }
 
 /// Reject a pending remote follow request for the authenticated local account.
 async fn reject_follow_request(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
+) -> ApiResult<Response> {
     let remote_id = AccountId(path.account_id);
-    match crate::federation::reject_remote_follow_request(&state, account.id, remote_id).await {
-        Ok(true) => relationship_response(&state, account.id, remote_id).await,
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+    let rejected =
+        crate::federation::reject_remote_follow_request(&database, account.id, remote_id).await?;
+    if !rejected {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    relationship_response(&state, &database, account.id, remote_id).await
 }
 
 /// Return locally known followers for a local or cached remote account.
 async fn followers(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path(path): Path<AccountPath>,
     Query(params): Query<AccountCollectionParams>,
-) -> Response {
+) -> ApiResult<Response> {
     account_collection(
         &state,
+        &database,
         AccountId(path.account_id),
         params,
         AccountCollection::Followers,
@@ -1238,11 +1034,13 @@ async fn followers(
 /// Return locally known accounts followed by a local or cached remote account.
 async fn following(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path(path): Path<AccountPath>,
     Query(params): Query<AccountCollectionParams>,
-) -> Response {
+) -> ApiResult<Response> {
     account_collection(
         &state,
+        &database,
         AccountId(path.account_id),
         params,
         AccountCollection::Following,
@@ -1253,143 +1051,145 @@ async fn following(
 /// Return local accounts blocked by the authenticated account.
 async fn blocked_accounts(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<AccountCollectionParams>,
-) -> Response {
-    account_collection(&state, account.id, params, AccountCollection::Blocks).await
+) -> ApiResult<Response> {
+    account_collection(
+        &state,
+        &database,
+        account.id,
+        params,
+        AccountCollection::Blocks,
+    )
+    .await
 }
 
 /// Return local accounts muted by the authenticated account.
 async fn muted_accounts(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<AccountCollectionParams>,
-) -> Response {
-    account_collection(&state, account.id, params, AccountCollection::Mutes).await
+) -> ApiResult<Response> {
+    account_collection(
+        &state,
+        &database,
+        account.id,
+        params,
+        AccountCollection::Mutes,
+    )
+    .await
 }
 
 /// Return a Mastodon account collection.
 async fn account_collection(
     state: &AppState,
+    database: &DatabaseContext,
     account_id: AccountId,
     params: AccountCollectionParams,
     collection: AccountCollection,
-) -> Response {
+) -> ApiResult<Response> {
     let limit = params
         .limit
         .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
         .clamp(1, MAX_ACCOUNT_LIMIT);
-    let cursor = match collection_cursor(&params) {
-        Ok(cursor) => cursor,
-        Err(()) => return bad_request("collection cursor is invalid"),
-    };
-    let accounts = match collection {
+    let cursor = collection_cursor(&params)?;
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(state, &txn);
+    let page = match collection {
         AccountCollection::Followers | AccountCollection::Following => {
-            match follow_account_collection(state, account_id, limit, cursor, collection).await {
-                Ok(Some(page)) => Ok(page),
-                Ok(None) => return not_found(),
-                Err(error) => Err(error),
-            }
+            follow_account_collection(&context, account_id, limit, cursor, collection)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?
         }
         AccountCollection::Blocks => {
-            roosty_db::blocked_accounts_for_account(&state.db, account_id, limit, cursor)
-                .await
-                .map(|page| roosty_db::CollectionPage {
-                    items: page.items.into_iter().map(|entry| entry.account).collect(),
-                    first_cursor: page.first_cursor,
-                    last_cursor: page.last_cursor,
-                    has_more: page.has_more,
-                })
+            let page =
+                roosty_db::blocked_accounts_for_account(&txn, account_id, limit, cursor).await?;
+            CollectionPage {
+                items: page.items.into_iter().map(|entry| entry.account).collect(),
+                first_cursor: page.first_cursor,
+                last_cursor: page.last_cursor,
+                has_more: page.has_more,
+            }
         }
         AccountCollection::Mutes => {
-            roosty_db::muted_accounts_for_account(&state.db, account_id, limit, cursor)
-                .await
-                .map(|page| roosty_db::CollectionPage {
-                    items: page.items.into_iter().map(|entry| entry.account).collect(),
-                    first_cursor: page.first_cursor,
-                    last_cursor: page.last_cursor,
-                    has_more: page.has_more,
-                })
+            let page =
+                roosty_db::muted_accounts_for_account(&txn, account_id, limit, cursor).await?;
+            CollectionPage {
+                items: page.items.into_iter().map(|entry| entry.account).collect(),
+                first_cursor: page.first_cursor,
+                last_cursor: page.last_cursor,
+                has_more: page.has_more,
+            }
         }
     };
-    match accounts {
-        Ok(page) => match account_responses(state, page.items).await {
-            Ok(accounts) => {
-                let path = match collection {
-                    AccountCollection::Followers => {
-                        format!("/api/v1/accounts/{}/followers", account_id.0)
-                    }
-                    AccountCollection::Following => {
-                        format!("/api/v1/accounts/{}/following", account_id.0)
-                    }
-                    AccountCollection::Blocks => "/api/v1/blocks".to_owned(),
-                    AccountCollection::Mutes => "/api/v1/mutes".to_owned(),
-                };
-                let link_header = CollectionLink::new(
-                    limit,
-                    page.first_cursor,
-                    page.last_cursor,
-                    page.has_more,
-                    &path,
-                )
-                .header_value();
-                let mut response = Json(accounts).into_response();
-                if let Some(link_header) = link_header {
-                    response.headers_mut().insert(header::LINK, link_header);
-                }
-                response
-            }
-            Err(error) => server_error(error),
-        },
-        Err(error) => server_error(error),
+    let accounts = account_responses(&context, page.items).await?;
+    let path = match collection {
+        AccountCollection::Followers => {
+            format!("/api/v1/accounts/{}/followers", account_id.0)
+        }
+        AccountCollection::Following => {
+            format!("/api/v1/accounts/{}/following", account_id.0)
+        }
+        AccountCollection::Blocks => "/api/v1/blocks".to_owned(),
+        AccountCollection::Mutes => "/api/v1/mutes".to_owned(),
+    };
+    let link_header = CollectionLink::new(
+        limit,
+        page.first_cursor,
+        page.last_cursor,
+        page.has_more,
+        &path,
+    )
+    .header_value();
+    let mut response = Json(accounts).into_response();
+    if let Some(link_header) = link_header {
+        response.headers_mut().insert(header::LINK, link_header);
     }
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Read one local or cached-remote follow collection from a consistent snapshot.
 async fn follow_account_collection(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     account_id: AccountId,
     limit: u64,
-    cursor: roosty_db::CollectionCursor,
+    cursor: CollectionCursor,
     collection: AccountCollection,
-) -> roosty_core::Result<Option<roosty_db::CollectionPage<roosty_db::FollowCollectionAccount>>> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let local = roosty_db::find_local_account_by_id(&txn, account_id)
+) -> RoostyResult<Option<CollectionPage<FollowCollectionAccount>>> {
+    let local = roosty_db::find_local_account_by_id(state.db, account_id)
         .await?
         .is_some();
     let page = if local {
         match collection {
             AccountCollection::Followers => {
-                roosty_db::followers_for_local_account(&txn, account_id, limit, cursor).await?
+                roosty_db::followers_for_local_account(state.db, account_id, limit, cursor).await?
             }
             AccountCollection::Following => {
-                roosty_db::following_for_local_account(&txn, account_id, limit, cursor).await?
+                roosty_db::following_for_local_account(state.db, account_id, limit, cursor).await?
             }
             AccountCollection::Blocks | AccountCollection::Mutes => unreachable!(),
         }
     } else {
-        let Some(actor) = roosty_db::find_remote_actor_by_id(&txn, account_id).await? else {
+        let Some(actor) = roosty_db::find_remote_actor_by_id(state.db, account_id).await? else {
             return Ok(None);
         };
-        if remote_actor_is_suspended(state, &actor).await? {
+        if remote_actor_is_suspended_on(state.db, &actor).await? {
             return Ok(None);
         }
         match collection {
             AccountCollection::Followers => {
-                roosty_db::followers_for_remote_account(&txn, account_id, limit, cursor).await?
+                roosty_db::followers_for_remote_account(state.db, account_id, limit, cursor).await?
             }
             AccountCollection::Following => {
-                roosty_db::following_for_remote_account(&txn, account_id, limit, cursor).await?
+                roosty_db::following_for_remote_account(state.db, account_id, limit, cursor).await?
             }
             AccountCollection::Blocks | AccountCollection::Mutes => unreachable!(),
         }
     };
-    txn.commit().await?;
-
-    Ok(Some(roosty_db::CollectionPage {
+    Ok(Some(CollectionPage {
         items: page.items.into_iter().map(|entry| entry.account).collect(),
         first_cursor: page.first_cursor,
         last_cursor: page.last_cursor,
@@ -1399,45 +1199,32 @@ async fn follow_account_collection(
 
 /// Convert local account records into Mastodon account responses.
 async fn account_responses(
-    state: &AppState,
-    accounts: Vec<roosty_db::FollowCollectionAccount>,
-) -> roosty_core::Result<Vec<CollectionAccountResponse>> {
-    let txn = state.begin_snapshot().await?;
+    state: &TransactionContext<'_, impl ConnectionTrait>,
+    accounts: Vec<FollowCollectionAccount>,
+) -> RoostyResult<Vec<CollectionAccountResponse>> {
     let mut responses = Vec::with_capacity(accounts.len());
     for account in accounts {
-        if let roosty_db::FollowCollectionAccount::Remote(actor) = &account
-            && remote_actor_is_suspended_on(&txn, actor).await?
+        if let FollowCollectionAccount::Remote(actor) = &account
+            && remote_actor_is_suspended_on(state.db, actor).await?
         {
             continue;
         }
         responses.push(match account {
-            roosty_db::FollowCollectionAccount::Local(account) => CollectionAccountResponse::Local(
-                Box::new(account_response_on(state, &txn, account).await?),
-            ),
-            roosty_db::FollowCollectionAccount::Remote(actor) => CollectionAccountResponse::Remote(
-                Box::new(remote_account_response_on(state, &txn, actor).await?),
-            ),
+            FollowCollectionAccount::Local(account) => CollectionAccountResponse::Local(Box::new(
+                account_response_on(state, state.db, account).await?,
+            )),
+            FollowCollectionAccount::Remote(actor) => CollectionAccountResponse::Remote(Box::new(
+                remote_account_response_on(state, state.db, actor).await?,
+            )),
         });
     }
-
-    txn.commit().await?;
     Ok(responses)
-}
-
-async fn remote_actor_is_suspended(
-    state: &AppState,
-    actor: &roosty_db::RemoteActor,
-) -> roosty_core::Result<bool> {
-    let txn = state.begin_read().await?;
-    let suspended = remote_actor_is_suspended_on(&txn, actor).await?;
-    txn.commit().await?;
-    Ok(suspended)
 }
 
 async fn remote_actor_is_suspended_on(
     db: &impl ConnectionTrait,
-    actor: &roosty_db::RemoteActor,
-) -> roosty_core::Result<bool> {
+    actor: &RemoteActor,
+) -> RoostyResult<bool> {
     if actor.deleted_at.is_some() || actor.suspended_at.is_some() {
         return Ok(true);
     }
@@ -1448,32 +1235,31 @@ async fn remote_actor_is_suspended_on(
 
 async fn relationship_response(
     state: &AppState,
+    database: &DatabaseContext,
     source_id: AccountId,
     target_id: AccountId,
-) -> Response {
-    match relationship_model(state, source_id, target_id).await {
-        Ok(relationship) => Json(relationship).into_response(),
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(state, &txn);
+    let relationship = relationship_model(&context, source_id, target_id).await?;
+    txn.commit().await?;
+    Ok(Json(relationship).into_response())
 }
 
 /// Build the local Mastodon relationship shape for two accounts.
 async fn relationship_model(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     source_id: AccountId,
     target_id: AccountId,
-) -> roosty_core::Result<RelationshipResponse> {
-    let txn = state.begin_snapshot().await?;
-    let relationship = relationship_model_on(&txn, source_id, target_id).await?;
-    txn.commit().await?;
-    Ok(relationship)
+) -> RoostyResult<RelationshipResponse> {
+    relationship_model_on(state.db, source_id, target_id).await
 }
 
 async fn relationship_model_on(
     db: &impl ConnectionTrait,
     source_id: AccountId,
     target_id: AccountId,
-) -> roosty_core::Result<RelationshipResponse> {
+) -> RoostyResult<RelationshipResponse> {
     let following = roosty_db::local_follow_relationship(db, source_id, target_id).await?;
     let remote_following = roosty_db::find_remote_following(db, source_id, target_id).await?;
     let followed_by = roosty_db::local_follow_relationship(db, target_id, source_id).await?;
@@ -1505,7 +1291,7 @@ async fn relationship_model_on(
         following: following.is_some()
             || remote_following
                 .as_ref()
-                .is_some_and(|follow| follow.state == roosty_db::RemoteFollowState::Accepted),
+                .is_some_and(|follow| follow.state == RemoteFollowState::Accepted),
         showing_reblogs: following.as_ref().is_some_and(|follow| follow.show_reblogs)
             || remote_following
                 .as_ref()
@@ -1526,24 +1312,24 @@ async fn relationship_model_on(
             .map(crate::statuses::format_timestamp),
         requested: remote_following
             .as_ref()
-            .is_some_and(|follow| follow.state == roosty_db::RemoteFollowState::Pending),
+            .is_some_and(|follow| follow.state == RemoteFollowState::Pending),
         domain_blocking: false,
         endorsed: false,
     })
 }
 
 /// Parse optional follow settings from JSON, form, or empty request bodies.
-async fn follow_input(request: Request) -> Result<FollowInput, String> {
+async fn follow_input(request: Request) -> Result<FollowInput, AccountInputError> {
     parse_account_action_input(request).await
 }
 
 /// Parse optional mute settings from JSON, form, or empty request bodies.
-async fn mute_input(request: Request) -> Result<MuteInput, String> {
+async fn mute_input(request: Request) -> Result<MuteInput, AccountInputError> {
     parse_account_action_input(request).await
 }
 
 /// Parse a small Mastodon account action payload from JSON or URL-encoded form data.
-async fn parse_account_action_input<T>(request: Request) -> Result<T, String>
+async fn parse_account_action_input<T>(request: Request) -> Result<T, AccountInputError>
 where
     T: Default + DeserializeOwned,
 {
@@ -1553,24 +1339,21 @@ where
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    let body = to_bytes(request.into_body(), 1024 * 1024)
-        .await
-        .map_err(|error| format!("invalid request body: {error}"))?;
+    let body = to_bytes(request.into_body(), 1024 * 1024).await?;
     if body.is_empty() {
         return Ok(T::default());
     }
 
     if content_type.contains("application/json") {
-        serde_json::from_slice(&body).map_err(|error| format!("invalid request body: {error}"))
+        Ok(serde_json::from_slice(&body)?)
     } else {
-        serde_urlencoded::from_bytes(&body)
-            .map_err(|error| format!("invalid request body: {error}"))
+        Ok(serde_urlencoded::from_bytes(&body)?)
     }
 }
 
 /// Parse Mastodon status cursor parameters from an account statuses request.
-fn timeline_cursor(params: &AccountStatusesParams) -> Result<roosty_db::TimelineCursor, ()> {
-    Ok(roosty_db::TimelineCursor {
+fn timeline_cursor(params: &AccountStatusesParams) -> Result<TimelineCursor, AccountQueryError> {
+    Ok(TimelineCursor {
         max_id: parse_optional_status_id(params.max_id.as_deref())?,
         since_id: parse_optional_status_id(params.since_id.as_deref())?,
         min_id: parse_optional_status_id(params.min_id.as_deref())?,
@@ -1578,8 +1361,10 @@ fn timeline_cursor(params: &AccountStatusesParams) -> Result<roosty_db::Timeline
 }
 
 /// Parse Mastodon cursor parameters from an account collection request.
-fn collection_cursor(params: &AccountCollectionParams) -> Result<roosty_db::CollectionCursor, ()> {
-    Ok(roosty_db::CollectionCursor {
+fn collection_cursor(
+    params: &AccountCollectionParams,
+) -> Result<CollectionCursor, AccountQueryError> {
+    Ok(CollectionCursor {
         max_id: parse_optional_uuid(params.max_id.as_deref())?,
         since_id: parse_optional_uuid(params.since_id.as_deref())?,
         min_id: parse_optional_uuid(params.min_id.as_deref())?,
@@ -1587,35 +1372,32 @@ fn collection_cursor(params: &AccountCollectionParams) -> Result<roosty_db::Coll
 }
 
 /// Parse an optional status UUID from Mastodon cursor query parameters.
-fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, ()> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.parse().map(StatusId).map_err(|_| ()))
-        .transpose()
+fn parse_optional_status_id(value: Option<&str>) -> Result<Option<StatusId>, AccountQueryError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(StatusId(value.parse()?)))
 }
 
 /// Parse an optional UUID cursor from Mastodon collection query parameters.
-fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.parse().map_err(|_| ()))
-        .transpose()
+fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, AccountQueryError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(value.parse()?))
 }
 
 /// Parse repeated relationship id query parameters.
-fn relationship_ids(query: Option<&str>) -> Result<Vec<Uuid>, ()> {
+fn relationship_ids(query: Option<&str>) -> Result<Vec<Uuid>, AccountQueryError> {
     let Some(query) = query else {
         return Ok(Vec::new());
     };
 
-    serde_qs::Config::new()
-        .array_format(serde_qs::ArrayFormat::EmptyIndexed)
+    let params = QueryStringConfig::new()
+        .array_format(ArrayFormat::EmptyIndexed)
         .use_form_encoding(true)
-        .deserialize_str::<RelationshipsParams>(query)
-        .map(|params| params.id)
-        .map_err(|_| ())
+        .deserialize_str::<RelationshipsParams>(query)?;
+    Ok(params.id)
 }
 
 /// Normalize a local account lookup query and reject remote addresses.
@@ -1709,7 +1491,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{remote_account_response_from_media, remote_custom_emojis};
-    use crate::{config::Config, http::AppState, password};
+    use crate::{
+        config::Config,
+        http::{AppState, DatabaseContext},
+        password,
+    };
 
     #[test]
     /// Prefers a remote actor's declared profile creation time over local cache metadata.
@@ -2881,9 +2667,7 @@ mod tests {
                 state,
                 ..
             } = self;
-            let AppState { db: state_db, .. } = state;
-
-            state_db.close().await.unwrap();
+            drop(state);
             db.close().await.unwrap();
             postgresql.stop().await.unwrap();
         }
@@ -2892,7 +2676,11 @@ mod tests {
     impl AccountContext {
         /// Build an app router backed by this test database.
         fn app(&self) -> Router {
-            crate::http::app_router(self.state.clone(), false)
+            crate::http::app_router(
+                self.state.clone(),
+                DatabaseContext::new(self.db.clone()),
+                false,
+            )
         }
 
         /// Send a raw request through the test router.

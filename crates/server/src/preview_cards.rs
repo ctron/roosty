@@ -1,94 +1,172 @@
 //! Durable, bounded fetching of Mastodon-compatible link preview metadata.
 
-use std::{net::IpAddr, time::Duration};
+use std::{
+    borrow::Cow,
+    net::{IpAddr, SocketAddr},
+    string::FromUtf8Error,
+    time::Duration,
+};
 
-use reqwest::header::CONTENT_TYPE;
-use roosty_core::{Result, RoostyError};
+use reqwest::{
+    Client, Response,
+    header::{CONTENT_TYPE, LOCATION, ToStrError},
+    redirect::Policy,
+};
+use roosty_core::{Result as RoostyResult, RoostyError};
 use roosty_db::PreviewCardUpdate;
 use scraper::{Html, Selector};
+use sea_orm::DbErr;
 use serde_json::Value;
-use url::Url;
-use uuid::Uuid;
+use thiserror::Error;
+use tokio::sync::AcquireError;
+use url::{ParseError as UrlParseError, Url};
+use uuid::{Error, Uuid};
 
 use crate::{
-    federation::discovery::is_unsafe_address, http::AppState, media::store_preview_card_image,
+    federation::discovery::is_unsafe_address,
+    http::{AppState, DatabaseContext},
+    media::store_preview_card_image,
 };
 
 const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 
+type PreviewResult<T> = Result<T, PreviewCardError>;
+
+#[derive(Debug, Error)]
+enum PreviewCardError {
+    #[error(transparent)]
+    Core(#[from] RoostyError),
+    #[error(transparent)]
+    Database(#[from] DbErr),
+    #[error("preview fetch pool is closed")]
+    Permit(#[from] AcquireError),
+    #[error("preview card id is invalid")]
+    Identifier(#[from] Error),
+    #[error("preview URL is invalid: {0}")]
+    Url(#[from] UrlParseError),
+    #[error("preview document is not UTF-8: {0}")]
+    Utf8(#[from] FromUtf8Error),
+    #[error("preview request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("preview response header is invalid: {0}")]
+    Header(#[from] ToStrError),
+    #[error("preview network lookup failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Invalid(Cow<'static, str>),
+}
+
+impl From<PreviewCardError> for RoostyError {
+    fn from(error: PreviewCardError) -> Self {
+        match error {
+            PreviewCardError::Core(error) => error,
+            PreviewCardError::Database(error) => error.into(),
+            PreviewCardError::Permit(_) => Self::Configuration(error.to_string()),
+            error => Self::InvalidInput(error.to_string()),
+        }
+    }
+}
+
+enum FetchOutcome {
+    Redirect(Url),
+    Document {
+        content_type: String,
+        bytes: Vec<u8>,
+    },
+}
+
 /// Fetch and persist one preview card named by a durable job payload.
 pub(crate) async fn fetch_preview_card(
     state: &AppState,
+    database: &DatabaseContext,
     payload: Value,
     attempts: u32,
-) -> Result<()> {
-    let _permit = state
-        .preview_card_fetches
-        .acquire()
-        .await
-        .map_err(|_| RoostyError::Configuration("preview fetch pool is closed".to_owned()))?;
+) -> RoostyResult<()> {
+    fetch_preview_card_with_context(state, database, payload, attempts).await?;
+    Ok(())
+}
+
+async fn fetch_preview_card_with_context(
+    state: &AppState,
+    database: &DatabaseContext,
+    payload: Value,
+    attempts: u32,
+) -> PreviewResult<()> {
+    let _permit = state.preview_card_fetches.acquire().await?;
     let id = payload
         .get("preview_card_id")
         .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| RoostyError::InvalidInput("preview card id is invalid".to_owned()))?;
-    let Some(card) = roosty_db::preview_card_by_id(&state.db, id).await? else {
+        .ok_or(PreviewCardError::Invalid(
+            "preview card id is missing".into(),
+        ))?
+        .parse::<Uuid>()?;
+    let txn = database.begin_read().await?;
+    let card = roosty_db::preview_card_by_id(&txn, id).await?;
+    txn.commit().await?;
+    let Some(card) = card else {
         return Ok(());
     };
-    let url = Url::parse(&card.url)
-        .map_err(|_| RoostyError::InvalidInput("preview card URL is invalid".to_owned()))?;
-    let result = fetch_preview_card_inner(state, id, url).await;
-    match result {
-        Ok(update) => roosty_db::update_preview_card(&state.db, id, update).await,
-        Err(error) if attempts >= 4 => {
-            roosty_db::mark_preview_card_failed(&state.db, id).await?;
-            tracing::warn!(%id, %error, "preview card fetch exhausted retries");
-            Ok(())
-        }
-        Err(error) => Err(error),
+    let url = Url::parse(&card.url)?;
+    let update = if attempts >= 4 {
+        fetch_preview_card_inner(state, database, id, url)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%id, %error, "preview card fetch exhausted retries");
+            })
+            .ok()
+    } else {
+        Some(fetch_preview_card_inner(state, database, id, url).await?)
+    };
+    let txn = database.begin_write().await?;
+    if let Some(update) = update {
+        roosty_db::update_preview_card(&txn, id, update).await?;
+    } else {
+        roosty_db::mark_preview_card_failed(&txn, id).await?;
     }
+    txn.commit().await?;
+    Ok(())
 }
 
 async fn fetch_preview_card_inner(
     state: &AppState,
+    database: &DatabaseContext,
     id: Uuid,
     url: Url,
-) -> Result<PreviewCardUpdate> {
+) -> PreviewResult<PreviewCardUpdate> {
     let (final_url, _content_type, bytes) =
-        fetch_bytes(state, url, MAX_DOCUMENT_BYTES, Some("text/html")).await?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| RoostyError::InvalidInput("preview document is not UTF-8".to_owned()))?;
+        fetch_bytes(state, database, url, MAX_DOCUMENT_BYTES, Some("text/html")).await?;
+    let content = String::from_utf8(bytes)?;
     let metadata = parse_metadata(&content, &final_url);
-    let (image_file_path, image_width, image_height, blurhash) =
-        if let Some(image_url) = metadata.image_url {
-            let image = fetch_bytes(
-                state,
-                image_url,
-                usize::try_from(state.config.remote_media_max_bytes).unwrap_or(usize::MAX),
-                Some("image/"),
-            )
-            .await;
-            match image {
-                Ok((_, image_type, image_bytes)) => {
-                    match store_preview_card_image(state, id, image_bytes, &image_type).await {
-                        Ok((path, width, height, blurhash)) => {
-                            (Some(path), width, height, Some(blurhash))
-                        }
-                        Err(error) => {
-                            tracing::warn!(%id, %error, "preview image was not cacheable");
-                            (None, 0, 0, None)
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%id, %error, "preview image fetch failed");
-                    (None, 0, 0, None)
-                }
-            }
+    let (image_file_path, image_width, image_height, blurhash) = if let Some(image_url) =
+        metadata.image_url
+    {
+        let image = fetch_bytes(
+            state,
+            database,
+            image_url,
+            usize::try_from(state.config.remote_media_max_bytes).unwrap_or(usize::MAX),
+            Some("image/"),
+        )
+        .await
+        .inspect_err(|error| tracing::warn!(%id, %error, "preview image fetch failed"))
+        .ok();
+        let stored = if let Some((_, image_type, image_bytes)) = image {
+            store_preview_card_image(state, id, image_bytes, &image_type)
+                .await
+                .inspect_err(|error| tracing::warn!(%id, %error, "preview image was not cacheable"))
+                .ok()
+        } else {
+            None
+        };
+        if let Some((path, width, height, blurhash)) = stored {
+            (Some(path), width, height, Some(blurhash))
         } else {
             (None, 0, 0, None)
-        };
+        }
+    } else {
+        (None, 0, 0, None)
+    };
     let provider_name = metadata.provider_name.unwrap_or_else(|| {
         final_url
             .host_str()
@@ -113,16 +191,19 @@ async fn fetch_preview_card_inner(
 
 async fn fetch_bytes(
     state: &AppState,
+    database: &DatabaseContext,
     mut url: Url,
     maximum: usize,
     expected_type: Option<&str>,
-) -> Result<(Url, String, Vec<u8>)> {
+) -> PreviewResult<(Url, String, Vec<u8>)> {
     for _ in 0..=MAX_REDIRECTS {
         let host = url
             .host_str()
-            .ok_or_else(|| RoostyError::InvalidInput("preview URL has no host".to_owned()))?
+            .ok_or(PreviewCardError::Invalid("preview URL has no host".into()))?
             .to_ascii_lowercase();
-        let domain_policy = roosty_db::federation_domain_policy(&state.db, &host).await?;
+        let txn = database.begin_read().await?;
+        let domain_policy = roosty_db::federation_domain_policy(&txn, &host).await?;
+        txn.commit().await?;
         if !state.config.federation_domain_is_allowed(&host)
             || domain_policy.is_suspended()
             || domain_policy.reject_media
@@ -131,115 +212,130 @@ async fn fetch_bytes(
             || !url.username().is_empty()
             || url.password().is_some()
         {
-            return Err(RoostyError::InvalidInput(
-                "preview URL is not permitted".to_owned(),
+            return Err(PreviewCardError::Invalid(
+                "preview URL is not permitted".into(),
             ));
         }
         let port = url
             .port_or_known_default()
-            .ok_or_else(|| RoostyError::InvalidInput("preview URL has no port".to_owned()))?;
+            .ok_or(PreviewCardError::Invalid("preview URL has no port".into()))?;
         let addresses = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|_| RoostyError::InvalidInput("preview host did not resolve".to_owned()))?
+            .await?
             .collect::<Vec<_>>();
         if addresses.is_empty()
             || addresses
                 .iter()
                 .any(|address| is_unsafe_address(address.ip()))
         {
-            return Err(RoostyError::InvalidInput(
-                "preview host resolves to an unsafe address".to_owned(),
+            return Err(PreviewCardError::Invalid(
+                "preview host resolves to an unsafe address".into(),
             ));
         }
         let address = addresses[0];
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .resolve(&host, address)
-            .build()
-            .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        if !roosty_db::acquire_preview_host_lease(&state.db, &host).await? {
-            return Err(RoostyError::InvalidInput(
-                "preview host is currently rate limited".to_owned(),
+        let txn = database.begin_write().await?;
+        let acquired = roosty_db::acquire_preview_host_lease(&txn, &host).await?;
+        txn.commit().await?;
+        if !acquired {
+            return Err(PreviewCardError::Invalid(
+                "preview host is currently rate limited".into(),
             ));
         }
-        let response = client.get(url.clone()).send().await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                roosty_db::release_preview_host_lease(&state.db, &host).await?;
-                return Err(RoostyError::InvalidInput(error.to_string()));
-            }
-        };
-        if response.status().is_redirection() {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| {
-                    RoostyError::InvalidInput("preview redirect has no location".to_owned())
-                })?;
-            url = url
-                .join(location)
-                .map_err(|_| RoostyError::InvalidInput("preview redirect is invalid".to_owned()))?;
-            roosty_db::release_preview_host_lease(&state.db, &host).await?;
-            continue;
+        let result = fetch_once(&url, &host, address, maximum, expected_type).await;
+        let txn = database.begin_write().await?;
+        roosty_db::release_preview_host_lease(&txn, &host).await?;
+        txn.commit().await?;
+        let outcome = result?;
+        match outcome {
+            FetchOutcome::Redirect(next) => url = next,
+            FetchOutcome::Document {
+                content_type,
+                bytes,
+            } => return Ok((url, content_type, bytes)),
         }
-        if !response.status().is_success() {
-            roosty_db::release_preview_host_lease(&state.db, &host).await?;
-            return Err(RoostyError::InvalidInput(format!(
-                "preview server returned {}",
-                response.status()
-            )));
-        }
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if expected_type.is_some_and(|expected| !content_type.starts_with(expected)) {
-            roosty_db::release_preview_host_lease(&state.db, &host).await?;
-            return Err(RoostyError::InvalidInput(
-                "preview response has an unsupported content type".to_owned(),
-            ));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > maximum as u64)
-        {
-            roosty_db::release_preview_host_lease(&state.db, &host).await?;
-            return Err(RoostyError::InvalidInput(
-                "preview response exceeds the size limit".to_owned(),
-            ));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| RoostyError::InvalidInput(error.to_string()));
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                roosty_db::release_preview_host_lease(&state.db, &host).await?;
-                return Err(error);
-            }
-        };
-        if bytes.len() > maximum {
-            roosty_db::release_preview_host_lease(&state.db, &host).await?;
-            return Err(RoostyError::InvalidInput(
-                "preview response exceeds the size limit".to_owned(),
-            ));
-        }
-        roosty_db::release_preview_host_lease(&state.db, &host).await?;
-        return Ok((url, content_type, bytes.to_vec()));
     }
-    Err(RoostyError::InvalidInput(
-        "preview response has too many redirects".to_owned(),
+    Err(PreviewCardError::Invalid(
+        "preview response has too many redirects".into(),
     ))
+}
+
+async fn fetch_once(
+    url: &Url,
+    host: &str,
+    address: SocketAddr,
+    maximum: usize,
+    expected_type: Option<&str>,
+) -> PreviewResult<FetchOutcome> {
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .resolve(host, address)
+        .build()?;
+    let response = client.get(url.clone()).send().await?;
+    if response.status().is_redirection() {
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .ok_or(PreviewCardError::Invalid(
+                "preview redirect has no location".into(),
+            ))?
+            .to_str()?;
+        return Ok(FetchOutcome::Redirect(url.join(location)?));
+    }
+    validate_response(&response, maximum, expected_type)?;
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .map(|value| value.to_str())
+        .transpose()?
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let bytes = response.bytes().await?.to_vec();
+    if bytes.len() > maximum {
+        return Err(PreviewCardError::Invalid(
+            "preview response exceeds the size limit".into(),
+        ));
+    }
+    Ok(FetchOutcome::Document {
+        content_type,
+        bytes,
+    })
+}
+
+fn validate_response(
+    response: &Response,
+    maximum: usize,
+    expected_type: Option<&str>,
+) -> PreviewResult<()> {
+    if !response.status().is_success() {
+        return Err(PreviewCardError::Invalid(Cow::Owned(format!(
+            "preview server returned {}",
+            response.status()
+        ))));
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .map(|value| value.to_str())
+        .transpose()?
+        .unwrap_or_default();
+    if expected_type.is_some_and(|expected| !content_type.starts_with(expected)) {
+        return Err(PreviewCardError::Invalid(
+            "preview response has an unsupported content type".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(PreviewCardError::Invalid(
+            "preview response exceeds the size limit".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]

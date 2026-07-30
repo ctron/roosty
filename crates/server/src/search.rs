@@ -1,5 +1,5 @@
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Query, State},
     http::{HeaderValue, header},
     response::{IntoResponse, Response},
@@ -14,8 +14,8 @@ use crate::{
     auth::{
         AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response_on,
     },
-    http::AppState,
-    statuses::{StatusResponse, TagResponse, search_status_models},
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
+    statuses::{StatusRenderContext, StatusResponse, TagResponse, search_status_models},
 };
 
 const DEFAULT_SEARCH_LIMIT: u64 = 20;
@@ -74,79 +74,87 @@ enum SearchAccountResponse {
     Remote(Box<RemoteAccountResponse>),
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: &'static str,
-    error_description: String,
-}
-
 async fn search(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(account): OptionalAuthenticatedAccount,
     Query(params): Query<SearchParams>,
-) -> Response {
+) -> ApiResult<Response> {
     let privileged = params.resolve.unwrap_or(false)
         || params.following.unwrap_or(false)
         || params.offset.unwrap_or(0) != 0;
     if privileged && account.is_none() {
-        return unauthorized();
+        return Err(ApiError::OAuth {
+            error: "unauthorized".into(),
+            description: "This method requires an authenticated user".into(),
+        });
     }
     let accounts = if matches!(params.search_type, None | Some(SearchType::Accounts)) {
         search_accounts(
             &state,
+            &database,
             account.as_ref().map(|account| account.id),
             &params,
             MAX_SEARCH_LIMIT,
         )
-        .await
+        .await?
     } else {
-        Ok(Vec::new())
+        Vec::new()
     };
     let hashtags = if matches!(params.search_type, None | Some(SearchType::Hashtags)) {
-        search_hashtags(&state, &params).await
+        search_hashtags(&state, &database, &params).await?
     } else {
-        Ok(Vec::new())
+        Vec::new()
     };
     let statuses = if matches!(params.search_type, None | Some(SearchType::Statuses)) {
-        search_statuses(&state, account.as_ref().map(|account| account.id), &params).await
+        search_statuses(
+            &state,
+            &database,
+            account.as_ref().map(|account| account.id),
+            &params,
+        )
+        .await?
     } else {
-        Ok(StatusSearchResults {
+        StatusSearchResults {
             items: Vec::new(),
             link: None,
-        })
+        }
     };
 
-    match (accounts, hashtags, statuses) {
-        (Ok(accounts), Ok(hashtags), Ok(statuses)) => {
-            let mut response = Json(SearchResponse {
-                accounts,
-                statuses: statuses.items,
-                hashtags,
-            })
-            .into_response();
-            if let Some(link) = statuses.link {
-                response.headers_mut().insert(header::LINK, link);
-            }
-            response
-        }
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => server_error(error),
+    let mut response = Json(SearchResponse {
+        accounts,
+        statuses: statuses.items,
+        hashtags,
+    })
+    .into_response();
+    if let Some(link) = statuses.link {
+        response.headers_mut().insert(header::LINK, link);
     }
+    Ok(response)
 }
 
 async fn account_search(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<SearchParams>,
-) -> Response {
-    match search_accounts(&state, Some(account.id), &params, MAX_ACCOUNT_SEARCH_LIMIT).await {
-        Ok(accounts) => Json(accounts).into_response(),
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Json<Vec<SearchAccountResponse>>> {
+    Ok(Json(
+        search_accounts(
+            &state,
+            &database,
+            Some(account.id),
+            &params,
+            MAX_ACCOUNT_SEARCH_LIMIT,
+        )
+        .await?,
+    ))
 }
 
 /// Search local accounts and convert them to Mastodon account responses.
 async fn search_accounts(
     state: &AppState,
+    database: &DatabaseContext,
     account_id: Option<AccountId>,
     params: &SearchParams,
     max_limit: u64,
@@ -158,7 +166,9 @@ async fn search_accounts(
         && state.config.federation_enabled
         && crate::federation::discovery::exact_remote_handle(&query).is_some()
     {
-        match crate::federation::discovery::resolve_remote_actor_for_search(state, &query).await {
+        match crate::federation::discovery::resolve_remote_actor_for_search(state, database, &query)
+            .await
+        {
             Ok(_)
             | Err(RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_))) => {
             }
@@ -172,7 +182,7 @@ async fn search_accounts(
     let offset = params.offset.unwrap_or(0);
     let viewer = account_id.unwrap_or(AccountId(uuid::Uuid::nil()));
     let local_domain = state.config.public_base_url.host_str().unwrap_or_default();
-    let txn = state.begin_snapshot().await?;
+    let txn = database.begin_snapshot().await?;
     let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
     let accounts = roosty_db::search_accounts(
         &txn,
@@ -212,7 +222,11 @@ async fn search_accounts(
 }
 
 /// Search local hashtags and include recent usage history in Mastodon tag responses.
-async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<TagResponse>> {
+async fn search_hashtags(
+    state: &AppState,
+    database: &DatabaseContext,
+    params: &SearchParams,
+) -> Result<Vec<TagResponse>> {
     let Some(query) = normalized_tag_query(params.q.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -221,7 +235,7 @@ async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
     let offset = params.offset.unwrap_or(0);
-    let txn = state.begin_snapshot().await?;
+    let txn = database.begin_snapshot().await?;
     let tags = roosty_db::search_local_tags(&txn, &query, limit, offset).await?;
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
@@ -236,6 +250,7 @@ async fn search_hashtags(state: &AppState, params: &SearchParams) -> Result<Vec<
 /// Search only statuses related to the authenticated user, matching Mastodon's privacy scope.
 async fn search_statuses(
     state: &AppState,
+    database: &DatabaseContext,
     account_id: Option<AccountId>,
     params: &SearchParams,
 ) -> Result<StatusSearchResults> {
@@ -255,9 +270,10 @@ async fn search_statuses(
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
-    let hidden_domains = roosty_db::hidden_federation_domains(&state.db).await?;
+    let txn = database.begin_snapshot().await?;
+    let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
     let page = roosty_db::search_statuses(
-        &state.db,
+        &txn,
         roosty_db::StatusSearchOptions {
             viewer_account_id,
             query: &query,
@@ -272,7 +288,9 @@ async fn search_statuses(
     )
     .await?;
     let link = status_search_link(&query, params.account_id, limit, &page);
-    let items = search_status_models(state, page.items, viewer_account_id).await?;
+    let context = StatusRenderContext::new(state, &txn);
+    let items = search_status_models(&context, page.items, viewer_account_id).await?;
+    txn.commit().await?;
     Ok(StatusSearchResults { items, link })
 }
 
@@ -332,33 +350,6 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn server_error(error: RoostyError) -> Response {
-    let status = if matches!(error, RoostyError::InvalidInput(_)) {
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (
-        status,
-        Json(ErrorResponse {
-            error: "server_error",
-            error_description: error.to_string(),
-        }),
-    )
-        .into_response()
-}
-
-fn unauthorized() -> Response {
-    (
-        axum::http::StatusCode::UNAUTHORIZED,
-        Json(ErrorResponse {
-            error: "unauthorized",
-            error_description: "This method requires an authenticated user".to_owned(),
-        }),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -382,7 +373,11 @@ mod tests {
     use test_context::{AsyncTestContext, test_context};
     use tower::ServiceExt;
 
-    use crate::{config::Config, http::AppState, password};
+    use crate::{
+        config::Config,
+        http::{AppState, DatabaseContext},
+        password,
+    };
 
     #[test_context(SearchContext)]
     #[tokio::test]
@@ -775,7 +770,11 @@ mod tests {
 
     impl SearchContext {
         fn app(&self) -> Router {
-            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+            crate::http::app_router(
+                AppState::new(self.config.clone(), self.db.clone()),
+                DatabaseContext::new(self.db.clone()),
+                false,
+            )
         }
 
         async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {

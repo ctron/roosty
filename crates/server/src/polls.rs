@@ -1,7 +1,7 @@
 //! Mastodon-compatible poll lookup and voting endpoints.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -9,11 +9,11 @@ use axum::{
 };
 use roosty_core::{AccountId, RoostyError};
 use roosty_db::{
-    PollStatus, PollViewerState, PollVoteError, StatusPoll, enqueue_job_in_transaction,
-    enqueue_poll_update, find_local_status_by_id, find_poll_by_id, find_remote_status_by_id,
-    poll_viewer_state, remote_status_visible_to_account, vote_in_poll,
+    DbConnection, PollStatus, PollViewerState, PollVoteError, StatusPoll,
+    enqueue_job_in_transaction, enqueue_poll_update, find_local_status_by_id, find_poll_by_id,
+    find_remote_status_by_id, poll_viewer_state, remote_status_visible_to_account, vote_in_poll,
 };
-use sea_orm::{AccessMode, ConnectionTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use thiserror::Error;
@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     auth::{AuthenticatedAccessToken, OptionalAuthenticatedAccount},
     federation::{StatusActivityKind, enqueue_status_activity_in_transaction, prepare_poll_vote},
-    http::AppState,
+    http::{AppState, DatabaseContext},
     notifications::publish_committed_notification,
     statuses::{parse_request_body, status_visible_to_viewer_on},
 };
@@ -109,14 +109,11 @@ impl IntoResponse for PollApiError {
 }
 
 async fn show_poll(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     Path(path): Path<PollPath>,
 ) -> Result<Json<PollResponse>, PollApiError> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+    let txn = database.begin_read().await?;
     let poll = find_poll_by_id(&txn, path.poll_id)
         .await?
         .ok_or(PollApiError::NotFound)?;
@@ -129,6 +126,7 @@ async fn show_poll(
 
 async fn vote_poll(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<PollPath>,
     request: axum::extract::Request,
@@ -141,7 +139,7 @@ async fn vote_poll(
     let input: VoteInput = parse_request_body(request)
         .await
         .map_err(|error| PollApiError::InvalidInput(error.to_string().into()))?;
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let poll = find_poll_by_id(&txn, path.poll_id)
         .await?
         .ok_or(PollApiError::NotFound)?;
@@ -263,11 +261,12 @@ fn map_vote_error(error: PollVoteError) -> PollApiError {
 /// Expire one poll exactly once and publish its committed notifications.
 pub(crate) async fn expire_poll_job(
     state: &AppState,
+    database: &DatabaseContext,
     payload: serde_json::Value,
 ) -> Result<(), RoostyError> {
     let payload: PollJobPayload = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid poll expiration payload".to_owned()))?;
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let expiration = roosty_db::expire_poll(&txn, payload.poll_id).await?;
     if let Some(expiration) = &expiration
         && expiration.newly_expired
@@ -278,7 +277,8 @@ pub(crate) async fn expire_poll_job(
     txn.commit().await?;
     if let Some(expiration) = expiration {
         for notification in expiration.notifications {
-            publish_committed_notification(state, notification.account_id, notification).await?;
+            publish_committed_notification(state, database, notification.account_id, notification)
+                .await?;
         }
     }
     Ok(())
@@ -287,11 +287,12 @@ pub(crate) async fn expire_poll_job(
 /// Fan out one coalesced local Question tally update, including remote voters.
 pub(crate) async fn publish_poll_update_job(
     state: &AppState,
+    db: &DbConnection,
     payload: serde_json::Value,
 ) -> Result<(), RoostyError> {
     let payload: PollJobPayload = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid poll update payload".to_owned()))?;
-    let txn = state.db.begin().await?;
+    let txn = db.begin().await?;
     let Some(poll) = find_poll_by_id(&txn, payload.poll_id).await? else {
         txn.commit().await?;
         return Ok(());

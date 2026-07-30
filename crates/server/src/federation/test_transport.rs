@@ -14,19 +14,23 @@ use serde_json::Value;
 use tower::ServiceExt;
 use url::Url;
 
-use crate::http::AppState;
+use crate::http::{AppState, DatabaseContext, app_router};
 
-use super::process_inbox;
+#[derive(Clone)]
+struct RegisteredInbox {
+    state: AppState,
+    database: DatabaseContext,
+}
 
-static INBOXES: LazyLock<Mutex<HashMap<String, AppState>>> =
+static INBOXES: LazyLock<Mutex<HashMap<String, RegisteredInbox>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Register an isolated test instance to receive signed requests for one host.
-pub(super) fn register_inbox(host: &str, state: AppState) {
+pub(super) fn register_inbox(host: &str, state: AppState, database: DatabaseContext) {
     let mut inboxes = INBOXES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    inboxes.insert(host.to_owned(), state);
+    inboxes.insert(host.to_owned(), RegisteredInbox { state, database });
 }
 
 /// Clear registered recipients after a test to prevent cross-test delivery.
@@ -39,7 +43,7 @@ pub(super) fn clear_inboxes() {
 
 /// Serve one in-process ActivityPub GET for federation discovery tests.
 pub(super) async fn fetch_if_registered(url: &Url) -> Option<Result<Value, RoostyError>> {
-    let state = {
+    let inbox = {
         let inboxes = INBOXES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -58,7 +62,10 @@ pub(super) async fn fetch_if_registered(url: &Url) -> Option<Result<Value, Roost
         Ok(request) => request,
         Err(error) => return Some(Err(RoostyError::InvalidInput(error.to_string()))),
     };
-    let response = match super::router().with_state(state).oneshot(request).await {
+    let response = match app_router(inbox.state, inbox.database, false)
+        .oneshot(request)
+        .await
+    {
         Ok(response) => response,
         Err(error) => match error {},
     };
@@ -86,7 +93,7 @@ pub(super) async fn deliver_if_registered(
     signature: &str,
     body: Vec<u8>,
 ) -> Option<Result<(), RoostyError>> {
-    let state = {
+    let inbox = {
         let inboxes = INBOXES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -109,7 +116,13 @@ pub(super) async fn deliver_if_registered(
         Ok(request) => request,
         Err(error) => return Some(Err(RoostyError::InvalidInput(error.to_string()))),
     };
-    let response = process_inbox(&state, request).await;
+    let response = match app_router(inbox.state, inbox.database, false)
+        .oneshot(request)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => match error {},
+    };
     if response.status().is_success() {
         Some(Ok(()))
     } else {

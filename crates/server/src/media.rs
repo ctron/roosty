@@ -1,10 +1,12 @@
 use std::{
+    borrow::Cow,
     io::Cursor,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{Path as AxumPath, State},
     http::{StatusCode, header},
@@ -13,18 +15,25 @@ use axum::{
 };
 use axum_params::{Params, UploadFile};
 use image::{GenericImageView, ImageFormat, ImageReader};
-use roosty_core::{AccountId, RoostyError};
-use roosty_db::{NewJob, RemoteMediaState};
-use sea_orm::{AccessMode, DatabaseTransaction, TransactionTrait};
+use roosty_core::{AccountId, RoostyError, StatusId};
+use roosty_db::{
+    JobKind, LocalMediaAttachment, LocalMediaAttachmentUpdate, LocalMediaPreviewUpdate, NewJob,
+    NewLocalMediaAttachment, RemoteMediaAttachment, RemoteMediaCacheWrite, RemoteMediaState,
+    StatusEditMedia,
+};
+use sea_orm::{DatabaseTransaction, DbErr};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use time::OffsetDateTime;
 use tokio::task;
+use url::Url;
 use uuid::Uuid;
 
 use crate::{
     auth::{AuthenticatedAccount, OptionalAuthenticatedAccount},
     config::ObjectStorageBackend,
-    http::AppState,
+    http::{AppState, DatabaseContext},
 };
 
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -121,12 +130,10 @@ pub fn router() -> Router<AppState> {
 /// Serve a cached remote avatar or header, scheduling a lazy cache fill on demand.
 async fn serve_remote_profile_media(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AxumPath(media_id): AxumPath<Uuid>,
 ) -> Result<Response, MediaStoreError> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+    let txn = database.begin_read().await?;
     let media = roosty_db::find_remote_profile_media(&txn, media_id).await?;
     txn.commit().await?;
     let Some(media) = media else {
@@ -134,7 +141,12 @@ async fn serve_remote_profile_media(
     };
     let Some(path) = media.file_path else {
         if media.state != RemoteMediaState::Failed {
-            let _ = enqueue_remote_profile_media_fetches(&state, media.remote_actor_id).await;
+            enqueue_remote_profile_media_fetches(&database, media.remote_actor_id)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "failed to queue remote profile media");
+                })
+                .ok();
         }
         return Ok(StatusCode::ACCEPTED.into_response());
     };
@@ -143,10 +155,16 @@ async fn serve_remote_profile_media(
         .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
     {
         // Continue serving the last known-good image while a deduplicated refresh runs.
-        let _ = enqueue_remote_profile_media_fetches(&state, media.remote_actor_id).await;
+        enqueue_remote_profile_media_fetches(&database, media.remote_actor_id)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, "failed to queue remote profile media refresh");
+            })
+            .ok();
     }
-    Ok(match tokio::fs::read(media_path(&state, &path)).await {
-        Ok(bytes) => (
+    let bytes = tokio::fs::read(media_path(&state, &path)).await.ok();
+    Ok(if let Some(bytes) = bytes {
+        (
             [(
                 header::CONTENT_TYPE,
                 media
@@ -155,17 +173,18 @@ async fn serve_remote_profile_media(
             )],
             bytes,
         )
-            .into_response(),
-        Err(_) => StatusCode::ACCEPTED.into_response(),
+            .into_response()
+    } else {
+        StatusCode::ACCEPTED.into_response()
     })
 }
 
 /// Queue all discovered profile images for one remote actor.
 pub(crate) async fn enqueue_remote_profile_media_fetches(
-    state: &AppState,
+    database: &DatabaseContext,
     actor_id: AccountId,
 ) -> Result<(), RoostyError> {
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let media = roosty_db::remote_profile_media_for_actor(&txn, actor_id).await?;
     if media.is_empty() {
         txn.commit().await?;
@@ -183,7 +202,7 @@ pub(crate) async fn enqueue_remote_profile_media_fetches(
             &txn,
             entry.id,
             NewJob {
-                kind: roosty_db::JobKind::FederationRemoteMediaFetch,
+                kind: JobKind::FederationRemoteMediaFetch,
                 payload: serde_json::json!({"profile_media_id": entry.id}),
                 deduplication_key: Some(format!("profile-media:{}", entry.id)),
                 run_after: time::OffsetDateTime::now_utc(),
@@ -198,27 +217,44 @@ pub(crate) async fn enqueue_remote_profile_media_fetches(
 /// Serve a successfully cached remote attachment from local storage.
 async fn serve_remote_media_attachment(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AxumPath(media_id): AxumPath<Uuid>,
-) -> Response {
-    let media = match roosty_db::find_remote_media_attachment(&state.db, media_id).await {
-        Ok(Some(media)) => media,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return server_error(error),
+) -> Result<Response, MediaStoreError> {
+    serve_remote_media_attachment_with_context(&state, &database, media_id).await
+}
+
+async fn serve_remote_media_attachment_with_context(
+    state: &AppState,
+    database: &DatabaseContext,
+    media_id: Uuid,
+) -> Result<Response, MediaStoreError> {
+    let txn = database.begin_read().await?;
+    let media = roosty_db::find_remote_media_attachment(&txn, media_id).await?;
+    txn.commit().await?;
+    let Some(media) = media else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let Some(path) = media.file_path else {
         if media.state != RemoteMediaState::Failed {
-            let _ = enqueue_remote_media_fetch(&state, media_id).await;
+            enqueue_remote_media_fetch(database, media_id)
+                .await
+                .inspect_err(|error| tracing::warn!(%error, "failed to queue remote media"))
+                .ok();
         }
-        return StatusCode::ACCEPTED.into_response();
+        return Ok(StatusCode::ACCEPTED.into_response());
     };
     if media
         .expires_at
         .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
     {
-        let _ = enqueue_remote_media_fetch(&state, media_id).await;
+        enqueue_remote_media_fetch(database, media_id)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "failed to queue remote media refresh"))
+            .ok();
     }
-    match tokio::fs::read(media_path(&state, &path)).await {
-        Ok(bytes) => (
+    let bytes = tokio::fs::read(media_path(state, &path)).await.ok();
+    Ok(if let Some(bytes) = bytes {
+        (
             [(
                 header::CONTENT_TYPE,
                 media
@@ -227,38 +263,46 @@ async fn serve_remote_media_attachment(
             )],
             bytes,
         )
-            .into_response(),
-        Err(_) => StatusCode::ACCEPTED.into_response(),
-    }
+            .into_response()
+    } else {
+        StatusCode::ACCEPTED.into_response()
+    })
 }
 
 /// Serve the generated preview for a remote image attachment.
 async fn serve_remote_media_preview(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AxumPath(media_id): AxumPath<Uuid>,
-) -> Response {
-    let media = match roosty_db::find_remote_media_attachment(&state.db, media_id).await {
-        Ok(Some(media)) => media,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return server_error(error),
+) -> Result<Response, MediaStoreError> {
+    let txn = database.begin_read().await?;
+    let media = roosty_db::find_remote_media_attachment(&txn, media_id).await?;
+    txn.commit().await?;
+    let Some(media) = media else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let Some(path) = media.preview_file_path else {
-        return serve_remote_media_attachment(State(state), AxumPath(media_id)).await;
+        return serve_remote_media_attachment_with_context(&state, &database, media_id).await;
     };
-    match tokio::fs::read(media_path(&state, &path)).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
-        Err(_) => StatusCode::ACCEPTED.into_response(),
-    }
+    let bytes = tokio::fs::read(media_path(&state, &path)).await.ok();
+    Ok(if let Some(bytes) = bytes {
+        ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+    } else {
+        StatusCode::ACCEPTED.into_response()
+    })
 }
 
 /// Queue one remote attachment fetch, deduplicating an in-flight or refresh job.
-async fn enqueue_remote_media_fetch(state: &AppState, media_id: Uuid) -> Result<(), RoostyError> {
-    let txn = state.db.begin().await?;
+async fn enqueue_remote_media_fetch(
+    database: &DatabaseContext,
+    media_id: Uuid,
+) -> Result<(), RoostyError> {
+    let txn = database.begin_write().await?;
     roosty_db::queue_remote_media_fetch(
         &txn,
         media_id,
         NewJob {
-            kind: roosty_db::JobKind::FederationRemoteMediaFetch,
+            kind: JobKind::FederationRemoteMediaFetch,
             payload: serde_json::json!({"attachment_id": media_id}),
             deduplication_key: Some(format!("remote-media:{media_id}")),
             run_after: time::OffsetDateTime::now_utc(),
@@ -272,7 +316,7 @@ async fn enqueue_remote_media_fetch(state: &AppState, media_id: Uuid) -> Result<
 /// Add attachment fetch jobs to the transaction that made their status visible.
 pub(crate) async fn enqueue_remote_status_media_fetches_in_transaction(
     txn: &DatabaseTransaction,
-    status_id: roosty_core::StatusId,
+    status_id: StatusId,
 ) -> Result<(), RoostyError> {
     for media in roosty_db::remote_media_attachments_for_status(txn, status_id).await? {
         if media.state != RemoteMediaState::Ready
@@ -284,7 +328,7 @@ pub(crate) async fn enqueue_remote_status_media_fetches_in_transaction(
                 txn,
                 media.id,
                 NewJob {
-                    kind: roosty_db::JobKind::FederationRemoteMediaFetch,
+                    kind: JobKind::FederationRemoteMediaFetch,
                     payload: serde_json::json!({"attachment_id": media.id}),
                     deduplication_key: Some(format!("remote-media:{}", media.id)),
                     run_after: time::OffsetDateTime::now_utc(),
@@ -299,24 +343,27 @@ pub(crate) async fn enqueue_remote_status_media_fetches_in_transaction(
 /// Fetch one remote attachment through the federation network policy.
 pub(crate) async fn fetch_remote_media(
     state: &AppState,
-    payload: serde_json::Value,
+    database: &DatabaseContext,
+    payload: Value,
 ) -> Result<(), RoostyError> {
     let attachment_id = payload
         .get("attachment_id")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok());
     let profile_media_id = payload
         .get("profile_media_id")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok());
-    let result = fetch_remote_media_inner(state, payload).await;
-    if let Err(error) = &result {
+    let result = fetch_remote_media_inner(state, database, payload).await;
+    if let Some(error) = result.as_ref().err() {
+        let txn = database.begin_write().await?;
         if let Some(id) = attachment_id {
-            roosty_db::mark_remote_media_failed(&state.db, id, &error.to_string()).await?;
+            roosty_db::mark_remote_media_failed(&txn, id, &error.to_string()).await?;
         }
         if let Some(id) = profile_media_id {
-            roosty_db::mark_remote_profile_media_failed(&state.db, id, &error.to_string()).await?;
+            roosty_db::mark_remote_profile_media_failed(&txn, id, &error.to_string()).await?;
         }
+        txn.commit().await?;
     }
     result
 }
@@ -324,20 +371,18 @@ pub(crate) async fn fetch_remote_media(
 /// Perform one remote-media fetch after the worker has selected its cache entry.
 async fn fetch_remote_media_inner(
     state: &AppState,
-    payload: serde_json::Value,
+    database: &DatabaseContext,
+    payload: Value,
 ) -> Result<(), RoostyError> {
     let attachment_id = payload
         .get("attachment_id")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok());
     let profile_media_id = payload
         .get("profile_media_id")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok());
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+    let txn = database.begin_snapshot().await?;
     let remote_media = match (attachment_id, profile_media_id) {
         (Some(id), None) => {
             let media = roosty_db::find_remote_media_attachment(&txn, id)
@@ -361,15 +406,14 @@ async fn fetch_remote_media_inner(
             ));
         }
     };
-    txn.commit().await?;
     let (id, remote_url, profile_media) = remote_media;
-    let url = url::Url::parse(&remote_url)
+    let url = Url::parse(&remote_url)
         .map_err(|_| RoostyError::InvalidInput("remote media URL is invalid".to_owned()))?;
     let host = url
         .host_str()
         .ok_or_else(|| RoostyError::InvalidInput("remote media URL has no host".to_owned()))?
         .to_owned();
-    if roosty_db::federation_domain_policy(&state.db, &host)
+    if roosty_db::federation_domain_policy(&txn, &host)
         .await?
         .reject_media
     {
@@ -377,11 +421,12 @@ async fn fetch_remote_media_inner(
             "remote media is rejected by federation policy".to_owned(),
         ));
     }
-    let address = crate::federation::discovery::validate_remote_url(state, &url).await?;
+    let address = crate::federation::discovery::validate_remote_url(state, &txn, &url).await?;
+    txn.commit().await?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .resolve(&host, address)
         .build()
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
@@ -468,15 +513,18 @@ async fn fetch_remote_media_inner(
         .await
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     if profile_media {
+        let txn = database.begin_write().await?;
         roosty_db::mark_remote_profile_media_ready(
-            &state.db,
+            &txn,
             id,
             content_type,
             path,
             bytes.len() as i64,
-            time::OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
+            OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
         )
-        .await
+        .await?;
+        txn.commit().await?;
+        Ok(())
     } else {
         let preview_file_path = if let Some(processed) = &processed_image {
             let preview_path = format!("remote/{id}-small.png");
@@ -491,10 +539,11 @@ async fn fetch_remote_media_inner(
         } else {
             None
         };
+        let txn = database.begin_write().await?;
         roosty_db::mark_remote_media_ready(
-            &state.db,
+            &txn,
             id,
-            roosty_db::RemoteMediaCacheWrite {
+            RemoteMediaCacheWrite {
                 content_type,
                 file_path: path,
                 preview_file_path,
@@ -504,17 +553,19 @@ async fn fetch_remote_media_inner(
                 preview_width: processed_image.as_ref().map(|image| image.preview_width),
                 preview_height: processed_image.as_ref().map(|image| image.preview_height),
                 blurhash: processed_image.map(|image| image.blurhash),
-                expires_at: time::OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
+                expires_at: OffsetDateTime::now_utc() + state.config.remote_media_cache_ttl,
             },
         )
-        .await
+        .await?;
+        txn.commit().await?;
+        Ok(())
     }
 }
 
 /// Project a remote cache entry into Mastodon's media attachment shape.
 pub(crate) fn remote_media_attachment_response(
     state: &AppState,
-    media: roosty_db::RemoteMediaAttachment,
+    media: RemoteMediaAttachment,
 ) -> MediaAttachmentResponse {
     let url = format!(
         "{}/media_attachments/remote/{}",
@@ -756,30 +807,21 @@ struct ProcessedImage {
 
 async fn upload_media(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Params(params, _temp_files): Params<MediaUploadParams>,
-) -> Response {
-    if let Err(error) = ensure_local_storage(&state) {
-        return server_error(error);
-    }
+) -> Result<Response, MediaStoreError> {
+    ensure_local_storage(&state)?;
     let Some(file) = params.file else {
-        return unprocessable("file is required");
+        return Err(MediaStoreError::Validation("file is required".into()));
     };
-    let format = match validate_image_content_type(&file.content_type) {
-        Ok(format) => format,
-        Err(error) => return unprocessable(&error),
-    };
-    let description = match normalize_description(params.description) {
-        Ok(description) => description,
-        Err(error) => return unprocessable(&error),
-    };
-    let focus = match parse_focus(params.focus.as_deref()) {
-        Ok(focus) => focus,
-        Err(error) => return unprocessable(&error),
-    };
+    let format = validate_image_content_type(&file.content_type)?;
+    let description = normalize_description(params.description)?;
+    let focus = parse_focus(params.focus.as_deref())?;
 
-    match store_upload(
+    let media = store_upload(
         &state,
+        &database,
         account.id,
         file,
         params.thumbnail,
@@ -787,89 +829,84 @@ async fn upload_media(
         description,
         focus,
     )
-    .await
-    {
-        Ok(media) => Json(media_response(&state, &media)).into_response(),
-        Err(MediaStoreError::Validation(error)) => unprocessable(&error),
-        Err(MediaStoreError::Roosty(error)) => server_error(error),
-    }
+    .await?;
+    Ok(Json(media_response(&state, &media)).into_response())
 }
 
 async fn get_media(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     AxumPath(path): AxumPath<MediaPath>,
-) -> Response {
-    match roosty_db::find_owned_unattached_media_attachment(&state.db, account.id, path.media_id)
-        .await
-    {
-        Ok(Some(media)) => Json(media_response(&state, &media)).into_response(),
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+) -> Result<Response, MediaStoreError> {
+    let txn = database.begin_read().await?;
+    let media =
+        roosty_db::find_owned_unattached_media_attachment(&txn, account.id, path.media_id).await?;
+    txn.commit().await?;
+    let Some(media) = media else {
+        return Ok(not_found());
+    };
+    Ok(Json(media_response(&state, &media)).into_response())
 }
 
 async fn update_media(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     AxumPath(path): AxumPath<MediaPath>,
     Params(params, _temp_files): Params<MediaUpdateParams>,
-) -> Response {
+) -> Result<Response, MediaStoreError> {
     let description = match params.description {
-        Some(description) => match normalize_description(Some(description)) {
-            Ok(description) => Some(description),
-            Err(error) => return unprocessable(&error),
-        },
+        Some(description) => Some(normalize_description(Some(description))?),
         None => None,
     };
-    let focus = match parse_focus(params.focus.as_deref()) {
-        Ok(focus) => focus,
-        Err(error) => return unprocessable(&error),
-    };
+    let focus = parse_focus(params.focus.as_deref())?;
     let thumbnail = params.thumbnail.or(params.file);
-    let preview = match replacement_preview(&state, path.media_id, thumbnail).await {
-        Ok(preview) => preview,
-        Err(MediaStoreError::Validation(error)) => return unprocessable(&error),
-        Err(MediaStoreError::Roosty(error)) => return server_error(error),
-    };
-    let update = roosty_db::LocalMediaAttachmentUpdate {
+    let preview = replacement_preview(&state, path.media_id, thumbnail).await?;
+    let update = LocalMediaAttachmentUpdate {
         description,
         focus,
         preview,
     };
 
-    match roosty_db::update_owned_unattached_media_attachment(
-        &state.db,
+    let txn = database.begin_write().await?;
+    let media = roosty_db::update_owned_unattached_media_attachment(
+        &txn,
         account.id,
         path.media_id,
         update,
     )
-    .await
-    {
-        Ok(Some(media)) => Json(media_response(&state, &media)).into_response(),
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    let Some(media) = media else {
+        return Ok(not_found());
+    };
+    Ok(Json(media_response(&state, &media)).into_response())
 }
 
 async fn delete_media(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     AxumPath(path): AxumPath<MediaPath>,
-) -> Response {
-    match roosty_db::delete_owned_unattached_media_attachment(&state.db, account.id, path.media_id)
+) -> Result<Response, MediaStoreError> {
+    let txn = database.begin_write().await?;
+    let media =
+        roosty_db::delete_owned_unattached_media_attachment(&txn, account.id, path.media_id)
+            .await?;
+    txn.commit().await?;
+    let Some(media) = media else {
+        return Ok(not_found());
+    };
+    tokio::fs::remove_file(media_path(&state, &media.file_path))
         .await
-    {
-        Ok(Some(media)) => {
-            let _ = tokio::fs::remove_file(media_path(&state, &media.file_path)).await;
-            if let Some(preview_path) = media.preview_file_path {
-                let _ = tokio::fs::remove_file(media_path(&state, &preview_path)).await;
-            }
-            StatusCode::OK.into_response()
-        }
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
+        .ok();
+    if let Some(preview_path) = media.preview_file_path {
+        tokio::fs::remove_file(media_path(&state, &preview_path))
+            .await
+            .ok();
     }
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn serve_media_attachment(
@@ -896,7 +933,7 @@ async fn serve_media_attachment(
 /// Build a local media response from stored metadata.
 pub(crate) fn media_response(
     state: &AppState,
-    media: &roosty_db::LocalMediaAttachment,
+    media: &LocalMediaAttachment,
 ) -> MediaAttachmentResponse {
     let url = media_url(state, &media.file_path);
     let preview_url = media
@@ -919,7 +956,7 @@ pub(crate) fn media_response(
 /// Project immutable revision media while retaining cached paths and remote fallback URLs.
 pub(crate) fn status_edit_media_response(
     state: &AppState,
-    media: roosty_db::StatusEditMedia,
+    media: StatusEditMedia,
 ) -> MediaAttachmentResponse {
     let fallback = media.remote_url.clone().unwrap_or_default();
     let url = media
@@ -975,13 +1012,14 @@ pub(crate) fn status_edit_media_response(
 /// Store an original upload, generated preview, and database media metadata.
 async fn store_upload(
     state: &AppState,
+    database: &DatabaseContext,
     account_id: AccountId,
     file: UploadFile,
     thumbnail: Option<UploadFile>,
     format: SupportedImageFormat,
     description: Option<String>,
     focus: Option<(f64, f64)>,
-) -> Result<roosty_db::LocalMediaAttachment, MediaStoreError> {
+) -> Result<LocalMediaAttachment, MediaStoreError> {
     let media_id = Uuid::now_v7();
     let relative_path = relative_media_path(media_id, "", format.extension);
     let preview_path = relative_media_path(media_id, "small", "png");
@@ -993,7 +1031,7 @@ async fn store_upload(
 
     let original_bytes = read_upload(file).await?;
     if original_bytes.len() as u64 > MAX_IMAGE_BYTES {
-        return Err(MediaStoreError::Validation("file is too large".to_owned()));
+        return Err(MediaStoreError::Validation("file is too large".into()));
     }
     let thumbnail_bytes = read_optional_upload(thumbnail).await?;
     let processed =
@@ -1002,7 +1040,7 @@ async fn store_upload(
     tokio::fs::write(&full_path, &original_bytes).await?;
     tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
-    let media = roosty_db::NewLocalMediaAttachment {
+    let media = NewLocalMediaAttachment {
         account_id,
         content_type: format.content_type.to_owned(),
         original_filename,
@@ -1018,9 +1056,10 @@ async fn store_upload(
         preview_height: Some(processed.preview_height),
         blurhash: Some(processed.blurhash),
     };
-    roosty_db::create_local_media_attachment(&state.db, media)
-        .await
-        .map_err(MediaStoreError::Roosty)
+    let txn = database.begin_write().await?;
+    let media = roosty_db::create_local_media_attachment(&txn, media).await?;
+    txn.commit().await?;
+    Ok(media)
 }
 
 /// Build replacement preview metadata from a custom thumbnail upload.
@@ -1028,12 +1067,11 @@ async fn replacement_preview(
     state: &AppState,
     media_id: Uuid,
     thumbnail: Option<UploadFile>,
-) -> Result<Option<roosty_db::LocalMediaPreviewUpdate>, MediaStoreError> {
+) -> Result<Option<LocalMediaPreviewUpdate>, MediaStoreError> {
     let Some(thumbnail) = thumbnail else {
         return Ok(None);
     };
-    let format = validate_image_content_type(&thumbnail.content_type)
-        .map_err(MediaStoreError::Validation)?;
+    let format = validate_image_content_type(&thumbnail.content_type)?;
     let preview_path = relative_media_path(media_id, "small", "png");
     let preview_full_path = media_path(state, &preview_path);
     create_media_parent(&preview_full_path).await?;
@@ -1046,7 +1084,7 @@ async fn replacement_preview(
     .await?;
     tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
-    Ok(Some(roosty_db::LocalMediaPreviewUpdate {
+    Ok(Some(LocalMediaPreviewUpdate {
         preview_file_path: preview_path,
         preview_width: processed.preview_width,
         preview_height: processed.preview_height,
@@ -1103,11 +1141,11 @@ async fn process_image(
         let (preview_width, preview_height) = preview.dimensions();
         let rgba = preview.to_rgba8();
         let blurhash = blurhash::encode(4, 3, preview_width, preview_height, rgba.as_raw())
-            .map_err(|_| MediaStoreError::Validation("could not generate blurhash".to_owned()))?;
+            .map_err(|_| MediaStoreError::Validation("could not generate blurhash".into()))?;
         let mut preview_bytes = Cursor::new(Vec::new());
         preview
             .write_to(&mut preview_bytes, ImageFormat::Png)
-            .map_err(|_| MediaStoreError::Validation("could not generate thumbnail".to_owned()))?;
+            .map_err(|_| MediaStoreError::Validation("could not generate thumbnail".into()))?;
 
         Ok(ProcessedImage {
             width: width as i32,
@@ -1125,16 +1163,16 @@ async fn process_image(
 /// Decode bytes using the MIME-derived image format accepted by upload validation.
 fn decode_image(bytes: &[u8], format: ImageFormat) -> Result<image::DynamicImage, MediaStoreError> {
     image::load_from_memory_with_format(bytes, format)
-        .map_err(|_| MediaStoreError::Validation("file is invalid".to_owned()))
+        .map_err(|_| MediaStoreError::Validation("file is invalid".into()))
 }
 
 /// Decode thumbnail bytes by sniffing their image format.
 fn decode_image_guessed(bytes: &[u8]) -> Result<image::DynamicImage, MediaStoreError> {
     ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|_| MediaStoreError::Validation("file is invalid".to_owned()))?
+        .map_err(|_| MediaStoreError::Validation("file is invalid".into()))?
         .decode()
-        .map_err(|_| MediaStoreError::Validation("file is invalid".to_owned()))
+        .map_err(|_| MediaStoreError::Validation("file is invalid".into()))
 }
 
 /// Ensure media writes use the local filesystem backend implemented by this module.
@@ -1236,7 +1274,7 @@ fn parse_focus(value: Option<&str>) -> Result<Option<(f64, f64)>, String> {
 }
 
 /// Build Mastodon-compatible structured metadata from stored local media metadata.
-fn media_meta(media: &roosty_db::LocalMediaAttachment) -> MediaMeta {
+fn media_meta(media: &LocalMediaAttachment) -> MediaMeta {
     MediaMeta {
         original: image_meta(media.width, media.height),
         small: image_meta(media.preview_width, media.preview_height),
@@ -1366,7 +1404,7 @@ fn server_error(error: RoostyError) -> Response {
 #[derive(Debug, thiserror::Error)]
 enum MediaStoreError {
     #[error("{0}")]
-    Validation(String),
+    Validation(Cow<'static, str>),
     #[error(transparent)]
     Roosty(#[from] RoostyError),
 }
@@ -1374,14 +1412,20 @@ enum MediaStoreError {
 /// Translate local image-processing failures at the remote-fetch boundary.
 fn media_store_error_to_roosty(error: MediaStoreError) -> RoostyError {
     match error {
-        MediaStoreError::Validation(error) => RoostyError::InvalidInput(error),
+        MediaStoreError::Validation(error) => RoostyError::InvalidInput(error.into_owned()),
         MediaStoreError::Roosty(error) => error,
     }
 }
 
-impl From<sea_orm::DbErr> for MediaStoreError {
-    fn from(error: sea_orm::DbErr) -> Self {
+impl From<DbErr> for MediaStoreError {
+    fn from(error: DbErr) -> Self {
         Self::Roosty(error.into())
+    }
+}
+
+impl From<String> for MediaStoreError {
+    fn from(error: String) -> Self {
+        Self::Validation(Cow::Owned(error))
     }
 }
 

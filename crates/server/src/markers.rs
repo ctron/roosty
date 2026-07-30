@@ -1,17 +1,14 @@
 use std::collections::BTreeMap;
 
-use axum::{
-    Form, Json, Router,
-    extract::{RawQuery, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-};
+use axum::{Extension, Form, Json, Router, extract::RawQuery, routing::get};
 use roosty_db::{LocalTimeline, LocalTimelineMarker};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::AuthenticatedAccount, http::AppState};
+use crate::{
+    auth::AuthenticatedAccount,
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
+};
 
 /// Build routes for Mastodon-compatible home and notification timeline markers.
 pub fn router() -> Router<AppState> {
@@ -42,69 +39,45 @@ struct MarkerResponse {
     updated_at: String,
 }
 
-/// Error response returned for malformed marker requests.
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: &'static str,
-}
-
 /// Return the authenticated account's saved positions for requested timelines.
 async fn markers(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     RawQuery(query): RawQuery,
-) -> Response {
-    let query = match marker_query(query.as_deref()) {
-        Ok(query) => query,
-        Err(()) => return bad_request(),
-    };
+) -> ApiResult<Json<BTreeMap<String, MarkerResponse>>> {
+    let query = marker_query(query.as_deref())
+        .map_err(|()| ApiError::BadRequest("marker request is invalid".into()))?;
     let timelines = query
         .timeline
         .iter()
         .filter_map(|timeline| parse_timeline(timeline))
         .collect::<Vec<_>>();
 
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let result = roosty_db::local_timeline_markers_for_account(&txn, account.id, &timelines).await;
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match result {
-        Ok(markers) => Json(marker_response_map(markers)).into_response(),
-        Err(error) => server_error(error),
-    }
+    let txn = database.begin_read().await?;
+    let markers =
+        roosty_db::local_timeline_markers_for_account(&txn, account.id, &timelines).await?;
+    txn.commit().await?;
+    Ok(Json(marker_response_map(markers)))
 }
 
 /// Save one or both timeline positions supplied by the authenticated account.
 async fn save_markers(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Form(params): Form<MarkerUpdateParams>,
-) -> Response {
-    let updates = match marker_updates(params) {
-        Ok(updates) => updates,
-        Err(()) => return bad_request(),
-    };
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
+) -> ApiResult<Json<BTreeMap<String, MarkerResponse>>> {
+    let updates = marker_updates(params)
+        .map_err(|()| ApiError::BadRequest("marker request is invalid".into()))?;
+    let txn = database.begin_write().await?;
     let mut markers = Vec::with_capacity(updates.len());
     for (timeline, last_read_id) in updates {
-        match roosty_db::save_local_timeline_marker(&txn, account.id, timeline, last_read_id).await
-        {
-            Ok(marker) => markers.push(marker),
-            Err(error) => return server_error(error),
-        }
+        markers.push(
+            roosty_db::save_local_timeline_marker(&txn, account.id, timeline, last_read_id).await?,
+        );
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
+    txn.commit().await?;
 
-    Json(marker_response_map(markers)).into_response()
+    Ok(Json(marker_response_map(markers)))
 }
 
 /// Decode a Mastodon bracket-array query string used by marker requests.
@@ -164,27 +137,4 @@ fn marker_response_map(markers: Vec<LocalTimelineMarker>) -> BTreeMap<String, Ma
             )
         })
         .collect()
-}
-
-/// Return a Mastodon-compatible malformed-marker response.
-fn bad_request() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "marker request is invalid",
-        }),
-    )
-        .into_response()
-}
-
-/// Return an internal error without exposing database details to the client.
-fn server_error(error: roosty_core::RoostyError) -> Response {
-    tracing::warn!(%error, "marker request failed");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: "internal server error",
-        }),
-    )
-        .into_response()
 }

@@ -613,7 +613,7 @@ pub async fn connect(database_url: &str) -> Result<DbConnection> {
 }
 
 /// Verify that the database connection can execute a trivial query.
-pub async fn ping(db: &DbConnection) -> Result<()> {
+pub async fn ping(db: &impl ConnectionTrait) -> Result<()> {
     db.query_one(Statement::from_string(
         DatabaseBackend::Postgres,
         "SELECT 1".to_owned(),
@@ -1156,7 +1156,7 @@ where
 
 /// List domain rules in stable UUIDv7 cursor order.
 pub async fn list_federation_domain_blocks(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     limit: u64,
     max_id: Option<Uuid>,
 ) -> Result<Vec<FederationDomainBlock>> {
@@ -1286,7 +1286,7 @@ pub async fn reconcile_federation_domain_block(txn: &DatabaseTransaction, id: Uu
 
 /// List local and cached-remote accounts for administrator tooling.
 pub async fn list_admin_accounts(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     query: &str,
     origin: Option<&str>,
     limited: Option<bool>,
@@ -1294,9 +1294,6 @@ pub async fn list_admin_accounts(
     limit: u64,
     max_id: Option<Uuid>,
 ) -> Result<Vec<AdminAccount>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let query = query.trim().to_lowercase();
     let fetch_limit = limit.min(101);
     let include_local = origin.is_none_or(|origin| origin == "local");
@@ -1337,7 +1334,7 @@ pub async fn list_admin_accounts(
             select
                 .order_by_desc(local_account::Column::Id)
                 .limit(fetch_limit)
-                .all(&txn)
+                .all(db)
                 .await?
                 .into_iter()
                 .map(|account| AdminAccount {
@@ -1387,7 +1384,7 @@ pub async fn list_admin_accounts(
             select
                 .order_by_desc(remote_actor::Column::Id)
                 .limit(fetch_limit)
-                .all(&txn)
+                .all(db)
                 .await?
                 .into_iter()
                 .map(|actor| AdminAccount {
@@ -1406,7 +1403,6 @@ pub async fn list_admin_accounts(
     }
     accounts.sort_unstable_by_key(|account| Reverse(account.id.0));
     accounts.truncate(fetch_limit as usize);
-    txn.commit().await?;
     Ok(accounts)
 }
 
@@ -3183,33 +3179,31 @@ async fn remote_status_snapshot(
 
 /// Soft-delete a remote Note only when its verified author owns it.
 pub async fn delete_remote_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     activitypub_id: &str,
     remote_actor_id: AccountId,
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let Some(status) = remote_status::Entity::find()
         .filter(remote_status::Column::ActivitypubId.eq(activitypub_id))
         .filter(remote_status::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status::Column::DeletedAt.is_null())
-        .one(&txn)
+        .one(db)
         .await?
     else {
-        txn.commit().await?;
         return Ok(false);
     };
     let status_id = StatusId(status.id);
-    remove_status_preview_card(&txn, PreviewStatusTarget::Remote(status_id)).await?;
+    remove_status_preview_card(db, PreviewStatusTarget::Remote(status_id)).await?;
     let tag_ids = remote_status_tag::Entity::find()
         .filter(remote_status_tag::Column::RemoteStatusId.eq(status.id))
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|row| row.tag_id)
         .collect::<Vec<_>>();
     if status.visibility == StatusVisibility::Public {
         adjust_tag_usage(
-            &txn,
+            db,
             &tag_ids,
             utc_date(status.published_at),
             "remote",
@@ -3221,11 +3215,10 @@ pub async fn delete_remote_status(
     let actor_id = AccountId(status.remote_actor_id);
     let mut active = status.into_active_model();
     active.deleted_at = Set(Some(OffsetDateTime::now_utc()));
-    active.update(&txn).await?;
-    refresh_status_search_document(&txn, StatusReference::Remote(status_id)).await?;
-    refresh_remote_actor_last_status_at(&txn, actor_id).await?;
-    mark_trend_dirty(&txn, "remote_status", status_id.0).await?;
-    txn.commit().await?;
+    active.update(db).await?;
+    refresh_status_search_document(db, StatusReference::Remote(status_id)).await?;
+    refresh_remote_actor_last_status_at(db, actor_id).await?;
+    mark_trend_dirty(db, "remote_status", status_id.0).await?;
     Ok(true)
 }
 
@@ -3422,7 +3415,7 @@ async fn repair_one_remote_status_delete(
 
 /// Find a remote actor by its canonical ActivityPub ID.
 pub async fn find_remote_actor_by_activitypub_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     activitypub_id: &str,
 ) -> Result<Option<RemoteActor>> {
     Ok(remote_actor::Entity::find()
@@ -3681,7 +3674,7 @@ pub async fn find_local_actor_key(
 
 /// Persist a newly generated ActivityPub signing key.
 pub async fn create_local_actor_key(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     key: &LocalActorKey,
 ) -> Result<()> {
@@ -5524,7 +5517,7 @@ pub async fn delete_remote_follow_with_response_job(
 
 /// List pending remote follows for internal approval and rejection lookup.
 pub async fn pending_remote_follows(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
 ) -> Result<Vec<RemoteFollow>> {
     Ok(remote_follow::Entity::find()
@@ -5540,7 +5533,7 @@ pub async fn pending_remote_follows(
 
 /// List pending remote follow-request actors for a local account with Mastodon cursor pagination.
 pub async fn pending_remote_follow_requests(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -7240,7 +7233,7 @@ pub async fn local_follow_relationship(
 
 /// List local follower ids for streaming delivery.
 pub async fn local_follower_ids_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     include_reblog_muted: bool,
 ) -> Result<Vec<AccountId>> {
@@ -7275,7 +7268,7 @@ pub async fn local_notified_follower_ids_for_account(
 
 /// Follow a local account, updating follow options when it already exists.
 pub async fn follow_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     follower_account_id: AccountId,
     followed_account_id: AccountId,
     show_reblogs: bool,
@@ -7327,7 +7320,7 @@ pub async fn follow_local_account(
 
 /// Remove a local follow relationship when it exists.
 pub async fn unfollow_local_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     follower_account_id: AccountId,
     followed_account_id: AccountId,
 ) -> Result<()> {
@@ -7535,7 +7528,7 @@ pub async fn active_local_account_mute(
 
 /// Return whether a viewer should hide a local account from personalized timelines.
 pub async fn local_account_is_hidden_for_viewer(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     viewer_account_id: AccountId,
     target_account_id: AccountId,
 ) -> Result<bool> {
@@ -7566,7 +7559,7 @@ pub async fn local_account_allows_notification(
 
 /// Return block targets for an account in either relationship direction.
 pub async fn blocked_local_account_ids_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Vec<AccountId>> {
     let rows = local_account_block::Entity::find()
@@ -7592,7 +7585,7 @@ pub async fn blocked_local_account_ids_for_account(
 
 /// Return local accounts hidden from one account's personalized timelines.
 pub async fn hidden_local_account_ids_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Vec<AccountId>> {
     let mut account_ids = blocked_local_account_ids_for_account(db, account_id).await?;
@@ -8135,7 +8128,7 @@ where
 
 /// List local and remote block targets in one UUIDv7 cursor order.
 pub async fn blocked_accounts_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -8156,7 +8149,7 @@ pub async fn blocked_accounts_for_account(
 
 /// List active local and remote mute targets in one UUIDv7 cursor order.
 pub async fn muted_accounts_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -8854,7 +8847,7 @@ pub async fn notify_local_status_mention(
 
 /// List visible local notifications for one recipient with Mastodon cursor filters.
 pub async fn local_notifications_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -8922,16 +8915,13 @@ pub async fn local_notifications_for_account(
 
 /// List notification groups newest-first using each group's newest notification as its cursor.
 pub async fn notification_groups_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
     filter: NotificationFilter,
     grouped_types: &[LocalNotificationType],
 ) -> Result<NotificationGroupPage> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let groupable = grouped_types
         .iter()
         .copied()
@@ -8976,7 +8966,7 @@ pub async fn notification_groups_for_account(
             actor_id.0
         ));
     }
-    let hidden_remote_ids = hidden_remote_actor_ids_for_account(&txn, account_id).await?;
+    let hidden_remote_ids = hidden_remote_actor_ids_for_account(db, account_id).await?;
     if !hidden_remote_ids.is_empty() {
         conditions.push(format!(
             "(remote_actor_id IS NULL OR remote_actor_id NOT IN ({}))",
@@ -9048,7 +9038,7 @@ pub async fn notification_groups_for_account(
         DatabaseBackend::Postgres,
         sql,
     ))
-    .all(&txn)
+    .all(db)
     .await?;
     let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|row| row.most_recent_notification_id);
@@ -9087,7 +9077,6 @@ pub async fn notification_groups_for_account(
         last_cursor,
         has_more,
     };
-    txn.commit().await?;
     Ok(page)
 }
 
@@ -9109,16 +9098,11 @@ fn parse_notification_group_key(group_key: &str) -> Option<(Option<LocalNotifica
 
 /// Return all visible rows belonging to one opaque notification group key.
 pub async fn notifications_in_group(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     group_key: &str,
 ) -> Result<Vec<LocalNotification>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let notifications = notifications_in_group_with_connection(&txn, account_id, group_key).await?;
-    txn.commit().await?;
-    Ok(notifications)
+    notifications_in_group_with_connection(db, account_id, group_key).await
 }
 
 async fn notifications_in_group_with_connection<C>(
@@ -9164,14 +9148,12 @@ where
 
 /// Soft-dismiss every row in one notification group owned by the recipient.
 pub async fn dismiss_notification_group(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     group_key: &str,
 ) -> Result<bool> {
-    let txn = db.begin().await?;
-    let rows = notifications_in_group_with_connection(&txn, account_id, group_key).await?;
+    let rows = notifications_in_group_with_connection(db, account_id, group_key).await?;
     if rows.is_empty() {
-        txn.commit().await?;
         return Ok(false);
     }
     local_notification::Entity::update_many()
@@ -9180,15 +9162,14 @@ pub async fn dismiss_notification_group(
             Expr::value(OffsetDateTime::now_utc()),
         )
         .filter(local_notification::Column::Id.is_in(rows.into_iter().map(|row| row.id)))
-        .exec(&txn)
+        .exec(db)
         .await?;
-    txn.commit().await?;
     Ok(true)
 }
 
 /// Find one visible local notification belonging to a recipient.
 pub async fn find_local_notification_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     notification_id: Uuid,
 ) -> Result<Option<LocalNotification>> {
@@ -9204,7 +9185,7 @@ pub async fn find_local_notification_for_account(
 
 /// Dismiss one visible local notification for a recipient.
 pub async fn dismiss_local_notification(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     notification_id: Uuid,
 ) -> Result<bool> {
@@ -9225,7 +9206,10 @@ pub async fn dismiss_local_notification(
 }
 
 /// Dismiss every visible local notification for a recipient.
-pub async fn clear_local_notifications(db: &DbConnection, account_id: AccountId) -> Result<()> {
+pub async fn clear_local_notifications(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<()> {
     let notifications = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::DismissedAt.is_null())
@@ -9243,14 +9227,11 @@ pub async fn clear_local_notifications(db: &DbConnection, account_id: AccountId)
 
 /// List pending notification requests with their notification counts in one query.
 pub async fn notification_requests_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
 ) -> Result<CollectionPage<NotificationRequest>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let mut conditions = vec![
         "r.account_id = $1".to_owned(),
         "r.state = 'pending'".to_owned(),
@@ -9282,7 +9263,7 @@ pub async fn notification_requests_for_account(
         sql,
         values,
     ))
-    .all(&txn)
+    .all(db)
     .await?;
     let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|row| row.id);
@@ -9291,7 +9272,6 @@ pub async fn notification_requests_for_account(
         .into_iter()
         .map(notification_request_from_row)
         .collect::<Result<Vec<_>>>()?;
-    txn.commit().await?;
     Ok(CollectionPage {
         items,
         first_cursor,
@@ -9302,30 +9282,26 @@ pub async fn notification_requests_for_account(
 
 /// Return pending request and held-notification counts for a policy summary.
 pub async fn notification_request_summary(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<(u64, u64)> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let requests_count = local_notification_request::Entity::find()
         .filter(local_notification_request::Column::AccountId.eq(account_id.0))
         .filter(local_notification_request::Column::State.eq(NotificationRequestState::Pending))
-        .count(&txn)
+        .count(db)
         .await?;
     let notifications_count = local_notification::Entity::find()
         .filter(local_notification::Column::AccountId.eq(account_id.0))
         .filter(local_notification::Column::Filtered.eq(true))
         .filter(local_notification::Column::DismissedAt.is_null())
-        .count(&txn)
+        .count(db)
         .await?;
-    txn.commit().await?;
     Ok((requests_count, notifications_count))
 }
 
 /// Find one pending notification request belonging to an account.
 pub async fn find_notification_request_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     request_id: Uuid,
 ) -> Result<Option<NotificationRequest>> {
@@ -9363,11 +9339,10 @@ pub async fn notification_unread_count(
 
 /// Accept pending notification requests and enqueue their durable merge.
 pub async fn accept_notification_requests(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     request_ids: &[Uuid],
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let mut query = local_notification_request::Entity::find()
         .filter(local_notification_request::Column::AccountId.eq(account_id.0))
         .filter(local_notification_request::Column::State.eq(NotificationRequestState::Pending));
@@ -9375,9 +9350,8 @@ pub async fn accept_notification_requests(
         query =
             query.filter(local_notification_request::Column::Id.is_in(request_ids.iter().copied()));
     }
-    let requests = query.lock_exclusive().all(&txn).await?;
+    let requests = query.lock_exclusive().all(db).await?;
     if requests.is_empty() || (!request_ids.is_empty() && requests.len() != request_ids.len()) {
-        txn.rollback().await?;
         return Ok(false);
     }
     for request in &requests {
@@ -9401,7 +9375,7 @@ pub async fn accept_notification_requests(
         } else {
             (None, Some(actor_id))
         };
-        txn.execute(Statement::from_sql_and_values(
+        db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO local_notification_permission
@@ -9428,10 +9402,10 @@ pub async fn accept_notification_requests(
             Expr::value(OffsetDateTime::now_utc()),
         )
         .filter(local_notification_request::Column::Id.is_in(requests.iter().map(|row| row.id)))
-        .exec(&txn)
+        .exec(db)
         .await?;
     enqueue_job_in_transaction(
-        &txn,
+        db,
         NewJob {
             kind: JobKind::NotificationRequestMerge,
             payload: serde_json::json!({ "account_id": account_id.0 }),
@@ -9440,17 +9414,15 @@ pub async fn accept_notification_requests(
         },
     )
     .await?;
-    txn.commit().await?;
     Ok(true)
 }
 
 /// Dismiss pending notification requests and enqueue durable cleanup.
 pub async fn dismiss_notification_requests(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     request_ids: &[Uuid],
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let mut query = local_notification_request::Entity::find()
         .filter(local_notification_request::Column::AccountId.eq(account_id.0))
         .filter(local_notification_request::Column::State.eq(NotificationRequestState::Pending));
@@ -9458,9 +9430,8 @@ pub async fn dismiss_notification_requests(
         query =
             query.filter(local_notification_request::Column::Id.is_in(request_ids.iter().copied()));
     }
-    let requests = query.lock_exclusive().all(&txn).await?;
+    let requests = query.lock_exclusive().all(db).await?;
     if requests.is_empty() || (!request_ids.is_empty() && requests.len() != request_ids.len()) {
-        txn.rollback().await?;
         return Ok(false);
     }
     local_notification_request::Entity::update_many()
@@ -9473,10 +9444,10 @@ pub async fn dismiss_notification_requests(
             Expr::value(OffsetDateTime::now_utc()),
         )
         .filter(local_notification_request::Column::Id.is_in(requests.iter().map(|row| row.id)))
-        .exec(&txn)
+        .exec(db)
         .await?;
     enqueue_job_in_transaction(
-        &txn,
+        db,
         NewJob {
             kind: JobKind::NotificationRequestCleanup,
             payload: serde_json::json!({ "account_id": account_id.0 }),
@@ -9485,13 +9456,12 @@ pub async fn dismiss_notification_requests(
         },
     )
     .await?;
-    txn.commit().await?;
     Ok(true)
 }
 
 /// Return whether no accepted notification requests are awaiting a merge.
 pub async fn notification_requests_merged(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<bool> {
     Ok(local_notification_request::Entity::find()
@@ -10101,7 +10071,7 @@ pub async fn remote_reply_actor_for_local_status(
 
 /// List tags attached to a local status in normalized name order.
 pub async fn local_tags_for_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Vec<LocalTag>> {
     let rows = local_status_tag::Entity::find()
@@ -10121,7 +10091,7 @@ pub async fn local_tags_for_status(
 
 /// List normalized hashtags indexed for a cached remote status.
 pub async fn remote_tags_for_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Vec<LocalTag>> {
     let rows = remote_status_tag::Entity::find()
@@ -10355,10 +10325,11 @@ pub async fn tag_history(db: &impl ConnectionTrait, tag_id: Uuid) -> Result<Vec<
 }
 
 /// Rank hashtags from the transactionally maintained shared trend cache.
-pub async fn trending_tags(db: &DbConnection, limit: u64, offset: u64) -> Result<Vec<TrendingTag>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+pub async fn trending_tags(
+    db: &impl ConnectionTrait,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<TrendingTag>> {
     let rows = TrendingTagRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"WITH selected AS (
@@ -10385,9 +10356,8 @@ pub async fn trending_tags(db: &DbConnection, limit: u64, offset: u64) -> Result
                 .into(),
         ],
     ))
-    .all(&txn)
+    .all(db)
     .await?;
-    txn.commit().await?;
 
     let mut trends = Vec::<TrendingTag>::new();
     for row in rows {
@@ -10442,7 +10412,7 @@ fn fill_tag_history(history: Vec<LocalTagHistory>) -> Vec<LocalTagHistory> {
 
 /// Return public, discoverable statuses ranked from cached interaction totals.
 pub async fn trending_statuses(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<TrendingStatus>> {
@@ -10454,9 +10424,6 @@ pub async fn trending_statuses(
         reblogs_count: i64,
     }
 
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let rows = TrendRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"SELECT metric.local_status_id, metric.remote_status_id,
@@ -10507,7 +10474,7 @@ pub async fn trending_statuses(
                 .into(),
         ],
     ))
-    .all(&txn)
+    .all(db)
     .await?;
 
     let local_ids = rows
@@ -10520,20 +10487,18 @@ pub async fn trending_statuses(
         .collect::<Vec<_>>();
     let local = local_status::Entity::find()
         .filter(local_status::Column::Id.is_in(local_ids))
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|model| local_status_from_model(model).map(|status| (status.id.0, status)))
         .collect::<Result<HashMap<_, _>>>()?;
     let remote = remote_status::Entity::find()
         .filter(remote_status::Column::Id.is_in(remote_ids))
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|model| remote_status_from_model(model).map(|status| (status.id.0, status)))
         .collect::<Result<HashMap<_, _>>>()?;
-    txn.commit().await?;
-
     rows.into_iter()
         .filter_map(|row| {
             let item = match (row.local_status_id, row.remote_status_id) {
@@ -10608,7 +10573,7 @@ pub async fn preview_card_for_status(
 
 /// Batch-load preview cards for a mixed status collection without per-status queries.
 pub async fn preview_cards_for_statuses(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     statuses: &[StatusReference],
 ) -> Result<HashMap<StatusReference, PreviewCard>> {
     let local_ids = statuses
@@ -10629,9 +10594,6 @@ pub async fn preview_cards_for_statuses(
         return Ok(HashMap::new());
     }
 
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let mut condition = Condition::any();
     if !local_ids.is_empty() {
         condition = condition.add(status_preview_card::Column::LocalStatusId.is_in(local_ids));
@@ -10641,7 +10603,7 @@ pub async fn preview_cards_for_statuses(
     }
     let associations = status_preview_card::Entity::find()
         .filter(condition)
-        .all(&txn)
+        .all(db)
         .await?;
     let card_ids = associations
         .iter()
@@ -10649,13 +10611,11 @@ pub async fn preview_cards_for_statuses(
         .collect::<HashSet<_>>();
     let cards = preview_card::Entity::find()
         .filter(preview_card::Column::Id.is_in(card_ids))
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|model| preview_card_from_model(model).map(|card| (card.id, card)))
         .collect::<Result<HashMap<_, _>>>()?;
-    txn.commit().await?;
-
     Ok(associations
         .into_iter()
         .filter_map(|association| {
@@ -10686,7 +10646,7 @@ pub async fn preview_card_by_id(
 
 /// Persist successfully fetched preview metadata.
 pub async fn update_preview_card(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     id: Uuid,
     update: PreviewCardUpdate,
 ) -> Result<()> {
@@ -10716,7 +10676,7 @@ pub async fn update_preview_card(
 }
 
 /// Mark a preview fetch permanently unsuccessful while retaining its compatible URL card.
-pub async fn mark_preview_card_failed(db: &DbConnection, id: Uuid) -> Result<()> {
+pub async fn mark_preview_card_failed(db: &impl ConnectionTrait, id: Uuid) -> Result<()> {
     preview_card::Entity::update_many()
         .col_expr(
             preview_card::Column::FetchState,
@@ -10737,16 +10697,15 @@ pub async fn mark_preview_card_failed(db: &DbConnection, id: Uuid) -> Result<()>
 }
 
 /// Acquire a short cluster-wide lease and rate slot for one preview host.
-pub async fn acquire_preview_host_lease(db: &DbConnection, host: &str) -> Result<bool> {
-    let txn = db.begin().await?;
-    txn.execute(Statement::from_sql_and_values(
+pub async fn acquire_preview_host_lease(db: &impl ConnectionTrait, host: &str) -> Result<bool> {
+    db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"INSERT INTO preview_fetch_host(host) VALUES ($1)
            ON CONFLICT (host) DO NOTHING"#,
         vec![host.to_owned().into()],
     ))
     .await?;
-    let result = txn
+    let result = db
         .execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"UPDATE preview_fetch_host
@@ -10759,12 +10718,11 @@ pub async fn acquire_preview_host_lease(db: &DbConnection, host: &str) -> Result
             vec![host.to_owned().into()],
         ))
         .await?;
-    txn.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 
 /// Release a preview host lease without relaxing its cluster-wide request spacing.
-pub async fn release_preview_host_lease(db: &DbConnection, host: &str) -> Result<()> {
+pub async fn release_preview_host_lease(db: &impl ConnectionTrait, host: &str) -> Result<()> {
     db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "UPDATE preview_fetch_host SET lease_until = NULL, updated_at = now() WHERE host = $1",
@@ -10821,7 +10779,7 @@ pub async fn prune_preview_cards(
 
 /// Rank preview cards from the shared link-trend cache.
 pub async fn trending_links(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<TrendingLink>> {
@@ -10844,9 +10802,6 @@ pub async fn trending_links(
         uses: Option<i64>,
         accounts: Option<i64>,
     }
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let rows = Row::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"WITH selected AS (
@@ -10876,9 +10831,8 @@ pub async fn trending_links(
                 .into(),
         ],
     ))
-    .all(&txn)
+    .all(db)
     .await?;
-    txn.commit().await?;
     let mut trends = Vec::<TrendingLink>::new();
     for row in rows {
         if trends.last().is_none_or(|trend| trend.card.id != row.id) {
@@ -11043,7 +10997,7 @@ pub async fn enqueue_preview_backfill_if_needed(db: &DbConnection) -> Result<Opt
 
 /// Return public statuses sharing an actively trending canonical article URL.
 pub async fn link_timeline(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     url: &str,
     limit: u64,
     cursor: TimelineCursor,
@@ -11061,9 +11015,6 @@ pub async fn link_timeline(
             has_more: false,
         });
     };
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let rows = Row::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"SELECT association.local_status_id, association.remote_status_id
@@ -11119,7 +11070,7 @@ pub async fn link_timeline(
                 .into(),
         ],
     ))
-    .all(&txn)
+    .all(db)
     .await?;
     let has_more = rows.len() > limit as usize;
     let rows = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
@@ -11133,19 +11084,18 @@ pub async fn link_timeline(
         .collect::<Vec<_>>();
     let local = local_status::Entity::find()
         .filter(local_status::Column::Id.is_in(local_ids))
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|model| local_status_from_model(model).map(|status| (status.id.0, status)))
         .collect::<Result<HashMap<_, _>>>()?;
     let remote = remote_status::Entity::find()
         .filter(remote_status::Column::Id.is_in(remote_ids))
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|model| remote_status_from_model(model).map(|status| (status.id.0, status)))
         .collect::<Result<HashMap<_, _>>>()?;
-    txn.commit().await?;
     let items = rows
         .iter()
         .filter_map(|row| match (row.local_status_id, row.remote_status_id) {
@@ -11761,7 +11711,7 @@ async fn refresh_link_trend(
 
 /// List public local and cached remote statuses containing a hashtag.
 pub async fn tag_timeline(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     tag: &str,
     options: TagTimelineOptions,
     limit: u64,
@@ -12003,7 +11953,7 @@ where
         .ok_or_else(|| RoostyError::InvalidInput(format!("hashtag {name} disappeared")))
 }
 
-async fn local_tags_by_names(db: &DbConnection, names: &[String]) -> Result<Vec<LocalTag>> {
+async fn local_tags_by_names(db: &impl ConnectionTrait, names: &[String]) -> Result<Vec<LocalTag>> {
     let mut tags = Vec::new();
     for name in names {
         if let Some(tag) = find_local_tag_by_name(db, name).await? {
@@ -12842,7 +12792,7 @@ pub async fn active_local_mentions_for_remote_status(
 
 /// Create local media metadata after the uploaded file has been stored.
 pub async fn create_local_media_attachment(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     media: NewLocalMediaAttachment,
 ) -> Result<LocalMediaAttachment> {
     let now = OffsetDateTime::now_utc();
@@ -12876,24 +12826,22 @@ pub async fn create_local_media_attachment(
 
 /// Store a schedule, reserve its media, and enqueue publication atomically.
 pub async fn create_scheduled_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     input: NewScheduledStatus,
     total_limit: u64,
     daily_limit: u64,
 ) -> Result<(ScheduleStatusResult, Option<ScheduledStatus>)> {
-    let txn = db.begin().await?;
     local_account::Entity::find_by_id(input.account_id.0)
         .lock_exclusive()
-        .one(&txn)
+        .one(db)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
 
     let total = scheduled_status::Entity::find()
         .filter(scheduled_status::Column::AccountId.eq(input.account_id.0))
-        .count(&txn)
+        .count(db)
         .await?;
     if total >= total_limit {
-        txn.rollback().await?;
         return Ok((ScheduleStatusResult::TotalLimitReached, None));
     }
     let day = input.scheduled_at.date();
@@ -12903,10 +12851,9 @@ pub async fn create_scheduled_status(
         .filter(scheduled_status::Column::AccountId.eq(input.account_id.0))
         .filter(scheduled_status::Column::ScheduledAt.gte(day_start))
         .filter(scheduled_status::Column::ScheduledAt.lt(day_end))
-        .count(&txn)
+        .count(db)
         .await?;
     if daily >= daily_limit {
-        txn.rollback().await?;
         return Ok((ScheduleStatusResult::DailyLimitReached, None));
     }
 
@@ -12916,7 +12863,7 @@ pub async fn create_scheduled_status(
             .filter(local_media_attachment::Column::StatusId.is_null())
             .filter(local_media_attachment::Column::ScheduledStatusId.is_null())
             .lock_exclusive()
-            .one(&txn)
+            .one(db)
             .await?;
         if available.is_none() {
             return Err(RoostyError::InvalidInput(
@@ -12945,25 +12892,25 @@ pub async fn create_scheduled_status(
         created_at: Set(now),
         updated_at: Set(now),
     }
-    .insert(&txn)
+    .insert(db)
     .await?;
     if let Some(poll) = &input.poll {
-        create_scheduled_poll(&txn, id, poll).await?;
+        create_scheduled_poll(db, id, poll).await?;
     }
     for (position, media_id) in input.media_ids.iter().enumerate() {
         let media = local_media_attachment::Entity::find_by_id(*media_id)
             .lock_exclusive()
-            .one(&txn)
+            .one(db)
             .await?
             .ok_or_else(|| RoostyError::InvalidInput("media attachment disappeared".to_owned()))?;
         let mut active = media.into_active_model();
         active.scheduled_status_id = Set(Some(id));
         active.status_order = Set(position as i32);
         active.updated_at = Set(now);
-        active.update(&txn).await?;
+        active.update(db).await?;
     }
     enqueue_job_in_transaction(
-        &txn,
+        db,
         NewJob {
             kind: JobKind::ScheduledStatusPublish,
             payload: serde_json::json!({ "scheduled_status_id": id }),
@@ -12972,7 +12919,6 @@ pub async fn create_scheduled_status(
         },
     )
     .await?;
-    txn.commit().await?;
     Ok((
         ScheduleStatusResult::Created,
         Some(scheduled_status_from_model(model)),
@@ -13005,7 +12951,7 @@ pub async fn find_scheduled_status_by_id(
 
 /// List one account's schedules in opaque UUIDv7 cursor order.
 pub async fn scheduled_statuses(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
@@ -13043,24 +12989,22 @@ pub async fn scheduled_statuses(
 
 /// Move a schedule and its active durable job under an account lock.
 pub async fn reschedule_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     id: Uuid,
     scheduled_at: OffsetDateTime,
     daily_limit: u64,
 ) -> Result<Option<ScheduledStatus>> {
-    let txn = db.begin().await?;
     local_account::Entity::find_by_id(account_id.0)
         .lock_exclusive()
-        .one(&txn)
+        .one(db)
         .await?;
     let Some(model) = scheduled_status::Entity::find_by_id(id)
         .filter(scheduled_status::Column::AccountId.eq(account_id.0))
         .lock_exclusive()
-        .one(&txn)
+        .one(db)
         .await?
     else {
-        txn.rollback().await?;
         return Ok(None);
     };
     let day = scheduled_at.date();
@@ -13071,7 +13015,7 @@ pub async fn reschedule_status(
         .filter(scheduled_status::Column::Id.ne(id))
         .filter(scheduled_status::Column::ScheduledAt.gte(day_start))
         .filter(scheduled_status::Column::ScheduledAt.lt(day_end))
-        .count(&txn)
+        .count(db)
         .await?;
     if daily >= daily_limit {
         return Err(RoostyError::InvalidInput(
@@ -13081,8 +13025,8 @@ pub async fn reschedule_status(
     let mut active = model.into_active_model();
     active.scheduled_at = Set(scheduled_at);
     active.updated_at = Set(OffsetDateTime::now_utc());
-    let updated = active.update(&txn).await?;
-    txn.execute(Statement::from_sql_and_values(
+    let updated = active.update(db).await?;
+    db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "UPDATE job SET run_after = $1 WHERE kind = $2 AND deduplication_key = $3 AND completed_at IS NULL",
         vec![
@@ -13092,28 +13036,25 @@ pub async fn reschedule_status(
         ],
     ))
     .await?;
-    txn.commit().await?;
     Ok(Some(scheduled_status_from_model(updated)))
 }
 
 /// Cancel an owned schedule, release media, and retire its active job.
 pub async fn cancel_scheduled_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     id: Uuid,
 ) -> Result<bool> {
-    let txn = db.begin().await?;
     let Some(model) = scheduled_status::Entity::find_by_id(id)
         .filter(scheduled_status::Column::AccountId.eq(account_id.0))
         .lock_exclusive()
-        .one(&txn)
+        .one(db)
         .await?
     else {
-        txn.rollback().await?;
         return Ok(false);
     };
-    model.into_active_model().delete(&txn).await?;
-    txn.execute(Statement::from_sql_and_values(
+    model.into_active_model().delete(db).await?;
+    db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "UPDATE job SET completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE kind = $1 AND deduplication_key = $2 AND completed_at IS NULL",
         vec![
@@ -13122,7 +13063,6 @@ pub async fn cancel_scheduled_status(
         ],
     ))
     .await?;
-    txn.commit().await?;
     Ok(true)
 }
 
@@ -13166,7 +13106,7 @@ pub async fn find_owned_media_attachment(
 
 /// Find an unattached media attachment owned by a local account.
 pub async fn find_owned_unattached_media_attachment(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     media_id: Uuid,
 ) -> Result<Option<LocalMediaAttachment>> {
@@ -13182,7 +13122,7 @@ pub async fn find_owned_unattached_media_attachment(
 
 /// Update mutable fields on an unattached media attachment owned by a local account.
 pub async fn update_owned_unattached_media_attachment(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     media_id: Uuid,
     update: LocalMediaAttachmentUpdate,
@@ -13219,7 +13159,7 @@ pub async fn update_owned_unattached_media_attachment(
 
 /// Delete an unattached media attachment owned by a local account.
 pub async fn delete_owned_unattached_media_attachment(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     media_id: Uuid,
 ) -> Result<Option<LocalMediaAttachment>> {
@@ -13375,7 +13315,10 @@ pub async fn remote_status_edits(
 }
 
 /// Return whether a local status has at least one media attachment.
-pub async fn local_status_has_media(db: &DbConnection, status_id: StatusId) -> Result<bool> {
+pub async fn local_status_has_media(
+    db: &impl ConnectionTrait,
+    status_id: StatusId,
+) -> Result<bool> {
     Ok(local_media_attachment::Entity::find()
         .filter(local_media_attachment::Column::StatusId.eq(status_id.0))
         .count(db)
@@ -13601,7 +13544,7 @@ pub async fn pinned_local_statuses_by_account(
 
 /// List cached remote pins newest-first using cache-row identities as cursors.
 pub async fn pinned_remote_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
@@ -14236,7 +14179,7 @@ pub async fn update_local_status_quote_policy(
 
 /// List an actor's public statuses for its ActivityPub outbox.
 pub async fn public_local_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
 ) -> Result<Vec<LocalStatus>> {
@@ -14253,7 +14196,7 @@ pub async fn public_local_statuses_by_account(
 
 /// Count an actor's public statuses for its ActivityPub outbox metadata.
 pub async fn count_public_local_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<u64> {
     Ok(local_status::Entity::find()
@@ -15084,7 +15027,7 @@ pub async fn local_status_local_recipients(
 
 /// Return the exact audience of the direct status selected for a conversation view.
 pub async fn direct_status_participants_for_view(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     view: &LocalConversationAccount,
 ) -> Result<DirectStatusParticipants> {
     let mut participants = DirectStatusParticipants::default();
@@ -15145,7 +15088,7 @@ pub async fn direct_status_participants_for_view(
 }
 
 async fn remote_conversation_participants_for_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Vec<RemoteConversationParticipant>> {
     Ok(remote_mentions_for_local_status(db, status_id)
@@ -15161,7 +15104,7 @@ async fn remote_conversation_participants_for_local_status(
 
 /// List visible local direct conversations for an account.
 pub async fn local_conversations_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -15229,7 +15172,7 @@ pub async fn find_local_conversation_for_account(
 
 /// List visible account-specific views for one local conversation.
 pub async fn local_conversation_views(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     conversation_id: Uuid,
 ) -> Result<Vec<LocalConversationView>> {
     let Some(conversation) = local_conversation::Entity::find_by_id(conversation_id)
@@ -15256,7 +15199,7 @@ pub async fn local_conversation_views(
 
 /// List accounts whose conversation view currently presents a given local status.
 pub async fn local_conversation_accounts_for_last_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     conversation_id: Uuid,
     status_id: StatusId,
 ) -> Result<Vec<AccountId>> {
@@ -15272,7 +15215,7 @@ pub async fn local_conversation_accounts_for_last_status(
 
 /// List accounts whose conversation view currently presents a given remote status.
 pub async fn local_conversation_accounts_for_last_remote_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     conversation_id: Uuid,
     status_id: StatusId,
 ) -> Result<Vec<AccountId>> {
@@ -15288,7 +15231,7 @@ pub async fn local_conversation_accounts_for_last_remote_status(
 
 /// Mark a local conversation as read for one account.
 pub async fn mark_local_conversation_read(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     conversation_account_id: Uuid,
 ) -> Result<Option<LocalConversationView>> {
@@ -15317,7 +15260,7 @@ pub async fn mark_local_conversation_read(
 
 /// Hide a local conversation for one account.
 pub async fn hide_local_conversation(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     conversation_account_id: Uuid,
 ) -> Result<bool> {
@@ -15352,7 +15295,7 @@ pub async fn local_conversation_participants(
 }
 
 async fn find_local_conversation_account_model(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     conversation_account_id: Uuid,
 ) -> Result<Option<local_conversation_account::Model>> {
@@ -15367,13 +15310,12 @@ async fn find_local_conversation_account_model(
 
 /// Mark a local status as favourited by an account.
 pub async fn favourite_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
-    let txn = db.begin().await?;
     if local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
-        .one(&txn)
+        .one(db)
         .await?
         .is_none()
     {
@@ -15383,11 +15325,10 @@ pub async fn favourite_local_status(
             status_id: Set(status_id.0),
             created_at: Set(OffsetDateTime::now_utc()),
         }
-        .insert(&txn)
+        .insert(db)
         .await?;
-        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 1, 0).await?;
+        adjust_status_trend(db, TrendTarget::LocalStatus(status_id), 1, 0).await?;
     }
-    txn.commit().await?;
     Ok(())
 }
 
@@ -15402,7 +15343,7 @@ pub async fn favourite_local_status_by_remote_actor(
     let existing = remote_status_favourite::Entity::find()
         .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_favourite::Column::LocalStatusId.eq(status_id.0))
-        .one(&txn)
+        .one(db)
         .await?;
     if existing.is_some() {
         txn.commit().await?;
@@ -15415,9 +15356,9 @@ pub async fn favourite_local_status_by_remote_actor(
         activity_id: Set(activity_id.to_owned()),
         created_at: Set(OffsetDateTime::now_utc()),
     }
-    .insert(&txn)
+    .insert(db)
     .await?;
-    adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 1, 0).await?;
+    adjust_status_trend(db, TrendTarget::LocalStatus(status_id), 1, 0).await?;
     txn.commit().await?;
     Ok(true)
 }
@@ -15470,12 +15411,12 @@ pub async fn unfavourite_local_status_by_remote_actor(
     let model = remote_status_favourite::Entity::find()
         .filter(remote_status_favourite::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_favourite::Column::ActivityId.eq(activity_id))
-        .one(&txn)
+        .one(db)
         .await?;
     if let Some(model) = model {
         let status_id = StatusId(model.local_status_id);
-        model.into_active_model().delete(&txn).await?;
-        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), -1, 0).await?;
+        model.into_active_model().delete(db).await?;
+        adjust_status_trend(db, TrendTarget::LocalStatus(status_id), -1, 0).await?;
         txn.commit().await?;
         return Ok(true);
     }
@@ -15513,7 +15454,7 @@ pub async fn favourite_remote_status(
     if local_remote_status_favourite::Entity::find()
         .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(&txn)
+        .one(db)
         .await?
         .is_none()
     {
@@ -15524,9 +15465,9 @@ pub async fn favourite_remote_status(
             activity_id: Set(activity_id.to_owned()),
             created_at: Set(OffsetDateTime::now_utc()),
         }
-        .insert(&txn)
+        .insert(db)
         .await?;
-        adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), 1, 0).await?;
+        adjust_status_trend(db, TrendTarget::RemoteStatus(remote_status_id), 1, 0).await?;
     }
     txn.commit().await?;
     Ok(())
@@ -15534,7 +15475,7 @@ pub async fn favourite_remote_status(
 
 /// Store a remote-status favourite and its Like delivery job in `txn`.
 pub async fn favourite_remote_status_with_job(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
     activity_id: &str,
@@ -15568,7 +15509,7 @@ pub async fn unfavourite_remote_status(
     let favourite = local_remote_status_favourite::Entity::find()
         .filter(local_remote_status_favourite::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_favourite::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(&txn)
+        .one(db)
         .await?;
     let Some(favourite) = favourite else {
         txn.commit().await?;
@@ -15579,15 +15520,15 @@ pub async fn unfavourite_remote_status(
         remote_status_id: StatusId(favourite.remote_status_id),
         activity_id: favourite.activity_id.clone(),
     };
-    favourite.into_active_model().delete(&txn).await?;
-    adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), -1, 0).await?;
+    favourite.into_active_model().delete(db).await?;
+    adjust_status_trend(db, TrendTarget::RemoteStatus(remote_status_id), -1, 0).await?;
     txn.commit().await?;
     Ok(Some(result))
 }
 
 /// Find a local favourite of a cached remote Note without changing it.
 pub async fn find_remote_status_favourite(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
 ) -> Result<Option<LocalRemoteStatusFavourite>> {
@@ -15605,7 +15546,7 @@ pub async fn find_remote_status_favourite(
 
 /// Remove a remote-status favourite and insert its Undo delivery job in `txn`.
 pub async fn unfavourite_remote_status_with_job(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
     job: NewJob,
@@ -15631,19 +15572,17 @@ pub async fn unfavourite_remote_status_with_job(
 
 /// Remove a local account's favourite from a status when it exists.
 pub async fn unfavourite_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
-    let txn = db.begin().await?;
     if let Some(model) = local_status_favourite::Entity::find_by_id((account_id.0, status_id.0))
-        .one(&txn)
+        .one(db)
         .await?
     {
-        model.into_active_model().delete(&txn).await?;
-        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), -1, 0).await?;
+        model.into_active_model().delete(db).await?;
+        adjust_status_trend(db, TrendTarget::LocalStatus(status_id), -1, 0).await?;
     }
-    txn.commit().await?;
     Ok(())
 }
 
@@ -15662,7 +15601,7 @@ pub async fn count_local_favourites(db: &impl ConnectionTrait, status_id: Status
 
 /// Return whether a local account has favourited a status.
 pub async fn is_local_status_favourited(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<bool> {
@@ -15720,7 +15659,7 @@ pub async fn local_favourites_for_account(
 
 /// List local and cached remote statuses favourited by an account, newest first.
 pub async fn favourites_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -15764,7 +15703,7 @@ pub async fn favourites_for_account(
 
 /// Mark a local status as bookmarked by an account.
 pub async fn bookmark_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
@@ -15788,7 +15727,7 @@ pub async fn bookmark_local_status(
 
 /// Remove a local account's bookmark from a status when it exists.
 pub async fn unbookmark_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<()> {
@@ -15804,7 +15743,7 @@ pub async fn unbookmark_local_status(
 
 /// Return whether a local account has bookmarked a status.
 pub async fn is_local_status_bookmarked(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<bool> {
@@ -15818,7 +15757,7 @@ pub async fn is_local_status_bookmarked(
 
 /// List local statuses bookmarked by an account, newest bookmark first.
 pub async fn local_bookmarks_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: CollectionCursor,
@@ -15848,16 +15787,14 @@ pub async fn local_bookmarks_for_account(
 
 /// Mark a local status as boosted by an account.
 pub async fn reblog_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<LocalStatusReblog> {
-    let txn = db.begin().await?;
     if let Some(model) = local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
-        .one(&txn)
+        .one(db)
         .await?
     {
-        txn.commit().await?;
         return Ok(local_status_reblog_from_model(model));
     }
 
@@ -15867,50 +15804,44 @@ pub async fn reblog_local_status(
         status_id: Set(status_id.0),
         created_at: Set(OffsetDateTime::now_utc()),
     }
-    .insert(&txn)
+    .insert(db)
     .await?;
-    adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 0, 1).await?;
+    adjust_status_trend(db, TrendTarget::LocalStatus(status_id), 0, 1).await?;
     let reblog = local_status_reblog_from_model(model);
-    txn.commit().await?;
     Ok(reblog)
 }
 
 /// Remove a local account's boost from a status when it exists.
 pub async fn unreblog_local_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<Option<LocalStatusReblog>> {
-    let txn = db.begin().await?;
     if let Some(model) = local_status_reblog::Entity::find_by_id((account_id.0, status_id.0))
-        .one(&txn)
+        .one(db)
         .await?
     {
         let reblog = local_status_reblog_from_model(model.clone());
-        model.into_active_model().delete(&txn).await?;
-        adjust_status_trend(&txn, TrendTarget::LocalStatus(status_id), 0, -1).await?;
-        txn.commit().await?;
+        model.into_active_model().delete(db).await?;
+        adjust_status_trend(db, TrendTarget::LocalStatus(status_id), 0, -1).await?;
         return Ok(Some(reblog));
     }
-    txn.commit().await?;
     Ok(None)
 }
 
 /// Store a local account's Announce of a cached remote Note.
 pub async fn reblog_remote_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
     activity_id: &str,
 ) -> Result<LocalRemoteStatusReblog> {
-    let txn = db.begin().await?;
     if let Some(model) = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(&txn)
+        .one(db)
         .await?
     {
-        txn.commit().await?;
         return Ok(local_remote_status_reblog_from_model(model));
     }
     let model = local_remote_status_reblog::ActiveModel {
@@ -15920,17 +15851,16 @@ pub async fn reblog_remote_status(
         activity_id: Set(activity_id.to_owned()),
         created_at: Set(OffsetDateTime::now_utc()),
     }
-    .insert(&txn)
+    .insert(db)
     .await?;
-    adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), 0, 1).await?;
+    adjust_status_trend(db, TrendTarget::RemoteStatus(remote_status_id), 0, 1).await?;
     let reblog = local_remote_status_reblog_from_model(model);
-    txn.commit().await?;
     Ok(reblog)
 }
 
 /// Store a remote-status boost and its Announce delivery job in `txn`.
 pub async fn reblog_remote_status_with_job(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
     activity_id: &str,
@@ -15971,22 +15901,22 @@ pub async fn unreblog_remote_status(
     let model = local_remote_status_reblog::Entity::find()
         .filter(local_remote_status_reblog::Column::LocalAccountId.eq(local_account_id.0))
         .filter(local_remote_status_reblog::Column::RemoteStatusId.eq(remote_status_id.0))
-        .one(&txn)
+        .one(db)
         .await?;
     let Some(model) = model else {
         txn.commit().await?;
         return Ok(None);
     };
     let reblog = local_remote_status_reblog_from_model(model.clone());
-    model.into_active_model().delete(&txn).await?;
-    adjust_status_trend(&txn, TrendTarget::RemoteStatus(remote_status_id), 0, -1).await?;
+    model.into_active_model().delete(db).await?;
+    adjust_status_trend(db, TrendTarget::RemoteStatus(remote_status_id), 0, -1).await?;
     txn.commit().await?;
     Ok(Some(reblog))
 }
 
 /// Find a local Announce of a cached remote Note without changing it.
 pub async fn find_remote_status_reblog(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
 ) -> Result<Option<LocalRemoteStatusReblog>> {
@@ -16000,7 +15930,7 @@ pub async fn find_remote_status_reblog(
 
 /// Remove a remote-status boost and insert its Undo delivery job in `txn`.
 pub async fn unreblog_remote_status_with_job(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_status_id: StatusId,
     job: NewJob,
@@ -16022,7 +15952,7 @@ pub async fn unreblog_remote_status_with_job(
 
 /// Return whether a local account announced a cached remote Note.
 pub async fn is_remote_status_reblogged(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<bool> {
@@ -16083,7 +16013,7 @@ pub async fn unreblog_status_by_remote_actor(
     let model = remote_status_reblog::Entity::find()
         .filter(remote_status_reblog::Column::RemoteActorId.eq(remote_actor_id.0))
         .filter(remote_status_reblog::Column::ActivityId.eq(activity_id))
-        .one(&txn)
+        .one(db)
         .await?;
     let Some(model) = model else {
         txn.commit().await?;
@@ -16093,12 +16023,12 @@ pub async fn unreblog_status_by_remote_actor(
         txn.commit().await?;
         return Ok(None);
     };
-    model.into_active_model().delete(&txn).await?;
+    model.into_active_model().delete(db).await?;
     let target = match reblog.target {
         RemoteStatusReblogTarget::Local(id) => TrendTarget::LocalStatus(id),
         RemoteStatusReblogTarget::Remote(id) => TrendTarget::RemoteStatus(id),
     };
-    adjust_status_trend(&txn, target, 0, -1).await?;
+    adjust_status_trend(db, target, 0, -1).await?;
     txn.commit().await?;
     Ok(Some(reblog))
 }
@@ -16130,7 +16060,7 @@ pub async fn process_remote_undo_reblog(
 
 /// Find a remote Announce by actor and ActivityPub identity.
 pub async fn find_remote_status_reblog_by_activity_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     remote_actor_id: AccountId,
     activity_id: &str,
 ) -> Result<Option<RemoteStatusReblog>> {
@@ -16157,7 +16087,7 @@ pub async fn count_local_reblogs(db: &impl ConnectionTrait, status_id: StatusId)
 
 /// Return whether a local account has boosted a status.
 pub async fn is_local_status_reblogged(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<bool> {
@@ -16201,14 +16131,11 @@ pub async fn local_reblogged_by_for_status(
 
 /// List locally known accounts that favourited a local or cached-remote status, newest first.
 pub async fn favourited_by_for_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     target: StatusInteractionTarget,
     limit: u64,
     cursor: CollectionCursor,
 ) -> Result<CollectionPage<StatusInteractionAccount>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let mut entries = Vec::new();
     match target {
         StatusInteractionTarget::Local(status_id) => {
@@ -16217,14 +16144,14 @@ pub async fn favourited_by_for_status(
                 .apply_collection_cursor(cursor)
                 .order_by_desc(local_status_favourite::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             let remote = remote_status_favourite::Entity::find()
                 .filter(remote_status_favourite::Column::LocalStatusId.eq(status_id.0))
                 .apply_collection_cursor(cursor)
                 .order_by_desc(remote_status_favourite::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             entries.extend(local.into_iter().map(|favourite| {
                 (
@@ -16245,7 +16172,7 @@ pub async fn favourited_by_for_status(
                 .apply_collection_cursor(cursor)
                 .order_by_desc(local_remote_status_favourite::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             entries.extend(local.into_iter().map(|favourite| {
                 (
@@ -16255,21 +16182,17 @@ pub async fn favourited_by_for_status(
             }));
         }
     }
-    let page = interaction_accounts_page(&txn, entries, limit).await?;
-    txn.commit().await?;
+    let page = interaction_accounts_page(db, entries, limit).await?;
     Ok(page)
 }
 
 /// List locally known accounts that boosted a local or cached-remote status, newest first.
 pub async fn reblogged_by_for_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     target: StatusInteractionTarget,
     limit: u64,
     cursor: CollectionCursor,
 ) -> Result<CollectionPage<StatusInteractionAccount>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let mut entries = Vec::new();
     match target {
         StatusInteractionTarget::Local(status_id) => {
@@ -16278,14 +16201,14 @@ pub async fn reblogged_by_for_status(
                 .apply_collection_cursor(cursor)
                 .order_by_desc(local_status_reblog::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             let remote = remote_status_reblog::Entity::find()
                 .filter(remote_status_reblog::Column::LocalStatusId.eq(Some(status_id.0)))
                 .apply_collection_cursor(cursor)
                 .order_by_desc(remote_status_reblog::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             entries.extend(local.into_iter().map(|reblog| {
                 (
@@ -16306,14 +16229,14 @@ pub async fn reblogged_by_for_status(
                 .apply_collection_cursor(cursor)
                 .order_by_desc(local_remote_status_reblog::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             let remote = remote_status_reblog::Entity::find()
                 .filter(remote_status_reblog::Column::RemoteStatusId.eq(Some(status_id.0)))
                 .apply_collection_cursor(cursor)
                 .order_by_desc(remote_status_reblog::Column::Id)
                 .limit(page_query_limit(limit))
-                .all(&txn)
+                .all(db)
                 .await?;
             entries.extend(local.into_iter().map(|reblog| {
                 (
@@ -16329,8 +16252,7 @@ pub async fn reblogged_by_for_status(
             }));
         }
     }
-    let page = interaction_accounts_page(&txn, entries, limit).await?;
-    txn.commit().await?;
+    let page = interaction_accounts_page(db, entries, limit).await?;
     Ok(page)
 }
 
@@ -16392,7 +16314,7 @@ async fn interaction_accounts_page(
 
 /// List local boost rows for an original status.
 pub async fn local_reblogs_for_status(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Vec<LocalStatusReblog>> {
     let reblogs = local_status_reblog::Entity::find()
@@ -16421,7 +16343,7 @@ pub async fn find_local_reblog_by_id(
 
 /// Load active local statuses for ordered status identifiers.
 async fn active_statuses_by_id(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     status_ids: Vec<StatusId>,
 ) -> Result<Vec<LocalStatus>> {
     let mut statuses = Vec::with_capacity(status_ids.len());
@@ -16551,7 +16473,7 @@ pub async fn public_timeline(
 
 /// List public statuses with Mastodon-compatible origin and media filters.
 pub async fn public_timeline_with_options(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     limit: u64,
     cursor: TimelineCursor,
     options: PublicTimelineOptions,
@@ -16813,7 +16735,7 @@ pub async fn local_statuses_by_account(
 
 /// List the locally cached public or unlisted statuses on a remote actor profile.
 pub async fn remote_statuses_by_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     viewer: Option<AccountId>,
     limit: u64,
@@ -17325,7 +17247,7 @@ pub async fn remove_local_list_accounts(
 
 /// Return the mixed local and cached-remote timeline for an owned list.
 pub async fn local_list_timeline(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     owner_id: AccountId,
     list_id: Uuid,
     limit: u64,
@@ -17578,7 +17500,7 @@ pub async fn local_list_timeline(
 
 /// List statuses authored by the account and followed local accounts.
 pub async fn home_timeline_for_account(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     limit: u64,
     cursor: TimelineCursor,
@@ -19233,13 +19155,10 @@ pub async fn insert_admin_audit_entry(
 
 /// Return recent audit events in stable UUIDv7 cursor order.
 pub async fn list_admin_audit_entries(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     limit: u64,
     max_id: Option<Uuid>,
 ) -> Result<Vec<AdminAuditEntry>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let mut query = entity::admin_audit_log::Entity::find()
         .order_by_desc(entity::admin_audit_log::Column::Id)
         .limit(limit.min(100));
@@ -19247,12 +19166,11 @@ pub async fn list_admin_audit_entries(
         query = query.filter(entity::admin_audit_log::Column::Id.lt(max_id));
     }
     let entries = query
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(admin_audit_entry_from_model)
         .collect();
-    txn.commit().await?;
     Ok(entries)
 }
 
@@ -19270,11 +19188,8 @@ fn admin_audit_entry_from_model(model: entity::admin_audit_log::Model) -> AdminA
 }
 
 /// Summarize durable work from shared database state.
-pub async fn admin_job_summary(db: &DbConnection) -> Result<AdminJobSummary> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let row = txn
+pub async fn admin_job_summary(db: &impl ConnectionTrait) -> Result<AdminJobSummary> {
+    let row = db
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
             r#"
@@ -19311,19 +19226,15 @@ pub async fn admin_job_summary(db: &DbConnection) -> Result<AdminJobSummary> {
             .map_err(|_| DbErr::Type("negative permanent failure count".to_owned()))?,
         oldest_due_at: row.try_get("", "oldest_due_at")?,
     };
-    txn.commit().await?;
     Ok(summary)
 }
 
 /// List current and recently permanently failed jobs without exposing payloads.
 pub async fn admin_job_diagnostics(
-    db: &DbConnection,
+    db: &impl ConnectionTrait,
     limit: u64,
     max_id: Option<Uuid>,
 ) -> Result<Vec<AdminJobDiagnostic>> {
-    let txn = db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
     let mut query = entity::job::Entity::find()
         .filter(
             Condition::any()
@@ -19336,7 +19247,7 @@ pub async fn admin_job_diagnostics(
         query = query.filter(entity::job::Column::Id.lt(max_id));
     }
     let diagnostics = query
-        .all(&txn)
+        .all(db)
         .await?
         .into_iter()
         .map(|model| {
@@ -19358,7 +19269,6 @@ pub async fn admin_job_diagnostics(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    txn.commit().await?;
     Ok(diagnostics)
 }
 
@@ -19404,10 +19314,7 @@ pub async fn enqueue_job(
 ///
 /// The job is rolled back with the enclosing domain mutation, preventing a
 /// delivery from observing state that was never committed.
-pub async fn enqueue_job_in_transaction(
-    txn: &sea_orm::DatabaseTransaction,
-    job: NewJob,
-) -> Result<JobId> {
+pub async fn enqueue_job_in_transaction(txn: &impl ConnectionTrait, job: NewJob) -> Result<JobId> {
     enqueue_job_on_connection(txn, job).await
 }
 

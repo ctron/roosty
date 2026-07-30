@@ -1,18 +1,21 @@
 //! Administrator authorization, APIs, and transactional account operations.
 
+use std::borrow::Cow;
+
 use axum::{
-    Form, Json, Router,
+    Extension, Form, Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderValue, StatusCode, header, header::InvalidHeaderValue},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use roosty_core::{AccountId, RoostyError};
 use roosty_db::{
     AdminAccount, AdminAuditAction, AdminAuditEntry, AdminAuditSource, AdminAuditTargetKind,
-    DbConnection, JobKind, ReportAccount,
+    AdminJobDiagnostic, AdminJobSummary, DbConnection, DomainBlockSeverity, FederationDomainBlock,
+    FederationDomainBlockUpdate, JobKind, NewFederationDomainBlock, NewJob, ReportAccount,
 };
-use sea_orm::{DatabaseTransaction, TransactionTrait};
+use sea_orm::{DatabaseTransaction, DbErr, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -21,9 +24,60 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    auth::AuthenticatedAccessToken, federation::enqueue_actor_delete_in_transaction,
-    http::AppState, password,
+    auth::AuthenticatedAccessToken,
+    federation::enqueue_actor_delete_in_transaction,
+    http::{AppState, DatabaseContext},
+    password,
 };
+
+type AdminResult<T> = Result<T, AdminApiError>;
+
+#[derive(Debug, Error)]
+enum AdminApiError {
+    #[error(transparent)]
+    Authorization(#[from] AdminAuthorizationError),
+    #[error("{0}")]
+    NotFound(Cow<'static, str>),
+    #[error("{0}")]
+    Forbidden(Cow<'static, str>),
+    #[error("{0}")]
+    Unprocessable(Cow<'static, str>),
+    #[error(transparent)]
+    Internal(RoostyError),
+}
+
+impl From<RoostyError> for AdminApiError {
+    fn from(error: RoostyError) -> Self {
+        match error {
+            RoostyError::InvalidInput(reason) => Self::Unprocessable(Cow::Owned(reason)),
+            error => Self::Internal(error),
+        }
+    }
+}
+
+impl From<DbErr> for AdminApiError {
+    fn from(error: DbErr) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl From<InvalidHeaderValue> for AdminApiError {
+    fn from(error: InvalidHeaderValue) -> Self {
+        Self::Internal(RoostyError::Configuration(error.to_string()))
+    }
+}
+
+impl IntoResponse for AdminApiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Authorization(error) => error.into_response(),
+            Self::NotFound(reason) => api_error(StatusCode::NOT_FOUND, &reason),
+            Self::Forbidden(reason) => api_error(StatusCode::FORBIDDEN, &reason),
+            Self::Unprocessable(reason) => api_error(StatusCode::UNPROCESSABLE_ENTITY, &reason),
+            Self::Internal(error) => server_error(error),
+        }
+    }
+}
 
 /// Mount Mastodon-compatible and Roosty-specific administrator routes.
 pub fn router() -> Router<AppState> {
@@ -95,20 +149,32 @@ pub(crate) async fn create_local_account(
     email: &str,
     is_admin: bool,
 ) -> Result<TemporaryCredential, RoostyError> {
+    let txn = db.begin().await?;
+    let credential =
+        create_local_account_in_transaction(&txn, actor, source, username, email, is_admin).await?;
+    txn.commit().await?;
+    Ok(credential)
+}
+
+pub(crate) async fn create_local_account_in_transaction(
+    txn: &DatabaseTransaction,
+    actor: Option<AccountId>,
+    source: AdminSource,
+    username: &str,
+    email: &str,
+    is_admin: bool,
+) -> Result<TemporaryCredential, RoostyError> {
     validate_username(username)?;
     validate_email(email)?;
     let temporary_password = password::generate_temporary_password();
     let password_hash = password::hash_password(&temporary_password)?;
-    let txn = db.begin().await?;
     let id = if is_admin {
-        roosty_db::create_admin_account_in_transaction(&txn, username, email, &password_hash)
-            .await?
+        roosty_db::create_admin_account_in_transaction(txn, username, email, &password_hash).await?
     } else {
-        roosty_db::create_local_account_in_transaction(&txn, username, email, &password_hash)
-            .await?
+        roosty_db::create_local_account_in_transaction(txn, username, email, &password_hash).await?
     };
     roosty_db::insert_admin_audit_entry(
-        &txn,
+        txn,
         actor,
         source.audit_source(),
         AdminAuditAction::AccountCreate,
@@ -117,10 +183,9 @@ pub(crate) async fn create_local_account(
         json!({ "username": username, "is_admin": is_admin }),
     )
     .await?;
-    let account = roosty_db::find_admin_account_by_id(&txn, AccountId(id))
+    let account = roosty_db::find_admin_account_by_id(txn, AccountId(id))
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("created account was not found".to_owned()))?;
-    txn.commit().await?;
     Ok(TemporaryCredential {
         account,
         temporary_password,
@@ -133,14 +198,25 @@ pub(crate) async fn reset_local_password(
     source: AdminSource,
     account_id: AccountId,
 ) -> Result<TemporaryCredential, RoostyError> {
+    let txn = db.begin().await?;
+    let credential = reset_local_password_in_transaction(&txn, actor, source, account_id).await?;
+    txn.commit().await?;
+    Ok(credential)
+}
+
+pub(crate) async fn reset_local_password_in_transaction(
+    txn: &DatabaseTransaction,
+    actor: Option<AccountId>,
+    source: AdminSource,
+    account_id: AccountId,
+) -> Result<TemporaryCredential, RoostyError> {
     let temporary_password = password::generate_temporary_password();
     let password_hash = password::hash_password(&temporary_password)?;
-    let txn = db.begin().await?;
     let account =
-        roosty_db::update_local_account_password_hash_by_id(&txn, account_id, &password_hash)
+        roosty_db::update_local_account_password_hash_by_id(txn, account_id, &password_hash)
             .await?;
     roosty_db::insert_admin_audit_entry(
-        &txn,
+        txn,
         actor,
         source.audit_source(),
         AdminAuditAction::AccountResetPassword,
@@ -149,10 +225,9 @@ pub(crate) async fn reset_local_password(
         json!({ "username": account.username }),
     )
     .await?;
-    let account = roosty_db::find_admin_account_by_id(&txn, account.id)
+    let account = roosty_db::find_admin_account_by_id(txn, account.id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("reset account was not found".to_owned()))?;
-    txn.commit().await?;
     Ok(TemporaryCredential {
         account,
         temporary_password,
@@ -160,12 +235,12 @@ pub(crate) async fn reset_local_password(
 }
 
 pub(crate) async fn set_account_limited(
-    db: &roosty_db::DbConnection,
+    db: &DbConnection,
     actor: Option<AccountId>,
     source: AdminSource,
     account_id: AccountId,
     limited: bool,
-) -> Result<roosty_db::AdminAccount, RoostyError> {
+) -> Result<AdminAccount, RoostyError> {
     let txn = db.begin().await?;
     let account =
         set_account_limited_in_transaction(&txn, actor, source, account_id, limited).await?;
@@ -173,13 +248,13 @@ pub(crate) async fn set_account_limited(
     Ok(account)
 }
 
-async fn set_account_limited_in_transaction(
+pub(crate) async fn set_account_limited_in_transaction(
     txn: &DatabaseTransaction,
     actor: Option<AccountId>,
     source: AdminSource,
     account_id: AccountId,
     limited: bool,
-) -> Result<roosty_db::AdminAccount, RoostyError> {
+) -> Result<AdminAccount, RoostyError> {
     let existing = roosty_db::find_admin_account_by_id(txn, account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))?;
@@ -214,12 +289,13 @@ async fn set_account_limited_in_transaction(
 
 pub(crate) async fn set_account_suspended(
     state: &AppState,
+    database: &DatabaseContext,
     actor: AccountId,
     source: AdminSource,
     account_id: AccountId,
     suspended: bool,
-) -> Result<roosty_db::AdminAccount, RoostyError> {
-    let txn = state.db.begin().await?;
+) -> Result<AdminAccount, RoostyError> {
+    let txn = database.begin_write().await?;
     let account =
         set_account_suspended_in_transaction(state, &txn, actor, source, account_id, suspended)
             .await?;
@@ -227,14 +303,14 @@ pub(crate) async fn set_account_suspended(
     Ok(account)
 }
 
-async fn set_account_suspended_in_transaction(
+pub(crate) async fn set_account_suspended_in_transaction(
     state: &AppState,
     txn: &DatabaseTransaction,
     actor: AccountId,
     source: AdminSource,
     account_id: AccountId,
     suspended: bool,
-) -> Result<roosty_db::AdminAccount, RoostyError> {
+) -> Result<AdminAccount, RoostyError> {
     if suspended && actor == account_id {
         return Err(RoostyError::InvalidInput(
             "administrators cannot suspend themselves".to_owned(),
@@ -378,7 +454,7 @@ struct DomainBlockPath {
 struct CreateDomainBlock {
     domain: String,
     #[serde(default = "default_domain_block_severity")]
-    severity: roosty_db::DomainBlockSeverity,
+    severity: DomainBlockSeverity,
     #[serde(default)]
     reject_media: bool,
     #[serde(default)]
@@ -389,13 +465,13 @@ struct CreateDomainBlock {
     obfuscate: bool,
 }
 
-fn default_domain_block_severity() -> roosty_db::DomainBlockSeverity {
-    roosty_db::DomainBlockSeverity::Silence
+fn default_domain_block_severity() -> DomainBlockSeverity {
+    DomainBlockSeverity::Silence
 }
 
 #[derive(Default, Deserialize)]
 struct UpdateDomainBlock {
-    severity: Option<roosty_db::DomainBlockSeverity>,
+    severity: Option<DomainBlockSeverity>,
     reject_media: Option<bool>,
     reject_reports: Option<bool>,
     private_comment: Option<String>,
@@ -409,7 +485,7 @@ struct DomainBlockResponse {
     domain: String,
     digest: String,
     created_at: String,
-    severity: roosty_db::DomainBlockSeverity,
+    severity: DomainBlockSeverity,
     reject_media: bool,
     reject_reports: bool,
     private_comment: Option<String>,
@@ -417,8 +493,8 @@ struct DomainBlockResponse {
     obfuscate: bool,
 }
 
-impl From<roosty_db::FederationDomainBlock> for DomainBlockResponse {
-    fn from(block: roosty_db::FederationDomainBlock) -> Self {
+impl From<FederationDomainBlock> for DomainBlockResponse {
+    fn from(block: FederationDomainBlock) -> Self {
         let digest = format!("{:x}", Sha256::digest(block.domain.as_bytes()));
         Self {
             id: block.id.to_string(),
@@ -437,88 +513,74 @@ impl From<roosty_db::FederationDomainBlock> for DomainBlockResponse {
 
 async fn domain_blocks(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Query(params): Query<DomainBlockQuery>,
-) -> Response {
-    if let Err(error) = require_admin(
+) -> AdminResult<Response> {
+    require_admin(
         &token,
         AdminPermission::Read(AdminReadPermission::DomainBlocks),
-    ) {
-        return error.into_response();
-    }
+    )?;
     let limit = params.limit.unwrap_or(100).clamp(1, 200);
-    match roosty_db::list_federation_domain_blocks(
-        &state.db,
-        limit.saturating_add(1),
-        params.max_id,
+    let txn = database.begin_snapshot().await?;
+    let mut blocks =
+        roosty_db::list_federation_domain_blocks(&txn, limit.saturating_add(1), params.max_id)
+            .await?;
+    let has_more = blocks.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    blocks.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let next = has_more
+        .then(|| blocks.last().map(|block| block.id))
+        .flatten();
+    let mut response = Json(
+        blocks
+            .into_iter()
+            .map(DomainBlockResponse::from)
+            .collect::<Vec<_>>(),
     )
-    .await
-    {
-        Ok(mut blocks) => {
-            let has_more = blocks.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-            blocks.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            let next = has_more
-                .then(|| blocks.last().map(|block| block.id))
-                .flatten();
-            let mut response = Json(
-                blocks
-                    .into_iter()
-                    .map(DomainBlockResponse::from)
-                    .collect::<Vec<_>>(),
-            )
-            .into_response();
-            if let Some(next) = next {
-                let link = format!(
-                    "<{}/api/v1/admin/domain_blocks?limit={limit}&max_id={next}>; rel=\"next\"",
-                    state.config.public_base_url.as_str().trim_end_matches('/')
-                );
-                if let Ok(value) = HeaderValue::from_str(&link) {
-                    response.headers_mut().insert(header::LINK, value);
-                }
-            }
-            response
-        }
-        Err(error) => server_error(error),
+    .into_response();
+    if let Some(next) = next {
+        let link = format!(
+            "<{}/api/v1/admin/domain_blocks?limit={limit}&max_id={next}>; rel=\"next\"",
+            state.config.public_base_url.as_str().trim_end_matches('/')
+        );
+        response
+            .headers_mut()
+            .insert(header::LINK, HeaderValue::from_str(&link)?);
     }
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn domain_block(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<DomainBlockPath>,
-) -> Response {
-    if let Err(error) = require_admin(
+) -> AdminResult<Response> {
+    require_admin(
         &token,
         AdminPermission::Read(AdminReadPermission::DomainBlocks),
-    ) {
-        return error.into_response();
-    }
-    match roosty_db::find_federation_domain_block(&state.db, path.domain_block_id).await {
-        Ok(Some(block)) => Json(DomainBlockResponse::from(block)).into_response(),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => server_error(error),
-    }
+    )?;
+    let txn = database.begin_read().await?;
+    let block = roosty_db::find_federation_domain_block(&txn, path.domain_block_id)
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+    txn.commit().await?;
+    Ok(Json(DomainBlockResponse::from(block)).into_response())
 }
 
 async fn create_domain_block(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Form(input): Form<CreateDomainBlock>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::DomainBlocks),
-    ) {
-        Ok(actor) => actor,
-        Err(error) => return error.into_response(),
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let block = match roosty_db::create_federation_domain_block(
+    )?;
+    let txn = database.begin_write().await?;
+    let block = roosty_db::create_federation_domain_block(
         &txn,
-        roosty_db::NewFederationDomainBlock {
+        NewFederationDomainBlock {
             domain: input.domain,
             severity: input.severity,
             reject_media: input.reject_media,
@@ -528,44 +590,28 @@ async fn create_domain_block(
             obfuscate: input.obfuscate,
         },
     )
-    .await
-    {
-        Ok(block) => block,
-        Err(RoostyError::InvalidInput(reason)) => {
-            return api_error(StatusCode::UNPROCESSABLE_ENTITY, &reason);
-        }
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = audit_domain_block(&txn, actor, "domain_block.create", &block).await {
-        return server_error(error);
-    }
-    if let Err(error) = enqueue_domain_reconciliation(&txn, &block).await {
-        return server_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Json(DomainBlockResponse::from(block)).into_response(),
-        Err(error) => server_error(error.into()),
-    }
+    .await?;
+    audit_domain_block(&txn, actor, "domain_block.create", &block).await?;
+    enqueue_domain_reconciliation(&txn, &block).await?;
+    txn.commit().await?;
+    Ok(Json(DomainBlockResponse::from(block)).into_response())
 }
 
 async fn update_domain_block(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<DomainBlockPath>,
     Form(input): Form<UpdateDomainBlock>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::DomainBlocks),
-    ) {
-        Ok(actor) => actor,
-        Err(error) => return error.into_response(),
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let update = roosty_db::FederationDomainBlockUpdate {
+    )?;
+    let txn = database.begin_write().await?;
+    roosty_db::find_federation_domain_block(&txn, path.domain_block_id)
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+    let update = FederationDomainBlockUpdate {
         severity: input.severity,
         reject_media: input.reject_media,
         reject_reports: input.reject_reports,
@@ -574,60 +620,36 @@ async fn update_domain_block(
         obfuscate: input.obfuscate,
     };
     let block =
-        match roosty_db::update_federation_domain_block(&txn, path.domain_block_id, update).await {
-            Ok(block) => block,
-            Err(RoostyError::InvalidInput(_)) => {
-                return api_error(StatusCode::NOT_FOUND, "Record not found");
-            }
-            Err(error) => return server_error(error),
-        };
-    if let Err(error) = audit_domain_block(&txn, actor, "domain_block.update", &block).await {
-        return server_error(error);
-    }
-    if let Err(error) = enqueue_domain_reconciliation(&txn, &block).await {
-        return server_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Json(DomainBlockResponse::from(block)).into_response(),
-        Err(error) => server_error(error.into()),
-    }
+        roosty_db::update_federation_domain_block(&txn, path.domain_block_id, update).await?;
+    audit_domain_block(&txn, actor, "domain_block.update", &block).await?;
+    enqueue_domain_reconciliation(&txn, &block).await?;
+    txn.commit().await?;
+    Ok(Json(DomainBlockResponse::from(block)).into_response())
 }
 
 async fn delete_domain_block(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<DomainBlockPath>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::DomainBlocks),
-    ) {
-        Ok(actor) => actor,
-        Err(error) => return error.into_response(),
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let block = match roosty_db::delete_federation_domain_block(&txn, path.domain_block_id).await {
-        Ok(Some(block)) => block,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = audit_domain_block(&txn, actor, "domain_block.delete", &block).await {
-        return server_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Json(json!({})).into_response(),
-        Err(error) => server_error(error.into()),
-    }
+    )?;
+    let txn = database.begin_write().await?;
+    let block = roosty_db::delete_federation_domain_block(&txn, path.domain_block_id)
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+    audit_domain_block(&txn, actor, "domain_block.delete", &block).await?;
+    txn.commit().await?;
+    Ok(Json(json!({})).into_response())
 }
 
 async fn audit_domain_block(
     txn: &DatabaseTransaction,
     actor: AccountId,
     action: &str,
-    block: &roosty_db::FederationDomainBlock,
+    block: &FederationDomainBlock,
 ) -> Result<(), RoostyError> {
     roosty_db::insert_admin_audit_entry(
         txn,
@@ -648,11 +670,11 @@ async fn audit_domain_block(
 
 async fn enqueue_domain_reconciliation(
     txn: &DatabaseTransaction,
-    block: &roosty_db::FederationDomainBlock,
+    block: &FederationDomainBlock,
 ) -> Result<(), RoostyError> {
     roosty_db::enqueue_job_in_transaction(
         txn,
-        roosty_db::NewJob {
+        NewJob {
             kind: JobKind::DomainModerationReconcile,
             payload: json!({"domain_block_id": block.id}),
             deduplication_key: Some(format!("domain-moderation:{}", block.id)),
@@ -677,19 +699,16 @@ struct AccountQuery {
 
 async fn accounts(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Query(params): Query<AccountQuery>,
-) -> Response {
-    if let Err(response) =
-        require_admin(&token, AdminPermission::Read(AdminReadPermission::Accounts))
-    {
-        return response.into_response();
-    }
+) -> AdminResult<Response> {
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::Accounts))?;
     let (limited, suspended) = match params.status.as_deref() {
         Some("silenced") => (Some(true), None),
         Some("suspended") => (None, Some(true)),
         Some("active") => (Some(false), Some(false)),
-        Some(_) => return Json(Vec::<AdminAccountResponse>::new()).into_response(),
+        Some(_) => return Ok(Json(Vec::<AdminAccountResponse>::new()).into_response()),
         None => (None, None),
     };
     let query = [
@@ -703,8 +722,9 @@ async fn accounts(
     .find(|value| !value.trim().is_empty())
     .unwrap_or_default();
     let limit = params.limit.unwrap_or(40).clamp(1, 100);
-    match roosty_db::list_admin_accounts(
-        &state.db,
+    let txn = database.begin_snapshot().await?;
+    let mut accounts = roosty_db::list_admin_accounts(
+        &txn,
         &query,
         params.origin.as_deref(),
         limited,
@@ -712,50 +732,43 @@ async fn accounts(
         limit.saturating_add(1),
         params.max_id,
     )
-    .await
-    {
-        Ok(mut accounts) => {
-            let page_len = usize::try_from(limit).unwrap_or(usize::MAX);
-            let has_more = accounts.len() > page_len;
-            accounts.truncate(page_len);
-            let next = has_more
-                .then(|| accounts.last().map(|account| account.id.0))
-                .flatten();
-            let body = accounts
-                .into_iter()
-                .map(AdminAccountResponse::from)
-                .collect::<Vec<_>>();
-            let mut response = Json(body).into_response();
-            if let Some(next) = next {
-                let link = format!(
-                    "<{}/api/v2/admin/accounts?limit={limit}&max_id={next}>; rel=\"next\"",
-                    state.config.public_base_url.as_str().trim_end_matches('/')
-                );
-                if let Ok(value) = HeaderValue::from_str(&link) {
-                    response.headers_mut().insert(header::LINK, value);
-                }
-            }
-            response
-        }
-        Err(error) => server_error(error),
+    .await?;
+    let page_len = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_more = accounts.len() > page_len;
+    accounts.truncate(page_len);
+    let next = has_more
+        .then(|| accounts.last().map(|account| account.id.0))
+        .flatten();
+    let body = accounts
+        .into_iter()
+        .map(AdminAccountResponse::from)
+        .collect::<Vec<_>>();
+    let mut response = Json(body).into_response();
+    if let Some(next) = next {
+        let link = format!(
+            "<{}/api/v2/admin/accounts?limit={limit}&max_id={next}>; rel=\"next\"",
+            state.config.public_base_url.as_str().trim_end_matches('/')
+        );
+        response
+            .headers_mut()
+            .insert(header::LINK, HeaderValue::from_str(&link)?);
     }
+    txn.commit().await?;
+    Ok(response)
 }
 
 async fn account(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(account_id): Path<Uuid>,
-) -> Response {
-    if let Err(response) =
-        require_admin(&token, AdminPermission::Read(AdminReadPermission::Accounts))
-    {
-        return response.into_response();
-    }
-    match roosty_db::find_admin_account_by_id(&state.db, AccountId(account_id)).await {
-        Ok(Some(account)) => Json(AdminAccountResponse::from(account)).into_response(),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => server_error(error),
-    }
+) -> AdminResult<Response> {
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::Accounts))?;
+    let txn = database.begin_read().await?;
+    let account = roosty_db::find_admin_account_by_id(&txn, AccountId(account_id))
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+    txn.commit().await?;
+    Ok(Json(AdminAccountResponse::from(account)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -767,20 +780,19 @@ struct AccountAction {
 
 async fn account_action(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(account_id): Path<Uuid>,
     Form(action): Form<AccountAction>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::Accounts),
-    ) {
-        Ok(actor) => actor,
-        Err(response) => return response.into_response(),
-    };
+    )?;
     if let Some(report_id) = action.report_id {
         return account_action_for_report(
             &state,
+            &database,
             actor,
             AccountId(account_id),
             report_id,
@@ -789,70 +801,59 @@ async fn account_action(
         .await;
     }
     match action.action_type.as_str() {
-        "silence" => match set_account_limited(
-            &state.db,
-            Some(actor),
-            AdminSource::Api,
-            AccountId(account_id),
-            true,
-        )
-        .await
-        {
-            Ok(_) => StatusCode::OK.into_response(),
-            Err(RoostyError::InvalidInput(_)) => {
-                api_error(StatusCode::NOT_FOUND, "Record not found")
-            }
-            Err(error) => server_error(error),
-        },
-        "suspend" => match set_account_suspended(
-            &state,
-            actor,
-            AdminSource::Api,
-            AccountId(account_id),
-            true,
-        )
-        .await
-        {
-            Ok(_) => Json(json!({})).into_response(),
-            Err(RoostyError::InvalidInput(reason)) => {
-                api_error(StatusCode::UNPROCESSABLE_ENTITY, &reason)
-            }
-            Err(error) => server_error(error),
-        },
-        "none" => Json(json!({})).into_response(),
-        _ => api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Only none, silence, and suspend actions are supported",
-        ),
+        "silence" => {
+            let txn = database.begin_write().await?;
+            set_account_limited_in_transaction(
+                &txn,
+                Some(actor),
+                AdminSource::Api,
+                AccountId(account_id),
+                true,
+            )
+            .await?;
+            txn.commit().await?;
+            Ok(StatusCode::OK.into_response())
+        }
+        "suspend" => {
+            set_account_suspended(
+                &state,
+                &database,
+                actor,
+                AdminSource::Api,
+                AccountId(account_id),
+                true,
+            )
+            .await?;
+            Ok(Json(json!({})).into_response())
+        }
+        "none" => Ok(Json(json!({})).into_response()),
+        _ => Err(AdminApiError::Unprocessable(
+            "Only none, silence, and suspend actions are supported".into(),
+        )),
     }
 }
 
 async fn account_action_for_report(
     state: &AppState,
+    database: &DatabaseContext,
     actor: AccountId,
     account_id: AccountId,
     report_id: Uuid,
     action_type: &str,
-) -> Response {
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let report = match roosty_db::find_moderation_report(&txn, report_id).await {
-        Ok(Some(report)) => report,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => return server_error(error),
-    };
+) -> AdminResult<Response> {
+    let txn = database.begin_write().await?;
+    let report = roosty_db::find_moderation_report(&txn, report_id)
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
     let target_id = match report.target {
         ReportAccount::Local(id) | ReportAccount::Remote(id) => id,
     };
     if target_id != account_id {
-        return api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Report target does not match account",
-        );
+        return Err(AdminApiError::Unprocessable(
+            "Report target does not match account".into(),
+        ));
     }
-    let action = match action_type {
+    match action_type {
         "silence" => {
             set_account_limited_in_transaction(
                 &txn,
@@ -861,7 +862,7 @@ async fn account_action_for_report(
                 account_id,
                 true,
             )
-            .await
+            .await?;
         }
         "suspend" => {
             set_account_suspended_in_transaction(
@@ -872,35 +873,21 @@ async fn account_action_for_report(
                 account_id,
                 true,
             )
-            .await
+            .await?;
         }
-        "none" => roosty_db::find_admin_account_by_id(&txn, account_id)
-            .await
-            .and_then(|account| {
-                account
-                    .ok_or_else(|| RoostyError::InvalidInput("account does not exist".to_owned()))
-            }),
+        "none" => {
+            roosty_db::find_admin_account_by_id(&txn, account_id)
+                .await?
+                .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+        }
         _ => {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "Only none, silence, and suspend actions are supported",
-            );
+            return Err(AdminApiError::Unprocessable(
+                "Only none, silence, and suspend actions are supported".into(),
+            ));
         }
-    };
-    if let Err(error) = action {
-        return match error {
-            RoostyError::InvalidInput(reason) => {
-                api_error(StatusCode::UNPROCESSABLE_ENTITY, &reason)
-            }
-            error => server_error(error),
-        };
     }
-    if let Err(error) =
-        roosty_db::set_moderation_report_resolved(&txn, report_id, Some(actor)).await
-    {
-        return server_error(error);
-    }
-    if let Err(error) = roosty_db::insert_admin_audit_entry(
+    roosty_db::set_moderation_report_resolved(&txn, report_id, Some(actor)).await?;
+    roosty_db::insert_admin_audit_entry(
         &txn,
         Some(actor),
         AdminSource::Api.audit_source(),
@@ -909,78 +896,57 @@ async fn account_action_for_report(
         &report_id.to_string(),
         json!({"account_id": account_id.0, "action": action_type}),
     )
-    .await
-    {
-        return server_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Json(json!({})).into_response(),
-        Err(error) => server_error(error.into()),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Json(json!({})).into_response())
 }
 
 async fn unsuspend_account(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(account_id): Path<Uuid>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::Accounts),
-    ) {
-        Ok(actor) => actor,
-        Err(error) => return error.into_response(),
-    };
-    match set_account_suspended(
+    )?;
+    let account = set_account_suspended(
         &state,
+        &database,
         actor,
         AdminSource::Api,
         AccountId(account_id),
         false,
     )
-    .await
-    {
-        Ok(account) => Json(AdminAccountResponse::from(account)).into_response(),
-        Err(RoostyError::InvalidInput(_)) => api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => server_error(error),
-    }
+    .await?;
+    Ok(Json(AdminAccountResponse::from(account)).into_response())
 }
 
 async fn delete_suspended_account(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(account_id): Path<Uuid>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::Accounts),
-    ) {
-        Ok(actor) => actor,
-        Err(error) => return error.into_response(),
-    };
+    )?;
     let account_id = AccountId(account_id);
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let Some(account) = (match roosty_db::find_admin_account_by_id(&txn, account_id).await {
-        Ok(account) => account,
-        Err(error) => return server_error(error),
-    }) else {
-        return api_error(StatusCode::NOT_FOUND, "Record not found");
-    };
+    let txn = database.begin_write().await?;
+    let account = roosty_db::find_admin_account_by_id(&txn, account_id)
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
     if !account.suspended {
-        return api_error(StatusCode::FORBIDDEN, "Account is not suspended");
+        return Err(AdminApiError::Forbidden("Account is not suspended".into()));
     }
     let paths = if account.domain.is_none() {
-        match roosty_db::purge_suspended_local_account(&txn, account_id).await {
-            Ok(paths) => paths,
-            Err(error) => return server_error(error),
-        }
+        roosty_db::purge_suspended_local_account(&txn, account_id).await?
     } else {
         Vec::new()
     };
-    if let Err(error) = roosty_db::insert_admin_audit_entry(
+    roosty_db::insert_admin_audit_entry(
         &txn,
         Some(actor),
         AdminSource::Api.audit_source(),
@@ -993,35 +959,30 @@ async fn delete_suspended_account(
         &account_id.0.to_string(),
         json!({"username": account.username, "domain": account.domain}),
     )
-    .await
-    {
-        return server_error(error);
-    }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
+    .await?;
+    txn.commit().await?;
     for path in paths {
-        let _ =
-            tokio::fs::remove_file(std::path::Path::new(&state.config.media_root).join(path)).await;
+        tokio::fs::remove_file(std::path::Path::new(&state.config.media_root).join(path))
+            .await
+            .ok();
     }
-    match roosty_db::find_admin_account_by_id(&state.db, account_id).await {
-        Ok(Some(account)) => Json(AdminAccountResponse::from(account)).into_response(),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => server_error(error),
-    }
+    let txn = database.begin_read().await?;
+    let account = roosty_db::find_admin_account_by_id(&txn, account_id)
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+    txn.commit().await?;
+    Ok(Json(AdminAccountResponse::from(account)).into_response())
 }
 
 async fn operations_summary(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
-) -> Response {
-    if let Err(response) = require_admin(&token, AdminPermission::Read(AdminReadPermission::All)) {
-        return response.into_response();
-    }
-    match roosty_db::admin_job_summary(&state.db).await {
-        Ok(summary) => Json(OperationSummaryResponse::from(summary)).into_response(),
-        Err(error) => server_error(error),
-    }
+) -> AdminResult<Response> {
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::All))?;
+    let txn = database.begin_snapshot().await?;
+    let summary = roosty_db::admin_job_summary(&txn).await?;
+    txn.commit().await?;
+    Ok(Json(OperationSummaryResponse::from(summary)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1031,54 +992,48 @@ struct PageQuery {
 }
 
 async fn jobs(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Query(params): Query<PageQuery>,
-) -> Response {
-    if let Err(response) = require_admin(&token, AdminPermission::Read(AdminReadPermission::All)) {
-        return response.into_response();
-    }
-    match roosty_db::admin_job_diagnostics(
-        &state.db,
+) -> AdminResult<Response> {
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::All))?;
+    let txn = database.begin_snapshot().await?;
+    let jobs = roosty_db::admin_job_diagnostics(
+        &txn,
         params.limit.unwrap_or(40).clamp(1, 100),
         params.max_id,
     )
-    .await
-    {
-        Ok(jobs) => Json(
-            jobs.into_iter()
-                .map(AdminJobResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => server_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Json(
+        jobs.into_iter()
+            .map(AdminJobResponse::from)
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
 }
 
 async fn audit_log(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Query(params): Query<PageQuery>,
-) -> Response {
-    if let Err(response) = require_admin(&token, AdminPermission::Read(AdminReadPermission::All)) {
-        return response.into_response();
-    }
-    match roosty_db::list_admin_audit_entries(
-        &state.db,
+) -> AdminResult<Response> {
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::All))?;
+    let txn = database.begin_snapshot().await?;
+    let entries = roosty_db::list_admin_audit_entries(
+        &txn,
         params.limit.unwrap_or(40).clamp(1, 100),
         params.max_id,
     )
-    .await
-    {
-        Ok(entries) => Json(
-            entries
-                .into_iter()
-                .map(AdminAuditResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => server_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Json(
+        entries
+            .into_iter()
+            .map(AdminAuditResponse::from)
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -1090,63 +1045,54 @@ struct CreateAccountRequest {
 }
 
 async fn create_account(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Json(request): Json<CreateAccountRequest>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::Accounts),
-    ) {
-        Ok(actor) => actor,
-        Err(response) => return response.into_response(),
-    };
-    match create_local_account(
-        &state.db,
+    )?;
+    let txn = database.begin_write().await?;
+    let result = create_local_account_in_transaction(
+        &txn,
         Some(actor),
         AdminSource::Api,
         &request.username,
         &request.email,
         request.admin,
     )
-    .await
-    {
-        Ok(result) => (
-            StatusCode::CREATED,
-            Json(TemporaryCredentialResponse::from(result)),
-        )
-            .into_response(),
-        Err(RoostyError::InvalidInput(reason)) => {
-            api_error(StatusCode::UNPROCESSABLE_ENTITY, &reason)
-        }
-        Err(error) => server_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(TemporaryCredentialResponse::from(result)),
+    )
+        .into_response())
 }
 
 async fn reset_password(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(account_id): Path<Uuid>,
-) -> Response {
-    let actor = match require_admin(
+) -> AdminResult<Response> {
+    let actor = require_admin(
         &token,
         AdminPermission::Write(AdminWritePermission::Accounts),
-    ) {
-        Ok(actor) => actor,
-        Err(response) => return response.into_response(),
-    };
-    match reset_local_password(
-        &state.db,
+    )?;
+    let txn = database.begin_write().await?;
+    roosty_db::find_admin_account_by_id(&txn, AccountId(account_id))
+        .await?
+        .ok_or(AdminApiError::NotFound("Record not found".into()))?;
+    let result = reset_local_password_in_transaction(
+        &txn,
         Some(actor),
         AdminSource::Api,
         AccountId(account_id),
     )
-    .await
-    {
-        Ok(result) => Json(TemporaryCredentialResponse::from(result)).into_response(),
-        Err(RoostyError::InvalidInput(_)) => api_error(StatusCode::NOT_FOUND, "Record not found"),
-        Err(error) => server_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Json(TemporaryCredentialResponse::from(result)).into_response())
 }
 
 #[derive(Serialize)]
@@ -1170,8 +1116,8 @@ pub(crate) struct AdminAccountResponse {
     account: Value,
 }
 
-impl From<roosty_db::AdminAccount> for AdminAccountResponse {
-    fn from(account: roosty_db::AdminAccount) -> Self {
+impl From<AdminAccount> for AdminAccountResponse {
+    fn from(account: AdminAccount) -> Self {
         let acct = account.domain.as_ref().map_or_else(
             || account.username.clone(),
             |domain| format!("{}@{domain}", account.username),
@@ -1241,8 +1187,8 @@ struct OperationSummaryResponse {
     oldest_due_at: Option<String>,
 }
 
-impl From<roosty_db::AdminJobSummary> for OperationSummaryResponse {
-    fn from(summary: roosty_db::AdminJobSummary) -> Self {
+impl From<AdminJobSummary> for OperationSummaryResponse {
+    fn from(summary: AdminJobSummary) -> Self {
         Self {
             due: summary.due,
             in_progress: summary.in_progress,
@@ -1267,8 +1213,8 @@ struct AdminJobResponse {
     permanently_failed_at: Option<String>,
 }
 
-impl From<roosty_db::AdminJobDiagnostic> for AdminJobResponse {
-    fn from(job: roosty_db::AdminJobDiagnostic) -> Self {
+impl From<AdminJobDiagnostic> for AdminJobResponse {
+    fn from(job: AdminJobDiagnostic) -> Self {
         let state = if job.permanently_failed_at.is_some() {
             "permanently_failed"
         } else if job.locked_at.is_some() {

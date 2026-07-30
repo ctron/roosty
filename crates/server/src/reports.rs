@@ -1,11 +1,11 @@
 //! Mastodon-compatible client and administrator report APIs.
 
 use axum::{
-    Form, Json, Router,
+    Extension, Form, Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderValue, StatusCode, header, header::InvalidHeaderValue},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
@@ -20,10 +20,11 @@ use roosty_db::{
     reorder_instance_rules as reorder_instance_rule_records, set_moderation_report_resolved,
     update_instance_rule as update_instance_rule_record, update_moderation_report,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, DbErr};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{borrow::Cow, collections::HashSet, str::FromStr};
+use strum::ParseError;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -31,12 +32,12 @@ use uuid::Uuid;
 use crate::{
     accounts::{RemoteAccountResponse, remote_account_response},
     admin::{
-        AdminAccountResponse, AdminPermission, AdminReadPermission, AdminWritePermission,
-        require_admin,
+        AdminAccountResponse, AdminAuthorizationError, AdminPermission, AdminReadPermission,
+        AdminWritePermission, require_admin,
     },
     auth::{AccountResponse, AuthenticatedAccessToken, account_response},
     federation,
-    http::AppState,
+    http::{AppState, DatabaseContext, TransactionContext},
     notifications::publish_committed_notification,
     statuses::{
         StatusResponse, delete_reported_status, remote_status_response_for_viewer,
@@ -81,7 +82,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/roosty/v1/admin/reports/{report_id}/statuses/{status_id}",
-            axum::routing::delete(delete_report_status),
+            delete(delete_report_status),
         )
 }
 
@@ -136,12 +137,57 @@ enum ReportApiError {
     #[error("Record not found")]
     NotFound,
     #[error(transparent)]
-    Internal(#[from] RoostyError),
+    Internal(RoostyError),
 }
 
-impl From<sea_orm::DbErr> for ReportApiError {
-    fn from(error: sea_orm::DbErr) -> Self {
+impl From<RoostyError> for ReportApiError {
+    fn from(error: RoostyError) -> Self {
+        match error {
+            RoostyError::InvalidInput(reason) => Self::InvalidInput(Cow::Owned(reason)),
+            error => Self::Internal(error),
+        }
+    }
+}
+
+impl From<DbErr> for ReportApiError {
+    fn from(error: DbErr) -> Self {
         Self::Internal(error.into())
+    }
+}
+
+impl From<AdminAuthorizationError> for ReportApiError {
+    fn from(error: AdminAuthorizationError) -> Self {
+        Self::Forbidden(Cow::Owned(error.to_string()))
+    }
+}
+
+impl From<InvalidHeaderValue> for ReportApiError {
+    fn from(error: InvalidHeaderValue) -> Self {
+        Self::Internal(RoostyError::Configuration(error.to_string()))
+    }
+}
+
+impl From<String> for ReportApiError {
+    fn from(reason: String) -> Self {
+        Self::InvalidInput(Cow::Owned(reason))
+    }
+}
+
+#[derive(Debug, Eq, Error, PartialEq)]
+#[error("category must be spam, legal, violation, or other")]
+struct InvalidReportCategory;
+
+impl From<ParseError> for InvalidReportCategory {
+    fn from(_: ParseError) -> Self {
+        Self
+    }
+}
+
+impl From<InvalidReportCategory> for ReportApiError {
+    fn from(_: InvalidReportCategory) -> Self {
+        Self::InvalidInput(Cow::Borrowed(
+            "category must be spam, legal, violation, or other",
+        ))
     }
 }
 
@@ -163,15 +209,9 @@ impl IntoResponse for ReportApiError {
     }
 }
 
-fn report_error(error: RoostyError) -> ReportApiError {
-    match error {
-        RoostyError::InvalidInput(reason) => ReportApiError::InvalidInput(Cow::Owned(reason)),
-        error => ReportApiError::Internal(error),
-    }
-}
-
 async fn create_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Form(form): Form<CreateReportForm>,
 ) -> ReportApiResult<Response> {
@@ -190,7 +230,7 @@ async fn create_report(
             "Comment is too long (maximum is 1000 characters)",
         )));
     }
-    let txn = state.begin_write().await?;
+    let txn = database.begin_write().await?;
     let target = report_target(&txn, AccountId(form.account_id))
         .await?
         .ok_or(ReportApiError::InvalidInput(Cow::Borrowed(
@@ -201,11 +241,9 @@ async fn create_report(
             "You cannot report your own account",
         )));
     }
-    let statuses = validate_report_statuses(&txn, token.grant.account.id, target, &form.status_ids)
-        .await
-        .map_err(report_error)?;
-    let category = report_category(form.category.as_deref(), !form.rule_ids.is_empty())
-        .map_err(|reason| ReportApiError::InvalidInput(Cow::Owned(reason)))?;
+    let statuses =
+        validate_report_statuses(&txn, token.grant.account.id, target, &form.status_ids).await?;
+    let category = report_category(form.category.as_deref(), !form.rule_ids.is_empty())?;
     let delivery = if form.forward {
         match target {
             ReportAccount::Remote(remote_actor_id) => Some(
@@ -217,8 +255,7 @@ async fn create_report(
                     &statuses,
                     &form.comment,
                 )
-                .await
-                .map_err(report_error)?,
+                .await?,
             ),
             ReportAccount::Local(_) => None,
         }
@@ -238,19 +275,19 @@ async fn create_report(
             rule_ids: form.rule_ids,
         },
     )
-    .await
-    .map_err(report_error)?;
+    .await?;
     let notifications = notify_administrators_of_report(&txn, &report).await?;
     if let Some(job) = delivery {
-        enqueue_job_in_transaction(&txn, job)
-            .await
-            .map_err(report_error)?;
+        enqueue_job_in_transaction(&txn, job).await?;
     }
+    let context = TransactionContext::new(&state, &txn);
+    let response = client_report_response(&context, report).await?;
     txn.commit().await?;
     for notification in notifications {
-        publish_committed_notification(&state, notification.account_id, notification).await?;
+        publish_committed_notification(&state, &database, notification.account_id, notification)
+            .await?;
     }
-    Ok(Json(client_report_response(&state, report).await?).into_response())
+    Ok(Json(response).into_response())
 }
 
 #[derive(Default, Deserialize)]
@@ -266,14 +303,16 @@ struct AdminReportQuery {
 
 async fn admin_reports(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Query(query): Query<AdminReportQuery>,
 ) -> ReportApiResult<Response> {
-    require_admin(&token, AdminPermission::Read(AdminReadPermission::Reports))
-        .map_err(|error| ReportApiError::Forbidden(Cow::Owned(error.to_string())))?;
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::Reports))?;
     let limit = query.limit.unwrap_or(40).clamp(1, 200);
+    let txn = database.begin_snapshot().await?;
+    let context = TransactionContext::new(&state, &txn);
     let reports = list_moderation_reports(
-        &state.db,
+        &txn,
         ReportListOptions {
             resolved: query.resolved,
             source_account_id: query.account_id.map(AccountId),
@@ -292,7 +331,7 @@ async fn admin_reports(
         .flatten();
     let mut body = Vec::with_capacity(reports.len());
     for report in reports {
-        body.push(admin_report_response(&state, report, token.grant.account.id).await?);
+        body.push(admin_report_response(&context, report, token.grant.account.id).await?);
     }
     let mut response = Json(body).into_response();
     if let Some(next) = next {
@@ -300,21 +339,22 @@ async fn admin_reports(
             "<{}/api/v1/admin/reports?limit={limit}&max_id={next}>; rel=\"next\"",
             state.config.public_base_url.as_str().trim_end_matches('/')
         );
-        if let Ok(value) = HeaderValue::from_str(&link) {
-            response.headers_mut().insert(header::LINK, value);
-        }
+        response
+            .headers_mut()
+            .insert(header::LINK, HeaderValue::from_str(&link)?);
     }
+    txn.commit().await?;
     Ok(response)
 }
 
 async fn admin_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(report_id): Path<Uuid>,
 ) -> ReportApiResult<Response> {
-    require_admin(&token, AdminPermission::Read(AdminReadPermission::Reports))
-        .map_err(|error| ReportApiError::Forbidden(Cow::Owned(error.to_string())))?;
-    admin_report_by_id(&state, report_id, token.grant.account.id).await
+    require_admin(&token, AdminPermission::Read(AdminReadPermission::Reports))?;
+    admin_report_by_id(&state, &database, report_id, token.grant.account.id).await
 }
 
 #[derive(Deserialize)]
@@ -326,17 +366,16 @@ struct UpdateAdminReportForm {
 
 async fn update_admin_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(report_id): Path<Uuid>,
     Form(form): Form<UpdateAdminReportForm>,
 ) -> ReportApiResult<Response> {
     let actor = report_admin(&token, true)?;
-    let category = report_category(form.category.as_deref(), !form.rule_ids.is_empty())
-        .map_err(|reason| ReportApiError::InvalidInput(Cow::Owned(reason)))?;
-    let txn = state.db.begin().await?;
+    let category = report_category(form.category.as_deref(), !form.rule_ids.is_empty())?;
+    let txn = database.begin_write().await?;
     let report = update_moderation_report(&txn, report_id, category, &form.rule_ids)
-        .await
-        .map_err(report_error)?
+        .await?
         .ok_or(ReportApiError::NotFound)?;
     audit_report(
         &txn,
@@ -351,44 +390,49 @@ async fn update_admin_report(
 
 async fn assign_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(report_id): Path<Uuid>,
 ) -> ReportApiResult<Response> {
-    mutate_assignment(&state, &token, report_id, true).await
+    mutate_assignment(&state, &database, &token, report_id, true).await
 }
 
 async fn unassign_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(report_id): Path<Uuid>,
 ) -> ReportApiResult<Response> {
-    mutate_assignment(&state, &token, report_id, false).await
+    mutate_assignment(&state, &database, &token, report_id, false).await
 }
 
 async fn resolve_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(report_id): Path<Uuid>,
 ) -> ReportApiResult<Response> {
-    mutate_resolution(&state, &token, report_id, true).await
+    mutate_resolution(&state, &database, &token, report_id, true).await
 }
 
 async fn reopen_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(report_id): Path<Uuid>,
 ) -> ReportApiResult<Response> {
-    mutate_resolution(&state, &token, report_id, false).await
+    mutate_resolution(&state, &database, &token, report_id, false).await
 }
 
 async fn mutate_assignment(
     state: &AppState,
+    database: &DatabaseContext,
     token: &AuthenticatedAccessToken,
     report_id: Uuid,
     assign: bool,
 ) -> ReportApiResult<Response> {
     let actor = report_admin(token, true)?;
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let report = assign_moderation_report(&txn, report_id, assign.then_some(actor))
         .await?
         .ok_or(ReportApiError::NotFound)?;
@@ -409,15 +453,15 @@ async fn mutate_assignment(
 
 async fn mutate_resolution(
     state: &AppState,
+    database: &DatabaseContext,
     token: &AuthenticatedAccessToken,
     report_id: Uuid,
     resolve: bool,
 ) -> ReportApiResult<Response> {
     let actor = report_admin(token, true)?;
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let report = set_moderation_report_resolved(&txn, report_id, resolve.then_some(actor))
-        .await
-        .map_err(report_error)?
+        .await?
         .ok_or(ReportApiError::NotFound)?;
     audit_report(
         &txn,
@@ -440,8 +484,11 @@ async fn commit_and_project(
     report: ModerationReport,
     viewer: AccountId,
 ) -> ReportApiResult<Response> {
+    let context = TransactionContext::new(state, &txn);
+    let response = admin_report_response(&context, report, viewer).await?;
+    drop(context);
     txn.commit().await?;
-    Ok(Json(admin_report_response(state, report, viewer).await?).into_response())
+    Ok(Json(response).into_response())
 }
 
 #[derive(Serialize)]
@@ -481,16 +528,15 @@ impl From<InstanceRule> for AdminRuleResponse {
 }
 
 async fn admin_instance_rules(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
 ) -> ReportApiResult<Json<Vec<AdminRuleResponse>>> {
     report_admin(&token, false)?;
+    let txn = database.begin_snapshot().await?;
+    let rules = list_instance_rules(&txn).await?;
+    txn.commit().await?;
     Ok(Json(
-        list_instance_rules(&state.db)
-            .await?
-            .into_iter()
-            .map(AdminRuleResponse::from)
-            .collect(),
+        rules.into_iter().map(AdminRuleResponse::from).collect(),
     ))
 }
 
@@ -500,31 +546,28 @@ struct RuleForm {
 }
 
 async fn create_instance_rule(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Form(form): Form<RuleForm>,
 ) -> ReportApiResult<Json<AdminRuleResponse>> {
     let actor = report_admin(&token, true)?;
-    let txn = state.db.begin().await?;
-    let rule = create_instance_rule_record(&txn, &form.text)
-        .await
-        .map_err(report_error)?;
+    let txn = database.begin_write().await?;
+    let rule = create_instance_rule_record(&txn, &form.text).await?;
     audit_rule(&txn, actor, AdminAuditAction::InstanceRuleCreate, &rule).await?;
     txn.commit().await?;
     Ok(Json(rule.into()))
 }
 
 async fn update_instance_rule(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(rule_id): Path<Uuid>,
     Form(form): Form<RuleForm>,
 ) -> ReportApiResult<Json<AdminRuleResponse>> {
     let actor = report_admin(&token, true)?;
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let rule = update_instance_rule_record(&txn, rule_id, &form.text)
-        .await
-        .map_err(report_error)?
+        .await?
         .ok_or(ReportApiError::NotFound)?;
     audit_rule(&txn, actor, AdminAuditAction::InstanceRuleUpdate, &rule).await?;
     txn.commit().await?;
@@ -532,12 +575,12 @@ async fn update_instance_rule(
 }
 
 async fn delete_instance_rule(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(rule_id): Path<Uuid>,
 ) -> ReportApiResult<Json<AdminRuleResponse>> {
     let actor = report_admin(&token, true)?;
-    let txn = state.db.begin().await?;
+    let txn = database.begin_write().await?;
     let rule = discard_instance_rule(&txn, rule_id)
         .await?
         .ok_or(ReportApiError::NotFound)?;
@@ -553,15 +596,13 @@ struct ReorderRulesForm {
 }
 
 async fn reorder_instance_rules(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Form(form): Form<ReorderRulesForm>,
 ) -> ReportApiResult<Json<Vec<AdminRuleResponse>>> {
     let actor = report_admin(&token, true)?;
-    let txn = state.db.begin().await?;
-    let rules = reorder_instance_rule_records(&txn, &form.rule_ids)
-        .await
-        .map_err(report_error)?;
+    let txn = database.begin_write().await?;
+    let rules = reorder_instance_rule_records(&txn, &form.rule_ids).await?;
     insert_admin_audit_entry(
         &txn,
         Some(actor),
@@ -602,7 +643,7 @@ async fn audit_report(
     actor: AccountId,
     action: AdminAuditAction,
     report_id: Uuid,
-    metadata: serde_json::Value,
+    metadata: Value,
 ) -> Result<(), RoostyError> {
     insert_admin_audit_entry(
         txn,
@@ -619,11 +660,13 @@ async fn audit_report(
 
 async fn delete_report_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path((report_id, status_id)): Path<(Uuid, Uuid)>,
 ) -> ReportApiResult<StatusCode> {
     let actor = report_admin(&token, true)?;
-    let report = find_moderation_report(&state.db, report_id)
+    let txn = database.begin_write().await?;
+    let report = find_moderation_report(&txn, report_id)
         .await?
         .ok_or(ReportApiError::NotFound)?;
     let reference = report
@@ -633,10 +676,10 @@ async fn delete_report_status(
             ReportStatus::Local(id) | ReportStatus::Remote(id) => id.0 == status_id,
         })
         .ok_or(ReportApiError::NotFound)?;
-    if !delete_reported_status(&state, reference).await? {
+    let context = TransactionContext::new(&state, &txn);
+    if !delete_reported_status(&context, reference).await? {
         return Err(ReportApiError::NotFound);
     }
-    let txn = state.db.begin().await?;
     insert_admin_audit_entry(
         &txn,
         Some(actor),
@@ -653,17 +696,22 @@ async fn delete_report_status(
 
 async fn admin_report_by_id(
     state: &AppState,
+    database: &DatabaseContext,
     id: Uuid,
     viewer: AccountId,
 ) -> ReportApiResult<Response> {
-    let report = find_moderation_report(&state.db, id)
+    let txn = database.begin_snapshot().await?;
+    let report = find_moderation_report(&txn, id)
         .await?
         .ok_or(ReportApiError::NotFound)?;
-    Ok(Json(admin_report_response(state, report, viewer).await?).into_response())
+    let context = TransactionContext::new(state, &txn);
+    let response = admin_report_response(&context, report, viewer).await?;
+    txn.commit().await?;
+    Ok(Json(response).into_response())
 }
 
 async fn admin_report_response(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     report: ModerationReport,
     viewer: AccountId,
 ) -> Result<AdminReportResponse, RoostyError> {
@@ -681,9 +729,9 @@ async fn admin_report_response(
     for reference in &report.statuses {
         match reference {
             ReportStatus::Local(id) => {
-                if let Some(status) = find_local_status_by_id(&state.db, *id).await?
+                if let Some(status) = find_local_status_by_id(state.db, *id).await?
                     && let Some(author) =
-                        find_local_account_by_id(&state.db, status.account_id).await?
+                        find_local_account_by_id(state.db, status.account_id).await?
                 {
                     statuses.push(
                         status_response_for_viewer(state, status, author, Some(viewer)).await?,
@@ -691,7 +739,7 @@ async fn admin_report_response(
                 }
             }
             ReportStatus::Remote(id) => {
-                if let Some(status) = find_remote_status_by_id(&state.db, *id).await? {
+                if let Some(status) = find_remote_status_by_id(state.db, *id).await? {
                     statuses.push(
                         remote_status_response_for_viewer(state, status, Some(viewer)).await?,
                     );
@@ -725,20 +773,22 @@ async fn admin_report_response(
 }
 
 async fn client_report_response(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     report: ModerationReport,
 ) -> Result<ReportResponse, RoostyError> {
     let target_account = match report.target {
         ReportAccount::Local(id) => {
-            let account = find_local_account_by_id(&state.db, id)
+            let account = find_local_account_by_id(state.db, id)
                 .await?
                 .ok_or_else(|| {
                     RoostyError::InvalidInput("report target was not found".to_owned())
                 })?;
-            ClientAccountResponse::Local(Box::new(account_response(state, account).await?))
+            ClientAccountResponse::Local(Box::new(
+                account_response(state, state.db, account).await?,
+            ))
         }
         ReportAccount::Remote(id) => {
-            let actor = find_remote_actor_by_id(&state.db, id)
+            let actor = find_remote_actor_by_id(state.db, id)
                 .await?
                 .ok_or_else(|| {
                     RoostyError::InvalidInput("report target was not found".to_owned())
@@ -830,26 +880,30 @@ async fn validate_report_statuses(
 }
 
 async fn admin_account(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     account: ReportAccount,
 ) -> Result<AdminAccountResponse, RoostyError> {
     let id = match account {
         ReportAccount::Local(id) | ReportAccount::Remote(id) => id,
     };
-    find_admin_account_by_id(&state.db, id)
+    find_admin_account_by_id(state.db, id)
         .await?
         .map(AdminAccountResponse::from)
         .ok_or_else(|| RoostyError::InvalidInput("report account was not found".to_owned()))
 }
 
-fn report_category(value: Option<&str>, has_rules: bool) -> Result<ReportCategory, String> {
+fn report_category(
+    value: Option<&str>,
+    has_rules: bool,
+) -> Result<ReportCategory, InvalidReportCategory> {
     if has_rules {
         return Ok(ReportCategory::Violation);
     }
-    value.map_or(Ok(ReportCategory::Other), |value| {
-        ReportCategory::from_str(value)
-            .map_err(|_| "category must be spam, legal, violation, or other".to_owned())
-    })
+    if let Some(value) = value {
+        Ok(ReportCategory::from_str(value)?)
+    } else {
+        Ok(ReportCategory::Other)
+    }
 }
 
 fn report_admin(token: &AuthenticatedAccessToken, write: bool) -> ReportApiResult<AccountId> {
@@ -858,8 +912,7 @@ fn report_admin(token: &AuthenticatedAccessToken, write: bool) -> ReportApiResul
     } else {
         AdminPermission::Read(AdminReadPermission::Reports)
     };
-    require_admin(token, permission)
-        .map_err(|error| ReportApiError::Forbidden(Cow::Owned(error.to_string())))
+    Ok(require_admin(token, permission)?)
 }
 
 fn has_scope(token: &AuthenticatedAccessToken, broad: &str, specific: &str) -> bool {

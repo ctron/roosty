@@ -1,14 +1,14 @@
 //! Mastodon-compatible private list management and list timelines.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::to_bytes,
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header},
+    http::header,
     response::{IntoResponse, Response},
     routing::get,
 };
-use roosty_core::{AccountId, RoostyError, StatusId};
+use roosty_core::{AccountId, StatusId};
 use roosty_db::{AddListAccountsResult, ListRepliesPolicy, LocalList};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,8 +16,8 @@ use uuid::Uuid;
 use crate::{
     accounts::{RemoteAccountResponse, remote_account_response_on},
     auth::{AccountResponse, AuthenticatedAccount, account_response_on},
-    http::AppState,
-    statuses::{CollectionLink, home_timeline_response, timeline_limit},
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
+    statuses::{CollectionLink, StatusRenderContext, home_timeline_response, timeline_limit},
 };
 
 const DEFAULT_ACCOUNT_LIMIT: u64 = 40;
@@ -96,117 +96,72 @@ enum ListAccountResponse {
     Remote(Box<RemoteAccountResponse>),
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
 async fn index(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let result = roosty_db::local_lists_for_account(&txn, account.id).await;
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match result {
-        Ok(lists) => Json(
-            lists
-                .into_iter()
-                .map(ListResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Json<Vec<ListResponse>>> {
+    let txn = database.begin_read().await?;
+    let lists = roosty_db::local_lists_for_account(&txn, account.id).await?;
+    txn.commit().await?;
+    Ok(Json(lists.into_iter().map(ListResponse::from).collect()))
 }
 
 async fn show(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
-) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let result = roosty_db::find_owned_local_list(&txn, account.id, path.list_id).await;
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match result {
-        Ok(Some(list)) => Json(ListResponse::from(list)).into_response(),
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Json<ListResponse>> {
+    let txn = database.begin_read().await?;
+    let list = roosty_db::find_owned_local_list(&txn, account.id, path.list_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    txn.commit().await?;
+    Ok(Json(ListResponse::from(list)))
 }
 
 async fn create(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     request: Request,
-) -> Response {
-    let input: ListInput = match parse_input(request).await {
-        Ok(input) => input,
-        Err(error) => return unprocessable(&error),
-    };
-    let title = match validate_title(input.title.as_deref()) {
-        Ok(title) => title,
-        Err(error) => return unprocessable(error),
-    };
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let list = match roosty_db::create_local_list(
+) -> ApiResult<Json<ListResponse>> {
+    let input: ListInput = parse_input(request)
+        .await
+        .map_err(|error| ApiError::Unprocessable(error.into()))?;
+    let title = validate_title(input.title.as_deref())
+        .map_err(|error| ApiError::Unprocessable(error.into()))?;
+    let txn = database.begin_write().await?;
+    let list = roosty_db::create_local_list(
         &txn,
         account.id,
         title,
         input.replies_policy.unwrap_or(ListRepliesPolicy::List),
         input.exclusive.unwrap_or(false),
     )
-    .await
-    {
-        Ok(list) => list,
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    Json(ListResponse::from(list)).into_response()
+    .await?;
+    txn.commit().await?;
+    Ok(Json(ListResponse::from(list)))
 }
 
 async fn update(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
     request: Request,
-) -> Response {
-    let input: ListInput = match parse_input(request).await {
-        Ok(input) => input,
-        Err(error) => return unprocessable(&error),
-    };
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let current = match roosty_db::find_owned_local_list(&txn, account.id, path.list_id).await {
-        Ok(Some(list)) => list,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
+) -> ApiResult<Json<ListResponse>> {
+    let input: ListInput = parse_input(request)
+        .await
+        .map_err(|error| ApiError::Unprocessable(error.into()))?;
+    let txn = database.begin_write().await?;
+    let current = roosty_db::find_owned_local_list(&txn, account.id, path.list_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
     let title = match input.title.as_deref() {
-        Some(title) => match validate_title(Some(title)) {
-            Ok(title) => title.to_owned(),
-            Err(error) => return unprocessable(error),
-        },
+        Some(title) => validate_title(Some(title))
+            .map_err(|error| ApiError::Unprocessable(error.into()))?
+            .to_owned(),
         None => current.title,
     };
-    let result = match roosty_db::update_local_list(
+    let list = roosty_db::update_local_list(
         &txn,
         account.id,
         path.list_id,
@@ -214,79 +169,47 @@ async fn update(
         input.replies_policy.unwrap_or(current.replies_policy),
         input.exclusive.unwrap_or(current.exclusive),
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match result {
-        Some(list) => Json(ListResponse::from(list)).into_response(),
-        None => not_found(),
-    }
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    txn.commit().await?;
+    Ok(Json(ListResponse::from(list)))
 }
 
 async fn destroy(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
-) -> Response {
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let deleted = match roosty_db::delete_local_list(&txn, account.id, path.list_id).await {
-        Ok(deleted) => deleted,
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
+) -> ApiResult<Json<serde_json::Value>> {
+    let txn = database.begin_write().await?;
+    if !roosty_db::delete_local_list(&txn, account.id, path.list_id).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    match deleted {
-        true => Json(serde_json::json!({})).into_response(),
-        false => not_found(),
-    }
+    txn.commit().await?;
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn account_lists(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
-) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let result =
+) -> ApiResult<Json<Vec<ListResponse>>> {
+    let txn = database.begin_read().await?;
+    let lists =
         roosty_db::local_lists_containing_account(&txn, account.id, AccountId(path.account_id))
-            .await;
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match result {
-        Ok(lists) => Json(
-            lists
-                .into_iter()
-                .map(ListResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => server_error(error),
-    }
+            .await?;
+    txn.commit().await?;
+    Ok(Json(lists.into_iter().map(ListResponse::from).collect()))
 }
 
 async fn accounts(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
     Query(params): Query<CursorParams>,
-) -> Response {
-    let cursor = match collection_cursor(&params) {
-        Ok(cursor) => cursor,
-        Err(()) => return bad_request("collection cursor is invalid"),
-    };
+) -> ApiResult<Response> {
+    let cursor = collection_cursor(&params)
+        .map_err(|()| ApiError::BadRequest("collection cursor is invalid".into()))?;
     let limit = match params.limit {
         Some(0) => None,
         limit => Some(
@@ -295,16 +218,10 @@ async fn accounts(
                 .clamp(1, MAX_ACCOUNT_LIMIT),
         ),
     };
-    let txn = match state.begin_snapshot().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let page =
-        match roosty_db::local_list_accounts(&txn, account.id, path.list_id, limit, cursor).await {
-            Ok(Some(page)) => page,
-            Ok(None) => return not_found(),
-            Err(error) => return server_error(error),
-        };
+    let txn = database.begin_snapshot().await?;
+    let page = roosty_db::local_list_accounts(&txn, account.id, path.list_id, limit, cursor)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
     let link = limit.and_then(|limit| {
         CollectionLink::new(
             limit,
@@ -317,122 +234,106 @@ async fn accounts(
     });
     let mut responses = Vec::with_capacity(page.items.len());
     for member in page.items {
-        let response = match member {
+        responses.push(match member {
             roosty_db::ListAccount::Local(member) => account_response_on(&state, &txn, member)
                 .await
-                .map(|response| ListAccountResponse::Local(Box::new(response))),
+                .map(|response| ListAccountResponse::Local(Box::new(response)))?,
             roosty_db::ListAccount::Remote(member) => {
                 remote_account_response_on(&state, &txn, member)
                     .await
-                    .map(|response| ListAccountResponse::Remote(Box::new(response)))
+                    .map(|response| ListAccountResponse::Remote(Box::new(response)))?
             }
-        };
-        match response {
-            Ok(response) => responses.push(response),
-            Err(error) => return server_error(error),
-        }
+        });
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
+    txn.commit().await?;
     let mut response = Json(responses).into_response();
     if let Some(link) = link {
         response.headers_mut().insert(header::LINK, link);
     }
-    response
+    Ok(response)
 }
 
 async fn add_accounts(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
     request: Request,
-) -> Response {
-    let input = match parse_account_ids(request).await {
-        Ok(input) => input,
-        Err(error) => return unprocessable(&error),
-    };
+) -> ApiResult<Json<serde_json::Value>> {
+    let input = parse_account_ids(request)
+        .await
+        .map_err(|error| ApiError::Unprocessable(error.into()))?;
     if input.account_ids.is_empty() {
-        return unprocessable("account_ids[] must contain at least one account");
+        return Err(ApiError::Unprocessable(
+            "account_ids[] must contain at least one account".into(),
+        ));
     }
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
+    let txn = database.begin_write().await?;
     let ids = input
         .account_ids
         .into_iter()
         .map(AccountId)
         .collect::<Vec<_>>();
-    match roosty_db::add_local_list_accounts(&txn, account.id, path.list_id, &ids).await {
-        Ok(AddListAccountsResult::Added) => match txn.commit().await {
-            Ok(()) => Json(serde_json::json!({})).into_response(),
-            Err(error) => server_error(error.into()),
-        },
-        Ok(AddListAccountsResult::ListNotFound | AddListAccountsResult::AccountNotFollowed) => {
-            not_found()
+    match roosty_db::add_local_list_accounts(&txn, account.id, path.list_id, &ids).await? {
+        AddListAccountsResult::Added => {
+            txn.commit().await?;
+            Ok(Json(serde_json::json!({})))
         }
-        Ok(AddListAccountsResult::AlreadyPresent) => {
-            unprocessable("Validation failed: Account has already been taken")
+        AddListAccountsResult::ListNotFound | AddListAccountsResult::AccountNotFollowed => {
+            Err(ApiError::NotFound("Record not found".into()))
         }
-        Err(error) => server_error(error),
+        AddListAccountsResult::AlreadyPresent => Err(ApiError::Unprocessable(
+            "Validation failed: Account has already been taken".into(),
+        )),
     }
 }
 
 async fn remove_accounts(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
     request: Request,
-) -> Response {
-    let input = match parse_account_ids(request).await {
-        Ok(input) => input,
-        Err(error) => return unprocessable(&error),
-    };
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
+) -> ApiResult<Json<serde_json::Value>> {
+    let input = parse_account_ids(request)
+        .await
+        .map_err(|error| ApiError::Unprocessable(error.into()))?;
+    let txn = database.begin_write().await?;
     let ids = input
         .account_ids
         .into_iter()
         .map(AccountId)
         .collect::<Vec<_>>();
-    match roosty_db::remove_local_list_accounts(&txn, account.id, path.list_id, &ids).await {
-        Ok(true) => match txn.commit().await {
-            Ok(()) => Json(serde_json::json!({})).into_response(),
-            Err(error) => server_error(error.into()),
-        },
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+    if !roosty_db::remove_local_list_accounts(&txn, account.id, path.list_id, &ids).await? {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    txn.commit().await?;
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn timeline(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ListPath>,
     Query(params): Query<CursorParams>,
-) -> Response {
-    let cursor = match timeline_cursor(&params) {
-        Ok(cursor) => cursor,
-        Err(()) => return bad_request("timeline cursor is invalid"),
-    };
+) -> ApiResult<Response> {
+    let cursor = timeline_cursor(&params)
+        .map_err(|()| ApiError::BadRequest("timeline cursor is invalid".into()))?;
     let limit = timeline_limit(params.limit);
-    match roosty_db::local_list_timeline(&state.db, account.id, path.list_id, limit, cursor).await {
-        Ok(Some(page)) => {
-            home_timeline_response(
-                &state,
-                page,
-                limit,
-                &format!("/api/v1/timelines/list/{}", path.list_id),
-                account.id,
-            )
-            .await
-        }
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+    let txn = database.begin_snapshot().await?;
+    let page = roosty_db::local_list_timeline(&txn, account.id, path.list_id, limit, cursor)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let response = home_timeline_response(
+        &context,
+        page,
+        limit,
+        &format!("/api/v1/timelines/list/{}", path.list_id),
+        account.id,
+    )
+    .await;
+    txn.commit().await?;
+    Ok(response)
 }
 
 fn validate_title(title: Option<&str>) -> Result<&str, &'static str> {
@@ -506,46 +407,6 @@ fn parse_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
     value
         .map(|value| Uuid::parse_str(value).map_err(|_| ()))
         .transpose()
-}
-
-fn bad_request(error: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: error.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-fn unprocessable(error: &str) -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(ErrorResponse {
-            error: error.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Record not found".to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-fn server_error(error: RoostyError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

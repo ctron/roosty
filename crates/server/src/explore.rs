@@ -1,23 +1,19 @@
 //! Mastodon-compatible public Explore and trend discovery.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Query, State, rejection::QueryRejection},
-    http::StatusCode,
-    response::{IntoResponse, Response},
     routing::get,
 };
-use roosty_core::RoostyError;
 use roosty_db::{LocalTagHistory, PreviewCard};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
 
 use crate::{
     auth::OptionalAuthenticatedAccount,
-    http::AppState,
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
     media::media_url,
-    statuses::{TagResponse, trending_status_models},
+    statuses::{StatusRenderContext, StatusResponse, TagResponse, trending_status_models},
 };
 
 const DEFAULT_TAG_LIMIT: u64 = 10;
@@ -36,61 +32,54 @@ pub fn router() -> Router<AppState> {
 
 async fn trending_statuses(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     OptionalAuthenticatedAccount(viewer): OptionalAuthenticatedAccount,
     query: Result<Query<TrendParams>, QueryRejection>,
-) -> Response {
-    let Query(params) = match query {
-        Ok(params) => params,
-        Err(_) => return bad_request(),
-    };
+) -> ApiResult<Json<Vec<StatusResponse>>> {
+    let Query(params) =
+        query.map_err(|_| ApiError::BadRequest("Invalid request parameters".into()))?;
     let limit = params
         .limit
         .unwrap_or(DEFAULT_STATUS_LIMIT)
         .clamp(1, MAX_STATUS_LIMIT);
     let offset = params.offset.unwrap_or_default();
     if i64::try_from(offset).is_err() {
-        return bad_request();
+        return Err(ApiError::BadRequest("Invalid request parameters".into()));
     }
 
-    match roosty_db::trending_statuses(&state.db, limit, offset).await {
-        Ok(trends) => {
-            match trending_status_models(&state, trends, viewer.as_ref().map(|account| account.id))
-                .await
-            {
-                Ok(statuses) => Json(statuses).into_response(),
-                Err(error) => server_error(error),
-            }
-        }
-        Err(error) => server_error(error),
-    }
+    let txn = database.begin_snapshot().await?;
+    let trends = roosty_db::trending_statuses(&txn, limit, offset).await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let statuses =
+        trending_status_models(&context, trends, viewer.as_ref().map(|account| account.id)).await?;
+    txn.commit().await?;
+    Ok(Json(statuses))
 }
 
 async fn trending_links(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     query: Result<Query<TrendParams>, QueryRejection>,
-) -> Response {
-    let Query(params) = match query {
-        Ok(params) => params,
-        Err(_) => return bad_request(),
-    };
+) -> ApiResult<Json<Vec<PreviewCardResponse>>> {
+    let Query(params) =
+        query.map_err(|_| ApiError::BadRequest("Invalid request parameters".into()))?;
     let limit = params
         .limit
         .unwrap_or(DEFAULT_TAG_LIMIT)
         .clamp(1, MAX_TAG_LIMIT);
     let offset = params.offset.unwrap_or_default();
     if i64::try_from(offset).is_err() {
-        return bad_request();
+        return Err(ApiError::BadRequest("Invalid request parameters".into()));
     }
-    match roosty_db::trending_links(&state.db, limit, offset).await {
-        Ok(links) => Json(
-            links
-                .into_iter()
-                .map(|link| PreviewCardResponse::new(&state, link.card, Some(link.history)))
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => server_error(error),
-    }
+    let txn = database.begin_snapshot().await?;
+    let links = roosty_db::trending_links(&txn, limit, offset).await?;
+    txn.commit().await?;
+    Ok(Json(
+        links
+            .into_iter()
+            .map(|link| PreviewCardResponse::new(&state, link.card, Some(link.history)))
+            .collect(),
+    ))
 }
 
 /// Mastodon preview-card projection, with optional trend history.
@@ -189,57 +178,29 @@ struct TrendParams {
     offset: Option<u64>,
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: &'static str,
-}
-
 async fn trending_tags(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     query: Result<Query<TrendParams>, QueryRejection>,
-) -> Response {
-    let Query(params) = match query {
-        Ok(params) => params,
-        Err(_) => return bad_request(),
-    };
+) -> ApiResult<Json<Vec<TagResponse>>> {
+    let Query(params) =
+        query.map_err(|_| ApiError::BadRequest("Invalid request parameters".into()))?;
     let limit = params
         .limit
         .unwrap_or(DEFAULT_TAG_LIMIT)
         .clamp(1, MAX_TAG_LIMIT);
     let offset = params.offset.unwrap_or_default();
     if i64::try_from(offset).is_err() {
-        return bad_request();
+        return Err(ApiError::BadRequest("Invalid request parameters".into()));
     }
 
-    match roosty_db::trending_tags(&state.db, limit, offset).await {
-        Ok(trends) => Json(
-            trends
-                .into_iter()
-                .map(|trend| TagResponse::new(&state, trend.tag, trend.history, None))
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => server_error(error),
-    }
-}
-
-fn bad_request() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "Invalid request parameters",
-        }),
-    )
-        .into_response()
-}
-
-fn server_error(error: RoostyError) -> Response {
-    warn!(%error, "trend query failed");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: "Internal server error",
-        }),
-    )
-        .into_response()
+    let txn = database.begin_snapshot().await?;
+    let trends = roosty_db::trending_tags(&txn, limit, offset).await?;
+    txn.commit().await?;
+    Ok(Json(
+        trends
+            .into_iter()
+            .map(|trend| TagResponse::new(&state, trend.tag, trend.history, None))
+            .collect(),
+    ))
 }

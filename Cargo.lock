@@ -4402,6 +4402,7 @@ version = "0.1.0-alpha.3"
 dependencies = [
  "sea-orm",
  "serde",
+ "serde_json",
  "strum 0.27.2",
  "thiserror 2.0.19",
  "time",

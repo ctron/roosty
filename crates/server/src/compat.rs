@@ -1,12 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -20,7 +20,8 @@ use roosty_core::AccountId;
 use crate::{
     auth::{self, AuthenticatedAccount},
     config::StreamingConfig,
-    http::AppState,
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
+    statuses::{StatusRenderContext, TagResponse, tag_response_model},
     streaming::{StreamingEvents, StreamingMetrics},
 };
 
@@ -46,28 +47,18 @@ struct ErrorResponse {
 
 async fn followed_tags(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-) -> Response {
-    let txn = match state.begin_snapshot().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    match roosty_db::followed_local_tags(&txn, account.id).await {
-        Ok(tags) => {
-            let mut response = Vec::with_capacity(tags.len());
-            for tag in tags {
-                match crate::statuses::tag_response_model(&state, &txn, tag, Some(true)).await {
-                    Ok(tag) => response.push(tag),
-                    Err(error) => return server_error(error),
-                }
-            }
-            if let Err(error) = txn.commit().await {
-                return server_error(error.into());
-            }
-            Json(response).into_response()
-        }
-        Err(error) => server_error(error),
+) -> ApiResult<Json<Vec<TagResponse>>> {
+    let txn = database.begin_snapshot().await?;
+    let tags = roosty_db::followed_local_tags(&txn, account.id).await?;
+    let context = StatusRenderContext::new(&state, &txn);
+    let mut response = Vec::with_capacity(tags.len());
+    for tag in tags {
+        response.push(tag_response_model(&context, &txn, tag, Some(true)).await?);
     }
+    txn.commit().await?;
+    Ok(Json(response))
 }
 
 async fn streaming_health() -> &'static str {
@@ -76,59 +67,63 @@ async fn streaming_health() -> &'static str {
 
 async fn streaming_direct(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     websocket: WebSocketUpgrade,
-) -> Response {
-    streaming_response(state, headers, query, websocket, Some("direct".to_owned())).await
+) -> ApiResult<Response> {
+    streaming_response(
+        state,
+        database,
+        headers,
+        query,
+        websocket,
+        Some("direct".to_owned()),
+    )
+    .await
 }
 
 async fn streaming(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     websocket: WebSocketUpgrade,
-) -> Response {
+) -> ApiResult<Response> {
     let stream = query.get("stream").cloned();
-    streaming_response(state, headers, query, websocket, stream).await
+    streaming_response(state, database, headers, query, websocket, stream).await
 }
 
 async fn streaming_response(
     state: AppState,
+    database: DatabaseContext,
     headers: HeaderMap,
     query: HashMap<String, String>,
     websocket: WebSocketUpgrade,
     stream: Option<String>,
-) -> Response {
+) -> ApiResult<Response> {
     let Some(token) = streaming_token(&headers, &query) else {
-        return unauthorized().into_response();
+        return Err(ApiError::Unauthorized("The access token is invalid".into()));
     };
-    let account = match auth::account_from_bearer_token(&state, &token).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
+    let account = auth::account_from_bearer_token(&state, &database, &token).await?;
 
     let permit = match state.streaming_connections.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             state.streaming_events.metrics().connection_rejected();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "Streaming connection limit reached".to_owned(),
-                }),
-            )
-                .into_response();
+            return Err(ApiError::ServiceUnavailable(
+                "Streaming connection limit reached".into(),
+            ));
         }
     };
 
     let events = state.streaming_events.clone();
     let config = state.config.streaming.clone();
-    websocket
+    Ok(websocket
         .on_upgrade(move |socket| {
             handle_streaming_socket(socket, account.id, stream, events, config, permit)
         })
-        .into_response()
+        .into_response())
 }
 
 /// Keep a validated streaming socket open until the client closes it.
@@ -346,25 +341,6 @@ fn websocket_protocol_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn unauthorized() -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(ErrorResponse {
-            error: "The access token is invalid".to_owned(),
-        }),
-    )
-}
-
-fn server_error(error: roosty_core::RoostyError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -393,7 +369,11 @@ mod tests {
     use super::{
         StreamingControlAction, custom_emojis, streaming_token, update_stream_subscription,
     };
-    use crate::{config::Config, http::AppState, password};
+    use crate::{
+        config::Config,
+        http::{AppState, DatabaseContext},
+        password,
+    };
 
     #[test_context(CompatContext)]
     #[tokio::test]
@@ -1493,7 +1473,11 @@ mod tests {
 
     impl CompatContext {
         fn app(&self) -> Router {
-            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+            crate::http::app_router(
+                AppState::new(self.config.clone(), self.db.clone()),
+                DatabaseContext::new(self.db.clone()),
+                false,
+            )
         }
 
         async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {

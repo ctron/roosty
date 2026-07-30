@@ -1,26 +1,27 @@
 use std::collections::HashSet;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::header,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use roosty_core::{AccountId, RoostyError, StatusId};
+use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     accounts::{
-        RemoteAccountResponse, remote_account_response, unresolved_remote_account_response,
+        RemoteAccountResponse, remote_account_response_on, unresolved_remote_account_response,
     },
     auth::{AccountResponse, AuthenticatedAccount, account_response},
-    http::AppState,
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
     statuses::{
-        CollectionLink, StatusResponse, remote_status_response, status_visible_to_viewer,
-        status_with_author,
+        CollectionLink, StatusRenderContext, StatusResponse, remote_status_response,
+        status_visible_to_viewer, status_with_author,
     },
 };
 
@@ -69,68 +70,61 @@ enum ConversationAccountResponse {
     Remote(Box<RemoteAccountResponse>),
 }
 
-#[derive(Serialize)]
-struct ErrorResponse<'a> {
-    error: &'a str,
-    error_description: &'a str,
-}
-
 /// Return direct-message conversations visible to the authenticated account.
 async fn conversations(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Query(params): Query<ConversationParams>,
-) -> Response {
+) -> ApiResult<Response> {
     let limit = conversation_limit(params.limit);
-    let cursor = match collection_cursor(&params) {
-        Ok(cursor) => cursor,
-        Err(()) => return bad_request("conversation cursor is invalid"),
-    };
-
-    match roosty_db::local_conversations_for_account(&state.db, account.id, limit, cursor).await {
-        Ok(page) => conversation_page_response(&state, account.id, page, limit).await,
-        Err(error) => server_error(error),
-    }
+    let cursor = collection_cursor(&params)
+        .map_err(|()| ApiError::BadRequest("conversation cursor is invalid".into()))?;
+    let txn = database.begin_snapshot().await?;
+    let page = roosty_db::local_conversations_for_account(&txn, account.id, limit, cursor).await?;
+    let response = conversation_page_response(&state, &txn, account.id, page, limit).await?;
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Hide one direct-message conversation for the authenticated account.
 async fn delete_conversation(
-    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ConversationPath>,
-) -> Response {
-    match roosty_db::hide_local_conversation(&state.db, account.id, path.conversation_id).await {
-        Ok(true) => Json(json!({})).into_response(),
-        Ok(false) => not_found(),
-        Err(error) => server_error(error),
+) -> ApiResult<Json<serde_json::Value>> {
+    let txn = database.begin_write().await?;
+    if !roosty_db::hide_local_conversation(&txn, account.id, path.conversation_id).await? {
+        return Err(ApiError::NotFound("conversation was not found".into()));
     }
+    txn.commit().await?;
+    Ok(Json(json!({})))
 }
 
 /// Mark one direct-message conversation as read for the authenticated account.
 async fn read_conversation(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<ConversationPath>,
-) -> Response {
-    match roosty_db::mark_local_conversation_read(&state.db, account.id, path.conversation_id).await
-    {
-        Ok(Some(conversation)) => {
-            match conversation_response(&state, account.id, conversation).await {
-                Ok(response) => Json(response).into_response(),
-                Err(error) => server_error(error),
-            }
-        }
-        Ok(None) => not_found(),
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Json<ConversationResponse>> {
+    let txn = database.begin_write().await?;
+    let conversation =
+        roosty_db::mark_local_conversation_read(&txn, account.id, path.conversation_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("conversation was not found".into()))?;
+    let response = conversation_response(&state, &txn, account.id, conversation).await?;
+    txn.commit().await?;
+    Ok(Json(response))
 }
 
 async fn conversation_page_response(
     state: &AppState,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     page: roosty_db::CollectionPage<roosty_db::LocalConversationView>,
     limit: u64,
-) -> Response {
+) -> Result<Response, RoostyError> {
     let link_header = CollectionLink::new(
         limit,
         page.first_cursor,
@@ -141,62 +135,56 @@ async fn conversation_page_response(
     .header_value();
     let mut conversations = Vec::with_capacity(page.items.len());
     for conversation in page.items {
-        if conversation_is_hidden(state, account_id, &conversation.account).await {
+        if conversation_is_hidden(db, account_id, &conversation.account).await? {
             continue;
         }
-        match conversation_response(state, account_id, conversation).await {
-            Ok(response) => conversations.push(response),
-            Err(error) => return server_error(error),
-        }
+        conversations.push(conversation_response(state, db, account_id, conversation).await?);
     }
     let mut response = Json(conversations).into_response();
     if let Some(link_header) = link_header {
         response.headers_mut().insert(header::LINK, link_header);
     }
-    response
+    Ok(response)
 }
 
 async fn conversation_is_hidden(
-    state: &AppState,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     view: &roosty_db::LocalConversationAccount,
-) -> bool {
+) -> Result<bool, RoostyError> {
     let Some(status_id) = view.last_remote_status_id else {
-        return false;
+        return Ok(false);
     };
-    let Ok(Some(status)) = roosty_db::find_remote_status_by_id(&state.db, status_id).await else {
-        return false;
+    let Some(status) = roosty_db::find_remote_status_by_id(db, status_id).await? else {
+        return Ok(false);
     };
-    if roosty_db::remote_account_is_hidden_for_viewer(&state.db, account_id, status.remote_actor_id)
-        .await
-        .unwrap_or(true)
+    if roosty_db::remote_account_is_hidden_for_viewer(db, account_id, status.remote_actor_id)
+        .await?
     {
-        return true;
+        return Ok(true);
     }
-    let Ok(Some(actor)) =
-        roosty_db::find_remote_actor_by_id(&state.db, status.remote_actor_id).await
-    else {
-        return true;
+    let Some(actor) = roosty_db::find_remote_actor_by_id(db, status.remote_actor_id).await? else {
+        return Ok(true);
     };
-    actor.suspended_at.is_some()
-        || roosty_db::federation_domain_policy(&state.db, &actor.domain)
-            .await
-            .map(|policy| policy.is_suspended())
-            .unwrap_or(true)
+    Ok(actor.suspended_at.is_some()
+        || roosty_db::federation_domain_policy(db, &actor.domain)
+            .await?
+            .is_suspended())
 }
 
 async fn conversation_response(
     state: &AppState,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     view: roosty_db::LocalConversationView,
 ) -> Result<ConversationResponse, RoostyError> {
-    let accounts = conversation_accounts(state, account_id, &view.account).await?;
+    let accounts = conversation_accounts(state, db, account_id, &view.account).await?;
     let last_status = match (
         view.account.last_status_id,
         view.account.last_remote_status_id,
     ) {
-        (Some(status_id), None) => conversation_status(state, account_id, status_id).await?,
-        (None, Some(status_id)) => remote_conversation_status(state, status_id).await?,
+        (Some(status_id), None) => conversation_status(state, db, account_id, status_id).await?,
+        (None, Some(status_id)) => remote_conversation_status(state, db, status_id).await?,
         _ => None,
     };
 
@@ -211,11 +199,12 @@ async fn conversation_response(
 /// Publish updated conversation payloads to each local participant's direct stream.
 pub(crate) async fn publish_conversation_update(
     state: &AppState,
+    db: &impl ConnectionTrait,
     conversation_id: Uuid,
 ) -> Result<(), RoostyError> {
-    for view in roosty_db::local_conversation_views(&state.db, conversation_id).await? {
+    for view in roosty_db::local_conversation_views(db, conversation_id).await? {
         let account_id = view.account.account_id;
-        let response = conversation_response(state, account_id, view).await?;
+        let response = conversation_response(state, db, account_id, view).await?;
         state
             .streaming_events
             .publish_conversation(&response, account_id);
@@ -227,14 +216,15 @@ pub(crate) async fn publish_conversation_update(
 /// Publish only recipient views whose latest visible direct status changed.
 pub(crate) async fn publish_conversation_updates(
     state: &AppState,
+    db: &impl ConnectionTrait,
     conversation_id: Uuid,
     account_ids: &[AccountId],
 ) -> Result<(), RoostyError> {
     let account_ids = account_ids.iter().copied().collect::<HashSet<_>>();
-    for view in roosty_db::local_conversation_views(&state.db, conversation_id).await? {
+    for view in roosty_db::local_conversation_views(db, conversation_id).await? {
         let account_id = view.account.account_id;
         if account_ids.contains(&account_id) {
-            let response = conversation_response(state, account_id, view).await?;
+            let response = conversation_response(state, db, account_id, view).await?;
             state
                 .streaming_events
                 .publish_conversation(&response, account_id);
@@ -246,40 +236,41 @@ pub(crate) async fn publish_conversation_updates(
 
 async fn conversation_accounts(
     state: &AppState,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     view: &roosty_db::LocalConversationAccount,
 ) -> Result<Vec<ConversationAccountResponse>, RoostyError> {
-    let participants = roosty_db::direct_status_participants_for_view(&state.db, view).await?;
+    let participants = roosty_db::direct_status_participants_for_view(db, view).await?;
     let mut accounts = Vec::new();
     for participant in participants.local_accounts {
         if participant.id != account_id {
             accounts.push(ConversationAccountResponse::Local(Box::new(
-                account_response(state, participant).await?,
+                account_response(state, db, participant).await?,
             )));
         }
     }
 
     for participant in participants.remote_accounts {
         if let Some(id) = participant.remote_actor_id {
-            let actor = roosty_db::find_remote_actor_by_id(&state.db, id).await?;
+            let actor = roosty_db::find_remote_actor_by_id(db, id).await?;
             let domain_suspended = match actor {
                 Some(actor) => {
                     actor.suspended_at.is_some()
-                        || roosty_db::federation_domain_policy(&state.db, &actor.domain)
+                        || roosty_db::federation_domain_policy(db, &actor.domain)
                             .await?
                             .is_suspended()
                 }
                 None => true,
             };
-            if roosty_db::remote_account_is_hidden_for_viewer(&state.db, account_id, id).await?
+            if roosty_db::remote_account_is_hidden_for_viewer(db, account_id, id).await?
                 || domain_suspended
             {
                 continue;
             }
         }
         let response = match participant.remote_actor_id {
-            Some(id) => match roosty_db::find_remote_actor_by_id(&state.db, id).await? {
-                Some(actor) => remote_account_response(state, actor).await?,
+            Some(id) => match roosty_db::find_remote_actor_by_id(db, id).await? {
+                Some(actor) => remote_account_response_on(state, db, actor).await?,
                 None => unresolved_remote_account_response(
                     &participant.activitypub_id,
                     participant.mention_name.as_deref(),
@@ -298,27 +289,31 @@ async fn conversation_accounts(
 
 async fn remote_conversation_status(
     state: &AppState,
+    db: &impl ConnectionTrait,
     status_id: StatusId,
 ) -> Result<Option<StatusResponse>, RoostyError> {
-    let Some(status) = roosty_db::find_remote_status_by_id(&state.db, status_id).await? else {
+    let Some(status) = roosty_db::find_remote_status_by_id(db, status_id).await? else {
         return Ok(None);
     };
-    remote_status_response(state, status).await.map(Some)
+    let context = StatusRenderContext::new(state, db);
+    remote_status_response(&context, status).await.map(Some)
 }
 
 async fn conversation_status(
     state: &AppState,
+    db: &impl ConnectionTrait,
     account_id: AccountId,
     status_id: StatusId,
 ) -> Result<Option<StatusResponse>, RoostyError> {
-    let Some(status) = roosty_db::find_local_status_by_id(&state.db, status_id).await? else {
+    let Some(status) = roosty_db::find_local_status_by_id(db, status_id).await? else {
         return Ok(None);
     };
-    if !status_visible_to_viewer(state, &status, Some(account_id)).await? {
+    if !status_visible_to_viewer(db, &status, Some(account_id)).await? {
         return Ok(None);
     }
 
-    status_with_author(state, status, Some(account_id))
+    let context = StatusRenderContext::new(state, db);
+    status_with_author(&context, status, Some(account_id))
         .await
         .map(Some)
 }
@@ -339,38 +334,4 @@ fn collection_cursor(params: &ConversationParams) -> Result<roosty_db::Collectio
 
 fn parse_optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ()> {
     value.map(Uuid::parse_str).transpose().map_err(|_| ())
-}
-
-fn bad_request(message: &'static str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "bad_request",
-            error_description: message,
-        }),
-    )
-        .into_response()
-}
-
-fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not_found",
-            error_description: "conversation was not found",
-        }),
-    )
-        .into_response()
-}
-
-fn server_error(error: RoostyError) -> Response {
-    let description = error.to_string();
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": "server_error",
-            "error_description": description,
-        })),
-    )
-        .into_response()
 }

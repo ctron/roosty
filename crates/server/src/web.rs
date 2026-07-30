@@ -1,13 +1,14 @@
 //! Native Axum integration for the server-rendered and hydrated first-party UI.
 
 use std::{
+    borrow::Cow,
     future::Future,
     pin::Pin,
     sync::{Arc, OnceLock},
 };
 
 use axum::{
-    Form, Router,
+    Extension, Form, Router,
     body::Body,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
@@ -17,10 +18,14 @@ use axum::{
 };
 use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
-use roosty_core::{AccountId, StatusId};
+use roosty_core::{AccountId, Result as RoostyResult, RoostyError, StatusId};
 use roosty_db::{
-    AdminAuditAction, AdminAuditEntry, AdminAuditSource, AdminAuditTargetKind, JobKind,
-    ReportAccount, ReportListOptions, ReportStatus,
+    AccountStatusTimelineOptions, AdminAccount, AdminAuditAction, AdminAuditEntry,
+    AdminAuditSource, AdminAuditTargetKind, AdminJobDiagnostic, AdminJobSummary,
+    FederationDomainBlock, FederationDomainBlockUpdate, InstanceRule, JobKind, LocalAccount,
+    LocalStatus, NewFederationDomainBlock, NewJob, PollStatus, QuoteState, RemoteStatus,
+    ReportAccount, ReportListOptions, ReportStatus, StatusContextItem, StatusContextParent,
+    StatusReference, StatusVisibility, TimelineCursor,
 };
 use roosty_web_ui::{
     App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
@@ -31,9 +36,11 @@ use roosty_web_ui::{
     UiServerContext, UiStatus, UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility,
     shell,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, DbErr};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use strum::ParseError;
+use thiserror::Error;
 use time::OffsetDateTime;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
@@ -43,7 +50,7 @@ use crate::version::build_identifier;
 use crate::{
     admin::{self, AdminSource},
     auth::{account_id_from_session, csrf_token_from_session, validate_csrf_token},
-    http::AppState,
+    http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
     statuses::delete_reported_status,
 };
 
@@ -54,11 +61,12 @@ fn ui_routes() -> Vec<AxumRouteListing> {
 }
 
 /// Mount explicit UI routes, internal server functions, and generated browser assets.
-pub fn router(state: &AppState) -> Router<AppState> {
+pub fn router(state: &AppState, database: &DatabaseContext) -> Router<AppState> {
     let routes = ui_routes();
     let options = state.leptos_options.clone();
     let context = UiServerContext(Arc::new(RoostyUiBackend {
         state: state.clone(),
+        database: database.clone(),
     }));
     let assets =
         ServeDir::new(std::path::Path::new(&*options.site_root).join(&*options.site_pkg_dir));
@@ -110,35 +118,31 @@ pub fn router(state: &AppState) -> Router<AppState> {
 
 async fn protect_ui_route(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     request: Request<Body>,
     next: Next,
-) -> Response {
+) -> ApiResult<Response> {
     let path = request.uri().path();
     if path != "/auth/edit" && !path.starts_with("/admin") {
-        return next.run(request).await;
+        return Ok(next.run(request).await);
     }
 
-    match account_id_from_session(&state, request.headers()) {
-        Ok(Some(account_id)) => {
-            if !path.starts_with("/admin") {
-                return next.run(request).await;
-            }
-            match roosty_db::find_local_account_by_id(&state.db, account_id).await {
-                Ok(Some(account)) if account.is_admin => next.run(request).await,
-                Ok(Some(_)) => StatusCode::FORBIDDEN.into_response(),
-                Ok(None) => redirect_login(&state, path),
-                Err(error) => {
-                    tracing::error!(%error, "failed to authorize administrator route");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            }
-        }
-        Ok(None) => redirect_login(&state, path),
-        Err(error) => {
-            tracing::error!(%error, "failed to validate browser session");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error\n").into_response()
-        }
+    let Some(account_id) = account_id_from_session(&state, request.headers())? else {
+        return Ok(redirect_login(&state, path));
+    };
+    if !path.starts_with("/admin") {
+        return Ok(next.run(request).await);
     }
+    let txn = database.begin_read().await?;
+    let account = roosty_db::find_local_account_by_id(&txn, account_id).await?;
+    txn.commit().await?;
+    let Some(account) = account else {
+        return Ok(redirect_login(&state, path));
+    };
+    if !account.is_admin {
+        return Err(ApiError::Forbidden("This action is not allowed".into()));
+    }
+    Ok(next.run(request).await)
 }
 
 fn redirect_login(state: &AppState, next: &str) -> Response {
@@ -165,6 +169,7 @@ fn login_return_query(next: &str) -> &'static str {
 #[derive(Clone)]
 struct RoostyUiBackend {
     state: AppState,
+    database: DatabaseContext,
 }
 
 impl UiBackend for RoostyUiBackend {
@@ -173,6 +178,7 @@ impl UiBackend for RoostyUiBackend {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiBootstrap, String>> + Send + 'static>> {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
             let mut headers = HeaderMap::new();
             if let Some(cookie_header) = cookie_header {
@@ -183,10 +189,16 @@ impl UiBackend for RoostyUiBackend {
             let account = match account_id_from_session(&state, &headers)
                 .map_err(|error| error.to_string())?
             {
-                Some(account_id) => roosty_db::find_local_account_by_id(&state.db, account_id)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map(|account| UiAccount {
+                Some(account_id) => {
+                    let txn = database
+                        .begin_read()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let account = roosty_db::find_local_account_by_id(&txn, account_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    txn.commit().await.map_err(|error| error.to_string())?;
+                    account.map(|account| UiAccount {
                         id: account.id.0,
                         username: account.username,
                         display_name: account.display_name,
@@ -195,7 +207,8 @@ impl UiBackend for RoostyUiBackend {
                             .as_deref()
                             .map(|path| crate::media::media_url(&state, path)),
                         is_admin: account.is_admin,
-                    }),
+                    })
+                }
                 None => None,
             };
             let csrf_token =
@@ -218,8 +231,9 @@ impl UiBackend for RoostyUiBackend {
     ) -> Pin<Box<dyn Future<Output = Result<UiProfileHeader, UiPublicPageError>> + Send + 'static>>
     {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
-            let txn = state
+            let txn = database
                 .begin_snapshot()
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?;
@@ -256,9 +270,10 @@ impl UiBackend for RoostyUiBackend {
     ) -> Pin<Box<dyn Future<Output = Result<UiProfileTimeline, UiPublicPageError>> + Send + 'static>>
     {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
             let cursor = parse_ui_cursor(max_id.as_deref())?;
-            let txn = state
+            let txn = database
                 .begin_snapshot()
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?;
@@ -296,7 +311,7 @@ impl UiBackend for RoostyUiBackend {
                     &txn,
                     account.id,
                     crate::statuses::MAX_PINNED_STATUSES,
-                    roosty_db::TimelineCursor::default(),
+                    TimelineCursor::default(),
                 )
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?;
@@ -325,9 +340,10 @@ impl UiBackend for RoostyUiBackend {
     ) -> Pin<Box<dyn Future<Output = Result<UiStatusPage, UiPublicPageError>> + Send + 'static>>
     {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
             let cursor = parse_ui_cursor(Some(&max_id))?;
-            let txn = state
+            let txn = database
                 .begin_snapshot()
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?;
@@ -372,11 +388,12 @@ impl UiBackend for RoostyUiBackend {
     ) -> Pin<Box<dyn Future<Output = Result<UiStatusThread, UiPublicPageError>> + Send + 'static>>
     {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
             let status_id = Uuid::parse_str(&status_id)
                 .map(StatusId)
                 .map_err(|_| UiPublicPageError::NotFound)?;
-            let txn = state
+            let txn = database
                 .begin_snapshot()
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?;
@@ -389,7 +406,7 @@ impl UiBackend for RoostyUiBackend {
             else {
                 return Err(UiPublicPageError::NotFound);
             };
-            let roosty_db::StatusContextItem::Local(local_focus) = &focus else {
+            let StatusContextItem::Local(local_focus) = &focus else {
                 return Err(UiPublicPageError::NotFound);
             };
             if local_focus.account_id != account.id {
@@ -443,13 +460,19 @@ impl UiBackend for RoostyUiBackend {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminWorkQueue, String>> + Send + 'static>> {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
-            authenticated_admin_headers(&state, cookie_header).await?;
+            authenticated_admin_headers(&state, &database, cookie_header).await?;
+            let txn = database
+                .begin_snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
             let (summary, jobs) = tokio::try_join!(
-                roosty_db::admin_job_summary(&state.db),
-                roosty_db::admin_job_diagnostics(&state.db, 40, None),
+                roosty_db::admin_job_summary(&txn),
+                roosty_db::admin_job_diagnostics(&txn, 40, None),
             )
             .map_err(|error| error.to_string())?;
+            txn.commit().await.map_err(|error| error.to_string())?;
             Ok(UiAdminWorkQueue {
                 summary: ui_admin_job_summary(summary),
                 jobs: jobs.into_iter().map(ui_admin_job).collect(),
@@ -464,13 +487,18 @@ impl UiBackend for RoostyUiBackend {
         origin: UiAdminAccountOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAccounts, String>> + Send + 'static>> {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
-            let headers = authenticated_admin_headers(&state, cookie_header).await?;
+            let headers = authenticated_admin_headers(&state, &database, cookie_header).await?;
             let csrf_token = csrf_token_from_session(&state, &headers)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "administrator session required".to_owned())?;
+            let txn = database
+                .begin_snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
             let accounts = roosty_db::list_admin_accounts(
-                &state.db,
+                &txn,
                 &query,
                 Some(origin.as_str()),
                 None,
@@ -480,6 +508,7 @@ impl UiBackend for RoostyUiBackend {
             )
             .await
             .map_err(|error| error.to_string())?;
+            txn.commit().await.map_err(|error| error.to_string())?;
             Ok(UiAdminAccounts {
                 csrf_token,
                 accounts: accounts.into_iter().map(ui_admin_account).collect(),
@@ -492,11 +521,17 @@ impl UiBackend for RoostyUiBackend {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAuditLog, String>> + Send + 'static>> {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
-            authenticated_admin_headers(&state, cookie_header).await?;
-            let audit_entries = roosty_db::list_admin_audit_entries(&state.db, 20, None)
+            authenticated_admin_headers(&state, &database, cookie_header).await?;
+            let txn = database
+                .begin_snapshot()
                 .await
                 .map_err(|error| error.to_string())?;
+            let audit_entries = roosty_db::list_admin_audit_entries(&txn, 20, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            txn.commit().await.map_err(|error| error.to_string())?;
             Ok(UiAdminAuditLog {
                 audit_entries: audit_entries
                     .into_iter()
@@ -511,17 +546,23 @@ impl UiBackend for RoostyUiBackend {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminDomainBlocks, String>> + Send + 'static>> {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
-            let headers = authenticated_admin_headers(&state, cookie_header).await?;
+            let headers = authenticated_admin_headers(&state, &database, cookie_header).await?;
             let csrf_token = csrf_token_from_session(&state, &headers)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "administrator session required".to_owned())?;
-            let domain_blocks = roosty_db::list_federation_domain_blocks(&state.db, 200, None)
+            let txn = database
+                .begin_snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
+            let domain_blocks = roosty_db::list_federation_domain_blocks(&txn, 200, None)
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
                 .map(ui_admin_domain_block)
                 .collect();
+            txn.commit().await.map_err(|error| error.to_string())?;
             Ok(UiAdminDomainBlocks {
                 csrf_token,
                 domain_blocks,
@@ -534,15 +575,20 @@ impl UiBackend for RoostyUiBackend {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminModeration, String>> + Send + 'static>> {
         let state = self.state.clone();
+        let database = self.database.clone();
         Box::pin(async move {
-            let headers = authenticated_admin_headers(&state, cookie_header).await?;
+            let headers = authenticated_admin_headers(&state, &database, cookie_header).await?;
             let csrf_token = csrf_token_from_session(&state, &headers)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "administrator session required".to_owned())?;
+            let txn = database
+                .begin_snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
             let (rules, reports) = tokio::try_join!(
-                roosty_db::list_instance_rules(&state.db),
+                roosty_db::list_instance_rules(&txn),
                 roosty_db::list_moderation_reports(
-                    &state.db,
+                    &txn,
                     ReportListOptions {
                         resolved: None,
                         limit: 100,
@@ -551,6 +597,7 @@ impl UiBackend for RoostyUiBackend {
                 ),
             )
             .map_err(|error| error.to_string())?;
+            txn.commit().await.map_err(|error| error.to_string())?;
             Ok(UiAdminModeration {
                 csrf_token,
                 rules: rules
@@ -587,13 +634,13 @@ impl UiBackend for RoostyUiBackend {
     }
 }
 
-fn parse_ui_cursor(value: Option<&str>) -> Result<roosty_db::TimelineCursor, UiPublicPageError> {
+fn parse_ui_cursor(value: Option<&str>) -> Result<TimelineCursor, UiPublicPageError> {
     let max_id = value
         .map(Uuid::parse_str)
         .transpose()
         .map_err(|_| UiPublicPageError::BadRequest)?
         .map(StatusId);
-    Ok(roosty_db::TimelineCursor {
+    Ok(TimelineCursor {
         max_id,
         ..Default::default()
     })
@@ -620,7 +667,7 @@ async fn ui_viewer(
 async fn active_local_profile(
     db: &impl ConnectionTrait,
     username: &str,
-) -> Result<roosty_db::LocalAccount, UiPublicPageError> {
+) -> Result<LocalAccount, UiPublicPageError> {
     roosty_db::find_local_account_by_username(db, username)
         .await
         .map_err(|_| UiPublicPageError::Internal)?
@@ -631,7 +678,7 @@ async fn active_local_profile(
 async fn ui_public_account(
     state: &AppState,
     db: &impl ConnectionTrait,
-    account: &roosty_db::LocalAccount,
+    account: &LocalAccount,
 ) -> Result<UiPublicAccount, UiPublicPageError> {
     let followers_count = roosty_db::count_local_followers(db, account.id)
         .await
@@ -690,11 +737,11 @@ async fn ui_public_account(
 async fn ui_profile_status_page(
     state: &AppState,
     db: &impl ConnectionTrait,
-    account: &roosty_db::LocalAccount,
+    account: &LocalAccount,
     viewer: Option<AccountId>,
     tab: &UiProfileTab,
     hashtag: Option<&str>,
-    cursor: roosty_db::TimelineCursor,
+    cursor: TimelineCursor,
 ) -> Result<UiStatusPage, UiPublicPageError> {
     let tagged = match tab {
         UiProfileTab::Tagged => Some(
@@ -709,7 +756,7 @@ async fn ui_profile_status_page(
         viewer,
         20,
         cursor,
-        roosty_db::AccountStatusTimelineOptions {
+        AccountStatusTimelineOptions {
             exclude_replies: matches!(tab, UiProfileTab::Posts),
             only_media: matches!(tab, UiProfileTab::Media),
             tagged,
@@ -728,8 +775,8 @@ async fn ui_profile_status_page(
 async fn ui_local_statuses(
     state: &AppState,
     db: &impl ConnectionTrait,
-    statuses: Vec<roosty_db::LocalStatus>,
-    account: &roosty_db::LocalAccount,
+    statuses: Vec<LocalStatus>,
+    account: &LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
 ) -> Result<Vec<UiStatus>, UiPublicPageError> {
@@ -745,12 +792,12 @@ async fn ui_local_statuses(
     Ok(result)
 }
 
-fn ui_visibility(visibility: roosty_db::StatusVisibility) -> UiStatusVisibility {
+fn ui_visibility(visibility: StatusVisibility) -> UiStatusVisibility {
     match visibility {
-        roosty_db::StatusVisibility::Public => UiStatusVisibility::Public,
-        roosty_db::StatusVisibility::Unlisted => UiStatusVisibility::Unlisted,
-        roosty_db::StatusVisibility::Private => UiStatusVisibility::Private,
-        roosty_db::StatusVisibility::Direct => UiStatusVisibility::Direct,
+        StatusVisibility::Public => UiStatusVisibility::Public,
+        StatusVisibility::Unlisted => UiStatusVisibility::Unlisted,
+        StatusVisibility::Private => UiStatusVisibility::Private,
+        StatusVisibility::Direct => UiStatusVisibility::Direct,
     }
 }
 
@@ -766,8 +813,8 @@ fn ui_media_kind(content_type: Option<&str>) -> UiMediaKind {
 async fn ui_local_status(
     state: &AppState,
     db: &impl ConnectionTrait,
-    status: roosty_db::LocalStatus,
-    account: &roosty_db::LocalAccount,
+    status: LocalStatus,
+    account: &LocalAccount,
     viewer: Option<AccountId>,
     pinned: bool,
     include_quote: bool,
@@ -792,13 +839,13 @@ async fn ui_local_status(
             description: media.description,
         })
         .collect();
-    let poll = ui_poll(db, roosty_db::PollStatus::Local(id)).await?;
-    let card = ui_preview_card(state, db, roosty_db::StatusReference::Local(id)).await?;
+    let poll = ui_poll(db, PollStatus::Local(id)).await?;
+    let card = ui_preview_card(state, db, StatusReference::Local(id)).await?;
     let quote = if include_quote {
         Box::pin(ui_status_quote(
             state,
             db,
-            roosty_db::StatusReference::Local(id),
+            StatusReference::Local(id),
             viewer,
         ))
         .await?
@@ -824,7 +871,7 @@ async fn ui_local_status(
         url: public_page_url(state, &path),
         activitypub_url,
         content_html: crate::statuses::status_content_html_with_mentions_and_tags(
-            state,
+            &TransactionContext::new(state, db),
             &status.content,
             &[],
             &[],
@@ -840,12 +887,9 @@ async fn ui_local_status(
         poll,
         card,
         quote,
-        replies_count: roosty_db::count_status_context_replies(
-            db,
-            roosty_db::StatusContextParent::Local(id),
-        )
-        .await
-        .map_err(|_| UiPublicPageError::Internal)?,
+        replies_count: roosty_db::count_status_context_replies(db, StatusContextParent::Local(id))
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?,
         reblogs_count: roosty_db::count_local_reblogs(db, id)
             .await
             .map_err(|_| UiPublicPageError::Internal)?,
@@ -859,7 +903,7 @@ async fn ui_local_status(
 async fn ui_remote_status(
     state: &AppState,
     db: &impl ConnectionTrait,
-    status: roosty_db::RemoteStatus,
+    status: RemoteStatus,
     viewer: Option<AccountId>,
     include_quote: bool,
 ) -> Result<UiStatus, UiPublicPageError> {
@@ -894,19 +938,19 @@ async fn ui_remote_status(
     let sensitive = status
         .object
         .get("sensitive")
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .unwrap_or(false);
     let spoiler_text = status
         .object
         .get("summary")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
     let quote = if include_quote {
         Box::pin(ui_status_quote(
             state,
             db,
-            roosty_db::StatusReference::Remote(id),
+            StatusReference::Remote(id),
             viewer,
         ))
         .await?
@@ -936,15 +980,12 @@ async fn ui_remote_status(
         edited_at: (status.updated_at != status.published_at)
             .then(|| format_timestamp(status.updated_at)),
         media,
-        poll: ui_poll(db, roosty_db::PollStatus::Remote(id)).await?,
-        card: ui_preview_card(state, db, roosty_db::StatusReference::Remote(id)).await?,
+        poll: ui_poll(db, PollStatus::Remote(id)).await?,
+        card: ui_preview_card(state, db, StatusReference::Remote(id)).await?,
         quote,
-        replies_count: roosty_db::count_status_context_replies(
-            db,
-            roosty_db::StatusContextParent::Remote(id),
-        )
-        .await
-        .map_err(|_| UiPublicPageError::Internal)?,
+        replies_count: roosty_db::count_status_context_replies(db, StatusContextParent::Remote(id))
+            .await
+            .map_err(|_| UiPublicPageError::Internal)?,
         reblogs_count: 0,
         favourites_count: 0,
         pinned: roosty_db::is_remote_status_pinned(db, id)
@@ -956,12 +997,12 @@ async fn ui_remote_status(
 async fn ui_context_status(
     state: &AppState,
     db: &impl ConnectionTrait,
-    item: roosty_db::StatusContextItem,
+    item: StatusContextItem,
     viewer: Option<AccountId>,
     include_quote: bool,
 ) -> Result<UiStatus, UiPublicPageError> {
     match item {
-        roosty_db::StatusContextItem::Local(status) => {
+        StatusContextItem::Local(status) => {
             let account = roosty_db::find_local_account_by_id(db, status.account_id)
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?
@@ -971,7 +1012,7 @@ async fn ui_context_status(
                 .map_err(|_| UiPublicPageError::Internal)?;
             ui_local_status(state, db, status, &account, viewer, pinned, include_quote).await
         }
-        roosty_db::StatusContextItem::Remote(status) => {
+        StatusContextItem::Remote(status) => {
             ui_remote_status(state, db, status, viewer, include_quote).await
         }
     }
@@ -979,7 +1020,7 @@ async fn ui_context_status(
 
 async fn ui_poll(
     db: &impl ConnectionTrait,
-    status: roosty_db::PollStatus,
+    status: PollStatus,
 ) -> Result<Option<UiPoll>, UiPublicPageError> {
     Ok(roosty_db::find_poll_for_status(db, status)
         .await
@@ -1005,7 +1046,7 @@ async fn ui_poll(
 async fn ui_preview_card(
     state: &AppState,
     db: &impl ConnectionTrait,
-    status: roosty_db::StatusReference,
+    status: StatusReference,
 ) -> Result<Option<UiPreviewCard>, UiPublicPageError> {
     Ok(roosty_db::preview_card_for_status(db, status)
         .await
@@ -1025,7 +1066,7 @@ async fn ui_preview_card(
 async fn ui_status_quote(
     state: &AppState,
     db: &impl ConnectionTrait,
-    status: roosty_db::StatusReference,
+    status: StatusReference,
     viewer: Option<AccountId>,
 ) -> Result<Option<Box<UiStatus>>, UiPublicPageError> {
     let Some(quote) = roosty_db::quote_for_status(db, status)
@@ -1034,21 +1075,21 @@ async fn ui_status_quote(
     else {
         return Ok(None);
     };
-    if quote.state != roosty_db::QuoteState::Accepted {
+    if quote.state != QuoteState::Accepted {
         return Ok(None);
     }
     let Some(target) = quote.quoted_status else {
         return Ok(None);
     };
     let item = match target {
-        roosty_db::StatusReference::Local(id) => roosty_db::find_local_status_by_id(db, id)
+        StatusReference::Local(id) => roosty_db::find_local_status_by_id(db, id)
             .await
             .map_err(|_| UiPublicPageError::Internal)?
-            .map(roosty_db::StatusContextItem::Local),
-        roosty_db::StatusReference::Remote(id) => roosty_db::find_remote_status_by_id(db, id)
+            .map(StatusContextItem::Local),
+        StatusReference::Remote(id) => roosty_db::find_remote_status_by_id(db, id)
             .await
             .map_err(|_| UiPublicPageError::Internal)?
-            .map(roosty_db::StatusContextItem::Remote),
+            .map(StatusContextItem::Remote),
     };
     let Some(item) = item else {
         return Ok(None);
@@ -1090,21 +1131,28 @@ fn report_account_label(account: ReportAccount) -> String {
 
 async fn authenticated_admin_headers(
     state: &AppState,
+    database: &DatabaseContext,
     cookie_header: Option<String>,
 ) -> Result<HeaderMap, String> {
     let headers = cookie_headers(cookie_header)?;
     let account_id = account_id_from_session(state, &headers)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "administrator session required".to_owned())?;
-    roosty_db::find_local_account_by_id(&state.db, account_id)
+    let txn = database
+        .begin_read()
+        .await
+        .map_err(|error| error.to_string())?;
+    let account = roosty_db::find_local_account_by_id(&txn, account_id)
         .await
         .map_err(|error| error.to_string())?
         .filter(|account| account.is_admin)
         .ok_or_else(|| "administrator session required".to_owned())?;
+    txn.commit().await.map_err(|error| error.to_string())?;
+    let _ = account;
     Ok(headers)
 }
 
-fn ui_admin_job_summary(summary: roosty_db::AdminJobSummary) -> UiAdminJobSummary {
+fn ui_admin_job_summary(summary: AdminJobSummary) -> UiAdminJobSummary {
     UiAdminJobSummary {
         due: summary.due,
         in_progress: summary.in_progress,
@@ -1114,7 +1162,7 @@ fn ui_admin_job_summary(summary: roosty_db::AdminJobSummary) -> UiAdminJobSummar
     }
 }
 
-fn ui_admin_job(job: roosty_db::AdminJobDiagnostic) -> UiAdminJob {
+fn ui_admin_job(job: AdminJobDiagnostic) -> UiAdminJob {
     UiAdminJob {
         id: job.id.0,
         kind: job.kind.as_str().to_owned(),
@@ -1134,7 +1182,7 @@ fn ui_admin_job(job: roosty_db::AdminJobDiagnostic) -> UiAdminJob {
     }
 }
 
-fn ui_admin_account(account: roosty_db::AdminAccount) -> UiAdminAccount {
+fn ui_admin_account(account: AdminAccount) -> UiAdminAccount {
     UiAdminAccount {
         id: account.id.0,
         username: account.username,
@@ -1147,7 +1195,7 @@ fn ui_admin_account(account: roosty_db::AdminAccount) -> UiAdminAccount {
     }
 }
 
-fn ui_admin_domain_block(block: roosty_db::FederationDomainBlock) -> UiAdminDomainBlock {
+fn ui_admin_domain_block(block: FederationDomainBlock) -> UiAdminDomainBlock {
     UiAdminDomainBlock {
         id: block.id,
         domain: block.domain,
@@ -1258,140 +1306,177 @@ enum ReportOperation {
     Reopen,
 }
 
+type WebAdminResult<T> = Result<T, WebAdminError>;
+
+#[derive(Debug, Error)]
+enum WebAdminError {
+    #[error("administrator session required")]
+    Unauthorized,
+    #[error("{0}")]
+    Forbidden(Cow<'static, str>),
+    #[error("Record not found")]
+    NotFound,
+    #[error("{0}")]
+    Unprocessable(Cow<'static, str>),
+    #[error(transparent)]
+    Internal(RoostyError),
+}
+
+impl From<RoostyError> for WebAdminError {
+    fn from(error: RoostyError) -> Self {
+        match error {
+            RoostyError::InvalidInput(reason) => Self::Unprocessable(Cow::Owned(reason)),
+            error => Self::Internal(error),
+        }
+    }
+}
+
+impl From<DbErr> for WebAdminError {
+    fn from(error: DbErr) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl From<ParseError> for WebAdminError {
+    fn from(_: ParseError) -> Self {
+        Self::Unprocessable("invalid value".into())
+    }
+}
+
+impl IntoResponse for WebAdminError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
+            Self::Forbidden(reason) => (StatusCode::FORBIDDEN, reason).into_response(),
+            Self::NotFound => StatusCode::NOT_FOUND.into_response(),
+            Self::Unprocessable(reason) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
+            }
+            Self::Internal(error) => {
+                tracing::error!(%error, "administrator form failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    }
+}
+
 async fn authenticated_admin_form(
     state: &AppState,
+    database: &DatabaseContext,
     headers: &HeaderMap,
     csrf_token: &str,
-) -> Result<roosty_core::AccountId, Response> {
-    if !validate_csrf_token(state, headers, csrf_token).map_err(|error| {
-        tracing::error!(%error, "failed to validate administrator CSRF token");
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })? {
-        return Err(StatusCode::FORBIDDEN.into_response());
+) -> WebAdminResult<AccountId> {
+    if !validate_csrf_token(state, headers, csrf_token)? {
+        return Err(WebAdminError::Forbidden("invalid CSRF token".into()));
     }
-    let account_id = account_id_from_session(state, headers)
-        .map_err(|error| {
-            tracing::error!(%error, "failed to validate administrator session");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?
-        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
-    let account = roosty_db::find_local_account_by_id(&state.db, account_id)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to load administrator account");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?
+    let account_id = account_id_from_session(state, headers)?.ok_or(WebAdminError::Unauthorized)?;
+    let txn = database.begin_read().await?;
+    let account = roosty_db::find_local_account_by_id(&txn, account_id)
+        .await?
         .filter(|account| account.is_admin)
-        .ok_or_else(|| StatusCode::FORBIDDEN.into_response())?;
+        .ok_or(WebAdminError::Forbidden(
+            "administrator privileges are required".into(),
+        ))?;
+    txn.commit().await?;
     Ok(account.id)
 }
 
 async fn create_admin_account(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Form(form): Form<CreateAccountForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    match admin::create_local_account(
-        &state.db,
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
+    let result = admin::create_local_account_in_transaction(
+        &txn,
         Some(actor),
         AdminSource::Web,
         &form.username,
         &form.email,
         form.admin,
     )
-    .await
-    {
-        Ok(result) => temporary_password_page(
-            &state,
-            "Account created",
-            &result.account.username,
-            &result.temporary_password,
-        ),
-        Err(error) => admin_form_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(temporary_password_page(
+        &state,
+        "Account created",
+        &result.account.username,
+        &result.temporary_password,
+    ))
 }
 
 async fn limit_admin_account(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
     Form(form): Form<LimitAccountForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    match admin::set_account_limited(
-        &state.db,
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
+    let account = admin::set_account_limited_in_transaction(
+        &txn,
         Some(actor),
         AdminSource::Web,
-        roosty_core::AccountId(account_id),
+        AccountId(account_id),
         form.limited,
     )
-    .await
-    {
-        Ok(account) => Redirect::to(if account.domain.is_some() {
-            "/admin/remote-accounts"
-        } else {
-            "/admin/accounts"
-        })
-        .into_response(),
-        Err(error) => admin_form_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Redirect::to(if account.domain.is_some() {
+        "/admin/remote-accounts"
+    } else {
+        "/admin/accounts"
+    })
+    .into_response())
 }
 
 async fn suspend_admin_account(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
     Form(form): Form<CsrfForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let account_id = roosty_core::AccountId(account_id);
-    let suspended = match roosty_db::find_admin_account_by_id(&state.db, account_id).await {
-        Ok(Some(account)) => !account.suspended,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return admin_form_error(error),
-    };
-    match admin::set_account_suspended(&state, actor, AdminSource::Web, account_id, suspended).await
-    {
-        Ok(account) => Redirect::to(if account.domain.is_some() {
-            "/admin/remote-accounts"
-        } else {
-            "/admin/accounts"
-        })
-        .into_response(),
-        Err(error) => admin_form_error(error),
-    }
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let account_id = AccountId(account_id);
+    let txn = database.begin_write().await?;
+    let suspended = !roosty_db::find_admin_account_by_id(&txn, account_id)
+        .await?
+        .ok_or(WebAdminError::NotFound)?
+        .suspended;
+    let account = admin::set_account_suspended_in_transaction(
+        &state,
+        &txn,
+        actor,
+        AdminSource::Web,
+        account_id,
+        suspended,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(Redirect::to(if account.domain.is_some() {
+        "/admin/remote-accounts"
+    } else {
+        "/admin/accounts"
+    })
+    .into_response())
 }
 
 async fn create_admin_domain_block(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Form(form): Form<DomainBlockForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let severity = match form.severity.parse() {
-        Ok(severity) => severity,
-        Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, "invalid severity").into_response(),
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return admin_form_error(error.into()),
-    };
-    let block = match roosty_db::create_federation_domain_block(
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let severity = form.severity.parse()?;
+    let txn = database.begin_write().await?;
+    let block = roosty_db::create_federation_domain_block(
         &txn,
-        roosty_db::NewFederationDomainBlock {
+        NewFederationDomainBlock {
             domain: form.domain,
             severity,
             reject_media: form.reject_media,
@@ -1401,78 +1486,44 @@ async fn create_admin_domain_block(
             obfuscate: form.obfuscate,
         },
     )
-    .await
-    {
-        Ok(block) => block,
-        Err(error) => return admin_form_error(error),
-    };
-    if let Err(error) =
-        audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockCreate, &block).await
-    {
-        return admin_form_error(error);
-    }
-    if let Err(error) = enqueue_web_domain_reconciliation(&txn, &block).await {
-        return admin_form_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Redirect::to("/admin/federation").into_response(),
-        Err(error) => admin_form_error(error.into()),
-    }
+    .await?;
+    audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockCreate, &block).await?;
+    enqueue_web_domain_reconciliation(&txn, &block).await?;
+    txn.commit().await?;
+    Ok(Redirect::to("/admin/federation").into_response())
 }
 
 async fn create_admin_instance_rule(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Form(form): Form<InstanceRuleForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return admin_form_error(error.into()),
-    };
-    let rule = match roosty_db::create_instance_rule(&txn, &form.text).await {
-        Ok(rule) => rule,
-        Err(error) => return admin_form_error(error),
-    };
-    if let Err(error) =
-        audit_web_rule(&txn, actor, AdminAuditAction::InstanceRuleCreate, &rule).await
-    {
-        return admin_form_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Redirect::to("/admin/moderation").into_response(),
-        Err(error) => admin_form_error(error.into()),
-    }
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
+    let rule = roosty_db::create_instance_rule(&txn, &form.text).await?;
+    audit_web_rule(&txn, actor, AdminAuditAction::InstanceRuleCreate, &rule).await?;
+    txn.commit().await?;
+    Ok(Redirect::to("/admin/moderation").into_response())
 }
 
 async fn update_admin_instance_rule(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path(rule_id): Path<Uuid>,
     Form(form): Form<InstanceRuleForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return admin_form_error(error.into()),
-    };
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
     if matches!(
         form.operation,
         InstanceRuleOperation::Up | InstanceRuleOperation::Down
     ) {
-        let rules = match roosty_db::list_instance_rules(&txn).await {
-            Ok(rules) => rules,
-            Err(error) => return admin_form_error(error),
-        };
+        let rules = roosty_db::list_instance_rules(&txn).await?;
         let mut ids = rules.iter().map(|rule| rule.id).collect::<Vec<_>>();
         let Some(index) = ids.iter().position(|id| *id == rule_id) else {
-            return StatusCode::NOT_FOUND.into_response();
+            return Err(WebAdminError::NotFound);
         };
         let destination = if matches!(form.operation, InstanceRuleOperation::Up) {
             index.saturating_sub(1)
@@ -1480,10 +1531,8 @@ async fn update_admin_instance_rule(
             (index + 1).min(ids.len().saturating_sub(1))
         };
         ids.swap(index, destination);
-        if let Err(error) = roosty_db::reorder_instance_rules(&txn, &ids).await {
-            return admin_form_error(error);
-        }
-        if let Err(error) = roosty_db::insert_admin_audit_entry(
+        roosty_db::reorder_instance_rules(&txn, &ids).await?;
+        roosty_db::insert_admin_audit_entry(
             &txn,
             Some(actor),
             AdminAuditSource::Web,
@@ -1492,52 +1541,40 @@ async fn update_admin_instance_rule(
             &rule_id.to_string(),
             json!({"rule_ids": ids}),
         )
-        .await
-        {
-            return admin_form_error(error);
-        }
-        return match txn.commit().await {
-            Ok(()) => Redirect::to("/admin/moderation").into_response(),
-            Err(error) => admin_form_error(error.into()),
-        };
+        .await?;
+        txn.commit().await?;
+        return Ok(Redirect::to("/admin/moderation").into_response());
     }
     let (rule, action) = if matches!(form.operation, InstanceRuleOperation::Delete) {
-        match roosty_db::discard_instance_rule(&txn, rule_id).await {
-            Ok(Some(rule)) => (rule, AdminAuditAction::InstanceRuleDelete),
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(error) => return admin_form_error(error),
-        }
+        (
+            roosty_db::discard_instance_rule(&txn, rule_id)
+                .await?
+                .ok_or(WebAdminError::NotFound)?,
+            AdminAuditAction::InstanceRuleDelete,
+        )
     } else {
-        match roosty_db::update_instance_rule(&txn, rule_id, &form.text).await {
-            Ok(Some(rule)) => (rule, AdminAuditAction::InstanceRuleUpdate),
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(error) => return admin_form_error(error),
-        }
+        (
+            roosty_db::update_instance_rule(&txn, rule_id, &form.text)
+                .await?
+                .ok_or(WebAdminError::NotFound)?,
+            AdminAuditAction::InstanceRuleUpdate,
+        )
     };
-    if let Err(error) = audit_web_rule(&txn, actor, action, &rule).await {
-        return admin_form_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Redirect::to("/admin/moderation").into_response(),
-        Err(error) => admin_form_error(error.into()),
-    }
+    audit_web_rule(&txn, actor, action, &rule).await?;
+    txn.commit().await?;
+    Ok(Redirect::to("/admin/moderation").into_response())
 }
 
 async fn update_admin_report(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path(report_id): Path<Uuid>,
     Form(form): Form<ReportActionForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return admin_form_error(error.into()),
-    };
-    let result = match form.operation {
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
+    let report = match form.operation {
         ReportOperation::Assign => {
             roosty_db::assign_moderation_report(&txn, report_id, Some(actor)).await
         }
@@ -1547,18 +1584,15 @@ async fn update_admin_report(
         ReportOperation::Reopen => {
             roosty_db::set_moderation_report_resolved(&txn, report_id, None).await
         }
-    };
-    match result {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return admin_form_error(error),
-    }
+    }?
+    .ok_or(WebAdminError::NotFound)?;
+    let _ = report;
     let action = match form.operation {
         ReportOperation::Assign => AdminAuditAction::ReportAssign,
         ReportOperation::Resolve => AdminAuditAction::ReportResolve,
         ReportOperation::Reopen => AdminAuditAction::ReportReopen,
     };
-    if let Err(error) = roosty_db::insert_admin_audit_entry(
+    roosty_db::insert_admin_audit_entry(
         &txn,
         Some(actor),
         AdminAuditSource::Web,
@@ -1567,50 +1601,35 @@ async fn update_admin_report(
         &report_id.to_string(),
         json!({}),
     )
-    .await
-    {
-        return admin_form_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Redirect::to("/admin/moderation").into_response(),
-        Err(error) => admin_form_error(error.into()),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Redirect::to("/admin/moderation").into_response())
 }
 
 async fn delete_admin_report_status(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path((report_id, status_id)): Path<(Uuid, Uuid)>,
     Form(form): Form<CsrfForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let report = match roosty_db::find_moderation_report(&state.db, report_id).await {
-        Ok(Some(report)) => report,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return admin_form_error(error),
-    };
-    let Some(reference) = report
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
+    let report = roosty_db::find_moderation_report(&txn, report_id)
+        .await?
+        .ok_or(WebAdminError::NotFound)?;
+    let reference = report
         .statuses
         .into_iter()
         .find(|reference| match reference {
             ReportStatus::Local(id) | ReportStatus::Remote(id) => id.0 == status_id,
         })
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match delete_reported_status(&state, reference).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return admin_form_error(error),
+        .ok_or(WebAdminError::NotFound)?;
+    let context = TransactionContext::new(&state, &txn);
+    if !delete_reported_status(&context, reference).await? {
+        return Err(WebAdminError::NotFound);
     }
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return admin_form_error(error.into()),
-    };
-    if let Err(error) = roosty_db::insert_admin_audit_entry(
+    roosty_db::insert_admin_audit_entry(
         &txn,
         Some(actor),
         AdminAuditSource::Web,
@@ -1619,22 +1638,17 @@ async fn delete_admin_report_status(
         &report_id.to_string(),
         json!({"removed_status_id": status_id}),
     )
-    .await
-    {
-        return admin_form_error(error);
-    }
-    match txn.commit().await {
-        Ok(()) => Redirect::to("/admin/moderation").into_response(),
-        Err(error) => admin_form_error(error.into()),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(Redirect::to("/admin/moderation").into_response())
 }
 
 async fn audit_web_rule(
     txn: &DatabaseTransaction,
-    actor: roosty_core::AccountId,
+    actor: AccountId,
     action: AdminAuditAction,
-    rule: &roosty_db::InstanceRule,
-) -> Result<(), roosty_core::RoostyError> {
+    rule: &InstanceRule,
+) -> RoostyResult<()> {
     roosty_db::insert_admin_audit_entry(
         txn,
         Some(actor),
@@ -1650,40 +1664,24 @@ async fn audit_web_rule(
 
 async fn update_admin_domain_block(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path(domain_block_id): Path<Uuid>,
     Form(form): Form<DomainBlockForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(error) => return admin_form_error(error.into()),
-    };
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
     if form.operation.as_deref() == Some("delete") {
-        let block = match roosty_db::delete_federation_domain_block(&txn, domain_block_id).await {
-            Ok(Some(block)) => block,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(error) => return admin_form_error(error),
-        };
-        if let Err(error) =
-            audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockDelete, &block).await
-        {
-            return admin_form_error(error);
-        }
+        let block = roosty_db::delete_federation_domain_block(&txn, domain_block_id)
+            .await?
+            .ok_or(WebAdminError::NotFound)?;
+        audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockDelete, &block).await?;
     } else {
-        let severity = match form.severity.parse() {
-            Ok(severity) => severity,
-            Err(_) => {
-                return (StatusCode::UNPROCESSABLE_ENTITY, "invalid severity").into_response();
-            }
-        };
-        let block = match roosty_db::update_federation_domain_block(
+        let severity = form.severity.parse()?;
+        let block = roosty_db::update_federation_domain_block(
             &txn,
             domain_block_id,
-            roosty_db::FederationDomainBlockUpdate {
+            FederationDomainBlockUpdate {
                 severity: Some(severity),
                 reject_media: Some(form.reject_media),
                 reject_reports: Some(form.reject_reports),
@@ -1692,24 +1690,12 @@ async fn update_admin_domain_block(
                 obfuscate: Some(form.obfuscate),
             },
         )
-        .await
-        {
-            Ok(block) => block,
-            Err(error) => return admin_form_error(error),
-        };
-        if let Err(error) =
-            audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockUpdate, &block).await
-        {
-            return admin_form_error(error);
-        }
-        if let Err(error) = enqueue_web_domain_reconciliation(&txn, &block).await {
-            return admin_form_error(error);
-        }
+        .await?;
+        audit_web_domain_block(&txn, actor, AdminAuditAction::DomainBlockUpdate, &block).await?;
+        enqueue_web_domain_reconciliation(&txn, &block).await?;
     }
-    match txn.commit().await {
-        Ok(()) => Redirect::to("/admin/federation").into_response(),
-        Err(error) => admin_form_error(error.into()),
-    }
+    txn.commit().await?;
+    Ok(Redirect::to("/admin/federation").into_response())
 }
 
 fn nonempty(value: String) -> Option<String> {
@@ -1718,10 +1704,10 @@ fn nonempty(value: String) -> Option<String> {
 
 async fn audit_web_domain_block(
     txn: &DatabaseTransaction,
-    actor: roosty_core::AccountId,
+    actor: AccountId,
     action: AdminAuditAction,
-    block: &roosty_db::FederationDomainBlock,
-) -> roosty_core::Result<()> {
+    block: &FederationDomainBlock,
+) -> RoostyResult<()> {
     roosty_db::insert_admin_audit_entry(
         txn,
         Some(actor),
@@ -1737,11 +1723,11 @@ async fn audit_web_domain_block(
 
 async fn enqueue_web_domain_reconciliation(
     txn: &DatabaseTransaction,
-    block: &roosty_db::FederationDomainBlock,
-) -> roosty_core::Result<()> {
+    block: &FederationDomainBlock,
+) -> RoostyResult<()> {
     roosty_db::enqueue_job_in_transaction(
         txn,
-        roosty_db::NewJob {
+        NewJob {
             kind: JobKind::DomainModerationReconcile,
             payload: json!({"domain_block_id": block.id}),
             deduplication_key: Some(format!("domain-moderation:{}", block.id)),
@@ -1754,30 +1740,30 @@ async fn enqueue_web_domain_reconciliation(
 
 async fn reset_admin_password(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
     Form(form): Form<CsrfForm>,
-) -> Response {
-    let actor = match authenticated_admin_form(&state, &headers, &form.csrf_token).await {
-        Ok(actor) => actor,
-        Err(response) => return response,
-    };
-    match admin::reset_local_password(
-        &state.db,
+) -> WebAdminResult<Response> {
+    let actor = authenticated_admin_form(&state, &database, &headers, &form.csrf_token).await?;
+    let txn = database.begin_write().await?;
+    roosty_db::find_admin_account_by_id(&txn, AccountId(account_id))
+        .await?
+        .ok_or(WebAdminError::NotFound)?;
+    let result = admin::reset_local_password_in_transaction(
+        &txn,
         Some(actor),
         AdminSource::Web,
-        roosty_core::AccountId(account_id),
+        AccountId(account_id),
     )
-    .await
-    {
-        Ok(result) => temporary_password_page(
-            &state,
-            "Password reset",
-            &result.account.username,
-            &result.temporary_password,
-        ),
-        Err(error) => admin_form_error(error),
-    }
+    .await?;
+    txn.commit().await?;
+    Ok(temporary_password_page(
+        &state,
+        "Password reset",
+        &result.account.username,
+        &result.temporary_password,
+    ))
 }
 
 fn temporary_password_page(
@@ -1820,6 +1806,7 @@ mod tests {
         UiPublicAccount, UiPublicPageError, UiServerContext, UiStatus, UiStatusAuthor,
         UiStatusPage, UiStatusThread, UiStatusVisibility, shell,
     };
+    use serde_json::Value;
     use tower::ServiceExt;
     use tower_http::services::ServeDir;
     use uuid::Uuid;
@@ -2141,7 +2128,7 @@ mod tests {
                     .and_then(|(_, rest)| rest.split_once("</script>"))
                     .map(|(script, _)| script)
                     .expect("profile JSON-LD script content");
-                let structured_data: serde_json::Value =
+                let structured_data: Value =
                     serde_json::from_str(script_content).expect("valid profile JSON-LD");
                 assert_eq!(structured_data["@type"], "ProfilePage");
                 assert_eq!(structured_data["mainEntity"]["@type"], "Person");

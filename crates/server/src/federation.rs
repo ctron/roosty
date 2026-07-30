@@ -11,10 +11,10 @@ pub(crate) mod discovery;
 mod test_transport;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::to_bytes,
-    extract::{Path, Query, State},
-    http::{StatusCode, header},
+    extract::{Path, Query, Request, State},
+    http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -23,9 +23,16 @@ use rand_core::{OsRng, RngCore};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    FeaturedTag, JobKind, LocalStatus, NewModerationReport, NewRemoteCustomEmoji, PollStatus,
-    RemoteActor, RemoteConversationParticipant, RemoteFeaturedTagInput, RemoteStatusPoll,
-    ReportAccount, ReportCategory, ReportStatus, StatusVisibility, create_moderation_report,
+    CollectionCursor, DirectConversationRefresh, FeaturedTag, FollowCollectionAccount,
+    InboxActivityMetadata, InboxActivityOutcome, InboxActivityType, InboxReplayResult, JobKind,
+    LocalAccount, LocalActorKey, LocalNotification, LocalNotificationType, LocalRemoteAccountBlock,
+    LocalRemoteStatusFavourite, LocalRemoteStatusReblog, LocalStatus, NewJob, NewModerationReport,
+    NewRemoteCustomEmoji, NewRemoteMediaAttachment, NewRemoteStatus, PollStatus,
+    QuoteApprovalPolicy, QuoteState, RemoteActor, RemoteConversationParticipant,
+    RemoteDeleteRepair, RemoteFeaturedTagInput, RemoteFollowResponseJob, RemoteFollowing,
+    RemoteStatus, RemoteStatusPoll, RemoteStatusReblogTarget, RemoteStatusUpsertResult,
+    ReportAccount, ReportCategory, ReportStatus, StatusPoll, StatusQuote, StatusReference,
+    StatusVisibility, StreamingStatusOrigin, TimelineCursor, create_moderation_report,
     federation_domain_policy, find_local_status_by_id, notify_administrators_of_report,
 };
 use rsa::{
@@ -35,7 +42,7 @@ use rsa::{
     pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
     signature::{SignatureEncoding, Signer, Verifier},
 };
-use sea_orm::{AccessMode, ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -44,7 +51,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{http::AppState, notifications::publish_committed_notification};
+use crate::{
+    http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
+    notifications::publish_committed_notification,
+};
 
 const ACTIVITYSTREAMS_CONTENT_TYPE: &str = "application/activity+json";
 const JRD_CONTENT_TYPE: &str = "application/jrd+json";
@@ -173,23 +183,23 @@ enum InboundActivityType {
 }
 
 impl InboundActivityType {
-    fn persisted(self) -> Option<roosty_db::InboxActivityType> {
+    fn persisted(self) -> Option<InboxActivityType> {
         match self {
-            Self::Follow => Some(roosty_db::InboxActivityType::Follow),
-            Self::Accept => Some(roosty_db::InboxActivityType::Accept),
-            Self::Reject => Some(roosty_db::InboxActivityType::Reject),
-            Self::Create => Some(roosty_db::InboxActivityType::Create),
-            Self::Update => Some(roosty_db::InboxActivityType::Update),
-            Self::Delete => Some(roosty_db::InboxActivityType::Delete),
-            Self::Like => Some(roosty_db::InboxActivityType::Like),
-            Self::Announce => Some(roosty_db::InboxActivityType::Announce),
-            Self::Undo => Some(roosty_db::InboxActivityType::Undo),
-            Self::Move => Some(roosty_db::InboxActivityType::Move),
-            Self::Block => Some(roosty_db::InboxActivityType::Block),
-            Self::Add => Some(roosty_db::InboxActivityType::Add),
-            Self::Remove => Some(roosty_db::InboxActivityType::Remove),
-            Self::Flag => Some(roosty_db::InboxActivityType::Flag),
-            Self::QuoteRequest => Some(roosty_db::InboxActivityType::QuoteRequest),
+            Self::Follow => Some(InboxActivityType::Follow),
+            Self::Accept => Some(InboxActivityType::Accept),
+            Self::Reject => Some(InboxActivityType::Reject),
+            Self::Create => Some(InboxActivityType::Create),
+            Self::Update => Some(InboxActivityType::Update),
+            Self::Delete => Some(InboxActivityType::Delete),
+            Self::Like => Some(InboxActivityType::Like),
+            Self::Announce => Some(InboxActivityType::Announce),
+            Self::Undo => Some(InboxActivityType::Undo),
+            Self::Move => Some(InboxActivityType::Move),
+            Self::Block => Some(InboxActivityType::Block),
+            Self::Add => Some(InboxActivityType::Add),
+            Self::Remove => Some(InboxActivityType::Remove),
+            Self::Flag => Some(InboxActivityType::Flag),
+            Self::QuoteRequest => Some(InboxActivityType::QuoteRequest),
             Self::Other => None,
         }
     }
@@ -613,9 +623,9 @@ struct ReplyFetchPayload {
 }
 
 struct ResolvedInboundQuote {
-    target: roosty_db::StatusReference,
+    target: StatusReference,
     activitypub_id: String,
-    state: roosty_db::QuoteState,
+    state: QuoteState,
     authorization_id: Option<String>,
     local_author_id: Option<AccountId>,
 }
@@ -676,8 +686,9 @@ fn remote_poll_from_note(note: &InboundNote) -> Result<Option<RemoteStatusPoll>,
 
 async fn resolve_inbound_quote(
     state: &AppState,
+    db: &impl ConnectionTrait,
     note: &InboundNote,
-    actor: &roosty_db::RemoteActor,
+    actor: &RemoteActor,
 ) -> Result<Option<ResolvedInboundQuote>, RoostyError> {
     let Some(target_id) = note.quote.as_deref() else {
         return Ok(None);
@@ -685,34 +696,29 @@ async fn resolve_inbound_quote(
     if !target_id.starts_with("https://") {
         return Ok(None);
     }
-    if let Some(id) = local_status_id_from_url(state, target_id).await?
-        && let Some(target) = roosty_db::find_local_status_by_id(&state.db, id).await?
+    if let Some(id) = local_status_id_from_url(state, db, target_id).await?
+        && let Some(target) = roosty_db::find_local_status_by_id(db, id).await?
     {
         if target.visibility == StatusVisibility::Direct
-            || roosty_db::local_remote_accounts_are_blocked(&state.db, target.account_id, actor.id)
-                .await?
+            || roosty_db::local_remote_accounts_are_blocked(db, target.account_id, actor.id).await?
         {
             return Ok(None);
         }
         let allowed = match target.quote_approval_policy {
-            roosty_db::QuoteApprovalPolicy::Public => true,
-            roosty_db::QuoteApprovalPolicy::Followers => {
-                roosty_db::remote_actor_follows_local_account(
-                    &state.db,
-                    actor.id,
-                    target.account_id,
-                )
-                .await?
+            QuoteApprovalPolicy::Public => true,
+            QuoteApprovalPolicy::Followers => {
+                roosty_db::remote_actor_follows_local_account(db, actor.id, target.account_id)
+                    .await?
             }
-            roosty_db::QuoteApprovalPolicy::Nobody => false,
+            QuoteApprovalPolicy::Nobody => false,
         };
         if !allowed {
             return Ok(None);
         }
         return Ok(Some(ResolvedInboundQuote {
-            target: roosty_db::StatusReference::Local(target.id),
+            target: StatusReference::Local(target.id),
             activitypub_id: target_id.to_owned(),
-            state: roosty_db::QuoteState::Accepted,
+            state: QuoteState::Accepted,
             authorization_id: Some(public_url(
                 state,
                 &format!("quote-authorizations/{}", Uuid::now_v7()),
@@ -720,16 +726,14 @@ async fn resolve_inbound_quote(
             local_author_id: Some(target.account_id),
         }));
     }
-    let Some(target) =
-        roosty_db::find_remote_status_by_activitypub_id(&state.db, target_id).await?
-    else {
+    let Some(target) = roosty_db::find_remote_status_by_activitypub_id(db, target_id).await? else {
         return Ok(None);
     };
     if target.remote_actor_id != actor.id {
         let Some(authorization_id) = note.quote_authorization.as_deref() else {
             return Ok(None);
         };
-        let target_actor = roosty_db::find_remote_actor_by_id(&state.db, target.remote_actor_id)
+        let target_actor = roosty_db::find_remote_actor_by_id(db, target.remote_actor_id)
             .await?
             .ok_or_else(|| {
                 RoostyError::InvalidInput("quoted remote author does not exist".to_owned())
@@ -742,7 +746,7 @@ async fn resolve_inbound_quote(
             Err(_) => return Ok(None),
         };
         let authorization: InboundQuoteAuthorization =
-            match discovery::fetch_json(state, authorization_url, None).await {
+            match discovery::fetch_json(state, db, authorization_url, None).await {
                 Ok(authorization) => authorization,
                 Err(_) => return Ok(None),
             };
@@ -755,17 +759,17 @@ async fn resolve_inbound_quote(
             return Ok(None);
         }
         return Ok(Some(ResolvedInboundQuote {
-            target: roosty_db::StatusReference::Remote(target.id),
+            target: StatusReference::Remote(target.id),
             activitypub_id: target_id.to_owned(),
-            state: roosty_db::QuoteState::Accepted,
+            state: QuoteState::Accepted,
             authorization_id: Some(authorization.id),
             local_author_id: None,
         }));
     }
     Ok(Some(ResolvedInboundQuote {
-        target: roosty_db::StatusReference::Remote(target.id),
+        target: StatusReference::Remote(target.id),
         activitypub_id: target_id.to_owned(),
-        state: roosty_db::QuoteState::Accepted,
+        state: QuoteState::Accepted,
         authorization_id: note.quote_authorization.clone(),
         local_author_id: None,
     }))
@@ -941,55 +945,52 @@ pub fn router() -> Router<AppState> {
 
 async fn quote_authorization(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path(authorization_id): Path<Uuid>,
-) -> Response {
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    let txn = database.begin_snapshot().await?;
     let id = public_url(&state, &format!("quote-authorizations/{authorization_id}"));
-    let quote = match roosty_db::quote_by_authorization_id(&state.db, &id).await {
-        Ok(Some(quote)) if quote.state == roosty_db::QuoteState::Accepted => quote,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
+    let quote = roosty_db::quote_by_authorization_id(&txn, &id)
+        .await?
+        .filter(|quote| quote.state == QuoteState::Accepted)
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let Some(StatusReference::Local(target_id)) = quote.quoted_status else {
+        return Err(ApiError::NotFound("Record not found".into()));
     };
-    let Some(roosty_db::StatusReference::Local(target_id)) = quote.quoted_status else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let target = match roosty_db::find_local_status_by_id(&state.db, target_id).await {
-        Ok(Some(status)) => status,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let author = match roosty_db::find_local_account_by_id(&state.db, target.account_id).await {
-        Ok(Some(account)) => account,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
+    let target = roosty_db::find_local_status_by_id(&txn, target_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let author = roosty_db::find_local_account_by_id(&txn, target.account_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
     let interacting_object = match quote.quoting_status {
-        roosty_db::StatusReference::Local(id) => {
-            let status = match roosty_db::find_local_status_by_id(&state.db, id).await {
-                Ok(Some(status)) => status,
-                _ => return StatusCode::NOT_FOUND.into_response(),
-            };
-            let account =
-                match roosty_db::find_local_account_by_id(&state.db, status.account_id).await {
-                    Ok(Some(account)) => account,
-                    _ => return StatusCode::NOT_FOUND.into_response(),
-                };
+        StatusReference::Local(id) => {
+            let status = roosty_db::find_local_status_by_id(&txn, id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+            let account = roosty_db::find_local_account_by_id(&txn, status.account_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
             status_url(&state, &account.username, status.id)
         }
-        roosty_db::StatusReference::Remote(id) => {
-            match roosty_db::find_remote_status_by_id(&state.db, id).await {
-                Ok(Some(status)) => status.activitypub_id,
-                _ => return StatusCode::NOT_FOUND.into_response(),
-            }
+        StatusReference::Remote(id) => {
+            roosty_db::find_remote_status_by_id(&txn, id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?
+                .activitypub_id
         }
     };
-    activity_response(QuoteAuthorizationObject {
+    txn.commit().await?;
+    Ok(activity_response(QuoteAuthorizationObject {
         id,
         r#type: "https://w3id.org/fep/044f#QuoteAuthorization",
         attributed_to: actor_url(&state, &author.username),
         interacting_object,
         interaction_target: quote.quoted_activitypub_id,
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1346,61 +1347,69 @@ struct CollectionQuery {
 }
 
 /// Serve a local WebFinger identity. Remote and malformed resources are never resolved here.
-async fn webfinger(State(state): State<AppState>, Query(query): Query<WebFingerQuery>) -> Response {
+async fn webfinger(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Query(query): Query<WebFingerQuery>,
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
     let Some((username, domain)) = query.resource.as_deref().and_then(parse_acct) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return Err(ApiError::BadRequest("WebFinger resource is invalid".into()));
     };
     if state.config.public_base_url.host_str() != Some(domain) {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    match roosty_db::find_local_account_by_username(&state.db, username).await {
-        Ok(Some(account)) if account.suspended_at.is_none() => {
-            let subject = format!("acct:{username}@{domain}");
-            (
-                [(header::CONTENT_TYPE, JRD_CONTENT_TYPE)],
-                Json(WebFinger {
-                    subject,
-                    links: vec![WebFingerLink {
-                        rel: "self",
-                        r#type: ACTIVITYSTREAMS_CONTENT_TYPE,
-                        href: actor_url(&state, username),
-                    }],
-                }),
-            )
-                .into_response()
-        }
-        Ok(Some(_)) | Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
-    }
+    let txn = database.begin_read().await?;
+    let account = roosty_db::find_local_account_by_username(&txn, username)
+        .await?
+        .filter(|account| account.suspended_at.is_none())
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    drop(account);
+    txn.commit().await?;
+    let subject = format!("acct:{username}@{domain}");
+    Ok((
+        [(header::CONTENT_TYPE, JRD_CONTENT_TYPE)],
+        Json(WebFinger {
+            subject,
+            links: vec![WebFingerLink {
+                rel: "self",
+                r#type: ACTIVITYSTREAMS_CONTENT_TYPE,
+                href: actor_url(&state, username),
+            }],
+        }),
+    )
+        .into_response())
 }
 
 /// Serve one local actor with a persisted public signing key.
-async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+async fn actor(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Path(username): Path<String>,
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) if account.suspended_at.is_none() => account,
-        Ok(Some(_)) => return StatusCode::GONE.into_response(),
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
-    };
-    let public_key_pem = match ensure_actor_key(&state, account.id).await {
-        Ok(key) => key,
-        Err(error) => return internal_error(error),
-    };
-    activity_response(actor_document(&state, account, public_key_pem))
+    let txn = database.begin_write().await?;
+    let account = roosty_db::find_local_account_by_username(&txn, &username)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if account.suspended_at.is_some() {
+        return Err(ApiError::NotFound("Record not found".into()));
+    }
+    let public_key_pem = ensure_actor_key(&state, &txn, account.id).await?;
+    txn.commit().await?;
+    Ok(activity_response(actor_document(
+        &state,
+        account,
+        public_key_pem,
+    )))
 }
 
 /// Build the canonical public actor document used for direct reads and Update activities.
-fn actor_document(
-    state: &AppState,
-    account: roosty_db::LocalAccount,
-    public_key_pem: String,
-) -> Actor {
+fn actor_document(state: &AppState, account: LocalAccount, public_key_pem: String) -> Actor {
     let id = actor_url(state, &account.username);
     Actor {
         context: actor_context(),
@@ -1443,58 +1452,55 @@ fn actor_document(
 }
 
 /// Serve complete pinned Notes in most-recently-pinned order.
-async fn featured(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+async fn featured(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Path(username): Path<String>,
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) if account.suspended_at.is_none() => account,
-        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
-    };
-    let page = match roosty_db::pinned_local_statuses_by_account(
-        &state.db,
+    let txn = database.begin_snapshot().await?;
+    let account = roosty_db::find_local_account_by_username(&txn, &username)
+        .await?
+        .filter(|account| account.suspended_at.is_none())
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let page = roosty_db::pinned_local_statuses_by_account(
+        &txn,
         account.id,
         crate::statuses::MAX_PINNED_STATUSES,
-        roosty_db::TimelineCursor::default(),
+        TimelineCursor::default(),
     )
-    .await
-    {
-        Ok(page) => page,
-        Err(error) => return internal_error(error),
-    };
+    .await?;
     let mut ordered_items = Vec::with_capacity(page.items.len());
     for status in page.items {
-        match note_object(&state, &state.db, &username, status).await {
-            Ok(note) => ordered_items.push(note),
-            Err(error) => return internal_error(error),
-        }
+        ordered_items.push(note_object(&state, &txn, &username, status).await?);
     }
-    activity_response(FeaturedCollection {
+    txn.commit().await?;
+    Ok(activity_response(FeaturedCollection {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: format!("{}/collections/featured", actor_url(&state, &username)),
         r#type: CollectionType::OrderedCollection,
         total_items: ordered_items.len() as u64,
         ordered_items,
-    })
+    }))
 }
 
 /// Serve the local account's featured hashtags as embedded ActivityStreams objects.
-async fn featured_tags(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+async fn featured_tags(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Path(username): Path<String>,
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) if account.suspended_at.is_none() => account,
-        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
-    };
-    let tags = match roosty_db::local_featured_tags(&state.db, account.id).await {
-        Ok(tags) => tags,
-        Err(error) => return internal_error(error),
-    };
+    let txn = database.begin_snapshot().await?;
+    let account = roosty_db::find_local_account_by_username(&txn, &username)
+        .await?
+        .filter(|account| account.suspended_at.is_none())
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let tags = roosty_db::local_featured_tags(&txn, account.id).await?;
     let ordered_items = tags
         .into_iter()
         .map(|tag| ActivityPubHashtag {
@@ -1503,13 +1509,14 @@ async fn featured_tags(State(state): State<AppState>, Path(username): Path<Strin
             name: format!("#{}", tag.name),
         })
         .collect::<Vec<_>>();
-    activity_response(FeaturedTagsCollection {
+    txn.commit().await?;
+    Ok(activity_response(FeaturedTagsCollection {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: format!("{}/collections/tags", actor_url(&state, &username)),
         r#type: CollectionType::OrderedCollection,
         total_items: ordered_items.len() as u64,
         ordered_items,
-    })
+    }))
 }
 
 /// Map Roosty's local bot setting to the ActivityPub actor type Mastodon uses for services.
@@ -1558,91 +1565,81 @@ fn actor_profile_fields(profile_fields: &JsonValue) -> Vec<ActorProfileField> {
 }
 
 /// Serve the local actor's public outbox as an ordered ActivityStreams collection.
-async fn outbox(State(state): State<AppState>, Path(username): Path<String>) -> Response {
+async fn outbox(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Path(username): Path<String>,
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    let account = match roosty_db::find_local_account_by_username(&state.db, &username).await {
-        Ok(Some(account)) if account.suspended_at.is_none() => account,
-        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
-    };
-    match roosty_db::public_local_statuses_by_account(&state.db, account.id, 20).await {
-        Ok(statuses) => {
-            let mut items = Vec::with_capacity(statuses.len());
-            for status in statuses {
-                match create(&state, &account.username, status).await {
-                    Ok(item) => items.push(item),
-                    Err(error) => return internal_error(error),
-                }
-            }
-            match roosty_db::count_public_local_statuses_by_account(&state.db, account.id).await {
-                Ok(total_items) => activity_response(OrderedCollection {
-                    context: ACTIVITYSTREAMS_CONTEXT,
-                    r#type: CollectionType::OrderedCollection,
-                    total_items,
-                    ordered_items: items,
-                }),
-                Err(error) => internal_error(error),
-            }
-        }
-        Err(error) => internal_error(error),
+    let txn = database.begin_snapshot().await?;
+    let account = roosty_db::find_local_account_by_username(&txn, &username)
+        .await?
+        .filter(|account| account.suspended_at.is_none())
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let statuses = roosty_db::public_local_statuses_by_account(&txn, account.id, 20).await?;
+    let mut items = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        items.push(create(&state, &txn, &account.username, status).await?);
     }
+    let total_items = roosty_db::count_public_local_statuses_by_account(&txn, account.id).await?;
+    txn.commit().await?;
+    Ok(activity_response(OrderedCollection {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        r#type: CollectionType::OrderedCollection,
+        total_items,
+        ordered_items: items,
+    }))
 }
 
 /// Serve a public local status as a Note.
 async fn note(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path((username, status_id)): Path<(String, String)>,
-) -> Response {
+) -> ApiResult<Response> {
     if !state.config.federation_enabled {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound("Record not found".into()));
     }
-    let Ok(id) = uuid::Uuid::parse_str(&status_id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match roosty_db::find_local_status_by_id(&state.db, StatusId(id)).await {
-        Ok(Some(status)) => {
-            let dereferenceable = status.visibility == StatusVisibility::Public
-                || (status.visibility == StatusVisibility::Unlisted
-                    && match roosty_db::is_local_status_pinned(&state.db, status.id).await {
-                        Ok(pinned) => pinned,
-                        Err(error) => return internal_error(error),
-                    });
-            if !dereferenceable {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            match roosty_db::find_local_account_by_id(&state.db, status.account_id).await {
-                Ok(Some(account)) if account.username == username => {
-                    match note_object(&state, &state.db, &username, status).await {
-                        Ok(note) => activity_response(note),
-                        Err(error) => internal_error(error),
-                    }
-                }
-                Ok(_) => StatusCode::NOT_FOUND.into_response(),
-                Err(error) => internal_error(error),
-            }
-        }
-        Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
+    let id = Uuid::parse_str(&status_id)
+        .ok()
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let txn = database.begin_snapshot().await?;
+    let status = roosty_db::find_local_status_by_id(&txn, StatusId(id))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let dereferenceable = status.visibility == StatusVisibility::Public
+        || (status.visibility == StatusVisibility::Unlisted
+            && roosty_db::is_local_status_pinned(&txn, status.id).await?);
+    if !dereferenceable {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    let account = roosty_db::find_local_account_by_id(&txn, status.account_id)
+        .await?
+        .filter(|account| account.username == username)
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    drop(account);
+    let note = note_object(&state, &txn, &username, status).await?;
+    txn.commit().await?;
+    Ok(activity_response(note))
 }
 
 /// Serve the actor's follower collection metadata without leaking local-only details.
 async fn followers(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path(username): Path<String>,
     Query(query): Query<CollectionQuery>,
-) -> Response {
-    let Some(account) = account_for_collection(&state, &username).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match (
-        roosty_db::count_local_followers(&state.db, account.id).await,
-        roosty_db::count_remote_followers(&state.db, account.id).await,
-    ) {
-        (Ok(local), Ok(remote)) if query.page != Some(true) => activity_response(Collection {
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let account = account_for_collection(&state, &txn, &username)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let local = roosty_db::count_local_followers(&txn, account.id).await?;
+    let remote = roosty_db::count_remote_followers(&txn, account.id).await?;
+    let response = if query.page != Some(true) {
+        activity_response(Collection {
             context: ACTIVITYSTREAMS_CONTEXT,
             id: format!("{}/followers", actor_url(&state, &username)),
             r#type: CollectionType::Collection,
@@ -1651,28 +1648,29 @@ async fn followers(
                 "{}/followers?page=true",
                 actor_url(&state, &username)
             )),
-        }),
-        (Ok(_), Ok(_)) => {
-            activity_collection_page(&state, &username, account.id, query.max_id, true).await
-        }
-        (Err(error), _) | (_, Err(error)) => internal_error(error),
-    }
+        })
+    } else {
+        activity_collection_page(&state, &txn, &username, account.id, query.max_id, true).await?
+    };
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Serve the actor's following collection metadata without leaking local-only details.
 async fn following(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path(username): Path<String>,
     Query(query): Query<CollectionQuery>,
-) -> Response {
-    let Some(account) = account_for_collection(&state, &username).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match (
-        roosty_db::count_local_following(&state.db, account.id).await,
-        roosty_db::count_remote_following(&state.db, account.id).await,
-    ) {
-        (Ok(local), Ok(remote)) if query.page != Some(true) => activity_response(Collection {
+) -> ApiResult<Response> {
+    let txn = database.begin_snapshot().await?;
+    let account = account_for_collection(&state, &txn, &username)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let local = roosty_db::count_local_following(&txn, account.id).await?;
+    let remote = roosty_db::count_remote_following(&txn, account.id).await?;
+    let response = if query.page != Some(true) {
+        activity_response(Collection {
             context: ACTIVITYSTREAMS_CONTEXT,
             id: format!("{}/following", actor_url(&state, &username)),
             r#type: CollectionType::Collection,
@@ -1681,92 +1679,96 @@ async fn following(
                 "{}/following?page=true",
                 actor_url(&state, &username)
             )),
-        }),
-        (Ok(_), Ok(_)) => {
-            activity_collection_page(&state, &username, account.id, query.max_id, false).await
-        }
-        (Err(error), _) | (_, Err(error)) => internal_error(error),
-    }
+        })
+    } else {
+        activity_collection_page(&state, &txn, &username, account.id, query.max_id, false).await?
+    };
+    txn.commit().await?;
+    Ok(response)
 }
 
 /// Render one public ordered page of a local actor's mixed follow collection.
 async fn activity_collection_page(
     state: &AppState,
+    db: &impl ConnectionTrait,
     username: &str,
     account_id: AccountId,
     max_id: Option<Uuid>,
     followers: bool,
-) -> Response {
-    let cursor = roosty_db::CollectionCursor {
+) -> Result<Response, RoostyError> {
+    let cursor = CollectionCursor {
         max_id,
         ..Default::default()
     };
     let page = if followers {
-        roosty_db::followers_for_local_account(&state.db, account_id, 20, cursor).await
+        roosty_db::followers_for_local_account(db, account_id, 20, cursor).await
     } else {
-        roosty_db::following_for_local_account(&state.db, account_id, 20, cursor).await
+        roosty_db::following_for_local_account(db, account_id, 20, cursor).await
     };
-    match page {
-        Ok(page) => {
-            let ordered_items = page
-                .items
-                .into_iter()
-                .map(|entry| match entry.account {
-                    roosty_db::FollowCollectionAccount::Local(account) => {
-                        actor_url(state, &account.username)
-                    }
-                    roosty_db::FollowCollectionAccount::Remote(actor) => actor.activitypub_id,
-                })
-                .collect();
-            let name = if followers { "followers" } else { "following" };
-            let next = page
-                .has_more
-                .then_some(page.last_cursor)
-                .flatten()
-                .map(|cursor| {
-                    format!(
-                        "{}/{name}?page=true&max_id={cursor}",
-                        actor_url(state, username),
-                    )
-                });
-            activity_response(OrderedCollectionPage {
-                context: ACTIVITYSTREAMS_CONTEXT,
-                id: format!("{}/{name}?page=true", actor_url(state, username)),
-                r#type: CollectionType::OrderedCollection,
-                ordered_items,
-                next,
-            })
-        }
-        Err(error) => internal_error(error),
-    }
+    let page = page?;
+    let ordered_items = page
+        .items
+        .into_iter()
+        .map(|entry| match entry.account {
+            FollowCollectionAccount::Local(account) => actor_url(state, &account.username),
+            FollowCollectionAccount::Remote(actor) => actor.activitypub_id,
+        })
+        .collect();
+    let name = if followers { "followers" } else { "following" };
+    let next = page
+        .has_more
+        .then_some(page.last_cursor)
+        .flatten()
+        .map(|cursor| {
+            format!(
+                "{}/{name}?page=true&max_id={cursor}",
+                actor_url(state, username),
+            )
+        });
+    Ok(activity_response(OrderedCollectionPage {
+        context: ACTIVITYSTREAMS_CONTEXT,
+        id: format!("{}/{name}?page=true", actor_url(state, username)),
+        r#type: CollectionType::OrderedCollection,
+        ordered_items,
+        next,
+    }))
 }
 
 async fn account_for_collection(
     state: &AppState,
+    db: &impl ConnectionTrait,
     username: &str,
-) -> Option<roosty_db::LocalAccount> {
+) -> Result<Option<LocalAccount>, RoostyError> {
     if !state.config.federation_enabled {
-        return None;
+        return Ok(None);
     }
-    match roosty_db::find_local_account_by_username(&state.db, username).await {
-        Ok(account) => account.filter(|account| account.suspended_at.is_none()),
-        Err(error) => {
-            tracing::error!(%error, "could not load ActivityPub collection actor");
-            None
-        }
-    }
+    Ok(roosty_db::find_local_account_by_username(db, username)
+        .await?
+        .filter(|account| account.suspended_at.is_none()))
 }
 
 /// Verify and process a remote Follow or Undo(Follow) inbox activity.
-async fn inbox(State(state): State<AppState>, request: axum::extract::Request) -> Response {
-    if state.config.federation_enabled {
-        process_inbox(&state, request).await
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+async fn inbox(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    request: Request,
+) -> ApiResult<Response> {
+    if !state.config.federation_enabled {
+        return Err(ApiError::NotFound("Record not found".into()));
     }
+    let txn = database.begin_write().await?;
+    let context = TransactionContext::new(&state, &txn);
+    let response = process_inbox(&context, &database, request).await;
+    txn.commit().await?;
+    Ok(response)
 }
 
-async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Response {
+async fn process_inbox(
+    state: &TransactionContext<'_, DatabaseTransaction>,
+    database: &DatabaseContext,
+    request: Request,
+) -> Response {
+    let db = state.db;
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, 1_048_576).await {
         Ok(body) => body,
@@ -1779,7 +1781,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     let Some(actor_id) = activity.get("actor").and_then(JsonValue::as_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let remote_actor = match discovery::resolve_remote_actor_by_id(state, actor_id).await {
+    let remote_actor = match discovery::resolve_remote_actor_by_id(state, database, actor_id).await
+    {
         Ok(actor) => actor,
         Err(error) => {
             tracing::warn!(%error, "rejected remote inbox actor");
@@ -1814,31 +1817,32 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let existing = roosty_db::classify_inbox_activity(
-        &state.db,
-        roosty_db::InboxActivityMetadata {
+        db,
+        InboxActivityMetadata {
             activity_id: &activity_id,
             remote_actor_id: remote_actor.id,
             payload_digest: &digest,
             activity_type: persisted_activity_type,
-            outcome: roosty_db::InboxActivityOutcome::Accepted,
+            outcome: InboxActivityOutcome::Accepted,
         },
     )
     .await;
     match existing {
-        Ok(Some(roosty_db::InboxReplayResult::Duplicate)) => {
+        Ok(Some(InboxReplayResult::Duplicate)) => {
             INBOX_DUPLICATE.fetch_add(1, Ordering::Relaxed);
             return StatusCode::ACCEPTED.into_response();
         }
-        Ok(Some(roosty_db::InboxReplayResult::Conflict)) => {
+        Ok(Some(InboxReplayResult::Conflict)) => {
             INBOX_CONFLICT.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(activity_id, remote_actor_id = %remote_actor.id.0, "ignored conflicting inbox activity replay");
             return StatusCode::ACCEPTED.into_response();
         }
-        Ok(Some(roosty_db::InboxReplayResult::New) | None) => {}
+        Ok(Some(InboxReplayResult::New) | None) => {}
         Err(error) => return internal_error(error),
     }
     if is_remote_actor_lifecycle_activity(&activity, &remote_actor.activitypub_id) {
-        return match process_remote_actor_lifecycle(state, &activity, &remote_actor).await {
+        return match process_remote_actor_lifecycle(state, database, &activity, &remote_actor).await
+        {
             Ok(repair) => {
                 if let Some(repair) = repair
                     && let Err(error) = publish_delete_repair(state, repair).await
@@ -1854,7 +1858,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         };
     }
     if activity_type == Some(InboundActivityType::Flag) {
-        let policy = match federation_domain_policy(&state.db, &remote_actor.domain).await {
+        let policy = match federation_domain_policy(db, &remote_actor.domain).await {
             Ok(policy) => policy,
             Err(error) => return internal_error(error),
         };
@@ -1867,7 +1871,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             .unwrap_or_default();
         let mut target = None;
         for reference in &references {
-            if let Some(account) = local_account_from_actor_url(state, reference).await {
+            if let Some(account) = local_account_from_actor_url(state, db, reference).await {
                 target = Some(account);
                 break;
             }
@@ -1883,7 +1887,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             let Ok(status_id) = raw_id.parse::<Uuid>().map(StatusId) else {
                 continue;
             };
-            let status = match find_local_status_by_id(&state.db, status_id).await {
+            let status = match find_local_status_by_id(db, status_id).await {
                 Ok(Some(status)) => status,
                 Ok(None) => continue,
                 Err(error) => return internal_error(error),
@@ -1894,7 +1898,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 statuses.push(ReportStatus::Local(status_id));
             }
         }
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -1937,9 +1941,13 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         return match txn.commit().await {
             Ok(()) => {
                 for notification in notifications {
-                    if let Err(error) =
-                        publish_committed_notification(state, notification.account_id, notification)
-                            .await
+                    if let Err(error) = publish_committed_notification(
+                        state,
+                        database,
+                        notification.account_id,
+                        notification,
+                    )
+                    .await
                     {
                         tracing::warn!(%error, "could not stream administrator report notification");
                     }
@@ -1980,14 +1988,12 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             return StatusCode::BAD_REQUEST.into_response();
         }
         let status =
-            match roosty_db::find_remote_status_by_activitypub_id(&state.db, featured.object.id())
-                .await
-            {
+            match roosty_db::find_remote_status_by_activitypub_id(db, featured.object.id()).await {
                 Ok(Some(status)) if status.remote_actor_id == remote_actor.id => status,
                 Ok(_) => return StatusCode::BAD_REQUEST.into_response(),
                 Err(error) => return internal_error(error),
             };
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2020,10 +2026,10 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             return StatusCode::BAD_REQUEST.into_response();
         }
         let target_url = block.object.id();
-        let Some(local_account) = local_account_from_actor_url(state, &target_url).await else {
+        let Some(local_account) = local_account_from_actor_url(state, db, &target_url).await else {
             return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         };
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2051,18 +2057,15 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         && let Ok(undo) = serde_json::from_value::<InboundUndoBlockActivity>(activity.clone())
         && let Some(original_id) = undo.object.block_id()
     {
-        let row = match roosty_db::find_remote_local_block_by_activity(
-            &state.db,
-            remote_actor.id,
-            &original_id,
-        )
-        .await
-        {
-            Ok(row) => row,
-            Err(error) => return internal_error(error),
-        };
+        let row =
+            match roosty_db::find_remote_local_block_by_activity(db, remote_actor.id, &original_id)
+                .await
+            {
+                Ok(row) => row,
+                Err(error) => return internal_error(error),
+            };
         if let Some(row) = row {
-            let txn = match state.db.begin().await {
+            let txn = match db.begin().await {
                 Ok(txn) => txn,
                 Err(error) => return internal_error(error),
             };
@@ -2092,13 +2095,14 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             if request.actor != remote_actor.activitypub_id || request.id != activity_id {
                 return StatusCode::BAD_REQUEST.into_response();
             }
-            let Some(target_id) = (match local_status_id_from_url(state, &request.object).await {
+            let Some(target_id) = (match local_status_id_from_url(state, db, &request.object).await
+            {
                 Ok(id) => id,
                 Err(error) => return internal_error(error),
             }) else {
                 return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
             };
-            let target = match roosty_db::find_local_status_by_id(&state.db, target_id).await {
+            let target = match roosty_db::find_local_status_by_id(db, target_id).await {
                 Ok(Some(status)) => status,
                 Ok(None) => {
                     return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
@@ -2106,7 +2110,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 Err(error) => return internal_error(error),
             };
             let blocked = match roosty_db::local_remote_accounts_are_blocked(
-                &state.db,
+                db,
                 target.account_id,
                 remote_actor.id,
             )
@@ -2116,7 +2120,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 Err(error) => return internal_error(error),
             };
             let follows = match roosty_db::remote_actor_follows_local_account(
-                &state.db,
+                db,
                 remote_actor.id,
                 target.account_id,
             )
@@ -2128,15 +2132,14 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             let accepted = !blocked
                 && target.visibility != StatusVisibility::Direct
                 && match target.quote_approval_policy {
-                    roosty_db::QuoteApprovalPolicy::Public => true,
-                    roosty_db::QuoteApprovalPolicy::Followers => follows,
-                    roosty_db::QuoteApprovalPolicy::Nobody => false,
+                    QuoteApprovalPolicy::Public => true,
+                    QuoteApprovalPolicy::Followers => follows,
+                    QuoteApprovalPolicy::Nobody => false,
                 };
-            let local =
-                match roosty_db::find_local_account_by_id(&state.db, target.account_id).await {
-                    Ok(Some(account)) => account,
-                    _ => return StatusCode::BAD_REQUEST.into_response(),
-                };
+            let local = match roosty_db::find_local_account_by_id(db, target.account_id).await {
+                Ok(Some(account)) => account,
+                _ => return StatusCode::BAD_REQUEST.into_response(),
+            };
             let actor = actor_url(state, &local.username);
             let authorization = accepted.then(|| QuoteAuthorizationObject {
                 id: public_url(state, &format!("quote-authorizations/{}", Uuid::now_v7())),
@@ -2177,7 +2180,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 Ok(value) => value,
                 Err(error) => return internal_error(error),
             };
-            let txn = match state.db.begin().await {
+            let txn = match db.begin().await {
                 Ok(txn) => txn,
                 Err(error) => return internal_error(error),
             };
@@ -2188,8 +2191,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             if is_new {
                 if let Err(error) = roosty_db::enqueue_job_in_transaction(
                     &txn,
-                    roosty_db::NewJob {
-                        kind: roosty_db::JobKind::FederationQuoteDelivery,
+                    NewJob {
+                        kind: JobKind::FederationQuoteDelivery,
                         payload,
                         deduplication_key: Some(format!("quote-response:{}", request.id)),
                         run_after: OffsetDateTime::now_utc(),
@@ -2205,12 +2208,12 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     if let Err(error) = roosty_db::upsert_remote_status_quote(
                         &txn,
                         quoting.id,
-                        roosty_db::StatusReference::Local(target.id),
+                        StatusReference::Local(target.id),
                         &request.object,
                         if accepted {
-                            roosty_db::QuoteState::Accepted
+                            QuoteState::Accepted
                         } else {
-                            roosty_db::QuoteState::Rejected
+                            QuoteState::Rejected
                         },
                         authorization_id.as_deref(),
                     )
@@ -2244,10 +2247,10 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         let object_id = match delete.object {
             InboundDeleteObject::Id(id) | InboundDeleteObject::Tombstone { id } => id,
         };
-        if let Ok(Some(quote)) = roosty_db::quote_by_authorization_id(&state.db, &object_id).await
-            && let Some(roosty_db::StatusReference::Remote(target_id)) = quote.quoted_status
+        if let Ok(Some(quote)) = roosty_db::quote_by_authorization_id(db, &object_id).await
+            && let Some(StatusReference::Remote(target_id)) = quote.quoted_status
         {
-            let target_matches = roosty_db::find_remote_status_by_id(&state.db, target_id)
+            let target_matches = roosty_db::find_remote_status_by_id(db, target_id)
                 .await
                 .ok()
                 .flatten()
@@ -2255,7 +2258,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             if !target_matches || delete.actor != remote_actor.activitypub_id {
                 return StatusCode::BAD_REQUEST.into_response();
             }
-            let txn = match state.db.begin().await {
+            let txn = match db.begin().await {
                 Ok(txn) => txn,
                 Err(error) => return internal_error(error),
             };
@@ -2269,7 +2272,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     Err(error) => return internal_error(error),
                 };
                 if revoked.is_some()
-                    && let roosty_db::StatusReference::Local(quoting_id) = quote.quoting_status
+                    && let StatusReference::Local(quoting_id) = quote.quoting_status
                     && let Ok(Some(status)) =
                         roosty_db::find_local_status_by_id(&txn, quoting_id).await
                     && let Err(error) = enqueue_status_activity_in_transaction(
@@ -2318,6 +2321,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     ) {
         return Box::pin(process_and_publish_remote_status_activity(
             state,
+            database,
             &activity_id,
             &activity,
             &remote_actor,
@@ -2329,21 +2333,18 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         Some(InboundActivityType::Accept | InboundActivityType::Reject)
     ) {
         if let Ok(response) = serde_json::from_value::<InboundQuoteResponse>(activity.clone())
-            && let Ok(Some(quote)) =
-                roosty_db::quote_by_request_id(&state.db, response.object.id()).await
+            && let Ok(Some(quote)) = roosty_db::quote_by_request_id(db, response.object.id()).await
         {
             return Box::pin(async {
                 if response.actor != remote_actor.activitypub_id {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
-                let (
-                    roosty_db::StatusReference::Local(quoting_id),
-                    Some(roosty_db::StatusReference::Remote(target_id)),
-                ) = (quote.quoting_status, quote.quoted_status)
+                let (StatusReference::Local(quoting_id), Some(StatusReference::Remote(target_id))) =
+                    (quote.quoting_status, quote.quoted_status)
                 else {
                     return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
                 };
-                let target = match roosty_db::find_remote_status_by_id(&state.db, target_id).await {
+                let target = match roosty_db::find_remote_status_by_id(db, target_id).await {
                     Ok(Some(target)) if target.remote_actor_id == remote_actor.id => target,
                     _ => {
                         return finish_ignored_inbox_activity(state, &activity, &remote_actor)
@@ -2355,9 +2356,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     let Some(auth) = response.result else {
                         return StatusCode::BAD_REQUEST.into_response();
                     };
-                    let quoting = match roosty_db::find_local_status_by_id(&state.db, quoting_id)
-                        .await
-                    {
+                    let quoting = match roosty_db::find_local_status_by_id(db, quoting_id).await {
                         Ok(Some(status)) => status,
                         _ => {
                             return finish_ignored_inbox_activity(state, &activity, &remote_actor)
@@ -2365,9 +2364,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                         }
                     };
                     let local =
-                        match roosty_db::find_local_account_by_id(&state.db, quoting.account_id)
-                            .await
-                        {
+                        match roosty_db::find_local_account_by_id(db, quoting.account_id).await {
                             Ok(Some(account)) => account,
                             _ => return StatusCode::BAD_REQUEST.into_response(),
                         };
@@ -2384,7 +2381,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 } else {
                     None
                 };
-                let txn = match state.db.begin().await {
+                let txn = match db.begin().await {
                     Ok(txn) => txn,
                     Err(error) => return internal_error(error),
                 };
@@ -2397,9 +2394,9 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                         &txn,
                         response.object.id(),
                         if accepted {
-                            roosty_db::QuoteState::Accepted
+                            QuoteState::Accepted
                         } else {
-                            roosty_db::QuoteState::Rejected
+                            QuoteState::Rejected
                         },
                         authorization_id.as_deref(),
                     )
@@ -2438,7 +2435,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2464,9 +2461,11 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 }
                 if accepted
                     && activity_type == Some(InboundActivityType::Accept)
-                    && let Err(error) =
-                        crate::media::enqueue_remote_profile_media_fetches(state, remote_actor.id)
-                            .await
+                    && let Err(error) = crate::media::enqueue_remote_profile_media_fetches(
+                        database,
+                        remote_actor.id,
+                    )
+                    .await
                 {
                     tracing::warn!(%error, "could not queue remote profile media fetches");
                 }
@@ -2483,24 +2482,20 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         if like.actor != remote_actor.activitypub_id || !like.object.starts_with("https://") {
             return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         }
-        let Some(status_id) = local_status_id_from_url(state, &like.object)
+        let Some(status_id) = local_status_id_from_url(state, db, &like.object)
             .await
             .ok()
             .flatten()
         else {
             return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         };
-        let status = match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+        let status = match roosty_db::find_local_status_by_id(db, status_id).await {
             Ok(Some(status)) => status,
             Ok(_) => return finish_ignored_inbox_activity(state, &activity, &remote_actor).await,
             Err(error) => return internal_error(error),
         };
-        match roosty_db::local_private_status_visible_to_remote_actor(
-            &state.db,
-            &status,
-            remote_actor.id,
-        )
-        .await
+        match roosty_db::local_private_status_visible_to_remote_actor(db, &status, remote_actor.id)
+            .await
         {
             Ok(true) => {}
             Ok(false) => {
@@ -2508,7 +2503,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             }
             Err(error) => return internal_error(error),
         }
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2536,8 +2531,13 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                     return internal_error(error);
                 }
                 if let Some(notification) = notification
-                    && let Err(error) =
-                        publish_committed_notification(state, status.account_id, notification).await
+                    && let Err(error) = publish_committed_notification(
+                        state,
+                        database,
+                        status.account_id,
+                        notification,
+                    )
+                    .await
                 {
                     tracing::warn!(%error, activity_id, "could not create remote favourite notification");
                 }
@@ -2555,28 +2555,23 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         {
             return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
         }
-        let target = match local_status_id_from_url(state, &announce.object).await {
-            Ok(Some(status_id)) => {
-                match roosty_db::find_local_status_by_id(&state.db, status_id).await {
-                    Ok(Some(status))
-                        if matches!(
-                            status.visibility,
-                            StatusVisibility::Public | StatusVisibility::Unlisted
-                        ) =>
-                    {
-                        roosty_db::RemoteStatusReblogTarget::Local(status.id)
-                    }
-                    Ok(_) => {
-                        return finish_ignored_inbox_activity(state, &activity, &remote_actor)
-                            .await;
-                    }
-                    Err(error) => return internal_error(error),
-                }
-            }
-            Ok(None) => {
-                match roosty_db::find_remote_status_by_activitypub_id(&state.db, &announce.object)
-                    .await
+        let target = match local_status_id_from_url(state, db, &announce.object).await {
+            Ok(Some(status_id)) => match roosty_db::find_local_status_by_id(db, status_id).await {
+                Ok(Some(status))
+                    if matches!(
+                        status.visibility,
+                        StatusVisibility::Public | StatusVisibility::Unlisted
+                    ) =>
                 {
+                    RemoteStatusReblogTarget::Local(status.id)
+                }
+                Ok(_) => {
+                    return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
+                }
+                Err(error) => return internal_error(error),
+            },
+            Ok(None) => {
+                match roosty_db::find_remote_status_by_activitypub_id(db, &announce.object).await {
                     Ok(Some(status))
                         if matches!(
                             status.visibility,
@@ -2584,7 +2579,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                         ) || (status.visibility == StatusVisibility::Private
                             && status.remote_actor_id == remote_actor.id) =>
                     {
-                        roosty_db::RemoteStatusReblogTarget::Remote(status.id)
+                        RemoteStatusReblogTarget::Remote(status.id)
                     }
                     Ok(_) => {
                         return finish_ignored_inbox_activity(state, &activity, &remote_actor)
@@ -2595,7 +2590,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             }
             Err(error) => return internal_error(error),
         };
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2621,8 +2616,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             Err(error) => return internal_error(error),
         };
         let notification = if created {
-            if let roosty_db::RemoteStatusReblogTarget::Local(status_id) = target {
-                match roosty_db::find_local_status_by_id(&state.db, status_id).await {
+            if let RemoteStatusReblogTarget::Local(status_id) = target {
+                match roosty_db::find_local_status_by_id(db, status_id).await {
                     Ok(Some(status)) => match roosty_db::notify_remote_actor_reblog(
                         &txn,
                         status.account_id,
@@ -2648,9 +2643,13 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         }
         if created {
             if let Some(notification) = notification
-                && let Err(error) =
-                    publish_committed_notification(state, notification.account_id, notification)
-                        .await
+                && let Err(error) = publish_committed_notification(
+                    state,
+                    database,
+                    notification.account_id,
+                    notification,
+                )
+                .await
             {
                 tracing::warn!(%error, activity_id, "could not publish remote reblog notification");
             }
@@ -2667,7 +2666,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         && let Ok(undo) = serde_json::from_value::<InboundUndoAnnounceActivity>(activity.clone())
         && let Some(original_id) = undo.object.announce_id()
     {
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2705,7 +2704,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         && let Ok(undo) = serde_json::from_value::<InboundUndoLikeActivity>(activity.clone())
         && let Some(original_id) = undo.object.like_id()
     {
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2743,7 +2742,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
         let Some(original_id) = undo.object.follow_id() else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        let txn = match state.db.begin().await {
+        let txn = match db.begin().await {
             Ok(txn) => txn,
             Err(error) => return internal_error(error),
         };
@@ -2781,7 +2780,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     if target_url != actor_url(state, username) {
         return finish_ignored_inbox_activity(state, &activity, &remote_actor).await;
     }
-    let local_account = match roosty_db::find_local_account_by_username(&state.db, username).await {
+    let local_account = match roosty_db::find_local_account_by_username(db, username).await {
         Ok(Some(account)) => account,
         Ok(None) => return finish_ignored_inbox_activity(state, &activity, &remote_actor).await,
         Err(error) => return internal_error(error),
@@ -2791,7 +2790,7 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     } else {
         InboundFollowState::Accepted
     };
-    let txn = match state.db.begin().await {
+    let txn = match db.begin().await {
         Ok(txn) => txn,
         Err(error) => return internal_error(error),
     };
@@ -2821,8 +2820,8 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
             local_account.id,
             &activity_id,
             activity.clone(),
-            roosty_db::RemoteFollowResponseJob {
-                kind: roosty_db::JobKind::FederationFollowResponse,
+            RemoteFollowResponseJob {
+                kind: JobKind::FederationFollowResponse,
                 payload,
                 deduplication_key: format!("{}:{activity_id}", FollowResponseType::Accept.as_str()),
             },
@@ -2844,9 +2843,9 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
     };
     let notification = if persisted {
         let notification_type = if matches!(follow_state, InboundFollowState::Pending) {
-            roosty_db::LocalNotificationType::FollowRequest
+            LocalNotificationType::FollowRequest
         } else {
-            roosty_db::LocalNotificationType::Follow
+            LocalNotificationType::Follow
         };
         match roosty_db::notify_remote_actor_follow(
             &txn,
@@ -2875,9 +2874,13 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
                 "processed remote follow"
             );
             if let Some(notification) = notification
-                && let Err(error) =
-                    publish_committed_notification(state, notification.account_id, notification)
-                        .await
+                && let Err(error) = publish_committed_notification(
+                    state,
+                    database,
+                    notification.account_id,
+                    notification,
+                )
+                .await
             {
                 tracing::warn!(%error, "failed to publish remote follow notification");
             }
@@ -2889,13 +2892,14 @@ async fn process_inbox(state: &AppState, request: axum::extract::Request) -> Res
 
 /// Apply one verified Mastodon-style `Create(Note)` vote outside the large inbox future.
 async fn process_inbound_poll_vote(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
     activity: &JsonValue,
     activity_id: &str,
-    remote_actor: &roosty_db::RemoteActor,
+    remote_actor: &RemoteActor,
     vote: InboundPollVoteActivity,
 ) -> Response {
-    let txn = match state.db.begin().await {
+    let db = state.db;
+    let txn = match db.begin().await {
         Ok(txn) => txn,
         Err(error) => return internal_error(error),
     };
@@ -2975,14 +2979,17 @@ async fn process_inbound_poll_vote(
 
 /// Keep the large remote status lifecycle future behind one heap allocation at the inbox boundary.
 async fn process_and_publish_remote_status_activity(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
+    database: &DatabaseContext,
     activity_id: &str,
     activity: &JsonValue,
-    remote_actor: &roosty_db::RemoteActor,
+    remote_actor: &RemoteActor,
 ) -> Response {
     match process_remote_status_activity(state, activity_id, activity, remote_actor).await {
         Ok(change) => {
-            if let Err(error) = publish_remote_status_change(state, remote_actor.id, change).await {
+            if let Err(error) =
+                publish_remote_status_change(state, database, remote_actor.id, change).await
+            {
                 tracing::warn!(%error, activity_id, "could not stream remote status activity");
             }
         }
@@ -3018,11 +3025,11 @@ fn canonical_activity_digest(activity: &JsonValue) -> Result<[u8; 32], RoostyErr
 }
 
 async fn register_inbox_replay(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     activity: &JsonValue,
-    remote_actor: &roosty_db::RemoteActor,
-    outcome: roosty_db::InboxActivityOutcome,
-) -> Result<roosty_db::InboxReplayResult, RoostyError> {
+    remote_actor: &RemoteActor,
+    outcome: InboxActivityOutcome,
+) -> Result<InboxReplayResult, RoostyError> {
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
@@ -3033,7 +3040,7 @@ async fn register_inbox_replay(
     let digest = canonical_activity_digest(activity)?;
     roosty_db::register_inbox_activity(
         txn,
-        roosty_db::InboxActivityMetadata {
+        InboxActivityMetadata {
             activity_id,
             remote_actor_id: remote_actor.id,
             payload_digest: &digest,
@@ -3045,27 +3052,21 @@ async fn register_inbox_replay(
 }
 
 async fn is_new_inbox_activity(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     activity: &JsonValue,
-    remote_actor: &roosty_db::RemoteActor,
+    remote_actor: &RemoteActor,
 ) -> Result<bool, RoostyError> {
-    match register_inbox_replay(
-        txn,
-        activity,
-        remote_actor,
-        roosty_db::InboxActivityOutcome::Accepted,
-    )
-    .await?
+    match register_inbox_replay(txn, activity, remote_actor, InboxActivityOutcome::Accepted).await?
     {
-        roosty_db::InboxReplayResult::New => {
+        InboxReplayResult::New => {
             INBOX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
             Ok(true)
         }
-        roosty_db::InboxReplayResult::Duplicate => {
+        InboxReplayResult::Duplicate => {
             INBOX_DUPLICATE.fetch_add(1, Ordering::Relaxed);
             Ok(false)
         }
-        roosty_db::InboxReplayResult::Conflict => {
+        InboxReplayResult::Conflict => {
             INBOX_CONFLICT.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 activity_id = activity.get("id").and_then(JsonValue::as_str),
@@ -3078,29 +3079,25 @@ async fn is_new_inbox_activity(
 }
 
 async fn finish_ignored_inbox_activity(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
     activity: &JsonValue,
-    remote_actor: &roosty_db::RemoteActor,
+    remote_actor: &RemoteActor,
 ) -> Response {
-    let txn = match state.db.begin().await {
+    let db = state.db;
+    let txn = match db.begin().await {
         Ok(txn) => txn,
         Err(error) => return internal_error(error),
     };
-    let result = register_inbox_replay(
-        &txn,
-        activity,
-        remote_actor,
-        roosty_db::InboxActivityOutcome::Ignored,
-    )
-    .await;
+    let result =
+        register_inbox_replay(&txn, activity, remote_actor, InboxActivityOutcome::Ignored).await;
     match result {
-        Ok(roosty_db::InboxReplayResult::New) => {
+        Ok(InboxReplayResult::New) => {
             INBOX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(roosty_db::InboxReplayResult::Duplicate) => {
+        Ok(InboxReplayResult::Duplicate) => {
             INBOX_DUPLICATE.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(roosty_db::InboxReplayResult::Conflict) => {
+        Ok(InboxReplayResult::Conflict) => {
             INBOX_CONFLICT.fetch_add(1, Ordering::Relaxed);
         }
         Err(error) => return internal_error(error),
@@ -3146,10 +3143,12 @@ fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> b
 
 /// Process a verified remote actor refresh, tombstone, or Move activity.
 async fn process_remote_actor_lifecycle(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
+    database: &DatabaseContext,
     activity: &JsonValue,
-    remote_actor: &roosty_db::RemoteActor,
-) -> Result<Option<roosty_db::RemoteDeleteRepair>, RoostyError> {
+    remote_actor: &RemoteActor,
+) -> Result<Option<RemoteDeleteRepair>, RoostyError> {
+    let db = state.db;
     match inbound_activity_type(activity) {
         Some(InboundActivityType::Update) => {
             let object_id = activity
@@ -3167,7 +3166,7 @@ async fn process_remote_actor_lifecycle(
                     "remote actor Update does not match signer".to_owned(),
                 ));
             }
-            let txn = state.db.begin().await?;
+            let txn = db.begin().await?;
             if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
                 txn.commit().await?;
                 return Ok(None);
@@ -3177,7 +3176,7 @@ async fn process_remote_actor_lifecycle(
                     .await?;
             txn.commit().await?;
             if let Err(error) =
-                crate::media::enqueue_remote_profile_media_fetches(state, refreshed.id).await
+                crate::media::enqueue_remote_profile_media_fetches(database, refreshed.id).await
             {
                 tracing::warn!(%error, remote_actor_id = %refreshed.id.0, "could not queue refreshed profile media");
             }
@@ -3198,7 +3197,7 @@ async fn process_remote_actor_lifecycle(
                     "remote actor Delete does not match signer".to_owned(),
                 ));
             }
-            let txn = state.db.begin().await?;
+            let txn = db.begin().await?;
             if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
                 txn.commit().await?;
                 return Ok(None);
@@ -3224,8 +3223,9 @@ async fn process_remote_actor_lifecycle(
                     "remote actor Move does not match signer".to_owned(),
                 ));
             }
-            let target = discovery::resolve_remote_move_target(state, &target, &source).await?;
-            let txn = state.db.begin().await?;
+            let target =
+                discovery::resolve_remote_move_target(state, database, &target, &source).await?;
+            let txn = db.begin().await?;
             if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
                 txn.commit().await?;
                 return Ok(None);
@@ -3246,27 +3246,22 @@ enum RemoteStatusChange {
     Ignored,
     /// A newly created or edited Note.
     Upsert {
-        status: Box<roosty_db::RemoteStatus>,
-        notifications: Vec<roosty_db::LocalNotification>,
-        refresh: Option<roosty_db::DirectConversationRefresh>,
+        status: Box<RemoteStatus>,
+        notifications: Vec<LocalNotification>,
+        refresh: Option<DirectConversationRefresh>,
         edited: bool,
     },
     /// Removed status-like projections and repaired conversations.
-    Delete(roosty_db::RemoteDeleteRepair),
+    Delete(RemoteDeleteRepair),
 }
 
 /// Resolve a canonical local Note URL without accepting look-alike remote URLs.
 async fn local_status_id_from_url(
     state: &AppState,
+    db: &impl ConnectionTrait,
     activitypub_id: &str,
 ) -> Result<Option<StatusId>, RoostyError> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
-    let status_id = local_status_id_from_url_on(state, &txn, activitypub_id).await?;
-    txn.commit().await?;
-    Ok(status_id)
+    local_status_id_from_url_on(state, db, activitypub_id).await
 }
 
 async fn local_status_id_from_url_on(
@@ -3301,11 +3296,12 @@ async fn local_status_id_from_url_on(
 
 /// Validate and cache one signed public or unlisted remote status lifecycle activity.
 async fn process_remote_status_activity(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
     activity_id: &str,
     activity: &JsonValue,
-    remote_actor: &roosty_db::RemoteActor,
+    remote_actor: &RemoteActor,
 ) -> Result<RemoteStatusChange, RoostyError> {
+    let db = state.db;
     if !same_url_origin(activity_id, &remote_actor.activitypub_id) {
         return Err(RoostyError::InvalidInput(
             "remote status activity origin does not match signer".to_owned(),
@@ -3337,13 +3333,11 @@ async fn process_remote_status_activity(
                 .iter()
                 .filter(|attachment| attachment.r#type == InboundAttachmentType::Document)
                 .filter_map(|attachment| {
-                    attachment
-                        .url()
-                        .map(|remote_url| roosty_db::NewRemoteMediaAttachment {
-                            remote_url,
-                            content_type: attachment.media_type.clone(),
-                            description: attachment.name.clone(),
-                        })
+                    attachment.url().map(|remote_url| NewRemoteMediaAttachment {
+                        remote_url,
+                        content_type: attachment.media_type.clone(),
+                        description: attachment.name.clone(),
+                    })
                 })
                 .collect::<Vec<_>>();
             let emojis = remote_custom_emoji_definitions(&note.tag);
@@ -3382,7 +3376,7 @@ async fn process_remote_status_activity(
                 })?
                 .unwrap_or(published_at);
             let in_reply_to_remote_status_id = match note.in_reply_to.as_deref() {
-                Some(id) => roosty_db::find_remote_status_by_activitypub_id(&state.db, id)
+                Some(id) => roosty_db::find_remote_status_by_activitypub_id(db, id)
                     .await?
                     .map(|status| status.id),
                 None => None,
@@ -3398,15 +3392,15 @@ async fn process_remote_status_activity(
             notification_recipients.extend(audience.explicit_recipients().iter().copied());
             notification_recipients.sort_by_key(|id| id.0);
             notification_recipients.dedup();
-            let resolved_quote = resolve_inbound_quote(state, &note, remote_actor).await?;
-            let txn = state.db.begin().await?;
+            let resolved_quote = resolve_inbound_quote(state, db, &note, remote_actor).await?;
+            let txn = db.begin().await?;
             if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
                 txn.commit().await?;
                 return Ok(RemoteStatusChange::Ignored);
             }
             let upsert = roosty_db::process_remote_status_upsert(
                 &txn,
-                roosty_db::NewRemoteStatus {
+                NewRemoteStatus {
                     activitypub_id: note.id,
                     remote_actor_id: remote_actor.id,
                     content: note.content,
@@ -3415,7 +3409,7 @@ async fn process_remote_status_activity(
                     updated_at,
                     in_reply_to: note.in_reply_to.clone(),
                     in_reply_to_local_status_id: match note.in_reply_to.as_deref() {
-                        Some(url) => local_status_id_from_url(state, url).await?,
+                        Some(url) => local_status_id_from_url(state, db, url).await?,
                         None => None,
                     },
                     in_reply_to_remote_status_id,
@@ -3438,9 +3432,9 @@ async fn process_remote_status_activity(
             )
             .await?;
             let (status, edited, unchanged) = match upsert {
-                roosty_db::RemoteStatusUpsertResult::Created(status) => (status, false, false),
-                roosty_db::RemoteStatusUpsertResult::Updated(status) => (status, true, false),
-                roosty_db::RemoteStatusUpsertResult::Unchanged(status) => (status, false, true),
+                RemoteStatusUpsertResult::Created(status) => (status, false, false),
+                RemoteStatusUpsertResult::Updated(status) => (status, true, false),
+                RemoteStatusUpsertResult::Unchanged(status) => (status, false, true),
             };
             if let Some(poll) = poll {
                 roosty_db::upsert_remote_poll(&txn, status.id, poll).await?;
@@ -3487,7 +3481,7 @@ async fn process_remote_status_activity(
                 )
                 .await?;
                 if !edited
-                    && quote.state == roosty_db::QuoteState::Accepted
+                    && quote.state == QuoteState::Accepted
                     && let Some(account_id) = quote.local_author_id
                     && let Some(notification) = roosty_db::notify_remote_actor_quote(
                         &txn,
@@ -3598,7 +3592,7 @@ async fn process_remote_status_activity(
                     "remote Delete object origin does not match signer".to_owned(),
                 ));
             }
-            let txn = state.db.begin().await?;
+            let txn = db.begin().await?;
             if !is_new_inbox_activity(&txn, activity, remote_actor).await? {
                 txn.commit().await?;
                 return Ok(RemoteStatusChange::Ignored);
@@ -3622,10 +3616,10 @@ async fn process_remote_status_activity(
 
 /// Return whether two absolute HTTPS identifiers share scheme, host, and effective port.
 fn same_url_origin(left: &str, right: &str) -> bool {
-    let Ok(left) = url::Url::parse(left) else {
+    let Ok(left) = Url::parse(left) else {
         return false;
     };
-    let Ok(right) = url::Url::parse(right) else {
+    let Ok(right) = Url::parse(right) else {
         return false;
     };
     left.scheme() == "https" && left.origin() == right.origin()
@@ -3634,7 +3628,7 @@ fn same_url_origin(left: &str, right: &str) -> bool {
 /// Enqueue bounded thread discovery after the status transaction commits.
 async fn enqueue_remote_thread_jobs(
     txn: &DatabaseTransaction,
-    status: &roosty_db::RemoteStatus,
+    status: &RemoteStatus,
 ) -> Result<(), RoostyError> {
     if status.in_reply_to.is_some()
         && status.in_reply_to_local_status_id.is_none()
@@ -3642,8 +3636,8 @@ async fn enqueue_remote_thread_jobs(
     {
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationThreadResolve,
+            NewJob {
+                kind: JobKind::FederationThreadResolve,
                 payload: serde_json::to_value(ThreadStatusPayload {
                     status_id: status.id.0,
                 })
@@ -3661,8 +3655,8 @@ async fn enqueue_remote_thread_jobs(
     {
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationRepliesFetch,
+            NewJob {
+                kind: JobKind::FederationRepliesFetch,
                 payload: serde_json::to_value(ThreadStatusPayload {
                     status_id: status.id.0,
                 })
@@ -3681,7 +3675,11 @@ fn permanent_fetch_failure(reason: impl Into<Cow<'static, str>>) -> RoostyError 
     RoostyError::InvalidInput(format!("permanent federation fetch failure: {error}"))
 }
 
-async fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, RoostyError> {
+async fn parse_remote_fetch_url(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    value: &str,
+) -> Result<Url, RoostyError> {
     let url =
         Url::parse(value).map_err(|_| permanent_fetch_failure("remote status URL is invalid"))?;
     let host = url
@@ -3691,7 +3689,7 @@ async fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, Ro
         || !url.username().is_empty()
         || url.password().is_some()
         || !state.config.federation_domain_is_allowed(host)
-        || roosty_db::federation_domain_policy(&state.db, host)
+        || roosty_db::federation_domain_policy(db, host)
             .await?
             .is_suspended()
     {
@@ -3704,12 +3702,14 @@ async fn parse_remote_fetch_url(state: &AppState, value: &str) -> Result<Url, Ro
 
 /// Fetch, validate, and cache one public remote Note without user-facing side effects.
 async fn fetch_public_remote_status(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
+    database: &DatabaseContext,
     requested_url: &str,
     expected_parent: Option<&str>,
-) -> Result<roosty_db::RemoteStatus, RoostyError> {
-    let url = parse_remote_fetch_url(state, requested_url).await?;
-    let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+) -> Result<RemoteStatus, RoostyError> {
+    let db = state.db;
+    let url = parse_remote_fetch_url(state, db, requested_url).await?;
+    let document: JsonValue = discovery::fetch_json(state, db, url, None).await?;
     let object = document
         .get("object")
         .filter(|_| document.get("type").and_then(JsonValue::as_str) == Some("Create"))
@@ -3727,7 +3727,7 @@ async fn fetch_public_remote_status(
             "remote status identity or attribution is invalid",
         ));
     }
-    let actor = discovery::resolve_remote_actor_by_id(state, &note.attributed_to).await?;
+    let actor = discovery::resolve_remote_actor_by_id(state, database, &note.attributed_to).await?;
     if actor.deleted_at.is_some() {
         THREAD_FETCH_REJECTED.fetch_add(1, Ordering::Relaxed);
         return Err(permanent_fetch_failure(
@@ -3765,23 +3765,21 @@ async fn fetch_public_remote_status(
         .iter()
         .filter(|attachment| attachment.r#type == InboundAttachmentType::Document)
         .filter_map(|attachment| {
-            attachment
-                .url()
-                .map(|remote_url| roosty_db::NewRemoteMediaAttachment {
-                    remote_url,
-                    content_type: attachment.media_type.clone(),
-                    description: attachment.name.clone(),
-                })
+            attachment.url().map(|remote_url| NewRemoteMediaAttachment {
+                remote_url,
+                content_type: attachment.media_type.clone(),
+                description: attachment.name.clone(),
+            })
         })
         .collect::<Vec<_>>();
     let emojis = remote_custom_emoji_definitions(&note.tag);
     let tag_names = remote_hashtag_names(&note.tag);
     let in_reply_to_local_status_id = match note.in_reply_to.as_deref() {
-        Some(url) => local_status_id_from_url(state, url).await?,
+        Some(url) => local_status_id_from_url(state, db, url).await?,
         None => None,
     };
     let in_reply_to_remote_status_id = match note.in_reply_to.as_deref() {
-        Some(id) => roosty_db::find_remote_status_by_activitypub_id(&state.db, id)
+        Some(id) => roosty_db::find_remote_status_by_activitypub_id(db, id)
             .await?
             .map(|status| status.id),
         None => None,
@@ -3798,10 +3796,10 @@ async fn fetch_public_remote_status(
         .and_then(|policy| policy.can_quote.as_ref())
         .map(|policy| policy.manual_approval.values())
         .unwrap_or_default();
-    let txn = state.db.begin().await?;
+    let txn = db.begin().await?;
     let upsert = roosty_db::process_remote_status_upsert(
         &txn,
-        roosty_db::NewRemoteStatus {
+        NewRemoteStatus {
             activitypub_id: note.id,
             remote_actor_id: actor.id,
             content: note.content,
@@ -3820,9 +3818,9 @@ async fn fetch_public_remote_status(
     )
     .await?;
     let status = match upsert {
-        roosty_db::RemoteStatusUpsertResult::Created(status)
-        | roosty_db::RemoteStatusUpsertResult::Updated(status)
-        | roosty_db::RemoteStatusUpsertResult::Unchanged(status) => status,
+        RemoteStatusUpsertResult::Created(status)
+        | RemoteStatusUpsertResult::Updated(status)
+        | RemoteStatusUpsertResult::Unchanged(status) => status,
     };
     if let Some(poll) = poll {
         roosty_db::upsert_remote_poll(&txn, status.id, poll).await?;
@@ -3843,10 +3841,14 @@ fn thread_status_payload(payload: JsonValue) -> Result<StatusId, RoostyError> {
 /// Fetch one missing parent and repair every child retaining its canonical URL.
 pub(crate) async fn resolve_remote_status_thread(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
+    let txn = database.begin_write().await?;
+    let context = TransactionContext::new(state, &txn);
+    let db = context.db;
     let status_id = thread_status_payload(payload)?;
-    let Some(child) = roosty_db::find_remote_status_by_id(&state.db, status_id).await? else {
+    let Some(child) = roosty_db::find_remote_status_by_id(db, status_id).await? else {
         return Ok(());
     };
     if child.in_reply_to_local_status_id.is_some()
@@ -3858,14 +3860,15 @@ pub(crate) async fn resolve_remote_status_thread(
     let Some(parent_url) = child.in_reply_to.as_deref() else {
         return Ok(());
     };
-    let parent = fetch_public_remote_status(state, parent_url, None).await?;
-    roosty_db::link_unresolved_remote_replies_to_parent(&state.db, &parent).await?;
+    let parent = fetch_public_remote_status(&context, database, parent_url, None).await?;
+    roosty_db::link_unresolved_remote_replies_to_parent(db, &parent).await?;
+    txn.commit().await?;
     THREAD_PARENT_RESOLVED.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
 async fn fetched_reply_collection(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
     mut replies: InboundReplies,
     parent_url: &str,
 ) -> Result<Vec<String>, RoostyError> {
@@ -3886,8 +3889,8 @@ async fn fetched_reply_collection(
                         "remote replies collection is outside the status origin",
                     ));
                 }
-                let url = parse_remote_fetch_url(state, &id).await?;
-                let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+                let url = parse_remote_fetch_url(state, state.db, &id).await?;
+                let document: JsonValue = discovery::fetch_json(state, state.db, url, None).await?;
                 replies = serde_json::from_value(document)
                     .map_err(|_| permanent_fetch_failure("remote replies collection is invalid"))?;
                 requests += 1;
@@ -3923,10 +3926,14 @@ async fn fetched_reply_collection(
 /// Read one replies collection page and enqueue at most five same-origin Notes.
 pub(crate) async fn fetch_remote_status_replies(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
+    let txn = database.begin_write().await?;
+    let context = TransactionContext::new(state, &txn);
+    let db = context.db;
     let status_id = thread_status_payload(payload)?;
-    let Some(parent) = roosty_db::find_remote_status_by_id(&state.db, status_id).await? else {
+    let Some(parent) = roosty_db::find_remote_status_by_id(db, status_id).await? else {
         return Ok(());
     };
     if parent.deleted_at.is_some()
@@ -3942,14 +3949,13 @@ pub(crate) async fn fetch_remote_status_replies(
     };
     let replies: InboundReplies = serde_json::from_value(replies)
         .map_err(|_| permanent_fetch_failure("remote replies reference is invalid"))?;
-    let urls = fetched_reply_collection(state, replies, &parent.activitypub_id).await?;
-    let txn = state.db.begin().await?;
+    let urls = fetched_reply_collection(&context, replies, &parent.activitypub_id).await?;
     for reply_url in urls {
         let digest = STANDARD.encode(Sha256::digest(reply_url.as_bytes()));
         roosty_db::enqueue_job_in_transaction(
-            &txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationReplyFetch,
+            db,
+            NewJob {
+                kind: JobKind::FederationReplyFetch,
                 payload: serde_json::to_value(ReplyFetchPayload {
                     parent_status_id: parent.id.0,
                     reply_url,
@@ -3968,12 +3974,16 @@ pub(crate) async fn fetch_remote_status_replies(
 /// Fetch one collection-listed reply only when it names the expected parent.
 pub(crate) async fn fetch_remote_status_reply(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
+    let txn = database.begin_write().await?;
+    let context = TransactionContext::new(state, &txn);
+    let db = context.db;
     let payload: ReplyFetchPayload = serde_json::from_value(payload)
         .map_err(|_| permanent_fetch_failure("reply fetch job payload is invalid"))?;
     let Some(parent) =
-        roosty_db::find_remote_status_by_id(&state.db, StatusId(payload.parent_status_id)).await?
+        roosty_db::find_remote_status_by_id(db, StatusId(payload.parent_status_id)).await?
     else {
         return Ok(());
     };
@@ -3984,24 +3994,28 @@ pub(crate) async fn fetch_remote_status_reply(
         ));
     }
     fetch_public_remote_status(
-        state,
+        &context,
+        database,
         &payload.reply_url,
         Some(parent.activitypub_id.as_str()),
     )
     .await?;
-    roosty_db::link_unresolved_remote_replies_to_parent(&state.db, &parent).await?;
+    roosty_db::link_unresolved_remote_replies_to_parent(db, &parent).await?;
+    txn.commit().await?;
     THREAD_REPLIES_DISCOVERED.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
 /// Publish a cached remote Note lifecycle event only to local accounts following its author.
 async fn publish_remote_status_change(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
+    database: &DatabaseContext,
     remote_actor_id: AccountId,
     change: RemoteStatusChange,
 ) -> Result<(), RoostyError> {
+    let db = state.db;
     let followers =
-        roosty_db::accepted_local_followers_of_remote_actor(&state.db, remote_actor_id).await?;
+        roosty_db::accepted_local_followers_of_remote_actor(db, remote_actor_id).await?;
     match change {
         RemoteStatusChange::Ignored => {}
         RemoteStatusChange::Upsert {
@@ -4017,9 +4031,8 @@ async fn publish_remote_status_change(
                 StatusVisibility::Direct => Vec::new(),
             };
             if status.visibility == StatusVisibility::Public {
-                recipients.extend(
-                    roosty_db::remote_tag_follower_ids_for_status(&state.db, status.id).await?,
-                );
+                recipients
+                    .extend(roosty_db::remote_tag_follower_ids_for_status(db, status.id).await?);
                 recipients.sort_by_key(|id| id.0);
                 recipients.dedup();
             }
@@ -4027,19 +4040,14 @@ async fn publish_remote_status_change(
                 status.visibility,
                 StatusVisibility::Private | StatusVisibility::Direct
             ) {
-                recipients
-                    .extend(roosty_db::remote_status_local_recipients(&state.db, status.id).await?);
+                recipients.extend(roosty_db::remote_status_local_recipients(db, status.id).await?);
                 recipients.sort_by_key(|id| id.0);
                 recipients.dedup();
             }
             let mut filtered = Vec::with_capacity(recipients.len());
             for recipient in recipients {
-                if !roosty_db::remote_account_is_hidden_for_viewer(
-                    &state.db,
-                    recipient,
-                    remote_actor_id,
-                )
-                .await?
+                if !roosty_db::remote_account_is_hidden_for_viewer(db, recipient, remote_actor_id)
+                    .await?
                 {
                     filtered.push(recipient);
                 }
@@ -4048,12 +4056,12 @@ async fn publish_remote_status_change(
             let response =
                 crate::statuses::remote_status_response(state, (*status).clone()).await?;
             let mention_recipients =
-                roosty_db::active_local_mentions_for_remote_status(&state.db, status.id).await?;
+                roosty_db::active_local_mentions_for_remote_status(db, status.id).await?;
             if let Some(refresh) = refresh {
                 let mut account_ids = refresh.updated_account_ids;
                 account_ids.extend(
                     roosty_db::local_conversation_accounts_for_last_remote_status(
-                        &state.db,
+                        db,
                         refresh.conversation_id,
                         status.id,
                     )
@@ -4063,6 +4071,7 @@ async fn publish_remote_status_change(
                 account_ids.dedup();
                 crate::conversations::publish_conversation_updates(
                     state,
+                    db,
                     refresh.conversation_id,
                     &account_ids,
                 )
@@ -4095,8 +4104,13 @@ async fn publish_remote_status_change(
                 }
             }
             for notification in notifications {
-                publish_committed_notification(state, notification.account_id, notification)
-                    .await?;
+                publish_committed_notification(
+                    state,
+                    database,
+                    notification.account_id,
+                    notification,
+                )
+                .await?;
             }
         }
         RemoteStatusChange::Delete(repair) => publish_delete_repair(state, repair).await?,
@@ -4106,15 +4120,15 @@ async fn publish_remote_status_change(
 
 /// Publish captured delete projections only after their repair transaction commits.
 async fn publish_delete_repair(
-    state: &AppState,
-    repair: roosty_db::RemoteDeleteRepair,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
+    repair: RemoteDeleteRepair,
 ) -> Result<(), RoostyError> {
     for projection in repair.projections {
         if projection.visibility == StatusVisibility::Public
             || !projection.home_recipient_ids.is_empty()
         {
             match projection.status_origin {
-                roosty_db::StreamingStatusOrigin::Local => {
+                StreamingStatusOrigin::Local => {
                     state.streaming_events.publish_local_status_delete(
                         &projection.status_id,
                         projection.actor_id,
@@ -4123,7 +4137,7 @@ async fn publish_delete_repair(
                         projection.has_media,
                     );
                 }
-                roosty_db::StreamingStatusOrigin::Remote => {
+                StreamingStatusOrigin::Remote => {
                     state.streaming_events.publish_remote_status_delete(
                         &projection.status_id,
                         projection.actor_id,
@@ -4146,6 +4160,7 @@ async fn publish_delete_repair(
     for refresh in repair.conversation_refreshes {
         crate::conversations::publish_conversation_updates(
             state,
+            state.db,
             refresh.conversation_id,
             &refresh.updated_account_ids,
         )
@@ -4234,10 +4249,11 @@ fn remote_hashtag_names(tags: &[InboundTag]) -> Vec<String> {
 
 /// Classify a verified Note using exact actor and collection identifiers.
 async fn classify_remote_audience(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     note: &InboundNote,
-    author: &roosty_db::RemoteActor,
+    author: &RemoteActor,
 ) -> Result<InboundAudience, InboundAudienceError> {
+    let db = state.db;
     if note.to.iter().any(|address| address == PUBLIC_AUDIENCE) {
         return Ok(InboundAudience::Public);
     }
@@ -4276,8 +4292,7 @@ async fn classify_remote_audience(
         }
         if let Some(username) = address.strip_prefix(&prefix)
             && !username.contains('/')
-            && let Some(account) =
-                roosty_db::find_local_account_by_username(&state.db, username).await?
+            && let Some(account) = roosty_db::find_local_account_by_username(db, username).await?
         {
             recipients.push(account.id);
         }
@@ -4302,8 +4317,7 @@ async fn classify_remote_audience(
         ));
     }
     if addresses_followers {
-        let follows =
-            roosty_db::accepted_local_followers_of_remote_actor(&state.db, author.id).await?;
+        let follows = roosty_db::accepted_local_followers_of_remote_actor(db, author.id).await?;
         if follows.is_empty() && recipients.is_empty() {
             return Err(InboundAudienceError::NoEligibleRecipient(
                 "remote private Note has no eligible local recipient".into(),
@@ -4325,10 +4339,11 @@ async fn classify_remote_audience(
 
 /// Retain every remote direct-message participant without fetching unknown actors.
 async fn remote_direct_participants(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     note: &InboundNote,
-    author: &roosty_db::RemoteActor,
+    author: &RemoteActor,
 ) -> Result<Vec<RemoteConversationParticipant>, RoostyError> {
+    let db = state.db;
     let mut participants = vec![RemoteConversationParticipant {
         activitypub_id: author.activitypub_id.clone(),
         remote_actor_id: Some(author.id),
@@ -4348,10 +4363,9 @@ async fn remote_direct_participants(
         if activitypub_id.starts_with(&local_prefix) {
             continue;
         }
-        let remote_actor_id =
-            roosty_db::find_remote_actor_by_activitypub_id(&state.db, activitypub_id)
-                .await?
-                .map(|actor| actor.id);
+        let remote_actor_id = roosty_db::find_remote_actor_by_activitypub_id(db, activitypub_id)
+            .await?
+            .map(|actor| actor.id);
         participants.push(RemoteConversationParticipant {
             activitypub_id: activitypub_id.to_owned(),
             remote_actor_id,
@@ -4365,9 +4379,10 @@ async fn remote_direct_participants(
 
 /// Resolve local recipients named by verified Mention tags without remote fetches.
 async fn local_mention_recipients(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait>,
     mention_urls: &[String],
 ) -> Result<Vec<AccountId>, RoostyError> {
+    let db = state.db;
     let prefix = format!(
         "{}/users/",
         state.config.public_base_url.as_str().trim_end_matches('/')
@@ -4376,8 +4391,7 @@ async fn local_mention_recipients(
     for url in mention_urls {
         if let Some(username) = url.strip_prefix(&prefix)
             && !username.contains('/')
-            && let Some(account) =
-                roosty_db::find_local_account_by_username(&state.db, username).await?
+            && let Some(account) = roosty_db::find_local_account_by_username(db, username).await?
         {
             recipients.push(account.id);
         }
@@ -4386,9 +4400,9 @@ async fn local_mention_recipients(
 }
 
 fn verify_legacy_signature(
-    parts: &axum::http::request::Parts,
+    parts: &Parts,
     body: &[u8],
-    actor: &roosty_db::RemoteActor,
+    actor: &RemoteActor,
 ) -> Result<bool, RoostyError> {
     let digest = parts
         .headers
@@ -4541,28 +4555,34 @@ struct FeaturedRefreshPayload {
 /// Refresh and atomically reconcile one validated remote featured collection.
 pub(crate) async fn refresh_remote_featured(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
+    let outer = database.begin_write().await?;
+    let context = TransactionContext::new(state, &outer);
+    let state = &context;
+    let db = state.db;
     let payload: FeaturedRefreshPayload = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid featured refresh payload".to_owned()))?;
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, payload.remote_actor_id)
+    let actor = roosty_db::find_remote_actor_by_id(db, payload.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote featured actor does not exist".to_owned())
         })?;
     let Some(featured_url) = actor.featured_url.as_deref() else {
-        let txn = state.db.begin().await?;
+        let txn = db.begin().await?;
         roosty_db::replace_remote_status_pins(&txn, actor.id, &[]).await?;
         txn.commit().await?;
+        outer.commit().await?;
         return Ok(());
     };
-    let featured = url::Url::parse(featured_url)
+    let featured = Url::parse(featured_url)
         .map_err(|_| RoostyError::InvalidInput("remote featured URL is invalid".to_owned()))?;
     let mut collection_url = Some(featured.clone());
     let mut followed_pages = 0_usize;
     let mut item_values = Vec::new();
     while let Some(url) = collection_url.take() {
-        let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+        let document: JsonValue = discovery::fetch_json(state, db, url, None).await?;
         let kind = document.get("type").and_then(JsonValue::as_str);
         if !matches!(kind, Some("OrderedCollection" | "OrderedCollectionPage")) {
             return Err(RoostyError::InvalidInput(
@@ -4608,7 +4628,7 @@ pub(crate) async fn refresh_remote_featured(
         let note_value = match item {
             JsonValue::String(reference) => {
                 let url = validated_featured_member_url(&featured, &reference)?;
-                discovery::fetch_json(state, url, None).await?
+                discovery::fetch_json(state, db, url, None).await?
             }
             JsonValue::Object(_) => item,
             _ => {
@@ -4642,7 +4662,7 @@ pub(crate) async fn refresh_remote_featured(
             "object": note_value,
         });
         process_remote_status_activity(state, &activity_id, &activity, &actor).await?;
-        let status = roosty_db::find_remote_status_by_activitypub_id(&state.db, &note.id)
+        let status = roosty_db::find_remote_status_by_activitypub_id(db, &note.id)
             .await?
             .ok_or_else(|| {
                 RoostyError::InvalidInput("remote featured Note was not cached".to_owned())
@@ -4659,41 +4679,48 @@ pub(crate) async fn refresh_remote_featured(
         }
         status_ids.push(status.id);
     }
-    let txn = state.db.begin().await?;
+    let txn = db.begin().await?;
     roosty_db::replace_remote_status_pins(&txn, actor.id, &status_ids).await?;
     if actor.featured_tags_url.is_none() {
         roosty_db::replace_remote_featured_tags(&txn, actor.id, &legacy_tags).await?;
     }
     txn.commit().await?;
+    outer.commit().await?;
     Ok(())
 }
 
 /// Refresh and atomically reconcile one validated remote featured-tags collection.
 pub(crate) async fn refresh_remote_featured_tags(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
+    let outer = database.begin_write().await?;
+    let context = TransactionContext::new(state, &outer);
+    let state = &context;
+    let db = state.db;
     let payload: FeaturedRefreshPayload = serde_json::from_value(payload).map_err(|_| {
         RoostyError::InvalidInput("invalid featured-tags refresh payload".to_owned())
     })?;
-    let actor = roosty_db::find_remote_actor_by_id(&state.db, payload.remote_actor_id)
+    let actor = roosty_db::find_remote_actor_by_id(db, payload.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote featured-tags actor does not exist".to_owned())
         })?;
     let Some(collection_url) = actor.featured_tags_url.as_deref() else {
-        let txn = state.db.begin().await?;
+        let txn = db.begin().await?;
         roosty_db::replace_remote_featured_tags(&txn, actor.id, &[]).await?;
         txn.commit().await?;
+        outer.commit().await?;
         return Ok(());
     };
-    let collection = url::Url::parse(collection_url)
+    let collection = Url::parse(collection_url)
         .map_err(|_| RoostyError::InvalidInput("remote featured-tags URL is invalid".to_owned()))?;
     let mut page_url = Some(collection.clone());
     let mut followed_pages = 0_usize;
     let mut item_values = Vec::new();
     while let Some(url) = page_url.take() {
-        let document: JsonValue = discovery::fetch_json(state, url, None).await?;
+        let document: JsonValue = discovery::fetch_json(state, db, url, None).await?;
         let kind = document.get("type").and_then(JsonValue::as_str);
         if !matches!(
             kind,
@@ -4738,7 +4765,7 @@ pub(crate) async fn refresh_remote_featured_tags(
         let value = match item {
             JsonValue::String(reference) => {
                 let url = validated_featured_member_url(&collection, &reference)?;
-                discovery::fetch_json(state, url, None).await?
+                discovery::fetch_json(state, db, url, None).await?
             }
             JsonValue::Object(_) => item,
             _ => {
@@ -4752,14 +4779,15 @@ pub(crate) async fn refresh_remote_featured_tags(
             tags.push(input);
         }
     }
-    let txn = state.db.begin().await?;
+    let txn = db.begin().await?;
     roosty_db::replace_remote_featured_tags(&txn, actor.id, &tags).await?;
     txn.commit().await?;
+    outer.commit().await?;
     Ok(())
 }
 
 fn validated_remote_hashtag(
-    collection: &url::Url,
+    collection: &Url,
     value: &JsonValue,
 ) -> Result<RemoteFeaturedTagInput, RoostyError> {
     if value.get("type").and_then(JsonValue::as_str) != Some("Hashtag") {
@@ -4792,11 +4820,12 @@ fn validated_remote_hashtag(
 
 /// Validate and apply one replay-safe featured hashtag activity in a compact inbox branch.
 async fn process_inbound_featured_tag_activity(
-    state: &AppState,
+    state: &TransactionContext<'_, impl ConnectionTrait + TransactionTrait>,
     activity: &JsonValue,
-    actor: &roosty_db::RemoteActor,
+    actor: &RemoteActor,
     feature: bool,
 ) -> Result<(), RoostyError> {
+    let db = state.db;
     if activity.get("actor").and_then(JsonValue::as_str) != Some(actor.activitypub_id.as_str()) {
         return Err(RoostyError::InvalidInput(
             "featured hashtag signer does not own the collection".to_owned(),
@@ -4808,13 +4837,13 @@ async fn process_inbound_featured_tag_activity(
         .ok_or_else(|| {
             RoostyError::InvalidInput("featured hashtag target is invalid".to_owned())
         })?;
-    let collection = url::Url::parse(target)
+    let collection = Url::parse(target)
         .map_err(|_| RoostyError::InvalidInput("featured hashtag target is invalid".to_owned()))?;
     let object = activity.get("object").ok_or_else(|| {
         RoostyError::InvalidInput("featured hashtag object is missing".to_owned())
     })?;
     let input = validated_remote_hashtag(&collection, object)?;
-    let txn = state.db.begin().await?;
+    let txn = db.begin().await?;
     if is_new_inbox_activity(&txn, activity, actor).await? {
         roosty_db::apply_remote_featured_tag_activity(
             &txn,
@@ -4837,11 +4866,8 @@ fn activitypub_reference(value: &JsonValue) -> Option<&str> {
     }
 }
 
-fn validated_featured_member_url(
-    featured: &url::Url,
-    member: &str,
-) -> Result<url::Url, RoostyError> {
-    let member = url::Url::parse(member).map_err(|_| {
+fn validated_featured_member_url(featured: &Url, member: &str) -> Result<Url, RoostyError> {
+    let member = Url::parse(member).map_err(|_| {
         RoostyError::InvalidInput("remote featured member URL is invalid".to_owned())
     })?;
     if member.scheme() != "https"
@@ -4859,8 +4885,8 @@ fn validated_featured_member_url(
 /// Atomically queue an Add or Remove for every accepted remote follower.
 pub(crate) async fn enqueue_pin_activity_in_transaction(
     state: &AppState,
-    txn: &sea_orm::DatabaseTransaction,
-    status: &roosty_db::LocalStatus,
+    txn: &DatabaseTransaction,
+    status: &LocalStatus,
     pinned: bool,
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled {
@@ -4894,8 +4920,8 @@ pub(crate) async fn enqueue_pin_activity_in_transaction(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationStatusDelivery,
+            NewJob {
+                kind: JobKind::FederationStatusDelivery,
                 payload,
                 deduplication_key: Some(format!("{activity_id}:{}", remote_actor_id.0)),
                 run_after: OffsetDateTime::now_utc(),
@@ -4909,8 +4935,8 @@ pub(crate) async fn enqueue_pin_activity_in_transaction(
 /// Atomically queue a featured hashtag Add or Remove for every accepted remote follower.
 pub(crate) async fn enqueue_featured_tag_activity(
     state: &AppState,
-    txn: &sea_orm::DatabaseTransaction,
-    account: &roosty_db::LocalAccount,
+    txn: &DatabaseTransaction,
+    account: &LocalAccount,
     tag: &FeaturedTag,
     featured: bool,
 ) -> Result<(), RoostyError> {
@@ -4946,8 +4972,8 @@ pub(crate) async fn enqueue_featured_tag_activity(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationStatusDelivery,
+            NewJob {
+                kind: JobKind::FederationStatusDelivery,
                 payload,
                 deduplication_key: Some(format!("{activity_id}:{}", remote_actor_id.0)),
                 run_after: OffsetDateTime::now_utc(),
@@ -4973,14 +4999,14 @@ struct QuoteRequestActivity {
 /// Atomically enqueue a QuoteRequest for a pending local quote of a remote status.
 pub(crate) async fn enqueue_quote_request_in_transaction(
     state: &AppState,
-    txn: &sea_orm::DatabaseTransaction,
-    status: &roosty_db::LocalStatus,
-    quote: &roosty_db::StatusQuote,
+    txn: &DatabaseTransaction,
+    status: &LocalStatus,
+    quote: &StatusQuote,
 ) -> Result<(), RoostyError> {
-    if !state.config.federation_enabled || quote.state != roosty_db::QuoteState::Pending {
+    if !state.config.federation_enabled || quote.state != QuoteState::Pending {
         return Ok(());
     }
-    let Some(roosty_db::StatusReference::Remote(target_id)) = quote.quoted_status else {
+    let Some(StatusReference::Remote(target_id)) = quote.quoted_status else {
         return Ok(());
     };
     let target = roosty_db::find_remote_status_by_id(txn, target_id)
@@ -4988,7 +5014,7 @@ pub(crate) async fn enqueue_quote_request_in_transaction(
         .ok_or_else(|| {
             RoostyError::InvalidInput("quoted remote status does not exist".to_owned())
         })?;
-    let local = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+    let local = roosty_db::find_local_account_by_id(txn, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local quote author does not exist".to_owned()))?;
     let request_id = quote
@@ -5013,8 +5039,8 @@ pub(crate) async fn enqueue_quote_request_in_transaction(
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     roosty_db::enqueue_job_in_transaction(
         txn,
-        roosty_db::NewJob {
-            kind: roosty_db::JobKind::FederationQuoteDelivery,
+        NewJob {
+            kind: JobKind::FederationQuoteDelivery,
             payload,
             deduplication_key: Some(request_id),
             run_after: OffsetDateTime::now_utc(),
@@ -5027,14 +5053,14 @@ pub(crate) async fn enqueue_quote_request_in_transaction(
 /// Enqueue deletion of a locally-issued QuoteAuthorization in the revocation transaction.
 pub(crate) async fn enqueue_quote_revocation_in_transaction(
     state: &AppState,
-    txn: &sea_orm::DatabaseTransaction,
-    quoted_status: &roosty_db::LocalStatus,
-    quote: &roosty_db::StatusQuote,
+    txn: &DatabaseTransaction,
+    quoted_status: &LocalStatus,
+    quote: &StatusQuote,
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled {
         return Ok(());
     }
-    let roosty_db::StatusReference::Remote(quoting_id) = quote.quoting_status else {
+    let StatusReference::Remote(quoting_id) = quote.quoting_status else {
         return Ok(());
     };
     let Some(authorization_id) = quote.authorization_id.as_ref() else {
@@ -5045,7 +5071,7 @@ pub(crate) async fn enqueue_quote_revocation_in_transaction(
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote quoting status does not exist".to_owned())
         })?;
-    let local = roosty_db::find_local_account_by_id(&state.db, quoted_status.account_id)
+    let local = roosty_db::find_local_account_by_id(txn, quoted_status.account_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("quoted status author does not exist".to_owned())
@@ -5070,8 +5096,8 @@ pub(crate) async fn enqueue_quote_revocation_in_transaction(
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     roosty_db::enqueue_job_in_transaction(
         txn,
-        roosty_db::NewJob {
-            kind: roosty_db::JobKind::FederationQuoteDelivery,
+        NewJob {
+            kind: JobKind::FederationQuoteDelivery,
             payload,
             deduplication_key: Some(format!("quote-revoke:{authorization_id}")),
             run_after: OffsetDateTime::now_utc(),
@@ -5163,19 +5189,14 @@ struct OutboundReblogActivity<T> {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_remote_favourite(
     state: &AppState,
+    database: &DatabaseContext,
     local_account_id: AccountId,
-    remote_status: &roosty_db::RemoteStatus,
+    remote_status: &RemoteStatus,
 ) -> Result<String, RoostyError> {
-    let (id, job) =
-        prepare_remote_favourite(state, &state.db, local_account_id, remote_status).await?;
-    roosty_db::enqueue_job(
-        &state.db,
-        job.kind,
-        job.payload,
-        job.deduplication_key.as_deref(),
-        job.run_after,
-    )
-    .await?;
+    let txn = database.begin_write().await?;
+    let (id, job) = prepare_remote_favourite(state, &txn, local_account_id, remote_status).await?;
+    roosty_db::enqueue_job_in_transaction(&txn, job).await?;
+    txn.commit().await?;
     Ok(id)
 }
 
@@ -5184,8 +5205,8 @@ pub(crate) async fn prepare_remote_favourite(
     state: &AppState,
     db: &impl ConnectionTrait,
     local_account_id: AccountId,
-    remote_status: &roosty_db::RemoteStatus,
-) -> Result<(String, roosty_db::NewJob), RoostyError> {
+    remote_status: &RemoteStatus,
+) -> Result<(String, NewJob), RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| {
@@ -5209,9 +5230,10 @@ pub(crate) async fn prepare_remote_favourite(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_remote_unfavourite(
     state: &AppState,
-    favourite: roosty_db::LocalRemoteStatusFavourite,
+    database: &DatabaseContext,
+    favourite: LocalRemoteStatusFavourite,
 ) -> Result<(), RoostyError> {
-    let txn = state.begin_write().await?;
+    let txn = database.begin_write().await?;
     let job = prepare_remote_unfavourite(state, &txn, favourite).await?;
     roosty_db::enqueue_job_in_transaction(&txn, job).await?;
     txn.commit().await?;
@@ -5222,8 +5244,8 @@ pub(crate) async fn enqueue_remote_unfavourite(
 pub(crate) async fn prepare_remote_unfavourite(
     state: &AppState,
     db: &impl ConnectionTrait,
-    favourite: roosty_db::LocalRemoteStatusFavourite,
-) -> Result<roosty_db::NewJob, RoostyError> {
+    favourite: LocalRemoteStatusFavourite,
+) -> Result<NewJob, RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, favourite.local_account_id)
         .await?
         .ok_or_else(|| {
@@ -5252,15 +5274,15 @@ fn favourite_delivery_job(
     remote_actor_id: AccountId,
     activity: JsonValue,
     activity_id: &str,
-) -> Result<roosty_db::NewJob, RoostyError> {
+) -> Result<NewJob, RoostyError> {
     let payload = serde_json::to_value(FavouriteDelivery {
         local_account_id,
         remote_actor_id,
         activity,
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    Ok(roosty_db::NewJob {
-        kind: roosty_db::JobKind::FederationFavouriteDelivery,
+    Ok(NewJob {
+        kind: JobKind::FederationFavouriteDelivery,
         payload,
         deduplication_key: Some(activity_id.to_owned()),
         run_after: OffsetDateTime::now_utc(),
@@ -5270,12 +5292,14 @@ fn favourite_delivery_job(
 /// Dispatch a durable Like or Undo(Like) delivery job.
 pub(crate) async fn deliver_favourite_activity(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: FavouriteDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid favourite delivery payload".to_owned()))?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -5289,9 +5313,9 @@ pub(crate) async fn prepare_poll_vote(
     state: &AppState,
     db: &impl ConnectionTrait,
     local_account_id: AccountId,
-    poll: &roosty_db::StatusPoll,
+    poll: &StatusPoll,
     choices: &[u32],
-) -> Result<roosty_db::NewJob, RoostyError> {
+) -> Result<NewJob, RoostyError> {
     let PollStatus::Remote(status_id) = poll.status else {
         return Err(RoostyError::InvalidInput(
             "poll vote delivery requires a remote poll".to_owned(),
@@ -5342,7 +5366,7 @@ pub(crate) async fn prepare_poll_vote(
         activities,
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    Ok(roosty_db::NewJob {
+    Ok(NewJob {
         kind: JobKind::FederationPollVoteDelivery,
         payload,
         deduplication_key: Some(format!("{local_account_id:?}:{batch_id}")),
@@ -5353,6 +5377,7 @@ pub(crate) async fn prepare_poll_vote(
 /// Deliver every choice in one multiple-choice vote to the poll author's inbox.
 pub(crate) async fn deliver_poll_vote(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: PollVoteDelivery = serde_json::from_value(payload)
@@ -5360,6 +5385,7 @@ pub(crate) async fn deliver_poll_vote(
     for activity in payload.activities {
         deliver_activity(
             state,
+            database,
             payload.local_account_id,
             payload.remote_actor_id,
             &activity,
@@ -5374,10 +5400,11 @@ pub(crate) async fn deliver_poll_vote(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_remote_reblog(
     state: &AppState,
+    database: &DatabaseContext,
     local_account_id: AccountId,
-    remote_status: &roosty_db::RemoteStatus,
+    remote_status: &RemoteStatus,
 ) -> Result<String, RoostyError> {
-    let txn = state.begin_write().await?;
+    let txn = database.begin_write().await?;
     let (id, job) = prepare_remote_reblog(state, &txn, local_account_id, remote_status).await?;
     roosty_db::enqueue_job_in_transaction(&txn, job).await?;
     txn.commit().await?;
@@ -5389,8 +5416,8 @@ pub(crate) async fn prepare_remote_reblog(
     state: &AppState,
     db: &impl ConnectionTrait,
     local_account_id: AccountId,
-    remote_status: &roosty_db::RemoteStatus,
-) -> Result<(String, roosty_db::NewJob), RoostyError> {
+    remote_status: &RemoteStatus,
+) -> Result<(String, NewJob), RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local boost actor does not exist".to_owned()))?;
@@ -5418,9 +5445,10 @@ pub(crate) async fn prepare_remote_reblog(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_remote_unreblog(
     state: &AppState,
-    reblog: roosty_db::LocalRemoteStatusReblog,
+    database: &DatabaseContext,
+    reblog: LocalRemoteStatusReblog,
 ) -> Result<(), RoostyError> {
-    let txn = state.begin_write().await?;
+    let txn = database.begin_write().await?;
     let job = prepare_remote_unreblog(state, &txn, reblog).await?;
     roosty_db::enqueue_job_in_transaction(&txn, job).await?;
     txn.commit().await?;
@@ -5431,8 +5459,8 @@ pub(crate) async fn enqueue_remote_unreblog(
 pub(crate) async fn prepare_remote_unreblog(
     state: &AppState,
     db: &impl ConnectionTrait,
-    reblog: roosty_db::LocalRemoteStatusReblog,
-) -> Result<roosty_db::NewJob, RoostyError> {
+    reblog: LocalRemoteStatusReblog,
+) -> Result<NewJob, RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, reblog.local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local boost actor does not exist".to_owned()))?;
@@ -5469,7 +5497,7 @@ fn reblog_delivery_job<T: Serialize>(
     remote_actor_id: AccountId,
     activity: T,
     activity_id: &str,
-) -> Result<roosty_db::NewJob, RoostyError> {
+) -> Result<NewJob, RoostyError> {
     let activity = serde_json::to_value(activity)
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     let payload = serde_json::to_value(ReblogDelivery {
@@ -5478,8 +5506,8 @@ fn reblog_delivery_job<T: Serialize>(
         activity,
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    Ok(roosty_db::NewJob {
-        kind: roosty_db::JobKind::FederationReblogDelivery,
+    Ok(NewJob {
+        kind: JobKind::FederationReblogDelivery,
         payload,
         deduplication_key: Some(activity_id.to_owned()),
         run_after: OffsetDateTime::now_utc(),
@@ -5489,12 +5517,14 @@ fn reblog_delivery_job<T: Serialize>(
 /// Dispatch a durable Announce or Undo(Announce) delivery job.
 pub(crate) async fn deliver_reblog_activity(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: ReblogDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid reblog delivery payload".to_owned()))?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -5507,10 +5537,11 @@ pub(crate) async fn deliver_reblog_activity(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_remote_follow(
     state: &AppState,
+    database: &DatabaseContext,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<String, RoostyError> {
-    let txn = state.begin_write().await?;
+    let txn = database.begin_write().await?;
     let (id, job) = prepare_remote_follow(state, &txn, local_account_id, remote_actor_id).await?;
     roosty_db::enqueue_job_in_transaction(&txn, job).await?;
     txn.commit().await?;
@@ -5523,7 +5554,7 @@ pub(crate) async fn prepare_remote_follow(
     db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
-) -> Result<(String, roosty_db::NewJob), RoostyError> {
+) -> Result<(String, NewJob), RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local follow actor does not exist".to_owned()))?;
@@ -5545,9 +5576,10 @@ pub(crate) async fn prepare_remote_follow(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_remote_unfollow(
     state: &AppState,
-    following: roosty_db::RemoteFollowing,
+    database: &DatabaseContext,
+    following: RemoteFollowing,
 ) -> Result<(), RoostyError> {
-    let txn = state.begin_write().await?;
+    let txn = database.begin_write().await?;
     let job = prepare_remote_unfollow(state, &txn, following).await?;
     roosty_db::enqueue_job_in_transaction(&txn, job).await?;
     txn.commit().await?;
@@ -5558,8 +5590,8 @@ pub(crate) async fn enqueue_remote_unfollow(
 pub(crate) async fn prepare_remote_unfollow(
     state: &AppState,
     db: &impl ConnectionTrait,
-    following: roosty_db::RemoteFollowing,
-) -> Result<roosty_db::NewJob, RoostyError> {
+    following: RemoteFollowing,
+) -> Result<NewJob, RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, following.local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local follow actor does not exist".to_owned()))?;
@@ -5586,15 +5618,15 @@ fn follow_delivery_job(
     remote_actor_id: AccountId,
     activity: JsonValue,
     activity_id: &str,
-) -> Result<roosty_db::NewJob, RoostyError> {
+) -> Result<NewJob, RoostyError> {
     let payload = serde_json::to_value(FollowDelivery {
         local_account_id,
         remote_actor_id,
         activity,
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    Ok(roosty_db::NewJob {
-        kind: roosty_db::JobKind::FederationFollowDelivery,
+    Ok(NewJob {
+        kind: JobKind::FederationFollowDelivery,
         payload,
         deduplication_key: Some(activity_id.to_owned()),
         run_after: OffsetDateTime::now_utc(),
@@ -5604,12 +5636,14 @@ fn follow_delivery_job(
 /// Dispatch a durable local Follow or Undo(Follow) delivery job.
 pub(crate) async fn deliver_follow_activity(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: FollowDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid follow delivery payload".to_owned()))?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -5624,7 +5658,7 @@ pub(crate) async fn prepare_remote_block(
     db: &impl ConnectionTrait,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
-) -> Result<(String, roosty_db::NewJob), RoostyError> {
+) -> Result<(String, NewJob), RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local block actor does not exist".to_owned()))?;
@@ -5650,7 +5684,7 @@ pub(crate) async fn prepare_report_flag(
     remote_actor_id: AccountId,
     statuses: &[ReportStatus],
     comment: &str,
-) -> Result<roosty_db::NewJob, RoostyError> {
+) -> Result<NewJob, RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("reporting account does not exist".to_owned()))?;
@@ -5697,8 +5731,8 @@ pub(crate) async fn prepare_report_flag(
 pub(crate) async fn prepare_remote_unblock(
     state: &AppState,
     db: &impl ConnectionTrait,
-    block: &roosty_db::LocalRemoteAccountBlock,
-) -> Result<roosty_db::NewJob, RoostyError> {
+    block: &LocalRemoteAccountBlock,
+) -> Result<NewJob, RoostyError> {
     let local = roosty_db::find_local_account_by_id(db, block.local_account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local block actor does not exist".to_owned()))?;
@@ -5719,14 +5753,14 @@ fn moderation_delivery_job(
     remote_actor_id: AccountId,
     activity: JsonValue,
     activity_id: &str,
-) -> Result<roosty_db::NewJob, RoostyError> {
+) -> Result<NewJob, RoostyError> {
     let payload = serde_json::to_value(ModerationDelivery {
         local_account_id,
         remote_actor_id,
         activity,
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    Ok(roosty_db::NewJob {
+    Ok(NewJob {
         kind: JobKind::FederationModerationDelivery,
         payload,
         deduplication_key: Some(activity_id.to_owned()),
@@ -5737,12 +5771,14 @@ fn moderation_delivery_job(
 /// Deliver moderation activities to the actor's personal inbox.
 pub(crate) async fn deliver_moderation_activity(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: ModerationDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid moderation delivery payload".to_owned()))?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -5755,6 +5791,7 @@ pub(crate) async fn deliver_moderation_activity(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn enqueue_status_activity(
     state: &AppState,
+    database: &DatabaseContext,
     status: &LocalStatus,
     kind: StatusActivityKind,
 ) -> Result<(), RoostyError> {
@@ -5769,25 +5806,20 @@ pub(crate) async fn enqueue_status_activity(
     {
         return Ok(());
     }
-    let local = roosty_db::find_local_account_by_id(&state.db, status.account_id)
+    let txn = database.begin_write().await?;
+    let db = &txn;
+    let local = roosty_db::find_local_account_by_id(db, status.account_id)
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local status actor does not exist".to_owned()))?;
-    let remote_audience = status_remote_audience(&state.db, status).await?;
-    let activity = status_activity(
-        state,
-        &state.db,
-        &local.username,
-        status,
-        kind,
-        &remote_audience,
-    )
-    .await?;
+    let remote_audience = status_remote_audience(db, status).await?;
+    let activity =
+        status_activity(state, db, &local.username, status, kind, &remote_audience).await?;
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
     let recipients =
-        status_delivery_recipients(&state.db, local.id, status, &remote_audience, &[]).await?;
+        status_delivery_recipients(db, local.id, status, &remote_audience, &[]).await?;
     for remote in recipients {
         let payload = serde_json::to_value(StatusDelivery {
             local_account_id: local.id,
@@ -5796,15 +5828,18 @@ pub(crate) async fn enqueue_status_activity(
             personal_inbox: status.visibility == StatusVisibility::Direct,
         })
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job(
-            &state.db,
-            roosty_db::JobKind::FederationStatusDelivery,
-            payload,
-            Some(&format!("{activity_id}:{}", remote.id.0)),
-            OffsetDateTime::now_utc(),
+        roosty_db::enqueue_job_in_transaction(
+            db,
+            NewJob {
+                kind: JobKind::FederationStatusDelivery,
+                payload,
+                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
+                run_after: OffsetDateTime::now_utc(),
+            },
         )
         .await?;
     }
+    txn.commit().await?;
     Ok(())
 }
 
@@ -5855,8 +5890,8 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationStatusDelivery,
+            NewJob {
+                kind: JobKind::FederationStatusDelivery,
                 payload,
                 deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
                 run_after: OffsetDateTime::now_utc(),
@@ -5923,14 +5958,14 @@ async fn status_delivery_recipients(
 /// Queue a refreshed local actor document for every accepted remote follower.
 pub(crate) async fn enqueue_actor_update_in_transaction(
     state: &AppState,
-    txn: &sea_orm::DatabaseTransaction,
-    account: roosty_db::LocalAccount,
+    txn: &DatabaseTransaction,
+    account: LocalAccount,
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled {
         return Ok(());
     }
 
-    let public_key_pem = ensure_actor_key(state, account.id).await?;
+    let public_key_pem = ensure_actor_key(state, txn, account.id).await?;
     let actor = actor_url(state, &account.username);
     let activity = serde_json::to_value(ActorUpdate {
         context: ACTIVITYSTREAMS_CONTEXT,
@@ -5946,7 +5981,7 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RoostyError::InvalidInput("actor update has no ID".to_owned()))?;
 
-    for remote in roosty_db::accepted_remote_followers(&state.db, account.id).await? {
+    for remote in roosty_db::accepted_remote_followers(txn, account.id).await? {
         let payload = serde_json::to_value(ActorUpdateDelivery {
             local_account_id: account.id,
             remote_actor_id: remote.id,
@@ -5955,8 +5990,8 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationActorUpdateDelivery,
+            NewJob {
+                kind: JobKind::FederationActorUpdateDelivery,
                 payload,
                 deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
                 run_after: OffsetDateTime::now_utc(),
@@ -5971,8 +6006,8 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
 /// Queue a local actor `Delete` before suspension severs its remote followers.
 pub(crate) async fn enqueue_actor_delete_in_transaction(
     state: &AppState,
-    txn: &sea_orm::DatabaseTransaction,
-    account: &roosty_db::LocalAccount,
+    txn: &DatabaseTransaction,
+    account: &LocalAccount,
 ) -> Result<(), RoostyError> {
     if !state.config.federation_enabled {
         return Ok(());
@@ -5996,8 +6031,8 @@ pub(crate) async fn enqueue_actor_delete_in_transaction(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
         roosty_db::enqueue_job_in_transaction(
             txn,
-            roosty_db::NewJob {
-                kind: roosty_db::JobKind::FederationActorUpdateDelivery,
+            NewJob {
+                kind: JobKind::FederationActorUpdateDelivery,
                 payload,
                 deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
                 run_after: OffsetDateTime::now_utc(),
@@ -6011,15 +6046,16 @@ pub(crate) async fn enqueue_actor_delete_in_transaction(
 /// Resolve syntactically valid remote handles for a local status without making posting fail.
 pub(crate) async fn resolve_remote_mentions(
     state: &AppState,
+    database: &DatabaseContext,
     content: &str,
-) -> Vec<roosty_db::RemoteActor> {
+) -> Vec<RemoteActor> {
     let mut actors = Vec::new();
     for handle in remote_mention_handles(content) {
-        match discovery::resolve_remote_actor(state, &handle).await {
+        match discovery::resolve_remote_actor(state, database, &handle).await {
             Ok(actor)
                 if !actors
                     .iter()
-                    .any(|existing: &roosty_db::RemoteActor| existing.id == actor.id) =>
+                    .any(|existing: &RemoteActor| existing.id == actor.id) =>
             {
                 actors.push(actor)
             }
@@ -6045,11 +6081,12 @@ pub(crate) enum StatusActivityKind {
 
 /// Accept a pending remote Follow while atomically creating its durable Accept job.
 pub(crate) async fn accept_remote_follow_request(
-    state: &AppState,
+    database: &DatabaseContext,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<bool, RoostyError> {
-    let follow = roosty_db::pending_remote_follows(&state.db, local_account_id)
+    let txn = database.begin_write().await?;
+    let follow = roosty_db::pending_remote_follows(&txn, local_account_id)
         .await?
         .into_iter()
         .find(|follow| follow.remote_actor_id == remote_actor_id);
@@ -6061,16 +6098,14 @@ pub(crate) async fn accept_remote_follow_request(
         remote_actor_id,
         follow: follow.activity.clone(),
         response_type: FollowResponseType::Accept,
-    })
-    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    let txn = state.db.begin().await?;
+    })?;
     let accepted = roosty_db::accept_remote_follow_with_response_job(
         &txn,
         local_account_id,
         remote_actor_id,
         &follow.activity_id,
-        roosty_db::RemoteFollowResponseJob {
-            kind: roosty_db::JobKind::FederationFollowResponse,
+        RemoteFollowResponseJob {
+            kind: JobKind::FederationFollowResponse,
             payload,
             deduplication_key: format!(
                 "{}:{}",
@@ -6086,11 +6121,12 @@ pub(crate) async fn accept_remote_follow_request(
 
 /// Reject a pending remote Follow while atomically creating its durable Reject job.
 pub(crate) async fn reject_remote_follow_request(
-    state: &AppState,
+    database: &DatabaseContext,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
 ) -> Result<bool, RoostyError> {
-    let follow = roosty_db::pending_remote_follows(&state.db, local_account_id)
+    let txn = database.begin_write().await?;
+    let follow = roosty_db::pending_remote_follows(&txn, local_account_id)
         .await?
         .into_iter()
         .find(|follow| follow.remote_actor_id == remote_actor_id);
@@ -6102,16 +6138,14 @@ pub(crate) async fn reject_remote_follow_request(
         remote_actor_id,
         follow: follow.activity.clone(),
         response_type: FollowResponseType::Reject,
-    })
-    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    let txn = state.db.begin().await?;
+    })?;
     let rejected = roosty_db::delete_remote_follow_with_response_job(
         &txn,
         local_account_id,
         remote_actor_id,
         &follow.activity_id,
-        roosty_db::RemoteFollowResponseJob {
-            kind: roosty_db::JobKind::FederationFollowResponse,
+        RemoteFollowResponseJob {
+            kind: JobKind::FederationFollowResponse,
             payload,
             deduplication_key: format!(
                 "{}:{}",
@@ -6128,21 +6162,24 @@ pub(crate) async fn reject_remote_follow_request(
 /// Dispatch one durable follow-response delivery job.
 pub(crate) async fn deliver_follow_response(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
+    let txn = database.begin_snapshot().await?;
+    let db = &txn;
     let payload: FollowResponseDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid federation delivery payload".to_owned()))?;
-    let local = roosty_db::find_local_account_by_id(&state.db, payload.local_account_id)
+    let local = roosty_db::find_local_account_by_id(db, payload.local_account_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("local delivery actor does not exist".to_owned())
         })?;
-    let remote = roosty_db::find_remote_actor_by_id(&state.db, payload.remote_actor_id)
+    let remote = roosty_db::find_remote_actor_by_id(db, payload.remote_actor_id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("remote delivery actor does not exist".to_owned())
         })?;
-    let key = roosty_db::find_local_actor_key(&state.db, local.id)
+    let key = roosty_db::find_local_actor_key(db, local.id)
         .await?
         .ok_or_else(|| {
             RoostyError::InvalidInput("local delivery actor has no signing key".to_owned())
@@ -6151,25 +6188,30 @@ pub(crate) async fn deliver_follow_response(
     let actor = actor_url(state, &local.username);
     let response_type = payload.response_type.as_str();
     let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": format!("{actor}#{}-{}", response_type.to_ascii_lowercase(), Uuid::now_v7()), "type": response_type, "actor": actor, "object": payload.follow});
-    signed_post(
+    let result = signed_post(
         state,
+        &txn,
         &remote.inbox_url,
         &private_key,
         &format!("{}#main-key", actor_url(state, &local.username)),
         &activity,
     )
-    .await
+    .await;
+    txn.commit().await?;
+    result
 }
 
 /// Dispatch one durable local status activity delivery job.
 pub(crate) async fn deliver_status_activity(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: StatusDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid status delivery payload".to_owned()))?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -6180,12 +6222,14 @@ pub(crate) async fn deliver_status_activity(
 
 pub(crate) async fn deliver_quote_activity(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: StatusDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid quote delivery payload".to_owned()))?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -6197,6 +6241,7 @@ pub(crate) async fn deliver_quote_activity(
 /// Dispatch one durable local actor Update delivery job.
 pub(crate) async fn deliver_actor_update(
     state: &AppState,
+    database: &DatabaseContext,
     payload: JsonValue,
 ) -> Result<(), RoostyError> {
     let payload: ActorUpdateDelivery = serde_json::from_value(payload).map_err(|_| {
@@ -6204,6 +6249,7 @@ pub(crate) async fn deliver_actor_update(
     })?;
     deliver_activity(
         state,
+        database,
         payload.local_account_id,
         payload.remote_actor_id,
         &payload.activity,
@@ -6215,15 +6261,13 @@ pub(crate) async fn deliver_actor_update(
 /// Sign and deliver one already-persisted activity to a remote actor's inbox.
 async fn deliver_activity(
     state: &AppState,
+    database: &DatabaseContext,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
     activity: &JsonValue,
     personal_inbox: bool,
 ) -> Result<(), RoostyError> {
-    let txn = state
-        .db
-        .begin_with_config(None, Some(AccessMode::ReadOnly))
-        .await?;
+    let txn = database.begin_snapshot().await?;
     let local = roosty_db::find_local_account_by_id(&txn, local_account_id)
         .await?
         .ok_or_else(|| {
@@ -6259,10 +6303,10 @@ async fn deliver_activity(
         .ok_or_else(|| {
             RoostyError::InvalidInput("local delivery actor has no signing key".to_owned())
         })?;
-    txn.commit().await?;
     let private_key = decrypt_private_key(state, &key)?;
-    signed_post(
+    let result = signed_post(
         state,
+        &txn,
         if personal_inbox {
             &remote.inbox_url
         } else {
@@ -6275,12 +6319,14 @@ async fn deliver_activity(
         &format!("{}#main-key", actor_url(state, &local.username)),
         activity,
     )
-    .await
+    .await;
+    txn.commit().await?;
+    result
 }
 
 fn decrypt_private_key(
     state: &AppState,
-    key: &roosty_db::LocalActorKey,
+    key: &LocalActorKey,
 ) -> Result<RsaPrivateKey, RoostyError> {
     let secret = state
         .config
@@ -6318,12 +6364,13 @@ fn decrypt_private_key(
 
 async fn signed_post(
     state: &AppState,
+    db: &impl ConnectionTrait,
     inbox: &str,
     private_key: &RsaPrivateKey,
     key_id: &str,
     activity: &JsonValue,
 ) -> Result<(), RoostyError> {
-    let url = url::Url::parse(inbox)
+    let url = Url::parse(inbox)
         .map_err(|_| RoostyError::InvalidInput("remote inbox URL is invalid".to_owned()))?;
     let host = url
         .host_str()
@@ -6351,7 +6398,7 @@ async fn signed_post(
     {
         return result;
     }
-    let address = discovery::validate_remote_url(state, &url).await?;
+    let address = discovery::validate_remote_url(state, db, &url).await?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -6390,10 +6437,11 @@ async fn signed_post(
 
 async fn create(
     state: &AppState,
+    db: &impl ConnectionTrait,
     username: &str,
     status: LocalStatus,
 ) -> Result<Create, RoostyError> {
-    let object = note_object(state, &state.db, username, status).await?;
+    let object = note_object(state, db, username, status).await?;
     Ok(Create {
         context: ACTIVITYSTREAMS_CONTEXT,
         r#type: CreateType::Create,
@@ -6546,16 +6594,16 @@ async fn note_object_with_remote_audience(
             name: media.description,
         })
         .collect();
-    let tags = crate::statuses::local_status_content_tag_links(state, &status.content);
+    let render_context = TransactionContext::new(state, db);
+    let tags = crate::statuses::local_status_content_tag_links(&render_context, &status.content);
     let mut content = crate::statuses::status_content_html_with_mentions_and_tags(
-        state,
+        &render_context,
         &status.content,
         &local_mentions,
         remote_mentions,
         &tags,
     );
-    let quote =
-        roosty_db::quote_for_status(db, roosty_db::StatusReference::Local(status.id)).await?;
+    let quote = roosty_db::quote_for_status(db, StatusReference::Local(status.id)).await?;
     if let Some(quote) = &quote
         && !content.contains(&quote.quoted_activitypub_id)
     {
@@ -6565,13 +6613,11 @@ async fn note_object_with_remote_audience(
         );
     }
     let automatic_approval = match status.quote_approval_policy {
-        roosty_db::QuoteApprovalPolicy::Public => {
-            InboundAudienceValues::One(PUBLIC_AUDIENCE.to_owned())
-        }
-        roosty_db::QuoteApprovalPolicy::Followers => {
+        QuoteApprovalPolicy::Public => InboundAudienceValues::One(PUBLIC_AUDIENCE.to_owned()),
+        QuoteApprovalPolicy::Followers => {
             InboundAudienceValues::One(format!("{}/followers", actor_url(state, username)))
         }
-        roosty_db::QuoteApprovalPolicy::Nobody => InboundAudienceValues::Many(Vec::new()),
+        QuoteApprovalPolicy::Nobody => InboundAudienceValues::Many(Vec::new()),
     };
     let quote_id = quote
         .as_ref()
@@ -6689,8 +6735,9 @@ fn activitypub_references(value: &JsonValue) -> Vec<String> {
 
 async fn local_account_from_actor_url(
     state: &AppState,
+    db: &impl ConnectionTrait,
     target_url: &str,
-) -> Option<roosty_db::LocalAccount> {
+) -> Option<LocalAccount> {
     let username = target_url
         .rsplit('/')
         .next()
@@ -6698,7 +6745,7 @@ async fn local_account_from_actor_url(
     if target_url != actor_url(state, username) {
         return None;
     }
-    roosty_db::find_local_account_by_username(&state.db, username)
+    roosty_db::find_local_account_by_username(db, username)
         .await
         .ok()
         .flatten()
@@ -6726,8 +6773,12 @@ fn internal_error(error: impl std::fmt::Display) -> Response {
 }
 
 /// Return the public key, generating and encrypting a fresh key only once.
-async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<String, RoostyError> {
-    if let Some(key) = roosty_db::find_local_actor_key(&state.db, account_id).await? {
+async fn ensure_actor_key(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<String, RoostyError> {
+    if let Some(key) = roosty_db::find_local_actor_key(db, account_id).await? {
         return Ok(key.public_key_pem);
     }
     let private_key = RsaPrivateKey::new(&mut OsRng, 2048).map_err(|error| {
@@ -6764,14 +6815,14 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
         &mut ciphertext,
     )
     .map_err(|_| RoostyError::Configuration("could not encrypt actor key".to_owned()))?;
-    let stored = roosty_db::LocalActorKey {
+    let stored = LocalActorKey {
         public_key_pem: public_key_pem.clone(),
         private_key_ciphertext: ciphertext,
         private_key_nonce: nonce.to_vec(),
     };
-    match roosty_db::create_local_actor_key(&state.db, account_id, &stored).await {
+    match roosty_db::create_local_actor_key(db, account_id, &stored).await {
         Ok(()) => Ok(public_key_pem),
-        Err(_) => roosty_db::find_local_actor_key(&state.db, account_id)
+        Err(_) => roosty_db::find_local_actor_key(db, account_id)
             .await?
             .map(|key| key.public_key_pem)
             .ok_or_else(|| {
@@ -6784,6 +6835,7 @@ async fn ensure_actor_key(state: &AppState, account_id: AccountId) -> Result<Str
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        ops::Deref,
         sync::LazyLock,
     };
 
@@ -6794,7 +6846,7 @@ mod tests {
         QuoteApprovalPolicy, StatusVisibility,
     };
     use roosty_migration::Migrator;
-    use sea_orm::TransactionTrait;
+    use sea_orm::{DatabaseConnection, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use serde_json::json;
     use tempfile::TempDir;
@@ -6808,7 +6860,11 @@ mod tests {
         canonical_activity_digest, is_remote_actor_lifecycle_activity, local_actor_type,
         parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
     };
-    use crate::{config::Config, federation::test_transport, http::AppState};
+    use crate::{
+        config::Config,
+        federation::test_transport,
+        http::{AppState, DatabaseContext},
+    };
 
     /// Serializes scenarios which share the in-process recipient registry.
     static FEDERATION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -7004,15 +7060,24 @@ mod tests {
     async fn remote_reply_author_receives_unmentioned_reply() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let parent_author = create_test_account(&context.alpha, "parent").await;
         let reply_author = create_test_account(&context.beta, "replier").await;
-        let alpha_key = super::ensure_actor_key(&context.alpha, parent_author.id)
-            .await
-            .unwrap();
-        let beta_key = super::ensure_actor_key(&context.beta, reply_author.id)
+        let alpha_key =
+            super::ensure_actor_key(&context.alpha, &context.alpha.db, parent_author.id)
+                .await
+                .unwrap();
+        let beta_key = super::ensure_actor_key(&context.beta, &context.beta.db, reply_author.id)
             .await
             .unwrap();
         let remote_parent_author =
@@ -7101,16 +7166,24 @@ mod tests {
     async fn remote_reply_resolver_fetches_and_links_an_unknown_parent() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let parent_author = create_test_account(&context.alpha, "parent").await;
         let reply_author = create_test_account(&context.alpha, "replier").await;
         let follower = create_test_account(&context.beta, "follower").await;
-        let reply_key = super::ensure_actor_key(&context.alpha, reply_author.id)
+        let reply_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, reply_author.id)
             .await
             .unwrap();
-        let follower_key = super::ensure_actor_key(&context.beta, follower.id)
+        let follower_key = super::ensure_actor_key(&context.beta, &context.beta.db, follower.id)
             .await
             .unwrap();
         let remote_reply_author =
@@ -7118,10 +7191,14 @@ mod tests {
         let remote_follower =
             cache_test_actor(&context.alpha, "follower", "beta.test", follower_key).await;
 
-        let follow_id =
-            super::enqueue_remote_follow(&context.beta, follower.id, remote_reply_author.id)
-                .await
-                .unwrap();
+        let follow_id = super::enqueue_remote_follow(
+            &context.beta,
+            &context.beta.database,
+            follower.id,
+            remote_reply_author.id,
+        )
+        .await
+        .unwrap();
         roosty_db::create_remote_following(
             &context.beta.db,
             follower.id,
@@ -7163,9 +7240,14 @@ mod tests {
         )
         .await
         .unwrap();
-        super::enqueue_status_activity(&context.alpha, &reply, super::StatusActivityKind::Create)
-            .await
-            .unwrap();
+        super::enqueue_status_activity(
+            &context.alpha,
+            &context.alpha.database,
+            &reply,
+            super::StatusActivityKind::Create,
+        )
+        .await
+        .unwrap();
         deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
 
         let reply_url = super::status_url(&context.alpha, "replier", reply.id);
@@ -7202,11 +7284,19 @@ mod tests {
     async fn remote_replies_fetch_caches_a_valid_same_origin_descendant() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let author = create_test_account(&context.alpha, "author").await;
-        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+        let alpha_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, author.id)
             .await
             .unwrap();
         let remote_author =
@@ -7263,6 +7353,7 @@ mod tests {
 
         super::fetch_remote_status_replies(
             &context.beta,
+            &context.beta.database,
             serde_json::to_value(super::ThreadStatusPayload {
                 status_id: cached_parent.id.0,
             })
@@ -7286,6 +7377,7 @@ mod tests {
         let unrelated_url = super::status_url(&context.alpha, "author", unrelated.id);
         let rejected = super::fetch_remote_status_reply(
             &context.beta,
+            &context.beta.database,
             serde_json::to_value(super::ReplyFetchPayload {
                 parent_status_id: cached_parent.id.0,
                 reply_url: unrelated_url.clone(),
@@ -7311,23 +7403,36 @@ mod tests {
     async fn remote_follow_handshake_delivers_then_stops_statuses() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let author = create_test_account(&context.alpha, "author").await;
         let follower = create_test_account(&context.beta, "follower").await;
-        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+        let alpha_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, author.id)
             .await
             .unwrap();
-        let beta_key = super::ensure_actor_key(&context.beta, follower.id)
+        let beta_key = super::ensure_actor_key(&context.beta, &context.beta.db, follower.id)
             .await
             .unwrap();
         let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
         let beta_remote = cache_test_actor(&context.alpha, "follower", "beta.test", beta_key).await;
 
-        let follow_id = super::enqueue_remote_follow(&context.beta, follower.id, alpha_remote.id)
-            .await
-            .unwrap();
+        let follow_id = super::enqueue_remote_follow(
+            &context.beta,
+            &context.beta.database,
+            follower.id,
+            alpha_remote.id,
+        )
+        .await
+        .unwrap();
         roosty_db::create_remote_following(
             &context.beta.db,
             follower.id,
@@ -7365,9 +7470,14 @@ mod tests {
             "first delivery https://example.test/first",
         )
         .await;
-        super::enqueue_status_activity(&context.alpha, &first, super::StatusActivityKind::Create)
-            .await
-            .unwrap();
+        super::enqueue_status_activity(
+            &context.alpha,
+            &context.alpha.database,
+            &first,
+            super::StatusActivityKind::Create,
+        )
+        .await
+        .unwrap();
         deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
         let first_url = super::status_url(&context.alpha, "author", first.id);
         let cached_first =
@@ -7483,9 +7593,14 @@ mod tests {
             StatusVisibility::Private,
         )
         .await;
-        super::enqueue_status_activity(&context.alpha, &private, super::StatusActivityKind::Create)
-            .await
-            .unwrap();
+        super::enqueue_status_activity(
+            &context.alpha,
+            &context.alpha.database,
+            &private,
+            super::StatusActivityKind::Create,
+        )
+        .await
+        .unwrap();
         deliver_test_job(&context.alpha, roosty_db::JobKind::FederationStatusDelivery).await;
         let cached_private = roosty_db::find_remote_status_by_activitypub_id(
             &context.beta.db,
@@ -7510,7 +7625,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        super::enqueue_remote_unfollow(&context.beta, following)
+        super::enqueue_remote_unfollow(&context.beta, &context.beta.database, following)
             .await
             .unwrap();
         deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
@@ -7534,9 +7649,14 @@ mod tests {
         );
 
         let second = create_public_test_status(&context.alpha, author.id, "not delivered").await;
-        super::enqueue_status_activity(&context.alpha, &second, super::StatusActivityKind::Create)
-            .await
-            .unwrap();
+        super::enqueue_status_activity(
+            &context.alpha,
+            &context.alpha.database,
+            &second,
+            super::StatusActivityKind::Create,
+        )
+        .await
+        .unwrap();
         assert!(
             roosty_db::claim_due_job(
                 &context.alpha.db,
@@ -7558,21 +7678,29 @@ mod tests {
     async fn locked_remote_follow_requests_deliver_accept_or_reject() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let approved = create_test_account(&context.alpha, "approved").await;
         let rejected = create_test_account(&context.alpha, "rejected").await;
         lock_test_account(&context.alpha, approved.id).await;
         lock_test_account(&context.alpha, rejected.id).await;
         let follower = create_test_account(&context.beta, "follower").await;
-        let alpha_key = super::ensure_actor_key(&context.alpha, approved.id)
+        let alpha_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, approved.id)
             .await
             .unwrap();
-        let rejected_key = super::ensure_actor_key(&context.alpha, rejected.id)
+        let rejected_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, rejected.id)
             .await
             .unwrap();
-        let beta_key = super::ensure_actor_key(&context.beta, follower.id)
+        let beta_key = super::ensure_actor_key(&context.beta, &context.beta.db, follower.id)
             .await
             .unwrap();
         let approved_remote =
@@ -7593,9 +7721,13 @@ mod tests {
             .unwrap()
         );
         assert!(
-            super::accept_remote_follow_request(&context.alpha, approved.id, beta_remote.id)
-                .await
-                .unwrap()
+            super::accept_remote_follow_request(
+                &context.alpha.database,
+                approved.id,
+                beta_remote.id
+            )
+            .await
+            .unwrap()
         );
         deliver_test_job(&context.alpha, roosty_db::JobKind::FederationFollowResponse).await;
         assert_eq!(
@@ -7610,9 +7742,13 @@ mod tests {
         follow_test_actor(&context.beta, follower.id, rejected_remote.id).await;
         deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
         assert!(
-            super::reject_remote_follow_request(&context.alpha, rejected.id, beta_remote.id)
-                .await
-                .unwrap()
+            super::reject_remote_follow_request(
+                &context.alpha.database,
+                rejected.id,
+                beta_remote.id
+            )
+            .await
+            .unwrap()
         );
         deliver_test_job(&context.alpha, roosty_db::JobKind::FederationFollowResponse).await;
         assert!(
@@ -7633,7 +7769,7 @@ mod tests {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
         let follower = create_test_account(&context.beta, "follower").await;
-        let actor_key = super::ensure_actor_key(&context.beta, follower.id)
+        let actor_key = super::ensure_actor_key(&context.beta, &context.beta.db, follower.id)
             .await
             .unwrap();
         let unreachable =
@@ -7648,9 +7784,13 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let error = super::deliver_follow_activity(&context.beta, job.payload.clone())
-            .await
-            .unwrap_err();
+        let error = super::deliver_follow_activity(
+            &context.beta,
+            &context.beta.database,
+            job.payload.clone(),
+        )
+        .await
+        .unwrap_err();
         let retried_at = roosty_db::mark_job_failed(&context.beta.db, &job, &error.to_string())
             .await
             .unwrap()
@@ -7679,7 +7819,7 @@ mod tests {
         let context = FederationTestContext::setup().await;
         let author = create_test_account(&context.alpha, "author").await;
         let follower = create_test_account(&context.beta, "follower").await;
-        let follower_key = super::ensure_actor_key(&context.beta, follower.id)
+        let follower_key = super::ensure_actor_key(&context.beta, &context.beta.db, follower.id)
             .await
             .unwrap();
         let remote_follower =
@@ -7753,15 +7893,23 @@ mod tests {
     async fn remote_favourite_and_undo_are_delivered_to_the_status_origin() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let author = create_test_account(&context.alpha, "author").await;
         let liker = create_test_account(&context.beta, "liker").await;
-        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+        let alpha_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, author.id)
             .await
             .unwrap();
-        let beta_key = super::ensure_actor_key(&context.beta, liker.id)
+        let beta_key = super::ensure_actor_key(&context.beta, &context.beta.db, liker.id)
             .await
             .unwrap();
         let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
@@ -7775,9 +7923,14 @@ mod tests {
         )
         .await;
 
-        let activity_id = super::enqueue_remote_favourite(&context.beta, liker.id, &remote_status)
-            .await
-            .unwrap();
+        let activity_id = super::enqueue_remote_favourite(
+            &context.beta,
+            &context.beta.database,
+            liker.id,
+            &remote_status,
+        )
+        .await
+        .unwrap();
         roosty_db::favourite_remote_status(
             &context.beta.db,
             liker.id,
@@ -7803,7 +7956,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        super::enqueue_remote_unfavourite(&context.beta, favourite)
+        super::enqueue_remote_unfavourite(&context.beta, &context.beta.database, favourite)
             .await
             .unwrap();
         deliver_test_job(
@@ -7828,15 +7981,23 @@ mod tests {
     async fn remote_reblog_and_undo_are_delivered_to_the_status_origin() {
         let _guard = FEDERATION_TEST_LOCK.lock().await;
         let context = FederationTestContext::setup().await;
-        test_transport::register_inbox("alpha.test", context.alpha.clone());
-        test_transport::register_inbox("beta.test", context.beta.clone());
+        test_transport::register_inbox(
+            "alpha.test",
+            context.alpha.state.clone(),
+            context.alpha.database.clone(),
+        );
+        test_transport::register_inbox(
+            "beta.test",
+            context.beta.state.clone(),
+            context.beta.database.clone(),
+        );
 
         let author = create_test_account(&context.alpha, "author").await;
         let booster = create_test_account(&context.beta, "booster").await;
-        let alpha_key = super::ensure_actor_key(&context.alpha, author.id)
+        let alpha_key = super::ensure_actor_key(&context.alpha, &context.alpha.db, author.id)
             .await
             .unwrap();
-        let beta_key = super::ensure_actor_key(&context.beta, booster.id)
+        let beta_key = super::ensure_actor_key(&context.beta, &context.beta.db, booster.id)
             .await
             .unwrap();
         let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
@@ -7850,9 +8011,14 @@ mod tests {
         )
         .await;
 
-        let activity_id = super::enqueue_remote_reblog(&context.beta, booster.id, &remote_status)
-            .await
-            .unwrap();
+        let activity_id = super::enqueue_remote_reblog(
+            &context.beta,
+            &context.beta.database,
+            booster.id,
+            &remote_status,
+        )
+        .await
+        .unwrap();
         roosty_db::reblog_remote_status(
             &context.beta.db,
             booster.id,
@@ -7874,7 +8040,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        super::enqueue_remote_unreblog(&context.beta, reblog)
+        super::enqueue_remote_unreblog(&context.beta, &context.beta.database, reblog)
             .await
             .unwrap();
         deliver_test_job(&context.beta, roosty_db::JobKind::FederationReblogDelivery).await;
@@ -8110,9 +8276,23 @@ mod tests {
 
     struct FederationTestContext {
         postgresql: PostgreSQL,
-        alpha: AppState,
-        beta: AppState,
+        alpha: FederationTestState,
+        beta: FederationTestState,
         _temp_dir: TempDir,
+    }
+
+    struct FederationTestState {
+        state: AppState,
+        db: DatabaseConnection,
+        database: DatabaseContext,
+    }
+
+    impl Deref for FederationTestState {
+        type Target = AppState;
+
+        fn deref(&self) -> &Self::Target {
+            &self.state
+        }
     }
 
     impl FederationTestContext {
@@ -8143,17 +8323,39 @@ mod tests {
 
             Self {
                 postgresql,
-                alpha: AppState::new(test_config(alpha_url, "https://alpha.test"), alpha_db),
-                beta: AppState::new(test_config(beta_url, "https://beta.test"), beta_db),
+                alpha: FederationTestState {
+                    state: AppState::new(
+                        test_config(alpha_url, "https://alpha.test"),
+                        alpha_db.clone(),
+                    ),
+                    database: DatabaseContext::new(alpha_db.clone()),
+                    db: alpha_db,
+                },
+                beta: FederationTestState {
+                    state: AppState::new(
+                        test_config(beta_url, "https://beta.test"),
+                        beta_db.clone(),
+                    ),
+                    database: DatabaseContext::new(beta_db.clone()),
+                    db: beta_db,
+                },
                 _temp_dir: temp_dir,
             }
         }
 
         /// Stop both databases after the transport registry has been cleared.
         async fn teardown(self) {
-            self.alpha.db.close().await.unwrap();
-            self.beta.db.close().await.unwrap();
-            self.postgresql.stop().await.unwrap();
+            let Self {
+                postgresql,
+                alpha,
+                beta,
+                ..
+            } = self;
+            drop(alpha.state);
+            drop(beta.state);
+            alpha.db.close().await.unwrap();
+            beta.db.close().await.unwrap();
+            postgresql.stop().await.unwrap();
         }
     }
 
@@ -8188,7 +8390,10 @@ mod tests {
         }
     }
 
-    async fn create_test_account(state: &AppState, username: &str) -> roosty_db::LocalAccount {
+    async fn create_test_account(
+        state: &FederationTestState,
+        username: &str,
+    ) -> roosty_db::LocalAccount {
         roosty_db::create_local_account(
             &state.db,
             username,
@@ -8203,7 +8408,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn lock_test_account(state: &AppState, account_id: AccountId) {
+    async fn lock_test_account(state: &FederationTestState, account_id: AccountId) {
         roosty_db::update_local_account_settings(
             &state.db,
             account_id,
@@ -8217,13 +8422,14 @@ mod tests {
     }
 
     async fn follow_test_actor(
-        state: &AppState,
+        state: &FederationTestState,
         local_account_id: AccountId,
         remote_actor_id: AccountId,
     ) {
-        let activity_id = super::enqueue_remote_follow(state, local_account_id, remote_actor_id)
-            .await
-            .unwrap();
+        let activity_id =
+            super::enqueue_remote_follow(state, &state.database, local_account_id, remote_actor_id)
+                .await
+                .unwrap();
         roosty_db::create_remote_following(
             &state.db,
             local_account_id,
@@ -8237,7 +8443,7 @@ mod tests {
     }
 
     async fn cache_test_actor(
-        state: &AppState,
+        state: &FederationTestState,
         username: &str,
         domain: &str,
         public_key_pem: String,
@@ -8273,7 +8479,7 @@ mod tests {
     }
 
     async fn create_public_test_status(
-        state: &AppState,
+        state: &FederationTestState,
         account_id: AccountId,
         content: &str,
     ) -> roosty_db::LocalStatus {
@@ -8281,7 +8487,7 @@ mod tests {
     }
 
     async fn create_test_status(
-        state: &AppState,
+        state: &FederationTestState,
         account_id: AccountId,
         content: &str,
         visibility: StatusVisibility,
@@ -8306,7 +8512,7 @@ mod tests {
     }
 
     async fn cache_test_status(
-        state: &AppState,
+        state: &FederationTestState,
         remote_actor_id: AccountId,
         activitypub_id: &str,
     ) -> roosty_db::RemoteStatus {
@@ -8332,7 +8538,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn deliver_test_job(state: &AppState, kind: roosty_db::JobKind) {
+    async fn deliver_test_job(state: &FederationTestState, kind: roosty_db::JobKind) {
         let job = loop {
             let claimed =
                 roosty_db::claim_due_job(&state.db, "federation-test", time::Duration::minutes(1))
@@ -8355,71 +8561,110 @@ mod tests {
         assert_eq!(job.kind, kind);
         match kind {
             roosty_db::JobKind::FederationFollowResponse => {
-                Box::pin(super::deliver_follow_response(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_follow_response(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationStatusDelivery => {
-                Box::pin(super::deliver_status_activity(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_status_activity(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationQuoteDelivery => {
-                Box::pin(super::deliver_quote_activity(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_quote_activity(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationFollowDelivery => {
-                Box::pin(super::deliver_follow_activity(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_follow_activity(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationFavouriteDelivery => {
                 Box::pin(super::deliver_favourite_activity(
                     state,
+                    &state.database,
                     job.payload.clone(),
                 ))
                 .await
                 .unwrap();
             }
             roosty_db::JobKind::FederationReblogDelivery => {
-                Box::pin(super::deliver_reblog_activity(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_reblog_activity(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationPollVoteDelivery => {
-                Box::pin(super::deliver_poll_vote(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_poll_vote(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationActorUpdateDelivery => {
-                Box::pin(super::deliver_actor_update(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::deliver_actor_update(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationModerationDelivery => {
                 Box::pin(super::deliver_moderation_activity(
                     state,
+                    &state.database,
                     job.payload.clone(),
                 ))
                 .await
                 .unwrap();
             }
             roosty_db::JobKind::FederationRemoteMediaFetch => {
-                Box::pin(crate::media::fetch_remote_media(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(crate::media::fetch_remote_media(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::FederationFeaturedRefresh => {
-                Box::pin(super::refresh_remote_featured(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::refresh_remote_featured(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             // Featured-tag refresh tests invoke their worker directly.
             roosty_db::JobKind::FederationFeaturedTagsRefresh => {}
             roosty_db::JobKind::FederationThreadResolve => {
                 Box::pin(super::resolve_remote_status_thread(
                     state,
+                    &state.database,
                     job.payload.clone(),
                 ))
                 .await
@@ -8428,15 +8673,20 @@ mod tests {
             roosty_db::JobKind::FederationRepliesFetch => {
                 Box::pin(super::fetch_remote_status_replies(
                     state,
+                    &state.database,
                     job.payload.clone(),
                 ))
                 .await
                 .unwrap();
             }
             roosty_db::JobKind::FederationReplyFetch => {
-                Box::pin(super::fetch_remote_status_reply(state, job.payload.clone()))
-                    .await
-                    .unwrap();
+                Box::pin(super::fetch_remote_status_reply(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                ))
+                .await
+                .unwrap();
             }
             roosty_db::JobKind::WebPushDelivery
             | roosty_db::JobKind::NotificationRequestMerge

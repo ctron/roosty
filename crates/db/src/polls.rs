@@ -191,7 +191,7 @@ pub async fn create_local_poll(
 
 /// Store a poll with a scheduled status for later atomic publication.
 pub async fn create_scheduled_poll(
-    txn: &DatabaseTransaction,
+    txn: &impl ConnectionTrait,
     scheduled_status_id: Uuid,
     input: &NewStatusPoll,
 ) -> Result<()> {

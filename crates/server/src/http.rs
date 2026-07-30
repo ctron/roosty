@@ -1,14 +1,21 @@
-use std::sync::Arc;
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 use tokio::sync::Semaphore;
 
 use axum::{
-    Router,
-    extract::{FromRef, State},
-    http::{Method, StatusCode, header},
-    response::IntoResponse,
+    Extension, Json, Router,
+    extract::{FromRef, State, rejection::ExtensionRejection},
+    http::{Method, StatusCode, header, header::InvalidHeaderValue},
+    response::{IntoResponse, Response},
     routing::get,
 };
-use sea_orm::{AccessMode, DatabaseTransaction, IsolationLevel, TransactionTrait};
+use roosty_core::{
+    AccountId, AccountRelationshipError, FederationDiscoveryError, Result as RoostyResult,
+    RoostyError,
+};
+use roosty_db::{DbConnection, StatusCreationReservation};
+use sea_orm::{AccessMode, DatabaseTransaction, DbErr, IsolationLevel, TransactionTrait};
+use serde_json::Error as JsonError;
+use thiserror::Error;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::{DefaultMakeSpan, DefaultOnResponse, HttpMakeClassifier, TraceLayer},
@@ -17,13 +24,147 @@ use tracing::Level;
 
 use crate::{config::Config, streaming::StreamingEvents};
 
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
+
+/// Shared Mastodon-compatible failures returned by HTTP API handlers.
+#[derive(Debug, Error)]
+pub(crate) enum ApiError {
+    #[error("{0}")]
+    BadRequest(Cow<'static, str>),
+    #[error("{0}")]
+    Unauthorized(Cow<'static, str>),
+    #[error("{description}")]
+    OAuth {
+        error: Cow<'static, str>,
+        description: Cow<'static, str>,
+    },
+    #[error("{0}")]
+    Forbidden(Cow<'static, str>),
+    #[error("{0}")]
+    NotFound(Cow<'static, str>),
+    #[error("{0}")]
+    Unprocessable(Cow<'static, str>),
+    #[error("{0}")]
+    ServiceUnavailable(Cow<'static, str>),
+    #[error(transparent)]
+    Internal(RoostyError),
+}
+
+impl From<DbErr> for ApiError {
+    fn from(error: DbErr) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl From<RoostyError> for ApiError {
+    fn from(error: RoostyError) -> Self {
+        match error {
+            RoostyError::AccountRelationship(
+                AccountRelationshipError::FollowTargetNotFound
+                | AccountRelationshipError::ModerationTargetNotFound,
+            ) => Self::NotFound("Record not found".into()),
+            RoostyError::AccountRelationship(AccountRelationshipError::FollowBlocked) => {
+                Self::Forbidden(error.to_string().into())
+            }
+            RoostyError::AccountRelationship(_) | RoostyError::InvalidInput(_) => {
+                Self::BadRequest(error.to_string().into())
+            }
+            RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_)) => {
+                Self::NotFound("Record not found".into())
+            }
+            error => Self::Internal(error),
+        }
+    }
+}
+
+impl From<AccountRelationshipError> for ApiError {
+    fn from(error: AccountRelationshipError) -> Self {
+        RoostyError::from(error).into()
+    }
+}
+
+impl From<ExtensionRejection> for ApiError {
+    fn from(error: ExtensionRejection) -> Self {
+        Self::Internal(RoostyError::Configuration(error.to_string()))
+    }
+}
+
+impl From<InvalidHeaderValue> for ApiError {
+    fn from(error: InvalidHeaderValue) -> Self {
+        Self::Internal(RoostyError::Configuration(error.to_string()))
+    }
+}
+
+impl From<JsonError> for ApiError {
+    fn from(error: JsonError) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, error, description) = match self {
+            Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error, None),
+            Self::Unauthorized(error) => (StatusCode::UNAUTHORIZED, error, None),
+            Self::OAuth { error, description } => {
+                (StatusCode::UNAUTHORIZED, error, Some(description))
+            }
+            Self::Forbidden(error) => (StatusCode::FORBIDDEN, error, None),
+            Self::NotFound(error) => (StatusCode::NOT_FOUND, error, None),
+            Self::Unprocessable(error) => (StatusCode::UNPROCESSABLE_ENTITY, error, None),
+            Self::ServiceUnavailable(error) => (StatusCode::SERVICE_UNAVAILABLE, error, None),
+            Self::Internal(error) => {
+                tracing::error!(%error, "API operation failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Cow::Borrowed("Internal server error"),
+                    None,
+                )
+            }
+        };
+        let body = match description {
+            Some(description) => serde_json::json!({
+                "error": error,
+                "error_description": description,
+            }),
+            None => serde_json::json!({ "error": error }),
+        };
+        (status, Json(body)).into_response()
+    }
+}
+
+/// Infrastructure readiness failures retain the plain-text probe response.
+#[derive(Debug, Error)]
+enum ReadinessError {
+    #[error("streaming listener unavailable")]
+    Streaming,
+    #[error("database unavailable: {0}")]
+    Database(RoostyError),
+}
+
+impl From<DbErr> for ReadinessError {
+    fn from(error: DbErr) -> Self {
+        Self::Database(error.into())
+    }
+}
+
+impl From<RoostyError> for ReadinessError {
+    fn from(error: RoostyError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl IntoResponse for ReadinessError {
+    fn into_response(self) -> Response {
+        (StatusCode::SERVICE_UNAVAILABLE, format!("{self}\n")).into_response()
+    }
+}
+
 /// Shared Axum application state.
 #[derive(Clone)]
 pub struct AppState {
     /// Validated application configuration.
     pub config: Arc<Config>,
-    /// Database connection pool.
-    pub db: roosty_db::DbConnection,
     /// Bounded local and cross-process Mastodon streaming event bus.
     pub streaming_events: StreamingEvents,
     /// Per-process permit pool held for each upgraded streaming socket.
@@ -38,7 +179,7 @@ pub struct AppState {
 
 impl AppState {
     /// Create shared application state from config and database connection.
-    pub fn new(config: Config, db: roosty_db::DbConnection) -> Self {
+    pub fn new(config: Config, db: DbConnection) -> Self {
         let streaming_events = StreamingEvents::new(
             db.clone(),
             config.database_url.clone(),
@@ -49,7 +190,6 @@ impl AppState {
         let push = crate::push::PushService::new(&config, db.clone());
         Self {
             config: Arc::new(config),
-            db,
             streaming_events,
             streaming_connections,
             preview_card_fetches,
@@ -62,15 +202,54 @@ impl AppState {
         }
     }
 
+    /// Override the default UI settings with Cargo Leptos build configuration.
+    pub fn with_leptos_options(mut self, leptos_options: leptos::config::LeptosOptions) -> Self {
+        self.leptos_options = leptos_options;
+        self
+    }
+}
+
+/// Transaction-only database access installed as an Axum extension.
+#[derive(Clone)]
+pub struct DatabaseContext {
+    db: DbConnection,
+}
+
+/// Application services paired with one caller-owned database transaction.
+pub(crate) struct TransactionContext<'a, C> {
+    pub(crate) state: &'a AppState,
+    pub(crate) db: &'a C,
+}
+
+impl<'a, C> TransactionContext<'a, C> {
+    pub(crate) fn new(state: &'a AppState, db: &'a C) -> Self {
+        Self { state, db }
+    }
+}
+
+impl<C> Deref for TransactionContext<'_, C> {
+    type Target = AppState;
+
+    fn deref(&self) -> &Self::Target {
+        self.state
+    }
+}
+
+impl DatabaseContext {
+    /// Wrap a connection pool without exposing transaction-free query access.
+    pub fn new(db: DbConnection) -> Self {
+        Self { db }
+    }
+
     /// Start a short read-only transaction for an isolated lookup.
-    pub async fn begin_read(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+    pub async fn begin_read(&self) -> Result<DatabaseTransaction, DbErr> {
         self.db
             .begin_with_config(None, Some(AccessMode::ReadOnly))
             .await
     }
 
     /// Start a stable read-only snapshot for a multi-query projection.
-    pub async fn begin_snapshot(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+    pub async fn begin_snapshot(&self) -> Result<DatabaseTransaction, DbErr> {
         self.db
             .begin_with_config(
                 Some(IsolationLevel::RepeatableRead),
@@ -80,14 +259,17 @@ impl AppState {
     }
 
     /// Start a transaction for an application mutation.
-    pub async fn begin_write(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+    pub async fn begin_write(&self) -> Result<DatabaseTransaction, DbErr> {
         self.db.begin().await
     }
 
-    /// Override the default UI settings with Cargo Leptos build configuration.
-    pub fn with_leptos_options(mut self, leptos_options: leptos::config::LeptosOptions) -> Self {
-        self.leptos_options = leptos_options;
-        self
+    /// Acquire the transaction-backed status idempotency reservation.
+    pub async fn begin_status_creation(
+        &self,
+        account_id: AccountId,
+        key: &str,
+    ) -> RoostyResult<StatusCreationReservation> {
+        roosty_db::begin_status_creation(&self.db, account_id, key).await
     }
 }
 
@@ -98,7 +280,11 @@ impl FromRef<AppState> for leptos::config::LeptosOptions {
 }
 
 /// Build the public application router.
-pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
+pub fn app_router(
+    state: AppState,
+    database: DatabaseContext,
+    include_infra_routes: bool,
+) -> Router {
     let public_router = Router::<AppState>::new()
         .merge(crate::accounts::router())
         .merge(crate::admin::router())
@@ -119,7 +305,7 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         .merge(crate::search::router())
         .merge(crate::statuses::router())
         .merge(crate::version::router())
-        .merge(crate::web::router(&state))
+        .merge(crate::web::router(&state, &database))
         .fallback(public_fallback)
         .layer(request_trace_layer())
         .layer(public_cors_layer());
@@ -129,12 +315,12 @@ pub fn app_router(state: AppState, include_infra_routes: bool) -> Router {
         public_router
     };
 
-    router.with_state(state)
+    router.layer(Extension(database)).with_state(state)
 }
 
 /// Build the infrastructure-only router.
-pub fn infra_router(state: AppState) -> Router {
-    infra_routes().with_state(state)
+pub fn infra_router(state: AppState, database: DatabaseContext) -> Router {
+    infra_routes().layer(Extension(database)).with_state(state)
 }
 
 /// Build routes intended for infrastructure probes and scraping.
@@ -189,22 +375,17 @@ async fn healthz() -> &'static str {
 }
 
 /// Check whether the server can reach its configured database.
-async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+async fn readyz(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+) -> Result<&'static str, ReadinessError> {
     if !state.streaming_events.listener_is_ready() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "streaming listener unavailable\n",
-        )
-            .into_response();
+        return Err(ReadinessError::Streaming);
     }
-    match roosty_db::ping(&state.db).await {
-        Ok(()) => (StatusCode::OK, "ok\n").into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("database unavailable: {error}\n"),
-        )
-            .into_response(),
-    }
+    let txn = database.begin_read().await?;
+    roosty_db::ping(&txn).await?;
+    txn.commit().await?;
+    Ok("ok\n")
 }
 
 /// Render Prometheus-compatible process and configuration metrics.

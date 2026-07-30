@@ -1,19 +1,23 @@
 //! Mastodon-compatible featured hashtag management and account projection.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::to_bytes,
     extract::{Path, Request, State},
-    http::{StatusCode, header},
+    http::header,
     response::{IntoResponse, Response},
     routing::{delete, get},
 };
-use roosty_core::{AccountId, RoostyError};
+use roosty_core::AccountId;
 use roosty_db::{FeatureTagResult, FeaturedTag};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::AuthenticatedAccount, http::AppState, statuses::TagResponse};
+use crate::{
+    auth::AuthenticatedAccount,
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
+    statuses::TagResponse,
+};
 
 pub(crate) const MAX_FEATURED_TAGS: u64 = 10;
 const MAX_SUGGESTIONS: u64 = 10;
@@ -43,147 +47,110 @@ struct FeaturedTagResponse {
     last_status_at: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
 async fn index(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let result = roosty_db::local_featured_tags(&txn, account.id).await;
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    match result {
-        Ok(tags) => Json(local_responses(&state, &account.username, tags)).into_response(),
-        Err(error) => server_error(error),
-    }
+) -> ApiResult<Json<Vec<FeaturedTagResponse>>> {
+    let txn = database.begin_read().await?;
+    let tags = roosty_db::local_featured_tags(&txn, account.id).await?;
+    txn.commit().await?;
+    Ok(Json(local_responses(&state, &account.username, tags)))
 }
 
 async fn create(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     request: Request,
-) -> Response {
-    let input = match parse_input(request).await {
-        Ok(input) => input,
-        Err(error) => return unprocessable(&error),
-    };
+) -> ApiResult<Json<FeaturedTagResponse>> {
+    let input = parse_input(request)
+        .await
+        .map_err(|error| ApiError::Unprocessable(error.into()))?;
     let Some(name) = roosty_db::normalize_featured_tag_name(&input.name) else {
-        return unprocessable("Featured tag name is invalid");
+        return Err(ApiError::Unprocessable(
+            "Featured tag name is invalid".into(),
+        ));
     };
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let result =
-        match roosty_db::feature_local_tag(&txn, account.id, &name, MAX_FEATURED_TAGS).await {
-            Ok(result) => result,
-            Err(error) => return server_error(error),
-        };
+    let txn = database.begin_write().await?;
+    let result = roosty_db::feature_local_tag(&txn, account.id, &name, MAX_FEATURED_TAGS).await?;
     let (tag, created) = match result {
         FeatureTagResult::Featured { tag, created } => (tag, created),
         FeatureTagResult::LimitReached => {
-            return unprocessable("You have already featured the maximum number of hashtags");
+            return Err(ApiError::Unprocessable(
+                "You have already featured the maximum number of hashtags".into(),
+            ));
         }
     };
-    if created
-        && let Err(error) =
-            crate::federation::enqueue_featured_tag_activity(&state, &txn, &account, &tag, true)
-                .await
-    {
-        return server_error(error);
+    if created {
+        crate::federation::enqueue_featured_tag_activity(&state, &txn, &account, &tag, true)
+            .await?;
     }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    Json(local_response(&state, &account.username, tag)).into_response()
+    txn.commit().await?;
+    Ok(Json(local_response(&state, &account.username, tag)))
 }
 
 async fn destroy(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(featured_tag_id): Path<Uuid>,
-) -> Response {
-    let txn = match state.begin_write().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let removed = match roosty_db::unfeature_local_tag(&txn, account.id, featured_tag_id).await {
-        Ok(Some(tag)) => tag,
-        Ok(None) => return not_found(),
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) =
-        crate::federation::enqueue_featured_tag_activity(&state, &txn, &account, &removed, false)
-            .await
-    {
-        return server_error(error);
-    }
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    Json(serde_json::json!({})).into_response()
+) -> ApiResult<Json<serde_json::Value>> {
+    let txn = database.begin_write().await?;
+    let removed = roosty_db::unfeature_local_tag(&txn, account.id, featured_tag_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    crate::federation::enqueue_featured_tag_activity(&state, &txn, &account, &removed, false)
+        .await?;
+    txn.commit().await?;
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn suggestions(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
-) -> Response {
-    let txn = match state.begin_read().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
-    };
-    let tags = match roosty_db::suggested_featured_tags(&txn, account.id, MAX_SUGGESTIONS).await {
-        Ok(tags) => tags,
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
+) -> ApiResult<Json<Vec<TagResponse>>> {
+    let txn = database.begin_read().await?;
+    let tags = roosty_db::suggested_featured_tags(&txn, account.id, MAX_SUGGESTIONS).await?;
+    txn.commit().await?;
     let responses = tags
         .into_iter()
         .map(|tag| TagResponse::new(&state, tag, Vec::new(), None))
         .collect::<Vec<_>>();
-    Json(responses).into_response()
+    Ok(Json(responses))
 }
 
 async fn account_featured_tags(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     Path(account_id): Path<Uuid>,
-) -> Response {
+) -> ApiResult<Response> {
     let account_id = AccountId(account_id);
-    let txn = match state.begin_snapshot().await {
-        Ok(txn) => txn,
-        Err(error) => return server_error(error.into()),
+    let txn = database.begin_snapshot().await?;
+    let response = match roosty_db::find_local_account_by_id(&txn, account_id).await? {
+        Some(account) => Json(local_responses(
+            &state,
+            &account.username,
+            roosty_db::local_featured_tags(&txn, account_id).await?,
+        ))
+        .into_response(),
+        None => {
+            roosty_db::find_remote_actor_by_id(&txn, account_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+            Json(
+                roosty_db::remote_featured_tags(&txn, account_id)
+                    .await?
+                    .into_iter()
+                    .map(remote_response)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
     };
-    let response = match roosty_db::find_local_account_by_id(&txn, account_id).await {
-        Ok(Some(account)) => match roosty_db::local_featured_tags(&txn, account_id).await {
-            Ok(tags) => Json(local_responses(&state, &account.username, tags)).into_response(),
-            Err(error) => return server_error(error),
-        },
-        Ok(None) => match roosty_db::find_remote_actor_by_id(&txn, account_id).await {
-            Ok(Some(_actor)) => match roosty_db::remote_featured_tags(&txn, account_id).await {
-                Ok(tags) => {
-                    Json(tags.into_iter().map(remote_response).collect::<Vec<_>>()).into_response()
-                }
-                Err(error) => return server_error(error),
-            },
-            Ok(None) => not_found(),
-            Err(error) => return server_error(error),
-        },
-        Err(error) => return server_error(error),
-    };
-    if let Err(error) = txn.commit().await {
-        return server_error(error.into());
-    }
-    response
+    txn.commit().await?;
+    Ok(response)
 }
 
 fn local_responses(
@@ -243,36 +210,6 @@ fn public_url(state: &AppState, path: &str) -> String {
         .join(path.trim_start_matches('/'))
         .map(|url| url.to_string())
         .unwrap_or_else(|_| format!("{}/{}", state.config.public_base_url, path))
-}
-
-fn unprocessable(description: &str) -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(ErrorResponse {
-            error: description.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Record not found".to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-fn server_error(error: RoostyError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

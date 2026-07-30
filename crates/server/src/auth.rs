@@ -1,7 +1,7 @@
 use std::{fmt, path::Path};
 
 use axum::{
-    Form, Json, Router,
+    Extension, Form, Json, Router,
     body::to_bytes,
     extract::{FromRef, FromRequest, FromRequestParts, Query, Request, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
@@ -19,7 +19,7 @@ use roosty_web_ui::{
     AuthorizationResult, LoginError, OutOfBandAuthorization, PasswordChangeResult,
     render_authorization_consent, render_out_of_band_authorization,
 };
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::ConnectionTrait;
 use serde::{
     Deserialize, Serialize,
     de::{self, DeserializeOwned, MapAccess, Visitor},
@@ -31,7 +31,11 @@ use time::{Duration, OffsetDateTime};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
-use crate::{http::AppState, password, version::build_identifier};
+use crate::{
+    http::{ApiError, ApiResult, AppState, DatabaseContext},
+    password,
+    version::build_identifier,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -99,11 +103,13 @@ where
     AppState: FromRef<S>,
     S: Send + Sync,
 {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(database) =
+            Extension::<DatabaseContext>::from_request_parts(parts, state).await?;
         let state = AppState::from_ref(state);
-        authenticated_account(&state, &parts.headers)
+        authenticated_account(&state, &database, &parts.headers)
             .await
             .map(Self)
     }
@@ -114,33 +120,27 @@ where
     AppState: FromRef<S>,
     S: Send + Sync,
 {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(database) =
+            Extension::<DatabaseContext>::from_request_parts(parts, state).await?;
         let state = AppState::from_ref(state);
         let raw_token = bearer_token(&parts.headers)
-            .ok_or_else(|| {
-                oauth_error(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_token",
-                    "missing bearer token",
-                )
+            .ok_or_else(|| ApiError::OAuth {
+                error: "invalid_token".into(),
+                description: "missing bearer token".into(),
             })?
             .to_owned();
-        let txn = state
-            .begin_read()
-            .await
-            .map_err(|error| server_error(error.into()))?;
+        let txn = database.begin_read().await?;
         let grant =
             roosty_db::find_access_token_grant(&txn, &state.config.token_pepper, &raw_token)
-                .await
-                .map_err(server_error)?
-                .ok_or_else(|| {
-                    oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token")
+                .await?
+                .ok_or_else(|| ApiError::OAuth {
+                    error: "invalid_token".into(),
+                    description: "invalid token".into(),
                 })?;
-        txn.commit()
-            .await
-            .map_err(|error| server_error(error.into()))?;
+        txn.commit().await?;
         Ok(Self { grant, raw_token })
     }
 }
@@ -150,11 +150,13 @@ where
     AppState: FromRef<S>,
     S: Send + Sync,
 {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(database) =
+            Extension::<DatabaseContext>::from_request_parts(parts, state).await?;
         let state = AppState::from_ref(state);
-        optional_authenticated_account(&state, &parts.headers)
+        optional_authenticated_account(&state, &database, &parts.headers)
             .await
             .map(Self)
     }
@@ -248,9 +250,13 @@ struct ChangePasswordForm {
     password_confirmation: String,
 }
 
-async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let next = sanitize_next(form.next.as_deref());
-    let txn = match state.begin_read().await {
+    let txn = match database.begin_read().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -295,6 +301,7 @@ async fn logout(State(state): State<AppState>) -> Response {
 /// Change the signed-in user's password after verifying their current password.
 async fn change_password(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Form(form): Form<ChangePasswordForm>,
 ) -> Response {
@@ -305,7 +312,7 @@ async fn change_password(
         }
         Err(error) => return server_error(error),
     };
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -411,6 +418,7 @@ struct CreateAppResponse {
 
 async fn register_app(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     FormOrJson(form): FormOrJson<CreateAppForm>,
 ) -> Response {
     if form.client_name.trim().is_empty() || form.redirect_uris.trim().is_empty() {
@@ -422,7 +430,7 @@ async fn register_app(
     }
 
     let scopes = form.scopes.as_deref().unwrap_or("read write follow push");
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -550,6 +558,7 @@ impl PkceMethod {
 
 async fn authorize_form(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
@@ -569,13 +578,13 @@ async fn authorize_form(
         Err(error) => return server_error(error),
     };
 
-    let validated = match validate_authorize_request(&state, &params).await {
+    let validated = match validate_authorize_request(&database, &params).await {
         Ok(validated) => validated,
         Err(response) => return response,
     };
     let app = validated.app;
 
-    let txn = match state.begin_read().await {
+    let txn = match database.begin_read().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -616,6 +625,7 @@ async fn authorize_form(
 
 async fn authorize(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     headers: HeaderMap,
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
@@ -626,7 +636,7 @@ async fn authorize(
         Err(error) => return server_error(error),
     };
 
-    let txn = match state.begin_read().await {
+    let txn = match database.begin_read().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -639,7 +649,7 @@ async fn authorize(
         return server_error(error.into());
     }
 
-    let validated = match validate_authorize_request(&state, &params).await {
+    let validated = match validate_authorize_request(&database, &params).await {
         Ok(validated) => validated,
         Err(response) => return response,
     };
@@ -668,7 +678,7 @@ async fn authorize(
     } else {
         roosty_db::PkceCodeChallengeMethod::S256
     };
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -710,7 +720,7 @@ async fn authorize(
 }
 
 async fn validate_authorize_request(
-    state: &AppState,
+    database: &DatabaseContext,
     params: &AuthorizeParams,
 ) -> Result<ValidatedAuthorizeRequest, Response> {
     if params.response_type != OAuthResponseType::Code {
@@ -730,7 +740,7 @@ async fn validate_authorize_request(
         ));
     }
 
-    let txn = state
+    let txn = database
         .begin_read()
         .await
         .map_err(|error| server_error(error.into()))?;
@@ -814,7 +824,11 @@ struct TokenResponse {
     created_at: i64,
 }
 
-async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<TokenForm>) -> Response {
+async fn token(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    FormOrJson(form): FormOrJson<TokenForm>,
+) -> Response {
     if form.grant_type != OAuthGrantType::AuthorizationCode {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -823,7 +837,7 @@ async fn token(State(state): State<AppState>, FormOrJson(form): FormOrJson<Token
         );
     }
 
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -924,9 +938,10 @@ struct RevokeForm {
 
 async fn revoke(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     FormOrJson(form): FormOrJson<RevokeForm>,
 ) -> Response {
-    let txn = match state.begin_write().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -1163,12 +1178,21 @@ where
 
 async fn verify_credentials(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
 ) -> Response {
-    match account_response(&state, account).await {
+    let txn = match database.begin_snapshot().await {
+        Ok(txn) => txn,
+        Err(error) => return server_error(error.into()),
+    };
+    let response = match account_response(&state, &txn, account).await {
         Ok(account) => Json(account).into_response(),
-        Err(error) => server_error(error),
+        Err(error) => return server_error(error),
+    };
+    if let Err(error) = txn.commit().await {
+        return server_error(error.into());
     }
+    response
 }
 
 async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Response {
@@ -1185,6 +1209,7 @@ async fn preferences(AuthenticatedAccount(account): AuthenticatedAccount) -> Res
 
 async fn update_credentials(
     State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     mut input: UpdateCredentialsInput,
 ) -> Response {
@@ -1207,7 +1232,7 @@ async fn update_credentials(
         Err(error) => return bad_request(&error.to_string()),
     };
 
-    let txn = match state.db.begin().await {
+    let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
     };
@@ -1220,73 +1245,70 @@ async fn update_credentials(
     {
         return server_error(error);
     }
+    let response = match account_response(&state, &txn, updated).await {
+        Ok(account) => Json(account).into_response(),
+        Err(error) => return server_error(error),
+    };
     if let Err(error) = txn.commit().await {
         return server_error(error.into());
     }
-
-    match account_response(&state, updated).await {
-        Ok(account) => Json(account).into_response(),
-        Err(error) => server_error(error),
-    }
+    response
 }
 
 /// Resolve an OAuth bearer token to the authenticated local account.
 pub(crate) async fn authenticated_account(
     state: &AppState,
+    database: &DatabaseContext,
     headers: &HeaderMap,
-) -> Result<roosty_db::LocalAccount, Response> {
-    let bearer = bearer_token(headers).ok_or_else(|| {
-        oauth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_token",
-            "missing bearer token",
-        )
+) -> ApiResult<roosty_db::LocalAccount> {
+    let bearer = bearer_token(headers).ok_or_else(|| ApiError::OAuth {
+        error: "invalid_token".into(),
+        description: "missing bearer token".into(),
     })?;
 
-    account_from_bearer_token(state, bearer).await
+    account_from_bearer_token(state, database, bearer).await
 }
 
 /// Resolve an OAuth bearer token to an account when the request has one.
 pub(crate) async fn optional_authenticated_account(
     state: &AppState,
+    database: &DatabaseContext,
     headers: &HeaderMap,
-) -> Result<Option<roosty_db::LocalAccount>, Response> {
+) -> ApiResult<Option<roosty_db::LocalAccount>> {
     let Some(bearer) = bearer_token(headers) else {
         return Ok(None);
     };
 
-    account_from_bearer_token(state, bearer).await.map(Some)
+    account_from_bearer_token(state, database, bearer)
+        .await
+        .map(Some)
 }
 
 /// Resolve a raw OAuth bearer token to the authenticated local account.
 pub(crate) async fn account_from_bearer_token(
     state: &AppState,
+    database: &DatabaseContext,
     bearer: &str,
-) -> Result<roosty_db::LocalAccount, Response> {
-    let txn = state
-        .begin_read()
-        .await
-        .map_err(|error| server_error(error.into()))?;
+) -> ApiResult<roosty_db::LocalAccount> {
+    let txn = database.begin_read().await?;
     let account = roosty_db::find_account_by_access_token(&txn, &state.config.token_pepper, bearer)
-        .await
-        .map_err(server_error)?
+        .await?
         .map(|(account, _scopes)| account)
-        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "invalid_token", "invalid token"))?;
-    txn.commit()
-        .await
-        .map_err(|error| server_error(error.into()))?;
+        .ok_or_else(|| ApiError::OAuth {
+            error: "invalid_token".into(),
+            description: "invalid token".into(),
+        })?;
+    txn.commit().await?;
     Ok(account)
 }
 
 /// Build the Mastodon-compatible credential account response.
 pub(crate) async fn account_response(
     state: &AppState,
+    db: &impl ConnectionTrait,
     account: roosty_db::LocalAccount,
 ) -> Result<AccountResponse, RoostyError> {
-    let txn = state.begin_snapshot().await?;
-    let response = account_response_on(state, &txn, account).await?;
-    txn.commit().await?;
-    Ok(response)
+    account_response_on(state, db, account).await
 }
 
 /// Build an account response within a containing database snapshot.
@@ -1892,7 +1914,11 @@ mod tests {
     use tower::ServiceExt;
     use url::{Url, form_urlencoded};
 
-    use crate::{config::Config, http::AppState, password};
+    use crate::{
+        config::Config,
+        http::{AppState, DatabaseContext},
+        password,
+    };
 
     const REDIRECT_URI: &str = "https://localhost:4001/oauth";
     const ELK_REDIRECT_URI: &str =
@@ -3394,7 +3420,11 @@ mod tests {
 
     impl EndpointContext {
         fn app(&self) -> Router {
-            crate::http::app_router(AppState::new(self.config.clone(), self.db.clone()), false)
+            crate::http::app_router(
+                AppState::new(self.config.clone(), self.db.clone()),
+                DatabaseContext::new(self.db.clone()),
+                false,
+            )
         }
 
         async fn request(&self, request: Request<Body>) -> Response<Body> {
