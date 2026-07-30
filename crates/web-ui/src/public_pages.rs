@@ -195,18 +195,22 @@ pub struct UiStatusPage {
     pub next_cursor: Option<Uuid>,
 }
 
-/// Complete initial profile document projection.
+/// Profile identity shared by every public timeline tab.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct UiProfilePage {
+pub struct UiProfileHeader {
     pub account: UiPublicAccount,
+    pub featured_tags: Vec<UiFeaturedTag>,
+    pub profile_url: String,
+    pub activitypub_url: String,
+}
+
+/// One selected public profile timeline and its document metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiProfileTimeline {
     pub tab: UiProfileTab,
     pub hashtag: Option<String>,
-    pub featured_tags: Vec<UiFeaturedTag>,
     pub pinned_statuses: Vec<UiStatus>,
     pub timeline: UiStatusPage,
-    pub canonical_url: String,
-    pub activitypub_url: String,
-    pub noindex: bool,
 }
 
 /// Bounded status thread with the focused local permalink.
@@ -239,28 +243,47 @@ impl std::fmt::Display for UiPublicPageError {
     }
 }
 
-pub(crate) type ProfileFuture =
-    Pin<Box<dyn Future<Output = Result<UiProfilePage, UiPublicPageError>> + Send + 'static>>;
+pub(crate) type ProfileHeaderFuture =
+    Pin<Box<dyn Future<Output = Result<UiProfileHeader, UiPublicPageError>> + Send + 'static>>;
+pub(crate) type ProfileTimelineFuture =
+    Pin<Box<dyn Future<Output = Result<UiProfileTimeline, UiPublicPageError>> + Send + 'static>>;
 pub(crate) type StatusPageFuture =
     Pin<Box<dyn Future<Output = Result<UiStatusPage, UiPublicPageError>> + Send + 'static>>;
 pub(crate) type ThreadFuture =
     Pin<Box<dyn Future<Output = Result<UiStatusThread, UiPublicPageError>> + Send + 'static>>;
 
-/// Load an initial profile page.
+/// Load profile identity that remains stable while timeline tabs change.
 #[server(prefix = "/api/web", protocol = Http<GetUrl, Json>)]
-pub async fn load_profile_page(
-    username: String,
-    tab: UiProfileTab,
-    hashtag: Option<String>,
-    max_id: Option<String>,
-) -> Result<UiProfilePage, ServerFnError> {
+pub async fn load_profile_header(username: String) -> Result<UiProfileHeader, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         let backend = expect_context::<UiServerContext>();
         public_result(
             backend
                 .0
-                .profile_page(request_cookie().await?, username, tab, hashtag, max_id)
+                .profile_header(request_cookie().await?, username)
+                .await,
+        )
+    }
+    #[cfg(not(feature = "ssr"))]
+    unreachable!("the browser build uses the generated server-function client")
+}
+
+/// Load the selected initial profile timeline.
+#[server(prefix = "/api/web", protocol = Http<GetUrl, Json>)]
+pub async fn load_profile_timeline(
+    username: String,
+    tab: UiProfileTab,
+    hashtag: Option<String>,
+    max_id: Option<String>,
+) -> Result<UiProfileTimeline, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        let backend = expect_context::<UiServerContext>();
+        public_result(
+            backend
+                .0
+                .profile_timeline(request_cookie().await?, username, tab, hashtag, max_id)
                 .await,
         )
     }

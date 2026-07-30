@@ -44,8 +44,9 @@ resource result instead of replacing server-rendered content after startup.
 Profile pages include profile metadata, fields, counts, featured tags, pins, and 20-post
 UUID-cursor pages. “Load more” appends and deduplicates posts after hydration and replaces the
 cursor query in browser history. Profile roots omit replies; the replies, media, and tagged tabs
-apply their named filters. Status pages render the visible bounded mixed local/remote thread,
-content warnings, sensitive media, accessible descriptions, polls, quotes, and preview cards.
+apply their named filters. Hydrated tab navigation preserves the profile identity card and tab bar
+while only the selected timeline loads. Status pages render the visible bounded mixed local/remote
+thread, content warnings, sensitive media, accessible descriptions, polls, quotes, and preview cards.
 
 Anonymous documents expose public and unlisted posts. A signed-in local account can additionally
 see follower-only and direct posts permitted by its follow, recipient, conversation, ownership,

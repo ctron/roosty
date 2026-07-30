@@ -28,8 +28,8 @@ pub use bootstrap::{
 pub use forms::{LoginError, PasswordChangeResult};
 pub use public_pages::{
     AtUsernameSegment, UiFeaturedTag, UiMedia, UiMediaKind, UiPoll, UiPollOption, UiPreviewCard,
-    UiProfileField, UiProfilePage, UiProfileTab, UiPublicAccount, UiPublicPageError, UiStatus,
-    UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility,
+    UiProfileField, UiProfileHeader, UiProfileTab, UiProfileTimeline, UiPublicAccount,
+    UiPublicPageError, UiStatus, UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility,
 };
 
 #[cfg(feature = "hydrate")]

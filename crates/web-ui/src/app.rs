@@ -2,8 +2,8 @@ use leptos::prelude::*;
 use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, Script, Title, provide_meta_context};
 use leptos_router::{
     ParamSegment, StaticSegment,
-    components::{A, Route, Router, Routes},
-    hooks::{use_params_map, use_query_map},
+    components::{A, Outlet, ParentRoute, Route, Router, Routes},
+    hooks::{use_location, use_params_map, use_query_map},
     path,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -18,8 +18,9 @@ use crate::{
     },
     forms::{LoginError, PasswordChangeResult},
     public_pages::{
-        AtUsernameSegment, UiMediaKind, UiProfilePage, UiProfileTab, UiStatus, UiStatusThread,
-        UiStatusVisibility, load_profile_page, load_profile_statuses, load_status_thread,
+        AtUsernameSegment, UiMediaKind, UiProfileHeader, UiProfileTab, UiProfileTimeline, UiStatus,
+        UiStatusThread, UiStatusVisibility, load_profile_header, load_profile_statuses,
+        load_profile_timeline, load_status_thread,
     },
     ui::{
         AccountMenu, AdminActionModal, AdminLayout, AdminPanel, AdminSection, FormField, Hero,
@@ -95,23 +96,15 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("admin/federation") view=AdminFederationPage/>
                 <Route path=path!("admin/moderation") view=AdminModerationPage/>
                 <Route path=path!("admin/audit-log") view=AdminAuditLogPage/>
-                <Route path=AtUsernameSegment("username") view=PublicProfilePostsPage/>
-                <Route
-                    path=(AtUsernameSegment("username"), StaticSegment("with_replies"))
-                    view=PublicProfileRepliesPage
-                />
-                <Route
-                    path=(AtUsernameSegment("username"), StaticSegment("media"))
-                    view=PublicProfileMediaPage
-                />
-                <Route
-                    path=(
-                        AtUsernameSegment("username"),
-                        StaticSegment("tagged"),
-                        ParamSegment("hashtag"),
-                    )
-                    view=PublicProfileTaggedPage
-                />
+                <ParentRoute path=AtUsernameSegment("username") view=PublicProfileLayout>
+                    <Route path=path!("") view=PublicProfilePostsPage/>
+                    <Route path=path!("with_replies") view=PublicProfileRepliesPage/>
+                    <Route path=path!("media") view=PublicProfileMediaPage/>
+                    <Route
+                        path=(StaticSegment("tagged"), ParamSegment("hashtag"))
+                        view=PublicProfileTaggedPage
+                    />
+                </ParentRoute>
                 <Route
                     path=(AtUsernameSegment("username"), ParamSegment("status_id"))
                     view=PublicStatusPage
@@ -123,33 +116,57 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn PublicProfilePostsPage() -> impl IntoView {
-    view! { <PublicProfilePage tab=UiProfileTab::Posts/> }
+    view! { <PublicProfileTimelinePage tab=UiProfileTab::Posts/> }
 }
 
 #[component]
 fn PublicProfileRepliesPage() -> impl IntoView {
-    view! { <PublicProfilePage tab=UiProfileTab::WithReplies/> }
+    view! { <PublicProfileTimelinePage tab=UiProfileTab::WithReplies/> }
 }
 
 #[component]
 fn PublicProfileMediaPage() -> impl IntoView {
-    view! { <PublicProfilePage tab=UiProfileTab::Media/> }
+    view! { <PublicProfileTimelinePage tab=UiProfileTab::Media/> }
 }
 
 #[component]
 fn PublicProfileTaggedPage() -> impl IntoView {
-    view! { <PublicProfilePage tab=UiProfileTab::Tagged/> }
+    view! { <PublicProfileTimelinePage tab=UiProfileTab::Tagged/> }
 }
 
 #[component]
-fn PublicProfilePage(tab: UiProfileTab) -> impl IntoView {
+fn PublicProfileLayout() -> impl IntoView {
     let bootstrap = expect_context::<BootstrapResource>();
+    let params = use_params_map().get();
+    let username = params.get("username").unwrap_or_default();
+    let profile = Resource::new_blocking(move || username.clone(), load_profile_header);
+
+    view! {
+        <PageFrame bootstrap login_next="/">
+            <Transition fallback=|| public_page_loading("Loading profile…")>
+                {Suspend::new(async move {
+                    match profile.await {
+                        Ok(header) => view! { <PublicProfileHeaderView header/> }.into_any(),
+                        Err(_) => public_page_not_found("Profile not found"),
+                    }
+                })}
+            </Transition>
+        </PageFrame>
+    }
+}
+
+#[component]
+fn PublicProfileTimelinePage(tab: UiProfileTab) -> impl IntoView {
+    let header = expect_context::<UiProfileHeader>();
     let params = use_params_map().get();
     let username = params.get("username").unwrap_or_default();
     let hashtag = matches!(tab, UiProfileTab::Tagged)
         .then(|| params.get("hashtag"))
         .flatten();
     let max_id = use_query_map().get().get("max_id");
+    let metadata_tab = tab.clone();
+    let metadata_hashtag = hashtag.clone();
+    let metadata_max_id = max_id.clone();
     let profile = Resource::new_blocking(
         move || {
             (
@@ -159,20 +176,24 @@ fn PublicProfilePage(tab: UiProfileTab) -> impl IntoView {
                 tab.clone(),
             )
         },
-        |(username, hashtag, max_id, tab)| load_profile_page(username, tab, hashtag, max_id),
+        |(username, hashtag, max_id, tab)| load_profile_timeline(username, tab, hashtag, max_id),
     );
 
     view! {
-        <PageFrame bootstrap login_next="/">
-            <Transition fallback=|| public_page_loading("Loading profile…")>
-                {Suspend::new(async move {
-                    match profile.await {
-                        Ok(page) => public_profile_content(page),
-                        Err(_) => public_page_not_found("Profile not found"),
-                    }
-                })}
-            </Transition>
-        </PageFrame>
+        <PublicProfileMetadata
+            header
+            tab=metadata_tab
+            hashtag=metadata_hashtag
+            max_id=metadata_max_id
+        />
+        <Transition fallback=|| public_timeline_loading()>
+            {Suspend::new(async move {
+                match profile.await {
+                    Ok(page) => public_profile_timeline_content(page),
+                    Err(_) => public_page_not_found("Profile not found"),
+                }
+            })}
+        </Transition>
     }
 }
 
@@ -224,63 +245,29 @@ fn public_page_not_found(title: &'static str) -> AnyView {
     .into_any()
 }
 
-fn public_profile_content(page: UiProfilePage) -> AnyView {
-    let username = page.account.username.clone();
-    let hashtag = page.hashtag.clone();
-    let tab = page.tab.clone();
-    let initial_next = page.timeline.next_cursor;
-    let statuses = RwSignal::new(page.timeline.statuses.clone());
-    let next_cursor = RwSignal::new(initial_next);
-    let load_more = Action::new(move |cursor: &Uuid| {
-        let cursor = *cursor;
-        let username = username.clone();
-        let hashtag = hashtag.clone();
-        let tab = tab.clone();
-        async move {
-            (
-                cursor,
-                load_profile_statuses(username, tab, hashtag, cursor.to_string()).await,
-            )
-        }
-    });
-    let load_error = RwSignal::new(false);
-    Effect::new(move |_| {
-        load_more.value().with(|value| {
-            let Some((cursor, result)) = value else {
-                return;
-            };
-            match result {
-                Ok(page) => {
-                    statuses.update(|current| append_unique_statuses(current, &page.statuses));
-                    next_cursor.set(page.next_cursor);
-                    load_error.set(false);
-                    replace_cursor_query(*cursor);
-                }
-                Err(_) => load_error.set(true),
-            }
-        });
-    });
-
-    let account = page.account.clone();
-    let profile_path = format!("/@{}", account.username);
-    let selected = page.tab.clone();
-    let posts_class = if matches!(selected, UiProfileTab::Posts) {
-        "tab tab-active"
-    } else {
-        "tab"
-    };
-    let replies_class = if matches!(selected, UiProfileTab::WithReplies) {
-        "tab tab-active"
-    } else {
-        "tab"
-    };
-    let media_class = if matches!(selected, UiProfileTab::Media) {
-        "tab tab-active"
-    } else {
-        "tab"
-    };
+fn public_timeline_loading() -> AnyView {
     view! {
-        <PublicProfileMetadata page=page.clone()/>
+        <div class="grid justify-items-center gap-3 py-8" aria-live="polite">
+            <span class="loading loading-spinner" aria-hidden="true"></span>
+            <span>"Loading posts…"</span>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn PublicProfileHeaderView(header: UiProfileHeader) -> impl IntoView {
+    provide_context(header.clone());
+    let account = header.account;
+    let profile_path = format!("/@{}", account.username);
+    let replies_path = format!("{profile_path}/with_replies");
+    let media_path = format!("{profile_path}/media");
+    let pathname = use_location().pathname;
+    let posts_class_path = profile_path.clone();
+    let replies_class_path = replies_path.clone();
+    let media_class_path = media_path.clone();
+
+    view! {
         <main class="mx-auto grid w-full max-w-3xl gap-6 py-8">
             <section class="card border-base-300 bg-base-100 overflow-hidden border shadow h-card">
                 {account.header_url.clone().map(|url| view! {
@@ -321,9 +308,9 @@ fn public_profile_content(page: UiProfilePage) -> AnyView {
                     <p class="text-base-content/70">
                         "Joined " <time datetime=account.created_at.clone()>{account.created_at.clone()}</time>
                     </p>
-                    {(!page.featured_tags.is_empty()).then(|| view! {
+                    {(!header.featured_tags.is_empty()).then(|| view! {
                         <nav aria-label="Featured hashtags" class="flex flex-wrap gap-2">
-                            {page.featured_tags.clone().into_iter().map(|tag| view! {
+                            {header.featured_tags.into_iter().map(|tag| view! {
                                 <a
                                     class="badge badge-outline"
                                     href=format!("/@{}/tagged/{}", account.username, tag.name)
@@ -337,49 +324,110 @@ fn public_profile_content(page: UiProfilePage) -> AnyView {
             </section>
 
             <nav class="tabs tabs-box" aria-label="Profile timelines">
-                <A attr:class=posts_class href=profile_path.clone()>"Posts"</A>
-                <A attr:class=replies_class href=format!("{profile_path}/with_replies")>"Posts and replies"</A>
-                <A attr:class=media_class href=format!("{profile_path}/media")>"Media"</A>
+                <A
+                    attr:class=move || if pathname.get() == posts_class_path { "tab tab-active" } else { "tab" }
+                    href=profile_path
+                    exact=true
+                >
+                    "Posts"
+                </A>
+                <A
+                    attr:class=move || if pathname.get() == replies_class_path { "tab tab-active" } else { "tab" }
+                    href=replies_path
+                    exact=true
+                >
+                    "Posts and replies"
+                </A>
+                <A
+                    attr:class=move || if pathname.get() == media_class_path { "tab tab-active" } else { "tab" }
+                    href=media_path
+                    exact=true
+                >
+                    "Media"
+                </A>
             </nav>
 
-            {(!page.pinned_statuses.is_empty() && matches!(page.tab, UiProfileTab::Posts)).then(|| view! {
+            <Outlet/>
+        </main>
+    }
+}
+
+fn public_profile_timeline_content(page: UiProfileTimeline) -> AnyView {
+    let header = expect_context::<UiProfileHeader>();
+    let username = header.account.username.clone();
+    let hashtag = page.hashtag.clone();
+    let tab = page.tab.clone();
+    let initial_next = page.timeline.next_cursor;
+    let statuses = RwSignal::new(page.timeline.statuses.clone());
+    let next_cursor = RwSignal::new(initial_next);
+    let load_more = Action::new(move |cursor: &Uuid| {
+        let cursor = *cursor;
+        let username = username.clone();
+        let hashtag = hashtag.clone();
+        let tab = tab.clone();
+        async move {
+            (
+                cursor,
+                load_profile_statuses(username, tab, hashtag, cursor.to_string()).await,
+            )
+        }
+    });
+    let load_error = RwSignal::new(false);
+    Effect::new(move |_| {
+        load_more.value().with(|value| {
+            let Some((cursor, result)) = value else {
+                return;
+            };
+            match result {
+                Ok(page) => {
+                    statuses.update(|current| append_unique_statuses(current, &page.statuses));
+                    next_cursor.set(page.next_cursor);
+                    load_error.set(false);
+                    replace_cursor_query(*cursor);
+                }
+                Err(_) => load_error.set(true),
+            }
+        });
+    });
+
+    view! {
+        {(!page.pinned_statuses.is_empty()).then(|| view! {
                 <section class="grid gap-4" aria-labelledby="pinned-heading">
                     <h2 id="pinned-heading" class="text-xl font-semibold">"Pinned posts"</h2>
                     {page.pinned_statuses.clone().into_iter().map(public_status_card).collect_view()}
                 </section>
-            })}
+        })}
 
-            <section class="grid gap-4" aria-label="Profile posts">
-                <Show when=move || statuses.with(Vec::is_empty)>
-                    <div class="card border-base-300 bg-base-100 border"><div class="card-body">"No posts to show."</div></div>
-                </Show>
-                <For
-                    each=move || statuses.get()
-                    key=|status| status.id
-                    children=public_status_card
-                />
-            </section>
-            <Show when=move || load_error.get()>
-                <div class="alert alert-error" role="alert">
-                    "Could not load more posts. You can retry."
-                </div>
+        <section class="grid gap-4" aria-label="Profile posts">
+            <Show when=move || statuses.with(Vec::is_empty)>
+                <div class="card border-base-300 bg-base-100 border"><div class="card-body">"No posts to show."</div></div>
             </Show>
-            <Show when=move || next_cursor.get().is_some()>
-                <button
-                    class="btn btn-outline"
-                    type="button"
-                    disabled=move || load_more.pending().get()
-                    on:click=move |_| {
-                        if let Some(cursor) = next_cursor.get_untracked() {
-                            load_error.set(false);
-                            load_more.dispatch(cursor);
-                        }
+            <For
+                each=move || statuses.get()
+                key=|status| status.id
+                children=public_status_card
+            />
+        </section>
+        <Show when=move || load_error.get()>
+            <div class="alert alert-error" role="alert">
+                "Could not load more posts. You can retry."
+            </div>
+        </Show>
+        <Show when=move || next_cursor.get().is_some()>
+            <button
+                class="btn btn-outline"
+                type="button"
+                disabled=move || load_more.pending().get()
+                on:click=move |_| {
+                    if let Some(cursor) = next_cursor.get_untracked() {
+                        load_error.set(false);
+                        load_more.dispatch(cursor);
                     }
-                >
-                    {move || if load_more.pending().get() { "Loading…" } else { "Load more" }}
-                </button>
-            </Show>
-        </main>
+                }
+            >
+                {move || if load_more.pending().get() { "Loading…" } else { "Load more" }}
+            </button>
+        </Show>
     }
     .into_any()
 }
@@ -549,27 +597,42 @@ fn public_status_media(media: Vec<crate::public_pages::UiMedia>) -> AnyView {
 }
 
 #[component]
-fn PublicProfileMetadata(page: UiProfilePage) -> impl IntoView {
-    let title = format!("{} (@{})", page.account.display_name, page.account.username);
-    let description = if page.account.bio.trim().is_empty() {
-        format!("Posts by @{}", page.account.username)
+fn PublicProfileMetadata(
+    header: UiProfileHeader,
+    tab: UiProfileTab,
+    hashtag: Option<String>,
+    max_id: Option<String>,
+) -> impl IntoView {
+    let account = &header.account;
+    let title = format!("{} (@{})", account.display_name, account.username);
+    let description = if account.bio.trim().is_empty() {
+        format!("Posts by @{}", account.username)
     } else {
-        page.account.bio.clone()
+        account.bio.clone()
     };
-    let image = page.account.avatar_url.clone();
-    let structured_data = profile_structured_data(&page);
+    let image = account.avatar_url.clone();
+    let structured_data = profile_structured_data(&header);
+    let canonical_url = match tab {
+        UiProfileTab::Tagged => format!(
+            "{}/tagged/{}",
+            header.profile_url,
+            hashtag.unwrap_or_default().trim_start_matches('#')
+        ),
+        _ => format!("{}{}", header.profile_url, tab.path_suffix()),
+    };
+    let noindex = max_id.is_some() || account.limited || !account.discoverable;
     view! {
         <Title text=title.clone()/>
         <Meta name="description" content=description.clone()/>
-        <Meta name="robots" content=if page.noindex { "noindex, nofollow" } else { "index, follow" }/>
+        <Meta name="robots" content=if noindex { "noindex, nofollow" } else { "index, follow" }/>
         <Meta property="og:type" content="profile"/>
         <Meta property="og:title" content=title/>
         <Meta property="og:description" content=description/>
-        <Meta property="og:url" content=page.canonical_url.clone()/>
+        <Meta property="og:url" content=canonical_url.clone()/>
         {image.map(|image| view! { <Meta property="og:image" content=image/> })}
-        <Meta name="fediverse:creator" content=format!("@{}", page.account.username)/>
-        <Link rel="canonical" href=page.canonical_url/>
-        <Link rel="alternate" type_="application/activity+json" href=page.activitypub_url/>
+        <Meta name="fediverse:creator" content=format!("@{}", account.username)/>
+        <Link rel="canonical" href=canonical_url/>
+        <Link rel="alternate" type_="application/activity+json" href=header.activitypub_url/>
         <Script type_="application/ld+json">{structured_data}</Script>
     }
 }
@@ -610,8 +673,8 @@ struct InteractionCounter {
     user_interaction_count: u64,
 }
 
-fn profile_structured_data(page: &UiProfilePage) -> String {
-    let account = &page.account;
+fn profile_structured_data(header: &UiProfileHeader) -> String {
+    let account = &header.account;
     let name = if account.display_name.trim().is_empty() {
         account.username.as_str()
     } else {
@@ -706,8 +769,7 @@ mod public_page_tests {
 
     use super::{append_unique_statuses, profile_structured_data, strip_html};
     use crate::public_pages::{
-        UiProfilePage, UiProfileTab, UiPublicAccount, UiStatus, UiStatusAuthor, UiStatusPage,
-        UiStatusVisibility,
+        UiProfileHeader, UiPublicAccount, UiStatus, UiStatusAuthor, UiStatusVisibility,
     };
 
     fn status(id: Uuid) -> UiStatus {
@@ -761,7 +823,7 @@ mod public_page_tests {
 
     #[test]
     fn profile_structured_data_is_google_compatible_and_script_safe() {
-        let page = UiProfilePage {
+        let header = UiProfileHeader {
             account: UiPublicAccount {
                 id: Uuid::nil(),
                 username: "alice".to_owned(),
@@ -777,20 +839,12 @@ mod public_page_tests {
                 limited: false,
                 discoverable: true,
             },
-            tab: UiProfileTab::Posts,
-            hashtag: None,
             featured_tags: Vec::new(),
-            pinned_statuses: Vec::new(),
-            timeline: UiStatusPage {
-                statuses: Vec::new(),
-                next_cursor: None,
-            },
-            canonical_url: "https://roosty.test/@alice".to_owned(),
+            profile_url: "https://roosty.test/@alice".to_owned(),
             activitypub_url: "https://roosty.test/users/alice".to_owned(),
-            noindex: false,
         };
 
-        let structured_data = profile_structured_data(&page);
+        let structured_data = profile_structured_data(&header);
 
         assert!(structured_data.contains("\"@type\":\"ProfilePage\""));
         assert!(structured_data.contains("\"@type\":\"Person\""));

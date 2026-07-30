@@ -27,8 +27,9 @@ use roosty_web_ui::{
     UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
     UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiFeaturedTag, UiInstanceRule,
     UiMedia, UiMediaKind, UiModerationReport, UiPoll, UiPollOption, UiPreviewCard, UiProfileField,
-    UiProfilePage, UiProfileTab, UiPublicAccount, UiPublicPageError, UiServerContext, UiStatus,
-    UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility, shell,
+    UiProfileHeader, UiProfileTab, UiProfileTimeline, UiPublicAccount, UiPublicPageError,
+    UiServerContext, UiStatus, UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility,
+    shell,
 };
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::Deserialize;
@@ -208,14 +209,49 @@ impl UiBackend for RoostyUiBackend {
         })
     }
 
-    fn profile_page(
+    fn profile_header(
+        &self,
+        _cookie_header: Option<String>,
+        username: String,
+    ) -> Pin<Box<dyn Future<Output = Result<UiProfileHeader, UiPublicPageError>> + Send + 'static>>
+    {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let txn = state
+                .begin_snapshot()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            let account = active_local_profile(&txn, &username).await?;
+            let account_dto = ui_public_account(&state, &txn, &account).await?;
+            let featured_tags = roosty_db::local_featured_tags(&txn, account.id)
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?
+                .into_iter()
+                .map(|tag| UiFeaturedTag {
+                    name: tag.name,
+                    statuses_count: u64::try_from(tag.statuses_count).unwrap_or_default(),
+                })
+                .collect();
+            txn.commit()
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
+            Ok(UiProfileHeader {
+                account: account_dto,
+                featured_tags,
+                profile_url: public_page_url(&state, &format!("/@{username}")),
+                activitypub_url: public_page_url(&state, &format!("/users/{username}")),
+            })
+        })
+    }
+
+    fn profile_timeline(
         &self,
         cookie_header: Option<String>,
         username: String,
         tab: UiProfileTab,
         hashtag: Option<String>,
         max_id: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<UiProfilePage, UiPublicPageError>> + Send + 'static>>
+    ) -> Pin<Box<dyn Future<Output = Result<UiProfileTimeline, UiPublicPageError>> + Send + 'static>>
     {
         let state = self.state.clone();
         Box::pin(async move {
@@ -226,7 +262,6 @@ impl UiBackend for RoostyUiBackend {
                 .map_err(|_| UiPublicPageError::Internal)?;
             let viewer = ui_viewer(&state, &txn, cookie_header).await?;
             let account = active_local_profile(&txn, &username).await?;
-            let account_dto = ui_public_account(&state, &txn, &account).await?;
             let blocked = match viewer {
                 Some(viewer) if viewer != account.id => {
                     roosty_db::local_accounts_are_blocked(&txn, viewer, account.id)
@@ -252,44 +287,26 @@ impl UiBackend for RoostyUiBackend {
                 )
                 .await?
             };
-            let pins = roosty_db::pinned_local_statuses_by_account(
-                &txn,
-                account.id,
-                crate::statuses::MAX_PINNED_STATUSES,
-                roosty_db::TimelineCursor::default(),
-            )
-            .await
-            .map_err(|_| UiPublicPageError::Internal)?;
-            let pinned_statuses = if blocked {
+            let pinned_statuses = if blocked || !matches!(tab, UiProfileTab::Posts) {
                 Vec::new()
             } else {
+                let pins = roosty_db::pinned_local_statuses_by_account(
+                    &txn,
+                    account.id,
+                    crate::statuses::MAX_PINNED_STATUSES,
+                    roosty_db::TimelineCursor::default(),
+                )
+                .await
+                .map_err(|_| UiPublicPageError::Internal)?;
                 ui_local_statuses(&state, &txn, pins.items, &account, viewer, true).await?
             };
-            let featured_tags = roosty_db::local_featured_tags(&txn, account.id)
-                .await
-                .map_err(|_| UiPublicPageError::Internal)?
-                .into_iter()
-                .map(|tag| UiFeaturedTag {
-                    name: tag.name,
-                    statuses_count: u64::try_from(tag.statuses_count).unwrap_or_default(),
-                })
-                .collect();
             txn.commit()
                 .await
                 .map_err(|_| UiPublicPageError::Internal)?;
 
-            let canonical_url =
-                public_page_url(&state, &profile_path(&username, &tab, hashtag.as_deref()));
-            Ok(UiProfilePage {
-                noindex: cursor.max_id.is_some()
-                    || account.limited_at.is_some()
-                    || !account.discoverable,
-                activitypub_url: public_page_url(&state, &format!("/users/{username}")),
-                canonical_url,
-                account: account_dto,
+            Ok(UiProfileTimeline {
                 tab,
                 hashtag,
-                featured_tags,
                 pinned_statuses,
                 timeline,
             })
@@ -1045,16 +1062,6 @@ async fn ui_status_quote(
     )))
 }
 
-fn profile_path(username: &str, tab: &UiProfileTab, hashtag: Option<&str>) -> String {
-    match tab {
-        UiProfileTab::Tagged => format!(
-            "/@{username}/tagged/{}",
-            hashtag.unwrap_or_default().trim_start_matches('#')
-        ),
-        _ => format!("/@{username}{}", tab.path_suffix()),
-    }
-}
-
 fn public_page_url(state: &AppState, path: &str) -> String {
     state
         .config
@@ -1807,9 +1814,9 @@ mod tests {
     use leptos::{config::LeptosOptions, prelude::provide_context};
     use leptos_axum::LeptosRoutes;
     use roosty_web_ui::{
-        UiAccount, UiBackend, UiBootstrap, UiProfilePage, UiProfileTab, UiPublicAccount,
-        UiPublicPageError, UiServerContext, UiStatus, UiStatusAuthor, UiStatusPage, UiStatusThread,
-        UiStatusVisibility, shell,
+        UiAccount, UiBackend, UiBootstrap, UiProfileHeader, UiProfileTab, UiProfileTimeline,
+        UiPublicAccount, UiPublicPageError, UiServerContext, UiStatus, UiStatusAuthor,
+        UiStatusPage, UiStatusThread, UiStatusVisibility, shell,
     };
     use tower::ServiceExt;
     use tower_http::services::ServeDir;
@@ -2114,7 +2121,10 @@ mod tests {
             )
             .unwrap();
             assert!(html.contains(marker));
-            assert!(html.contains(&format!("href=\"{canonical}\" rel=\"canonical\"")));
+            assert!(
+                html.contains(&format!("href=\"{canonical}\" rel=\"canonical\"")),
+                "canonical metadata missing from {path}"
+            );
             assert!(html.contains("property=\"og:type\""));
             assert!(html.contains(&format!("content=\"{og_type}\"")));
             assert!(html.contains("application/activity+json"));
@@ -2193,15 +2203,36 @@ mod tests {
             })
         }
 
-        fn profile_page(
+        fn profile_header(
+            &self,
+            _cookie_header: Option<String>,
+            username: String,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<UiProfileHeader, UiPublicPageError>> + Send + 'static>,
+        > {
+            Box::pin(async move {
+                if username != "alice" {
+                    return Err(UiPublicPageError::NotFound);
+                }
+                Ok(UiProfileHeader {
+                    account: public_account(),
+                    featured_tags: Vec::new(),
+                    profile_url: "https://roosty.test/@alice".to_owned(),
+                    activitypub_url: "https://roosty.test/users/alice".to_owned(),
+                })
+            })
+        }
+
+        fn profile_timeline(
             &self,
             _cookie_header: Option<String>,
             username: String,
             tab: UiProfileTab,
             hashtag: Option<String>,
             max_id: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<UiProfilePage, UiPublicPageError>> + Send + 'static>>
-        {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<UiProfileTimeline, UiPublicPageError>> + Send + 'static>,
+        > {
             Box::pin(async move {
                 if max_id
                     .as_deref()
@@ -2212,19 +2243,14 @@ mod tests {
                 if username != "alice" {
                     return Err(UiPublicPageError::NotFound);
                 }
-                Ok(UiProfilePage {
-                    account: public_account(),
+                Ok(UiProfileTimeline {
                     tab,
                     hashtag,
-                    featured_tags: Vec::new(),
                     pinned_statuses: Vec::new(),
                     timeline: UiStatusPage {
                         statuses: vec![public_status("Profile post")],
                         next_cursor: None,
                     },
-                    canonical_url: "https://roosty.test/@alice".to_owned(),
-                    activitypub_url: "https://roosty.test/users/alice".to_owned(),
-                    noindex: false,
                 })
             })
         }

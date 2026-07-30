@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::public_pages::{
-    ProfileFuture, StatusPageFuture, ThreadFuture, UiProfileTab, UiPublicPageError,
+    ProfileHeaderFuture, ProfileTimelineFuture, StatusPageFuture, ThreadFuture, UiProfileTab,
+    UiPublicPageError,
 };
 
 /// Public instance and session data needed to render the application shell.
@@ -166,14 +167,22 @@ pub trait UiBackend: Send + Sync {
         cookie_header: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiBootstrap, String>> + Send + 'static>>;
 
-    fn profile_page(
+    fn profile_header(
+        &self,
+        _cookie_header: Option<String>,
+        _username: String,
+    ) -> ProfileHeaderFuture {
+        Box::pin(async { Err(UiPublicPageError::NotFound) })
+    }
+
+    fn profile_timeline(
         &self,
         _cookie_header: Option<String>,
         _username: String,
         _tab: UiProfileTab,
         _hashtag: Option<String>,
         _max_id: Option<String>,
-    ) -> ProfileFuture {
+    ) -> ProfileTimelineFuture {
         Box::pin(async { Err(UiPublicPageError::NotFound) })
     }
 
