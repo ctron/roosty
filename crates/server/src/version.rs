@@ -13,10 +13,8 @@ build_info::build_info!(fn build_info);
 /// A release tag is preferred when the current commit has one; development
 /// builds fall back to the abbreviated commit hash.
 pub(crate) fn build_identifier() -> String {
-    build_identifier_from(build_info())
-}
+    let info = build_info();
 
-fn build_identifier_from(info: &BuildInfo) -> String {
     let Some(version_control) = info.version_control.as_ref() else {
         return info.crate_info.version.to_string();
     };
@@ -26,6 +24,7 @@ fn build_identifier_from(info: &BuildInfo) -> String {
         .first()
         .cloned()
         .unwrap_or_else(|| git.commit_short_id.clone());
+
     if git.dirty {
         format!("{identifier}-dirty")
     } else {
