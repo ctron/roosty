@@ -1,0 +1,8 @@
+*{{#if scope}} **{{scope}}:**{{/if}} {{subject}}{{#if hash}} ({{hash}}){{/if}}
+{{~#if references}}, closes
+  {{~#each references}} {{#if @root.linkReferences~}}
+    [{{this.prefix}}{{this.issue}}]({{issueUrlFormat}})
+  {{~else}}{{this.prefix}}{{this.issue}}
+  {{~/if}}{{/each}}
+{{~/if}}
+

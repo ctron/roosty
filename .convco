@@ -43,3 +43,4 @@ types:
     increment: Patch
     section: Reverts
     hidden: false
+template: .github/convco
