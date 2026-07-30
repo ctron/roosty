@@ -38,6 +38,8 @@ use time::OffsetDateTime;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
+use crate::media::media_url;
+use crate::version::build_identifier;
 use crate::{
     admin::{self, AdminSource},
     auth::{account_id_from_session, csrf_token_from_session, validate_csrf_token},
@@ -202,7 +204,7 @@ impl UiBackend for RoostyUiBackend {
                 instance_name: state.config.instance_name.clone(),
                 instance_description: state.config.instance_description.clone(),
                 public_base_url: state.config.public_base_url.to_string(),
-                build_identifier: crate::version::build_identifier(),
+                build_identifier: build_identifier(),
                 account,
                 csrf_token,
             })
@@ -670,11 +672,11 @@ async fn ui_public_account(
         avatar_url: account
             .avatar_file_path
             .as_deref()
-            .map(|path| crate::media::media_url(state, path)),
+            .map(|path| media_url(state, path)),
         header_url: account
             .header_file_path
             .as_deref()
-            .map(|path| crate::media::media_url(state, path)),
+            .map(|path| media_url(state, path)),
         fields,
         created_at: format_timestamp(account.created_at),
         followers_count,

@@ -31,7 +31,7 @@ use time::{Duration, OffsetDateTime};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
-use crate::{http::AppState, password};
+use crate::{http::AppState, password, version::build_identifier};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -790,7 +790,7 @@ fn authorization_page_context(
 ) -> AuthorizationPageContext {
     AuthorizationPageContext {
         instance_name: state.config.instance_name.clone(),
-        build_identifier: crate::version::build_identifier(),
+        build_identifier: build_identifier(),
         account_username: account_username.to_owned(),
         stylesheet_href: roosty_web_ui::stylesheet_href(&state.leptos_options),
     }

@@ -22,13 +22,13 @@ pub(crate) fn build_identifier() -> String {
     let identifier = git
         .tags
         .first()
-        .cloned()
+        .map(|tag| format!("{tag}-{}", git.commit_short_id))
         .unwrap_or_else(|| git.commit_short_id.clone());
 
     if git.dirty {
         format!("{identifier}-dirty")
     } else {
-        identifier
+        identifier.clone()
     }
 }
 
