@@ -696,9 +696,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "bytesize"
-version = "2.4.2"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d7c8918969267b2932ffd5655509bbbea0833823058c378876953217f5fc50e"
+checksum = "351a3e803ee3c6eaeee6b00076b767514b37c32a73d326c3ec7abddb7d6c3493"
 
 [[package]]
 name = "camino"
@@ -820,9 +820,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -830,9 +830,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2026,9 +2026,9 @@ dependencies = [
 
 [[package]]
 name = "html-escape"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46c1ff2d1cbf39efe5af0900ced8a069b5e61557a17544eb0c4a50239937389e"
+checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "html5ever"
@@ -2099,9 +2099,9 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "subtle",
  "typenum",
@@ -4343,7 +4343,7 @@ dependencies = [
 
 [[package]]
 name = "roosty"
-version = "0.1.0-alpha.3"
+version = "0.1.0"
 dependencies = [
  "ammonia",
  "argon2",
@@ -4398,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "roosty-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0"
 dependencies = [
  "sea-orm",
  "serde",
@@ -4411,7 +4411,7 @@ dependencies = [
 
 [[package]]
 name = "roosty-db"
-version = "0.1.0-alpha.3"
+version = "0.1.0"
 dependencies = [
  "base64",
  "hmac 0.12.1",
@@ -4434,7 +4434,7 @@ dependencies = [
 
 [[package]]
 name = "roosty-migration"
-version = "0.1.0-alpha.3"
+version = "0.1.0"
 dependencies = [
  "postgresql_embedded",
  "sea-orm",
@@ -4446,7 +4446,7 @@ dependencies = [
 
 [[package]]
 name = "roosty-web-push"
-version = "0.1.0-alpha.3"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -4465,7 +4465,7 @@ dependencies = [
 
 [[package]]
 name = "roosty-web-ui"
-version = "0.1.0-alpha.3"
+version = "0.1.0"
 dependencies = [
  "axum",
  "browser-panic-hook",
@@ -4557,9 +4557,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -5893,9 +5893,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.54"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
  "num-conv",
