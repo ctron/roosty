@@ -119,7 +119,8 @@
 - [x] Add SEO-friendly first-party local profile tabs and status-thread pages with session-aware
   visibility, cursor hydration, metadata, microformats, and separate ActivityPub identifiers.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
-- [ ] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags, statuses, rich link cards, link timelines, and the offset-paginated local/remote profile directory are available; account suggestions remain.
+- [x] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags, statuses, rich link cards, link timelines, the offset-paginated local/remote profile directory, and ranked follow suggestions are available.
+- [ ] Replace request-time account-suggestion ranking with a transactionally refreshed PostgreSQL cache. The current implementation bounds each request to 1,000 recent local and 1,000 recent remote candidates and uses indexed follower lookups, but repeated ranking work still scales with request concurrency; cache refreshes must coordinate safely across processes while read-time filtering continues to enforce follows, moderation policy, and durable dismissals.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account
   creation/password reset/limits/suspension, database-backed domain moderation, compatible account
   and domain-block APIs, OAuth scope enforcement, CSRF

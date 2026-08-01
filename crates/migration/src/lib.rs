@@ -79,6 +79,7 @@ mod m20260701_000074_create_status_search;
 mod m20260701_000075_add_account_suspension_and_domain_blocks;
 mod m20260701_000076_create_reports_and_instance_rules;
 mod m20260701_000077_create_polls;
+mod m20260701_000078_create_account_suggestion_dismissals;
 
 pub struct Migrator;
 
@@ -163,6 +164,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000075_add_account_suspension_and_domain_blocks::Migration),
             Box::new(m20260701_000076_create_reports_and_instance_rules::Migration),
             Box::new(m20260701_000077_create_polls::Migration),
+            Box::new(m20260701_000078_create_account_suggestion_dismissals::Migration),
         ]
     }
 }

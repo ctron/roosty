@@ -142,14 +142,16 @@ idempotently for local targets. Domain `reject_reports` policy drops inbound rep
 |`/api/v1/version`
 |Roosty-specific extension.
 
-|🟡
+|🟢
 |Explore and trends
 |Trending hashtags, statuses, and rich preview-card links are available from shared,
 transactionally maintained caches. Trending links can be opened through
 `/api/v1/timelines/link`.
 Results are eventually consistent and normally refresh within `ROOSTY_TRENDS_REFRESH_INTERVAL`.
 The public profile directory supports active/new ordering, local-only filtering, and offset
-pagination. Account suggestions are missing.
+pagination. Authenticated v1/v2 account suggestions rank eligible locally known accounts by
+accepted local followers and recent activity, with offset pagination and durable per-account
+dismissals. Ranking considers a bounded pool of recently active known accounts.
 
 |===
 

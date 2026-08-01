@@ -1025,6 +1025,17 @@ pub struct AccountDirectoryPage {
     pub has_more: bool,
 }
 
+/// Inputs for a bounded, viewer-specific account suggestion query.
+pub struct AccountSuggestionOptions<'a> {
+    pub viewer_account_id: AccountId,
+    pub limit: u64,
+    pub offset: u64,
+    pub blocked_remote_domains: &'a [String],
+}
+
+/// A suggested account with counters loaded by the ranking query.
+pub type AccountSuggestion = DirectoryAccount;
+
 /// Administrative projection shared by compatible and first-party account views.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminAccount {
@@ -1680,6 +1691,272 @@ pub async fn account_directory(
         })
         .collect();
     Ok(AccountDirectoryPage { items, has_more })
+}
+
+/// Return ranked follow suggestions from accounts already known to this instance.
+pub async fn account_suggestions(
+    db: &impl ConnectionTrait,
+    options: AccountSuggestionOptions<'_>,
+) -> Result<Vec<AccountSuggestion>> {
+    #[derive(Clone)]
+    struct SuggestionRow {
+        kind: AccountSearchKind,
+        id: AccountId,
+        followers_count: u64,
+        following_count: u64,
+        statuses_count: u64,
+        last_status_at: Option<OffsetDateTime>,
+    }
+
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            WITH local_candidates AS (
+                SELECT 'local'::text AS account_kind, account.id,
+                       account.last_status_at AS sort_status_at,
+                       account.created_at AS sort_created_at,
+                       (SELECT count(*)
+                          FROM local_follow follow
+                          JOIN local_account follower
+                            ON follower.id = follow.follower_account_id
+                           AND follower.suspended_at IS NULL
+                         WHERE follow.followed_account_id = account.id) AS local_followers_count
+                  FROM local_account account
+                 WHERE account.id <> $1
+                   AND account.discoverable
+                   AND account.limited_at IS NULL
+                   AND account.suspended_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_follow follow
+                        WHERE follow.follower_account_id = $1
+                          AND follow.followed_account_id = account.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_account_suggestion_dismissal dismissal
+                        WHERE dismissal.account_id = $1
+                          AND dismissal.target_account_id = account.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_account_block block
+                        WHERE (block.account_id = $1 AND block.target_account_id = account.id)
+                           OR (block.account_id = account.id AND block.target_account_id = $1)
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_account_mute mute
+                        WHERE mute.account_id = $1
+                          AND mute.target_account_id = account.id
+                          AND (mute.expires_at IS NULL OR mute.expires_at > now())
+                   )
+                 ORDER BY account.last_status_at DESC NULLS LAST, account.created_at DESC, account.id DESC
+                 LIMIT $5
+            ),
+            remote_candidates AS (
+                SELECT 'remote'::text, actor.id, actor.last_status_at,
+                       coalesce(actor.profile_created_at, actor.created_at),
+                       (SELECT count(*)
+                          FROM remote_following follow
+                          JOIN local_account follower
+                            ON follower.id = follow.local_account_id
+                           AND follower.suspended_at IS NULL
+                         WHERE follow.remote_actor_id = actor.id
+                           AND follow.state = 'accepted'
+                           AND follow.deactivated_at IS NULL)
+                  FROM remote_actor actor
+                 WHERE actor.discoverable IS TRUE
+                   AND actor.limited_at IS NULL
+                   AND actor.suspended_at IS NULL
+                   AND actor.deleted_at IS NULL
+                   AND actor.moved_to_remote_actor_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM remote_following follow
+                        WHERE follow.local_account_id = $1
+                          AND follow.remote_actor_id = actor.id
+                          AND follow.deactivated_at IS NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_account_suggestion_dismissal dismissal
+                        WHERE dismissal.account_id = $1
+                          AND dismissal.target_remote_actor_id = actor.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM jsonb_array_elements_text($2::jsonb) blocked(domain)
+                        WHERE actor.domain = blocked.domain
+                           OR actor.domain LIKE '%.' || blocked.domain
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_remote_account_block block
+                        WHERE block.local_account_id = $1
+                          AND block.remote_actor_id = actor.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM remote_local_account_block block
+                        WHERE block.local_account_id = $1
+                          AND block.remote_actor_id = actor.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM local_remote_account_mute mute
+                        WHERE mute.local_account_id = $1
+                          AND mute.remote_actor_id = actor.id
+                          AND (mute.expires_at IS NULL OR mute.expires_at > now())
+                   )
+                 ORDER BY actor.last_status_at DESC NULLS LAST,
+                          coalesce(actor.profile_created_at, actor.created_at) DESC, actor.id DESC
+                 LIMIT $5
+            ),
+            candidates AS (
+                SELECT * FROM local_candidates
+                UNION ALL
+                SELECT * FROM remote_candidates
+            ),
+            selected AS (
+                SELECT * FROM candidates
+                 ORDER BY local_followers_count DESC, sort_status_at DESC NULLS LAST,
+                          sort_created_at DESC, id DESC
+                 LIMIT $3 OFFSET $4
+            )
+            SELECT selected.account_kind, selected.id, selected.sort_status_at,
+                   CASE selected.account_kind
+                     WHEN 'local' THEN
+                       (SELECT count(*) FROM local_follow follow
+                         WHERE follow.followed_account_id = selected.id)
+                       + (SELECT count(*) FROM remote_follow follow
+                           WHERE follow.local_account_id = selected.id
+                             AND follow.state = 'accepted')
+                     ELSE
+                       (SELECT count(*) FROM remote_following follow
+                         WHERE follow.remote_actor_id = selected.id
+                           AND follow.state = 'accepted'
+                           AND follow.deactivated_at IS NULL)
+                   END AS followers_count,
+                   CASE selected.account_kind
+                     WHEN 'local' THEN
+                       (SELECT count(*) FROM local_follow follow
+                         WHERE follow.follower_account_id = selected.id)
+                       + (SELECT count(*) FROM remote_following follow
+                           WHERE follow.local_account_id = selected.id
+                             AND follow.state = 'accepted'
+                             AND follow.deactivated_at IS NULL)
+                     ELSE
+                       (SELECT count(*) FROM remote_follow follow
+                         WHERE follow.remote_actor_id = selected.id
+                           AND follow.state = 'accepted')
+                   END AS following_count,
+                   CASE selected.account_kind
+                     WHEN 'local' THEN
+                       (SELECT count(*) FROM local_status status
+                         WHERE status.account_id = selected.id AND status.deleted_at IS NULL)
+                     ELSE
+                       (SELECT count(*) FROM remote_status status
+                         WHERE status.remote_actor_id = selected.id AND status.deleted_at IS NULL)
+                   END AS statuses_count
+              FROM selected
+             ORDER BY selected.local_followers_count DESC,
+                      selected.sort_status_at DESC NULLS LAST,
+                      selected.sort_created_at DESC, selected.id DESC
+            "#,
+            vec![
+                options.viewer_account_id.0.into(),
+                serde_json::to_string(options.blocked_remote_domains)
+                    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?
+                    .into(),
+                (options.limit.min(i64::MAX as u64) as i64).into(),
+                (options.offset.min(i64::MAX as u64) as i64).into(),
+                1_000_i64.into(),
+            ],
+        ))
+        .await?;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            Ok(SuggestionRow {
+                kind: row.try_get("", "account_kind")?,
+                id: AccountId(row.try_get("", "id")?),
+                followers_count: u64::try_from(row.try_get::<i64>("", "followers_count")?)
+                    .map_err(|_| DbErr::Type("negative suggestion follower count".to_owned()))?,
+                following_count: u64::try_from(row.try_get::<i64>("", "following_count")?)
+                    .map_err(|_| DbErr::Type("negative suggestion following count".to_owned()))?,
+                statuses_count: u64::try_from(row.try_get::<i64>("", "statuses_count")?)
+                    .map_err(|_| DbErr::Type("negative suggestion status count".to_owned()))?,
+                last_status_at: row.try_get("", "sort_status_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let local_ids = rows
+        .iter()
+        .filter(|row| row.kind == AccountSearchKind::Local)
+        .map(|row| row.id)
+        .collect();
+    let remote_ids = rows
+        .iter()
+        .filter(|row| row.kind == AccountSearchKind::Remote)
+        .map(|row| row.id)
+        .collect();
+    let mut local_accounts = local_accounts_by_id(db, local_ids)
+        .await?
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect::<HashMap<_, _>>();
+    let mut remote_actors = remote_actors_by_id(db, remote_ids)
+        .await?
+        .into_iter()
+        .map(|actor| (actor.id, actor))
+        .collect::<HashMap<_, _>>();
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let account = match row.kind {
+                AccountSearchKind::Local => {
+                    AccountSearchResult::Local(local_accounts.remove(&row.id)?)
+                }
+                AccountSearchKind::Remote => {
+                    AccountSearchResult::Remote(remote_actors.remove(&row.id)?)
+                }
+            };
+            Some(DirectoryAccount {
+                account,
+                followers_count: row.followers_count,
+                following_count: row.following_count,
+                statuses_count: row.statuses_count,
+                last_status_at: row.last_status_at,
+            })
+        })
+        .collect())
+}
+
+/// Idempotently suppress a local or cached-remote account from future suggestions.
+pub async fn dismiss_account_suggestion(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    target_id: AccountId,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"
+        INSERT INTO local_account_suggestion_dismissal (
+            id, account_id, target_account_id, target_remote_actor_id, created_at
+        )
+        SELECT $1, $2, target.local_id, target.remote_id, now()
+          FROM (
+            SELECT local_target.id AS local_id,
+                   CASE WHEN local_target.id IS NULL THEN remote_target.id END AS remote_id
+              FROM (SELECT $3::uuid AS id) input
+              LEFT JOIN local_account local_target ON local_target.id = input.id
+              LEFT JOIN remote_actor remote_target ON remote_target.id = input.id
+             WHERE local_target.id IS NOT NULL OR remote_target.id IS NOT NULL
+          ) target
+        ON CONFLICT DO NOTHING
+        "#,
+        vec![
+            Uuid::now_v7().into(),
+            account_id.0.into(),
+            target_id.0.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// Inputs controlling unified local and cached-remote account search.

@@ -65,6 +65,7 @@ pub(crate) enum OAuthScope<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OAuthScopeResource<'a> {
     All,
+    Accounts,
     Statuses,
     Other(&'a str),
 }
@@ -89,6 +90,7 @@ impl<'a> OAuthScope<'a> {
 impl<'a> OAuthScopeResource<'a> {
     fn parse(value: &'a str) -> Self {
         match value {
+            "accounts" => Self::Accounts,
             "statuses" => Self::Statuses,
             other => Self::Other(other),
         }

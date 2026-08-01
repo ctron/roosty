@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, RawQuery, Request, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use roosty_core::{
     AccountId, AccountRelationshipError, Result as RoostyResult, RoostyError, StatusId,
@@ -27,8 +27,9 @@ use uuid::{Error, Uuid};
 
 use crate::{
     auth::{
-        AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response,
-        account_response_on, account_response_with_stats, format_account_date,
+        AccountResponse, AuthenticatedAccessToken, AuthenticatedAccount, OAuthScope,
+        OAuthScopeResource, OptionalAuthenticatedAccount, account_response, account_response_on,
+        account_response_with_stats, format_account_date,
     },
     http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
     statuses::{CollectionLink, StatusRenderContext},
@@ -41,6 +42,12 @@ const MAX_ACCOUNT_LIMIT: u64 = 80;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/directory", get(directory))
+        .route("/api/v1/suggestions", get(suggestions_v1))
+        .route("/api/v2/suggestions", get(suggestions_v2))
+        .route(
+            "/api/v1/suggestions/{account_id}",
+            delete(dismiss_suggestion),
+        )
         .route("/api/v1/accounts/relationships", get(relationships))
         .route("/api/v1/follow_requests", get(follow_requests))
         .route(
@@ -72,6 +79,11 @@ pub fn router() -> Router<AppState> {
 #[derive(Deserialize)]
 struct AccountPath {
     account_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct SuggestionPath {
+    account_id: String,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +147,12 @@ struct DirectoryParams {
     local: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct SuggestionParams {
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
 #[derive(Serialize)]
 pub(crate) struct RemoteAccountResponse {
     id: String,
@@ -179,6 +197,13 @@ enum CollectionAccountResponse {
 enum DirectoryAccountResponse {
     Local(Box<AccountResponse>),
     Remote(Box<RemoteAccountResponse>),
+}
+
+#[derive(Serialize)]
+struct SuggestionResponse {
+    source: &'static str,
+    sources: [&'static str; 1],
+    account: DirectoryAccountResponse,
 }
 
 #[derive(Default, Deserialize)]
@@ -359,6 +384,181 @@ async fn directory(
         response.headers_mut().insert(header::LINK, value);
     }
     Ok(response)
+}
+
+fn has_account_read_scope(scopes: &str) -> bool {
+    scopes
+        .split_ascii_whitespace()
+        .map(OAuthScope::parse)
+        .any(|scope| {
+            matches!(
+                scope,
+                OAuthScope::Read(OAuthScopeResource::All | OAuthScopeResource::Accounts)
+            )
+        })
+}
+
+fn require_account_read_scope(token: &AuthenticatedAccessToken) -> ApiResult<()> {
+    if has_account_read_scope(&token.grant.scopes) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ))
+    }
+}
+
+fn require_account_write_scope(token: &AuthenticatedAccessToken) -> ApiResult<()> {
+    let allowed = token
+        .grant
+        .scopes
+        .split_ascii_whitespace()
+        .map(OAuthScope::parse)
+        .any(|scope| {
+            matches!(
+                scope,
+                OAuthScope::Write(OAuthScopeResource::All | OAuthScopeResource::Accounts)
+            )
+        });
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ))
+    }
+}
+
+/// Return Mastodon v2 follow suggestions with modern and legacy source metadata.
+async fn suggestions_v2(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    token: AuthenticatedAccessToken,
+    Query(params): Query<SuggestionParams>,
+) -> ApiResult<Response> {
+    require_account_read_scope(&token)?;
+    let accounts = suggestion_account_responses(
+        &state,
+        &database,
+        token.grant.account.id,
+        params.limit,
+        params.offset,
+    )
+    .await?;
+    Ok(Json(
+        accounts
+            .into_iter()
+            .map(|account| SuggestionResponse {
+                source: "global",
+                sources: ["most_followed"],
+                account,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
+}
+
+/// Return the deprecated Mastodon v1 plain-account suggestion projection.
+async fn suggestions_v1(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    token: AuthenticatedAccessToken,
+    Query(params): Query<SuggestionParams>,
+) -> ApiResult<Response> {
+    require_account_read_scope(&token)?;
+    Ok(Json(
+        suggestion_account_responses(
+            &state,
+            &database,
+            token.grant.account.id,
+            params.limit,
+            params.offset,
+        )
+        .await?,
+    )
+    .into_response())
+}
+
+async fn suggestion_account_responses(
+    state: &AppState,
+    database: &DatabaseContext,
+    viewer_account_id: AccountId,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> ApiResult<Vec<DirectoryAccountResponse>> {
+    let limit = limit
+        .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
+        .clamp(1, MAX_ACCOUNT_LIMIT);
+    let txn = database.begin_snapshot().await?;
+    let hidden_domains = roosty_db::hidden_federation_domains(&txn).await?;
+    let suggestions = roosty_db::account_suggestions(
+        &txn,
+        roosty_db::AccountSuggestionOptions {
+            viewer_account_id,
+            limit,
+            offset: offset.unwrap_or_default(),
+            blocked_remote_domains: &hidden_domains,
+        },
+    )
+    .await?;
+    let remote_ids = suggestions
+        .iter()
+        .filter_map(|suggestion| match &suggestion.account {
+            AccountSearchResult::Remote(actor) => Some(actor.id),
+            AccountSearchResult::Local(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let remote_media = roosty_db::remote_profile_media_for_actors(&txn, &remote_ids).await?;
+    let mut responses = Vec::with_capacity(suggestions.len());
+    for suggestion in suggestions {
+        responses.push(match suggestion.account {
+            AccountSearchResult::Local(account) => {
+                DirectoryAccountResponse::Local(Box::new(account_response_with_stats(
+                    state,
+                    account,
+                    suggestion.followers_count,
+                    suggestion.following_count,
+                    suggestion.statuses_count,
+                    suggestion.last_status_at,
+                )))
+            }
+            AccountSearchResult::Remote(actor) => {
+                let media_url = |kind| {
+                    remote_media
+                        .iter()
+                        .find(|media| media.remote_actor_id == actor.id && media.kind == kind)
+                        .map(|media| crate::media::remote_profile_media_url(state, media.id))
+                        .unwrap_or_default()
+                };
+                let avatar = media_url(RemoteProfileMediaKind::Avatar);
+                let header = media_url(RemoteProfileMediaKind::Header);
+                let mut response = remote_account_response_from_media(actor, avatar, header);
+                response.followers_count = suggestion.followers_count;
+                response.following_count = suggestion.following_count;
+                response.statuses_count = suggestion.statuses_count;
+                response.last_status_at = suggestion.last_status_at.map(format_account_date);
+                DirectoryAccountResponse::Remote(Box::new(response))
+            }
+        });
+    }
+    txn.commit().await?;
+    Ok(responses)
+}
+
+/// Idempotently remove an account from the authenticated viewer's suggestions.
+async fn dismiss_suggestion(
+    Extension(database): Extension<DatabaseContext>,
+    token: AuthenticatedAccessToken,
+    Path(path): Path<SuggestionPath>,
+) -> ApiResult<Response> {
+    require_account_write_scope(&token)?;
+    if let Ok(target_id) = Uuid::parse_str(&path.account_id) {
+        let txn = database.begin().await?;
+        roosty_db::dismiss_account_suggestion(&txn, token.grant.account.id, AccountId(target_id))
+            .await?;
+        txn.commit().await?;
+    }
+    Ok(Json(json!({})).into_response())
 }
 
 fn directory_link(
@@ -1662,6 +1862,142 @@ mod tests {
 
     #[test_context(AccountContext)]
     #[tokio::test]
+    /// Given eligible known accounts, suggestions rank social proof, exclude follows, and persist dismissals.
+    async fn suggestions_rank_filter_and_dismiss_accounts(context: &mut AccountContext) {
+        let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        let (bob_id, _bob_token) = context.create_account("bob", "bob@example.com").await;
+        let (_dave_id, dave_token) = context.create_account("dave", "dave@example.com").await;
+        let remote_id = context.create_remote_actor("carol", "remote.test").await;
+
+        let followed = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &dave_token,
+            )
+            .await;
+        assert_eq!(followed.status(), StatusCode::OK);
+
+        let suggestions = context
+            .authenticated_get("/api/v2/suggestions?limit=80", &alice_token)
+            .await;
+        assert_eq!(suggestions.status(), StatusCode::OK);
+        let suggestions = json_body(suggestions).await;
+        assert_eq!(suggestions[0]["source"], "global");
+        assert_eq!(suggestions[0]["sources"], json!(["most_followed"]));
+        assert_eq!(suggestions[0]["account"]["username"], "bob");
+        let usernames = suggestions
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|suggestion| suggestion["account"]["username"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!usernames.contains(&"alice"));
+        assert!(usernames.contains(&"carol"));
+        let second = json_body(
+            context
+                .authenticated_get("/api/v2/suggestions?limit=1&offset=1", &alice_token)
+                .await,
+        )
+        .await;
+        assert_ne!(suggestions[0]["account"]["id"], second[0]["account"]["id"]);
+
+        let followed = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", bob_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(followed.status(), StatusCode::OK);
+        let suggestions = json_body(
+            context
+                .authenticated_get("/api/v2/suggestions", &alice_token)
+                .await,
+        )
+        .await;
+        assert!(suggestions.as_array().unwrap().iter().all(|suggestion| {
+            suggestion["account"]["id"] != bob_id.0.to_string()
+                && suggestion["account"]["id"] != alice_id.0.to_string()
+        }));
+
+        for _ in 0..2 {
+            let dismissed = context
+                .authenticated_empty(
+                    "DELETE",
+                    &format!("/api/v1/suggestions/{}", remote_id.0),
+                    &alice_token,
+                )
+                .await;
+            assert_eq!(dismissed.status(), StatusCode::OK);
+            assert_eq!(json_body(dismissed).await, json!({}));
+        }
+        let v1 = json_body(
+            context
+                .authenticated_get("/api/v1/suggestions", &alice_token)
+                .await,
+        )
+        .await;
+        assert!(v1.as_array().unwrap().iter().all(|account| {
+            account["id"] != remote_id.0.to_string() && account.get("source").is_none()
+        }));
+        let invalid = context
+            .authenticated_empty("DELETE", "/api/v1/suggestions/not-an-id", &alice_token)
+            .await;
+        assert_eq!(invalid.status(), StatusCode::OK);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// Suggestion APIs require a user token with umbrella or account-specific read permission.
+    async fn suggestions_enforce_account_read_scope(context: &mut AccountContext) {
+        let (_alice_id, write_token) = context
+            .create_account_with_scope("alice", "alice@example.com", "write")
+            .await;
+        let (_bob_id, account_read_token) = context
+            .create_account_with_scope("bob", "bob@example.com", "read:accounts")
+            .await;
+
+        assert_eq!(
+            context.get("/api/v2/suggestions").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            context
+                .authenticated_get("/api/v2/suggestions", &write_token)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            context
+                .authenticated_get("/api/v2/suggestions", &account_read_token)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            context
+                .authenticated_empty(
+                    "DELETE",
+                    "/api/v1/suggestions/not-an-id",
+                    &account_read_token,
+                )
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            context
+                .authenticated_empty("DELETE", "/api/v1/suggestions/not-an-id", &write_token,)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
     /// Verifies account pages expose profile data and public status collections.
     async fn account_lookup_and_statuses_return_local_profile(context: &mut AccountContext) {
         let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
@@ -2753,6 +3089,17 @@ mod tests {
 
         /// Create a local account with an access token for endpoint tests.
         async fn create_account(&self, username: &str, email: &str) -> (AccountId, String) {
+            self.create_account_with_scope(username, email, "read write follow push")
+                .await
+        }
+
+        /// Create a local account with a specifically scoped access token.
+        async fn create_account_with_scope(
+            &self,
+            username: &str,
+            email: &str,
+            scopes: &str,
+        ) -> (AccountId, String) {
             let password_hash = password::hash_password("password").unwrap();
             let account_id = AccountId(
                 roosty_db::create_local_account(&self.db, username, email, &password_hash)
@@ -2764,7 +3111,7 @@ mod tests {
                 &self.config.token_pepper,
                 account_id,
                 self.application_id,
-                "read write follow push",
+                scopes,
             )
             .await
             .unwrap()

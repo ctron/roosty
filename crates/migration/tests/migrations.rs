@@ -47,6 +47,21 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_timeline_marker").await);
     assert!(table_exists(database.connection(), "local_account_block").await);
     assert!(table_exists(database.connection(), "local_account_mute").await);
+    assert!(table_exists(database.connection(), "local_account_suggestion_dismissal").await);
+    assert!(
+        index_exists(
+            database.connection(),
+            "remote_following_suggestion_follower_idx"
+        )
+        .await
+    );
+    assert!(
+        index_exists(
+            database.connection(),
+            "remote_follow_suggestion_follower_idx"
+        )
+        .await
+    );
     assert!(table_exists(database.connection(), "remote_actor").await);
     assert!(table_exists(database.connection(), "local_remote_account_block").await);
     assert!(table_exists(database.connection(), "remote_local_account_block").await);
