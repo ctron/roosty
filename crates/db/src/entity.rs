@@ -7,7 +7,6 @@ pub mod job;
 pub mod local_account;
 pub mod local_account_block;
 pub mod local_account_mute;
-pub mod local_account_suggestion_dismissal;
 pub mod local_actor_key;
 pub mod local_conversation;
 pub mod local_conversation_account;

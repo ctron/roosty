@@ -4,17 +4,16 @@ use axum::{
     Error as AxumError, Extension, Json, Router,
     body::to_bytes,
     extract::{Path, Query, RawQuery, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderValue, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use roosty_core::{
-    AccountId, AccountRelationshipError, Result as RoostyResult, RoostyError, StatusId,
-};
+use roosty_core::{AccountId, AccountRelationshipError, Result as RoostyResult, StatusId};
 use roosty_db::{
     AccountDirectoryOptions, AccountDirectoryOrder, AccountSearchResult,
-    AccountStatusTimelineOptions, CollectionCursor, CollectionPage, FollowCollectionAccount,
-    LocalNotificationType, RemoteActor, RemoteFollowState, RemoteProfileMediaKind, TimelineCursor,
+    AccountStatusTimelineOptions, AccountSuggestionSource, CollectionCursor, CollectionPage,
+    FollowCollectionAccount, LocalNotificationType, RemoteActor, RemoteFollowState,
+    RemoteProfileMediaKind, TimelineCursor,
 };
 use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -93,7 +92,8 @@ struct AccountStatusesParams {
     since_id: Option<String>,
     min_id: Option<String>,
     exclude_replies: Option<bool>,
-    exclude_reblogs: Option<bool>,
+    #[serde(rename = "exclude_reblogs")]
+    _exclude_reblogs: Option<bool>,
     only_media: Option<bool>,
     pinned: Option<bool>,
     tagged: Option<String>,
@@ -202,8 +202,13 @@ enum DirectoryAccountResponse {
 #[derive(Serialize)]
 struct SuggestionResponse {
     source: &'static str,
-    sources: [&'static str; 1],
+    sources: Vec<&'static str>,
     account: DirectoryAccountResponse,
+}
+
+struct RenderedSuggestion {
+    account: DirectoryAccountResponse,
+    sources: Vec<AccountSuggestionSource>,
 }
 
 #[derive(Default, Deserialize)]
@@ -249,11 +254,6 @@ struct RelationshipResponse {
     requested: bool,
     domain_blocking: bool,
     endorsed: bool,
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 #[derive(Debug, Error)]
@@ -448,10 +448,17 @@ async fn suggestions_v2(
     Ok(Json(
         accounts
             .into_iter()
-            .map(|account| SuggestionResponse {
-                source: "global",
-                sources: ["most_followed"],
-                account,
+            .map(|suggestion| SuggestionResponse {
+                source: match suggestion.sources.first() {
+                    Some(AccountSuggestionSource::FriendsOfFriends) => "past_interactions",
+                    _ => "global",
+                },
+                sources: suggestion
+                    .sources
+                    .iter()
+                    .map(|source| source.as_str())
+                    .collect(),
+                account: suggestion.account,
             })
             .collect::<Vec<_>>(),
     )
@@ -474,7 +481,10 @@ async fn suggestions_v1(
             params.limit,
             params.offset,
         )
-        .await?,
+        .await?
+        .into_iter()
+        .map(|suggestion| suggestion.account)
+        .collect::<Vec<_>>(),
     )
     .into_response())
 }
@@ -485,7 +495,7 @@ async fn suggestion_account_responses(
     viewer_account_id: AccountId,
     limit: Option<u64>,
     offset: Option<u64>,
-) -> ApiResult<Vec<DirectoryAccountResponse>> {
+) -> ApiResult<Vec<RenderedSuggestion>> {
     let limit = limit
         .unwrap_or(DEFAULT_ACCOUNT_LIMIT)
         .clamp(1, MAX_ACCOUNT_LIMIT);
@@ -511,7 +521,7 @@ async fn suggestion_account_responses(
     let remote_media = roosty_db::remote_profile_media_for_actors(&txn, &remote_ids).await?;
     let mut responses = Vec::with_capacity(suggestions.len());
     for suggestion in suggestions {
-        responses.push(match suggestion.account {
+        let account = match suggestion.account {
             AccountSearchResult::Local(account) => {
                 DirectoryAccountResponse::Local(Box::new(account_response_with_stats(
                     state,
@@ -539,6 +549,10 @@ async fn suggestion_account_responses(
                 response.last_status_at = suggestion.last_status_at.map(format_account_date);
                 DirectoryAccountResponse::Remote(Box::new(response))
             }
+        };
+        responses.push(RenderedSuggestion {
+            account,
+            sources: suggestion.sources,
         });
     }
     txn.commit().await?;
@@ -553,7 +567,7 @@ async fn dismiss_suggestion(
 ) -> ApiResult<Response> {
     require_account_write_scope(&token)?;
     if let Ok(target_id) = Uuid::parse_str(&path.account_id) {
-        let txn = database.begin().await?;
+        let txn = database.begin_write().await?;
         roosty_db::dismiss_account_suggestion(&txn, token.grant.account.id, AccountId(target_id))
             .await?;
         txn.commit().await?;
@@ -615,7 +629,6 @@ async fn lookup_account(
         .acct
         .as_deref()
         .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
-    drop(context);
     txn.commit().await?;
     let actor = crate::federation::discovery::resolve_remote_actor(&state, &database, acct).await?;
     if actor.deleted_at.is_some() {
@@ -1623,50 +1636,6 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// Return a Mastodon-style bad request response with a compact error string.
-fn bad_request(description: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: description.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-/// Return a Mastodon-style forbidden response.
-fn forbidden(description: &str) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ErrorResponse {
-            error: description.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-/// Return a Mastodon-style not found response.
-fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Record not found".to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-/// Return a Mastodon-style internal error response.
-fn server_error(error: RoostyError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1866,7 +1835,7 @@ mod tests {
     async fn suggestions_rank_filter_and_dismiss_accounts(context: &mut AccountContext) {
         let (alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
         let (bob_id, _bob_token) = context.create_account("bob", "bob@example.com").await;
-        let (_dave_id, dave_token) = context.create_account("dave", "dave@example.com").await;
+        let (dave_id, dave_token) = context.create_account("dave", "dave@example.com").await;
         let remote_id = context.create_remote_actor("carol", "remote.test").await;
 
         let followed = context
@@ -1877,14 +1846,28 @@ mod tests {
             )
             .await;
         assert_eq!(followed.status(), StatusCode::OK);
+        let followed = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", dave_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(followed.status(), StatusCode::OK);
+        roosty_db::refresh_account_suggestion_scores(&context.db)
+            .await
+            .unwrap();
 
         let suggestions = context
             .authenticated_get("/api/v2/suggestions?limit=80", &alice_token)
             .await;
         assert_eq!(suggestions.status(), StatusCode::OK);
         let suggestions = json_body(suggestions).await;
-        assert_eq!(suggestions[0]["source"], "global");
-        assert_eq!(suggestions[0]["sources"], json!(["most_followed"]));
+        assert_eq!(suggestions[0]["source"], "past_interactions");
+        assert_eq!(
+            suggestions[0]["sources"],
+            json!(["friends_of_friends", "most_followed"])
+        );
         assert_eq!(suggestions[0]["account"]["username"], "bob");
         let usernames = suggestions
             .as_array()
@@ -1939,12 +1922,66 @@ mod tests {
         )
         .await;
         assert!(v1.as_array().unwrap().iter().all(|account| {
-            account["id"] != remote_id.0.to_string() && account.get("source").is_none()
+            account["id"] != remote_id.0.to_string()
+                && account.get("account").is_none()
+                && account.get("sources").is_none()
         }));
         let invalid = context
             .authenticated_empty("DELETE", "/api/v1/suggestions/not-an-id", &alice_token)
             .await;
         assert_eq!(invalid.status(), StatusCode::OK);
+    }
+
+    #[test_context(AccountContext)]
+    #[tokio::test]
+    /// A locally known remote account followed by a friend is recommended without cache refresh.
+    async fn suggestions_include_live_mixed_friends_of_friends(context: &mut AccountContext) {
+        let (_alice_id, alice_token) = context.create_account("alice", "alice@example.com").await;
+        let (dave_id, _dave_token) = context.create_account("dave", "dave@example.com").await;
+        let remote_id = context.create_remote_actor("carol", "remote.test").await;
+
+        let followed = context
+            .authenticated_empty(
+                "POST",
+                &format!("/api/v1/accounts/{}/follow", dave_id.0),
+                &alice_token,
+            )
+            .await;
+        assert_eq!(followed.status(), StatusCode::OK);
+        let activity_id = "https://localhost:4000/follows/dave-carol";
+        roosty_db::create_remote_following(
+            &context.db,
+            dave_id,
+            remote_id,
+            activity_id,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            roosty_db::accept_remote_following(&context.db, remote_id, activity_id)
+                .await
+                .unwrap()
+        );
+
+        let suggestions = json_body(
+            context
+                .authenticated_get("/api/v2/suggestions", &alice_token)
+                .await,
+        )
+        .await;
+        let carol = suggestions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|suggestion| suggestion["account"]["id"] == remote_id.0.to_string())
+            .unwrap();
+        assert_eq!(carol["source"], "past_interactions");
+        assert_eq!(
+            carol["sources"],
+            json!(["friends_of_friends", "most_followed"])
+        );
     }
 
     #[test_context(AccountContext)]
@@ -2980,6 +3017,7 @@ mod tests {
                 preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
+                account_suggestions_refresh_interval: time::Duration::hours(24),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),

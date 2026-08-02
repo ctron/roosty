@@ -48,6 +48,24 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "local_account_block").await);
     assert!(table_exists(database.connection(), "local_account_mute").await);
     assert!(table_exists(database.connection(), "local_account_suggestion_dismissal").await);
+    assert!(materialized_view_exists(database.connection(), "account_suggestion_score").await);
+    assert!(
+        index_exists(
+            database.connection(),
+            "account_suggestion_score_identity_idx"
+        )
+        .await
+    );
+    assert!(index_exists(database.connection(), "account_suggestion_score_rank_idx").await);
+    assert!(index_exists(database.connection(), "local_follow_suggestion_edge_idx").await);
+    assert!(
+        index_exists(
+            database.connection(),
+            "remote_following_suggestion_edge_idx"
+        )
+        .await
+    );
+    assert!(index_exists(database.connection(), "remote_follow_suggestion_edge_idx").await);
     assert!(
         index_exists(
             database.connection(),
@@ -637,6 +655,7 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!table_exists(database.connection(), "streaming_event").await);
     assert!(!table_exists(database.connection(), "push_subscription").await);
     assert!(!table_exists(database.connection(), "trend_refresh_schedule").await);
+    assert!(!materialized_view_exists(database.connection(), "account_suggestion_score").await);
 }
 
 /// A legacy ID-only replay marker survives the payload-aware ledger upgrade.
@@ -966,6 +985,25 @@ async fn table_exists(connection: &DatabaseConnection, table_name: &str) -> bool
         .expect("table existence query returned no rows");
 
     row.try_get::<bool>("", "table_exists").unwrap()
+}
+
+async fn materialized_view_exists(connection: &DatabaseConnection, view_name: &str) -> bool {
+    let row = connection
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM pg_matviews
+                WHERE schemaname = 'public' AND matviewname = $1
+            ) AS view_exists
+            "#,
+            vec![view_name.to_owned().into()],
+        ))
+        .await
+        .unwrap()
+        .expect("materialized view existence query returned no rows");
+
+    row.try_get::<bool>("", "view_exists").unwrap()
 }
 
 async fn column_exists(

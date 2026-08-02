@@ -9,6 +9,7 @@ const DEFAULT_MEDIA_ROOT: &str = "./media";
 const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
 const DEFAULT_WORKER_CONCURRENCY: &str = "4";
+const DEFAULT_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL: &str = "24h";
 
 /// Operator-configurable policy limits for future publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +181,8 @@ pub struct Config {
     pub worker_concurrency: usize,
     /// Shared cadence for eventually consistent trend refreshes.
     pub trends_refresh_interval: time::Duration,
+    /// Per-process cadence for refreshing global account-suggestion scores.
+    pub account_suggestions_refresh_interval: time::Duration,
     pub scheduled_statuses: ScheduledStatusConfig,
     pub streaming: StreamingConfig,
     pub instance_name: String,
@@ -234,6 +237,10 @@ impl Config {
             DEFAULT_WORKER_CONCURRENCY,
         )?)?;
         let trends_refresh_interval = trends_refresh_interval_env()?;
+        let account_suggestions_refresh_interval = optional_humantime_duration_env(
+            "ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL",
+            DEFAULT_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL,
+        )?;
         if federation_enabled {
             if public_base_url.scheme() != "https" || public_base_url.host_str().is_none() {
                 return Err(RoostyError::Configuration(
@@ -283,6 +290,7 @@ impl Config {
             preview_card_fetch_concurrency,
             worker_concurrency,
             trends_refresh_interval,
+            account_suggestions_refresh_interval,
             scheduled_statuses: ScheduledStatusConfig::from_env()?,
             streaming: StreamingConfig::from_env()?,
             instance_name: required_env("ROOSTY_INSTANCE_NAME")?,
@@ -506,6 +514,7 @@ mod tests {
             preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
+            account_suggestions_refresh_interval: time::Duration::hours(24),
             scheduled_statuses: ScheduledStatusConfig::default(),
             streaming: StreamingConfig::default(),
             instance_name: "Roosty Test".to_owned(),
@@ -562,6 +571,27 @@ mod tests {
         for duration in [time::Duration::ZERO, time::Duration::seconds(59)] {
             let error = validate_trends_refresh_interval(duration).unwrap_err();
             assert!(error.to_string().contains("ROOSTY_TRENDS_REFRESH_INTERVAL"));
+        }
+    }
+
+    #[test]
+    fn account_suggestion_refresh_interval_defaults_to_one_day_and_must_be_nonzero() {
+        assert_eq!(
+            nonzero_duration(
+                "ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL",
+                DEFAULT_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL,
+            )
+            .unwrap(),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        for value in ["0s", "daily"] {
+            let error =
+                nonzero_duration("ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL", value).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL")
+            );
         }
     }
 

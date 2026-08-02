@@ -1157,7 +1157,6 @@ async fn create_status_from_input(
             {
                 return server_error(error);
             }
-            drop(context);
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
@@ -1354,7 +1353,6 @@ async fn create_scheduled_status(
         Err(RoostyError::InvalidInput(error)) => bad_request(&error),
         Err(error) => server_error(error),
     };
-    drop(context);
     if should_commit && let Err(error) = txn.commit().await {
         return server_error(error.into());
     }
@@ -2192,7 +2190,6 @@ async fn update_status(
                 Err(error) => return server_error(error),
             };
             let recipients = status_stream_recipients(&context, &status).await;
-            drop(context);
             if let Err(error) = txn.commit().await {
                 return server_error(error.into());
             }
@@ -2274,7 +2271,6 @@ async fn update_status(
             }
             match status_response(&context, status, account).await {
                 Ok(response) => {
-                    drop(context);
                     if let Err(error) = txn.commit().await {
                         return server_error(error.into());
                     }
@@ -2330,7 +2326,6 @@ async fn delete_status(
                 {
                     return server_error(error);
                 }
-                drop(context);
                 if let Err(error) = txn.commit().await {
                     return server_error(error.into());
                 }
@@ -2468,7 +2463,6 @@ async fn update_interaction_policy(
         .await?;
     }
     let response = status_response(&context, updated, account).await?;
-    drop(context);
     txn.commit().await?;
     Ok(Json(response).into_response())
 }
@@ -2552,7 +2546,6 @@ async fn status_quotes(
     {
         response.headers_mut().insert(header::LINK, value);
     }
-    drop(context);
     txn.commit().await?;
     Ok(response)
 }
@@ -2600,7 +2593,6 @@ async fn revoke_quote(
             remote_status_response_for_viewer(&context, status, Some(account.id)).await?
         }
     };
-    drop(context);
     txn.commit().await?;
     Ok(Json(response).into_response())
 }
@@ -2665,7 +2657,6 @@ async fn status_context(
     let context = StatusRenderContext::new(&state, &txn);
     let ancestors = status_context_models(&context, ancestors, viewer).await?;
     let descendants = status_context_models(&context, descendants, viewer).await?;
-    drop(context);
     txn.commit().await?;
     Ok(Json(ContextResponse {
         ancestors,
@@ -2923,7 +2914,6 @@ async fn home_timeline(
         account.id,
     )
     .await;
-    drop(context);
     txn.commit().await?;
     Ok(response)
 }
@@ -2973,7 +2963,6 @@ async fn public_timeline(
         filters,
     )
     .await;
-    drop(context);
     txn.commit().await?;
     Ok(response)
 }
@@ -3010,7 +2999,6 @@ async fn link_timeline(
     if let Some(link) = link {
         response.headers_mut().insert(header::LINK, link);
     }
-    drop(context);
     txn.commit().await?;
     Ok(response)
 }
@@ -3069,7 +3057,6 @@ async fn tag_timeline(
         &params,
     )
     .await;
-    drop(context);
     txn.commit().await?;
     Ok(response)
 }
@@ -3448,7 +3435,6 @@ async fn status_collection_action_with_database(
     let txn = database.begin_write().await?;
     let context = StatusRenderContext::new(state, &txn);
     let outcome = status_collection_action(&context, account_id, path, action).await?;
-    drop(context);
     txn.commit().await?;
     for notification in outcome.notifications {
         create_and_stream_notification(
@@ -4234,17 +4220,6 @@ pub(crate) async fn remote_timeline_response(
         response.headers_mut().insert(header::LINK, link_header);
     }
     response
-}
-
-async fn status_with_author_response(
-    state: &StatusRenderContext<'_, impl ConnectionTrait>,
-    status: LocalStatus,
-    viewer: Option<AccountId>,
-) -> Response {
-    match status_with_author(state, status, viewer).await {
-        Ok(status) => Json(status).into_response(),
-        Err(error) => server_error(error),
-    }
 }
 
 pub(crate) async fn status_with_author(
@@ -11077,6 +11052,7 @@ mod tests {
                 preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
+                account_suggestions_refresh_interval: time::Duration::hours(24),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),

@@ -21,6 +21,9 @@
 - Mastodon-compatible favourite and boost actor lists for local and cached-remote statuses, with visibility enforcement and cursor pagination over locally known interactions.
 - Mastodon-compatible trending hashtags and statuses use transactionally maintained,
   cross-process PostgreSQL caches, with seven-day tag history and Rust-owned scheduled refreshes.
+- Mastodon-compatible account suggestions combine live, bounded friends-of-friends ranking with a
+  concurrently refreshed PostgreSQL materialized view for global social proof, while follows,
+  moderation policy, and dismissals remain live filters.
 - Mastodon-compatible safe linkification of explicit web URLs across local API, history, streaming, and outbound ActivityPub projections.
 - Mastodon-compatible local and cached-remote status edit history with immutable media projections, visibility enforcement, and multi-process-safe transactional revision capture.
 - Mastodon-compatible consent-aware quote posts with transactional policy, authorization, listing, revocation, notifications, and FEP-044f delivery.
@@ -120,7 +123,7 @@
   visibility, cursor hydration, metadata, microformats, and separate ActivityPub identifiers.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.
 - [x] Add ranked Explore data and the Mastodon-compatible trends, profile-directory, and account-suggestion APIs used by clients. Trending hashtags, statuses, rich link cards, link timelines, the offset-paginated local/remote profile directory, and ranked follow suggestions are available.
-- [ ] Replace request-time account-suggestion ranking with a transactionally refreshed PostgreSQL cache. The current implementation bounds each request to 1,000 recent local and 1,000 recent remote candidates and uses indexed follower lookups, but repeated ranking work still scales with request concurrency; cache refreshes must coordinate safely across processes while read-time filtering continues to enforce follows, moderation policy, and durable dismissals.
+- [x] Replace request-time global account-suggestion ranking with a concurrently refreshed PostgreSQL materialized view and add bounded friends-of-friends recommendations. Durable jobs deduplicate independently scheduled process refreshes while read-time filtering continues to enforce follows, moderation policy, and durable dismissals.
 - [x] Add an operations-first administrator interface with durable queue diagnostics, account
   creation/password reset/limits/suspension, database-backed domain moderation, compatible account
   and domain-block APIs, OAuth scope enforcement, CSRF

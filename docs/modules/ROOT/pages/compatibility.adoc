@@ -149,9 +149,12 @@ transactionally maintained caches. Trending links can be opened through
 `/api/v1/timelines/link`.
 Results are eventually consistent and normally refresh within `ROOSTY_TRENDS_REFRESH_INTERVAL`.
 The public profile directory supports active/new ordering, local-only filtering, and offset
-pagination. Authenticated v1/v2 account suggestions rank eligible locally known accounts by
-accepted local followers and recent activity, with offset pagination and durable per-account
-dismissals. Ranking considers a bounded pool of recently active known accounts.
+pagination. Authenticated v1/v2 account suggestions combine bounded friends-of-friends results with
+global social proof from accepted local followers, with offset pagination and durable per-account
+dismissals. Global scores use a concurrently refreshed PostgreSQL materialized view and normally
+refresh daily, configurable through `ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL`. Viewer-specific
+follows, moderation policy, friends-of-friends relationships, and dismissals are enforced when each
+page is read.
 
 |===
 

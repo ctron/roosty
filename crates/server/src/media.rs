@@ -805,6 +805,12 @@ struct ProcessedImage {
     blurhash: String,
 }
 
+struct UploadMetadata {
+    format: SupportedImageFormat,
+    description: Option<String>,
+    focus: Option<(f64, f64)>,
+}
+
 async fn upload_media(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
@@ -825,9 +831,11 @@ async fn upload_media(
         account.id,
         file,
         params.thumbnail,
-        format,
-        description,
-        focus,
+        UploadMetadata {
+            format,
+            description,
+            focus,
+        },
     )
     .await?;
     Ok(Json(media_response(&state, &media)).into_response())
@@ -1016,12 +1024,10 @@ async fn store_upload(
     account_id: AccountId,
     file: UploadFile,
     thumbnail: Option<UploadFile>,
-    format: SupportedImageFormat,
-    description: Option<String>,
-    focus: Option<(f64, f64)>,
+    metadata: UploadMetadata,
 ) -> Result<LocalMediaAttachment, MediaStoreError> {
     let media_id = Uuid::now_v7();
-    let relative_path = relative_media_path(media_id, "", format.extension);
+    let relative_path = relative_media_path(media_id, "", metadata.format.extension);
     let preview_path = relative_media_path(media_id, "small", "png");
     let full_path = media_path(state, &relative_path);
     let preview_full_path = media_path(state, &preview_path);
@@ -1034,22 +1040,26 @@ async fn store_upload(
         return Err(MediaStoreError::Validation("file is too large".into()));
     }
     let thumbnail_bytes = read_optional_upload(thumbnail).await?;
-    let processed =
-        process_image(original_bytes.clone(), thumbnail_bytes, format.image_format).await?;
+    let processed = process_image(
+        original_bytes.clone(),
+        thumbnail_bytes,
+        metadata.format.image_format,
+    )
+    .await?;
 
     tokio::fs::write(&full_path, &original_bytes).await?;
     tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
     let media = NewLocalMediaAttachment {
         account_id,
-        content_type: format.content_type.to_owned(),
+        content_type: metadata.format.content_type.to_owned(),
         original_filename,
         file_path: relative_path,
         preview_file_path: Some(preview_path),
         file_size: original_bytes.len() as i64,
-        description,
-        focus_x: focus.map(|focus| focus.0),
-        focus_y: focus.map(|focus| focus.1),
+        description: metadata.description,
+        focus_x: metadata.focus.map(|focus| focus.0),
+        focus_y: metadata.focus.map(|focus| focus.1),
         width: Some(processed.width),
         height: Some(processed.height),
         preview_width: Some(processed.preview_width),

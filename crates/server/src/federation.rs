@@ -8383,6 +8383,7 @@ mod tests {
             preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
+            account_suggestions_refresh_interval: time::Duration::hours(24),
             scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
             streaming: crate::config::StreamingConfig::default(),
             instance_name: "Federation test".to_owned(),
@@ -8695,6 +8696,7 @@ mod tests {
             | roosty_db::JobKind::PollExpiration
             | roosty_db::JobKind::PollUpdate
             | roosty_db::JobKind::TrendMaintenance
+            | roosty_db::JobKind::AccountSuggestionMaintenance
             | roosty_db::JobKind::AccountPurge
             | roosty_db::JobKind::DomainModerationReconcile
             | roosty_db::JobKind::PreviewCardFetch
