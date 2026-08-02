@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use tracing::{debug, warn};
@@ -38,11 +38,6 @@ pub fn router() -> Router<AppState> {
 /// Roosty exposes the standard picker API but does not host local custom emoji.
 async fn custom_emojis() -> Json<Vec<Value>> {
     Json(Vec::new())
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 async fn followed_tags(
@@ -1449,6 +1444,7 @@ mod tests {
                 preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
+                account_suggestions_refresh_interval: time::Duration::hours(24),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),

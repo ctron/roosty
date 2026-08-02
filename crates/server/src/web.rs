@@ -1779,16 +1779,6 @@ fn temporary_password_page(
     .into_response()
 }
 
-fn admin_form_error(error: roosty_core::RoostyError) -> Response {
-    let status = if matches!(error, roosty_core::RoostyError::InvalidInput(_)) {
-        StatusCode::UNPROCESSABLE_ENTITY
-    } else {
-        tracing::error!(%error, "administrator form failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (status, error.to_string()).into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{future::Future, pin::Pin, sync::Arc};

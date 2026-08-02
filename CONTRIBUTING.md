@@ -283,6 +283,11 @@ Trend scores refresh every five minutes by default. Set
 using the same value for every process connected to the database. Worker processes
 claim the shared schedule through PostgreSQL without electing a leader; a process
 with a conflicting interval is rejected during startup.
+Global account-suggestion scores refresh once per day by default through a concurrently refreshed
+PostgreSQL materialized view. Set `ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL` to any non-zero
+humantime duration. Each worker process uses the value read at startup, so a change needs only a
+restart; different processes may use different values, which can cause extra refreshes but does not
+expose partial results.
 
 This surface provides WebFinger, local actor documents, public Notes, outboxes,
 follower/following collections, policy-controlled remote `resolve=true` lookup,

@@ -1033,8 +1033,32 @@ pub struct AccountSuggestionOptions<'a> {
     pub blocked_remote_domains: &'a [String],
 }
 
-/// A suggested account with counters loaded by the ranking query.
-pub type AccountSuggestion = DirectoryAccount;
+/// Reason an account was selected by Mastodon's suggestion API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountSuggestionSource {
+    FriendsOfFriends,
+    MostFollowed,
+}
+
+impl AccountSuggestionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FriendsOfFriends => "friends_of_friends",
+            Self::MostFollowed => "most_followed",
+        }
+    }
+}
+
+/// A suggested account with counters and all matching recommendation sources.
+#[derive(Clone, Debug)]
+pub struct AccountSuggestion {
+    pub account: AccountSearchResult,
+    pub followers_count: u64,
+    pub following_count: u64,
+    pub statuses_count: u64,
+    pub last_status_at: Option<OffsetDateTime>,
+    pub sources: Vec<AccountSuggestionSource>,
+}
 
 /// Administrative projection shared by compatible and first-party account views.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1702,6 +1726,7 @@ pub async fn account_suggestions(
     struct SuggestionRow {
         kind: AccountSearchKind,
         id: AccountId,
+        friends_count: u64,
         followers_count: u64,
         following_count: u64,
         statuses_count: u64,
@@ -1712,17 +1737,145 @@ pub async fn account_suggestions(
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"
-            WITH local_candidates AS (
+            WITH first_degree AS (
+                SELECT account_kind, id
+                FROM (
+                    SELECT 'local'::text AS account_kind,
+                           follow.followed_account_id AS id, follow.created_at
+                    FROM local_follow follow
+                    WHERE follow.follower_account_id = $1
+                    UNION ALL
+                    SELECT 'remote'::text, follow.remote_actor_id, follow.created_at
+                    FROM remote_following follow
+                    WHERE follow.local_account_id = $1
+                      AND follow.state = 'accepted'
+                      AND follow.deactivated_at IS NULL
+                ) followed
+                ORDER BY created_at DESC, id DESC
+                LIMIT $6
+            ),
+            friend_edges AS (
+                SELECT first.account_kind AS first_kind, first.id AS first_id,
+                       'local'::text AS candidate_kind,
+                       follow.followed_account_id AS candidate_id
+                FROM first_degree first
+                CROSS JOIN LATERAL (
+                    SELECT edge.followed_account_id
+                    FROM local_follow edge
+                    WHERE edge.follower_account_id = first.id
+                    ORDER BY edge.created_at DESC, edge.followed_account_id DESC
+                    LIMIT $7
+                ) follow
+                WHERE first.account_kind = 'local'
+                UNION ALL
+                SELECT first.account_kind, first.id, 'remote'::text,
+                       follow.remote_actor_id
+                FROM first_degree first
+                CROSS JOIN LATERAL (
+                    SELECT edge.remote_actor_id
+                    FROM remote_following edge
+                    WHERE edge.local_account_id = first.id
+                      AND edge.state = 'accepted'
+                      AND edge.deactivated_at IS NULL
+                    ORDER BY edge.created_at DESC, edge.remote_actor_id DESC
+                    LIMIT $7
+                ) follow
+                WHERE first.account_kind = 'local'
+                UNION ALL
+                SELECT first.account_kind, first.id, 'local'::text,
+                       follow.local_account_id
+                FROM first_degree first
+                CROSS JOIN LATERAL (
+                    SELECT edge.local_account_id
+                    FROM remote_follow edge
+                    WHERE edge.remote_actor_id = first.id
+                      AND edge.state = 'accepted'
+                    ORDER BY edge.created_at DESC, edge.local_account_id DESC
+                    LIMIT $7
+                ) follow
+                WHERE first.account_kind = 'remote'
+            ),
+            friend_candidate_counts AS (
+                SELECT candidate_kind, candidate_id,
+                       count(DISTINCT (first_kind, first_id)) AS friends_count
+                FROM friend_edges
+                GROUP BY candidate_kind, candidate_id
+            ),
+            friend_candidates AS (
+                SELECT candidate_kind, candidate_id, friends_count
+                FROM (
+                    SELECT candidate_kind, candidate_id, friends_count,
+                           row_number() OVER (
+                               PARTITION BY candidate_kind
+                               ORDER BY friends_count DESC, candidate_id DESC
+                           ) AS candidate_rank
+                    FROM friend_candidate_counts
+                ) ranked
+                WHERE candidate_rank <= $8
+            ),
+            local_pool AS (
+                SELECT candidate_id AS id
+                FROM friend_candidates
+                WHERE candidate_kind = 'local'
+                UNION
+                SELECT id FROM (
+                    SELECT score.account_id AS id
+                    FROM account_suggestion_score score
+                    WHERE score.account_kind = 'local'
+                    ORDER BY score.local_followers_count DESC, score.account_id DESC
+                    LIMIT $5
+                ) globally_ranked
+                UNION
+                SELECT id FROM (
+                    SELECT account.id
+                    FROM local_account account
+                    WHERE account.discoverable
+                      AND account.limited_at IS NULL
+                      AND account.suspended_at IS NULL
+                    ORDER BY account.last_status_at DESC NULLS LAST,
+                             account.created_at DESC, account.id DESC
+                    LIMIT $5
+                ) recently_active
+            ),
+            remote_pool AS (
+                SELECT candidate_id AS id
+                FROM friend_candidates
+                WHERE candidate_kind = 'remote'
+                UNION
+                SELECT id FROM (
+                    SELECT score.account_id AS id
+                    FROM account_suggestion_score score
+                    WHERE score.account_kind = 'remote'
+                    ORDER BY score.local_followers_count DESC, score.account_id DESC
+                    LIMIT $5
+                ) globally_ranked
+                UNION
+                SELECT id FROM (
+                    SELECT actor.id
+                    FROM remote_actor actor
+                    WHERE actor.discoverable IS TRUE
+                      AND actor.limited_at IS NULL
+                      AND actor.suspended_at IS NULL
+                      AND actor.deleted_at IS NULL
+                      AND actor.moved_to_remote_actor_id IS NULL
+                    ORDER BY actor.last_status_at DESC NULLS LAST,
+                             coalesce(actor.profile_created_at, actor.created_at) DESC,
+                             actor.id DESC
+                    LIMIT $5
+                ) recently_active
+            ),
+            local_candidates AS (
                 SELECT 'local'::text AS account_kind, account.id,
                        account.last_status_at AS sort_status_at,
                        account.created_at AS sort_created_at,
-                       (SELECT count(*)
-                          FROM local_follow follow
-                          JOIN local_account follower
-                            ON follower.id = follow.follower_account_id
-                           AND follower.suspended_at IS NULL
-                         WHERE follow.followed_account_id = account.id) AS local_followers_count
-                  FROM local_account account
+                       coalesce(friend.friends_count, 0) AS friends_count,
+                       coalesce(score.local_followers_count, 0) AS local_followers_count
+                  FROM local_pool pool
+                  JOIN local_account account ON account.id = pool.id
+                  LEFT JOIN account_suggestion_score score
+                    ON score.account_kind = 'local' AND score.account_id = account.id
+                  LEFT JOIN friend_candidates friend
+                    ON friend.candidate_kind = 'local' AND friend.candidate_id = account.id
                  WHERE account.id <> $1
                    AND account.discoverable
                    AND account.limited_at IS NULL
@@ -1748,21 +1901,23 @@ pub async fn account_suggestions(
                           AND mute.target_account_id = account.id
                           AND (mute.expires_at IS NULL OR mute.expires_at > now())
                    )
-                 ORDER BY account.last_status_at DESC NULLS LAST, account.created_at DESC, account.id DESC
+                  ORDER BY coalesce(friend.friends_count, 0) DESC,
+                           coalesce(score.local_followers_count, 0) DESC,
+                           account.last_status_at DESC NULLS LAST,
+                           account.created_at DESC, account.id DESC
                  LIMIT $5
             ),
             remote_candidates AS (
                 SELECT 'remote'::text, actor.id, actor.last_status_at,
                        coalesce(actor.profile_created_at, actor.created_at),
-                       (SELECT count(*)
-                          FROM remote_following follow
-                          JOIN local_account follower
-                            ON follower.id = follow.local_account_id
-                           AND follower.suspended_at IS NULL
-                         WHERE follow.remote_actor_id = actor.id
-                           AND follow.state = 'accepted'
-                           AND follow.deactivated_at IS NULL)
-                  FROM remote_actor actor
+                       coalesce(friend.friends_count, 0),
+                       coalesce(score.local_followers_count, 0)
+                  FROM remote_pool pool
+                  JOIN remote_actor actor ON actor.id = pool.id
+                  LEFT JOIN account_suggestion_score score
+                    ON score.account_kind = 'remote' AND score.account_id = actor.id
+                  LEFT JOIN friend_candidates friend
+                    ON friend.candidate_kind = 'remote' AND friend.candidate_id = actor.id
                  WHERE actor.discoverable IS TRUE
                    AND actor.limited_at IS NULL
                    AND actor.suspended_at IS NULL
@@ -1801,7 +1956,9 @@ pub async fn account_suggestions(
                           AND mute.remote_actor_id = actor.id
                           AND (mute.expires_at IS NULL OR mute.expires_at > now())
                    )
-                 ORDER BY actor.last_status_at DESC NULLS LAST,
+                  ORDER BY coalesce(friend.friends_count, 0) DESC,
+                           coalesce(score.local_followers_count, 0) DESC,
+                           actor.last_status_at DESC NULLS LAST,
                           coalesce(actor.profile_created_at, actor.created_at) DESC, actor.id DESC
                  LIMIT $5
             ),
@@ -1812,11 +1969,13 @@ pub async fn account_suggestions(
             ),
             selected AS (
                 SELECT * FROM candidates
-                 ORDER BY local_followers_count DESC, sort_status_at DESC NULLS LAST,
+                  ORDER BY (friends_count > 0) DESC, friends_count DESC,
+                           local_followers_count DESC, sort_status_at DESC NULLS LAST,
                           sort_created_at DESC, id DESC
                  LIMIT $3 OFFSET $4
             )
-            SELECT selected.account_kind, selected.id, selected.sort_status_at,
+             SELECT selected.account_kind, selected.id, selected.sort_status_at,
+                    selected.friends_count,
                    CASE selected.account_kind
                      WHEN 'local' THEN
                        (SELECT count(*) FROM local_follow follow
@@ -1852,7 +2011,8 @@ pub async fn account_suggestions(
                          WHERE status.remote_actor_id = selected.id AND status.deleted_at IS NULL)
                    END AS statuses_count
               FROM selected
-             ORDER BY selected.local_followers_count DESC,
+              ORDER BY (selected.friends_count > 0) DESC, selected.friends_count DESC,
+                       selected.local_followers_count DESC,
                       selected.sort_status_at DESC NULLS LAST,
                       selected.sort_created_at DESC, selected.id DESC
             "#,
@@ -1864,6 +2024,9 @@ pub async fn account_suggestions(
                 (options.limit.min(i64::MAX as u64) as i64).into(),
                 (options.offset.min(i64::MAX as u64) as i64).into(),
                 1_000_i64.into(),
+                1_000_i64.into(),
+                100_i64.into(),
+                1_000_i64.into(),
             ],
         ))
         .await?;
@@ -1873,6 +2036,8 @@ pub async fn account_suggestions(
             Ok(SuggestionRow {
                 kind: row.try_get("", "account_kind")?,
                 id: AccountId(row.try_get("", "id")?),
+                friends_count: u64::try_from(row.try_get::<i64>("", "friends_count")?)
+                    .map_err(|_| DbErr::Type("negative suggestion friend count".to_owned()))?,
                 followers_count: u64::try_from(row.try_get::<i64>("", "followers_count")?)
                     .map_err(|_| DbErr::Type("negative suggestion follower count".to_owned()))?,
                 following_count: u64::try_from(row.try_get::<i64>("", "following_count")?)
@@ -1915,12 +2080,18 @@ pub async fn account_suggestions(
                     AccountSearchResult::Remote(remote_actors.remove(&row.id)?)
                 }
             };
-            Some(DirectoryAccount {
+            let mut sources = Vec::with_capacity(2);
+            if row.friends_count > 0 {
+                sources.push(AccountSuggestionSource::FriendsOfFriends);
+            }
+            sources.push(AccountSuggestionSource::MostFollowed);
+            Some(AccountSuggestion {
                 account,
                 followers_count: row.followers_count,
                 following_count: row.following_count,
                 statuses_count: row.statuses_count,
                 last_status_at: row.last_status_at,
+                sources,
             })
         })
         .collect())
@@ -5556,6 +5727,7 @@ pub enum JobKind {
     PollUpdate,
     FederationPollVoteDelivery,
     TrendMaintenance,
+    AccountSuggestionMaintenance,
     PreviewCardFetch,
     PreviewCardBackfill,
 }
@@ -11502,6 +11674,45 @@ pub async fn enqueue_due_trend_refresh(db: &DbConnection) -> Result<Option<JobId
     .await?;
     txn.commit().await?;
     Ok(Some(job_id))
+}
+
+/// Atomically replace reusable suggestion social-proof scores.
+pub async fn refresh_account_suggestion_scores(db: &DbConnection) -> Result<()> {
+    #[derive(FromQueryResult)]
+    struct RefreshLock {
+        acquired: bool,
+    }
+
+    let txn = db.begin().await?;
+    let lock = RefreshLock::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT pg_try_advisory_xact_lock(726675923346527341) AS acquired".to_owned(),
+    ))
+    .one(&txn)
+    .await?
+    .ok_or_else(|| DbErr::RecordNotFound("suggestion refresh lock returned no row".to_owned()))?;
+    if !lock.acquired {
+        txn.rollback().await?;
+        return Err(RoostyError::Configuration(
+            "account suggestion refresh is already running".to_owned(),
+        ));
+    }
+    txn.execute_unprepared("REFRESH MATERIALIZED VIEW CONCURRENTLY account_suggestion_score")
+        .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Enqueue or reuse the single active account-suggestion refresh job.
+pub async fn enqueue_account_suggestion_refresh(db: &DbConnection) -> Result<JobId> {
+    enqueue_job(
+        db,
+        JobKind::AccountSuggestionMaintenance,
+        serde_json::json!({}),
+        Some("account-suggestion-refresh"),
+        OffsetDateTime::now_utc(),
+    )
+    .await
 }
 
 fn trend_interval_milliseconds(interval: Duration) -> Result<i64> {
@@ -19605,21 +19816,12 @@ where
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"
-            WITH inserted AS (
-                INSERT INTO job (id, kind, payload, deduplication_key, run_after)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (kind, deduplication_key)
-                WHERE deduplication_key IS NOT NULL AND completed_at IS NULL
-                DO NOTHING
-                RETURNING id
-            )
-            SELECT id FROM inserted
-            UNION ALL
-            SELECT id FROM job
-            WHERE kind = $2
-              AND deduplication_key = $4
-              AND completed_at IS NULL
-            LIMIT 1
+            INSERT INTO job (id, kind, payload, deduplication_key, run_after)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (kind, deduplication_key)
+            WHERE deduplication_key IS NOT NULL AND completed_at IS NULL
+            DO UPDATE SET deduplication_key = excluded.deduplication_key
+            RETURNING id
             "#,
             vec![
                 job_id.0.into(),
@@ -19670,6 +19872,7 @@ pub async fn claim_due_job(
                     'federation_replies_fetch', 'federation_reply_fetch', 'web_push_delivery',
                     'notification_request_merge', 'notification_request_cleanup',
                     'scheduled_status_publish', 'trend_maintenance',
+                    'account_suggestion_maintenance',
                     'preview_card_fetch', 'preview_card_backfill'
                   )
                 ORDER BY run_after, created_at

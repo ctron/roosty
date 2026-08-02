@@ -746,6 +746,7 @@ mod tests {
                 preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
+                account_suggestions_refresh_interval: time::Duration::hours(24),
                 scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
                 streaming: crate::config::StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),

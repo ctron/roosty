@@ -15,10 +15,10 @@ Roosty is early-stage and under active development. Federation, timelines, follo
 notifications, moderation, OAuth, streaming, and Web Push are available across a growing Mastodon-compatible API
 surface.
 
-Compatibility is not complete. Explore and trends, scheduled posts, public registration, and parts of the
-administration API are still missing. The first-party frontend covers instance information, account flows, an
-operations-first administrator dashboard, and server-rendered public profiles and status threads. APIs and deployment
-expectations may still change between releases.
+Compatibility is not complete. Public registration, video and audio uploads, account migration, and parts of account
+management are still missing. The first-party frontend covers instance information, account flows, an operations-first
+administrator dashboard, and server-rendered public profiles and status threads. APIs and deployment expectations may
+still change between releases.
 
 See the [documentation](https://ctron.github.io/roosty/) and
 [compatibility matrix](https://ctron.github.io/roosty/development/compatibility.html) for detailed client and

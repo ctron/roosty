@@ -486,7 +486,6 @@ async fn commit_and_project(
 ) -> ReportApiResult<Response> {
     let context = TransactionContext::new(state, &txn);
     let response = admin_report_response(&context, report, viewer).await?;
-    drop(context);
     txn.commit().await?;
     Ok(Json(response).into_response())
 }

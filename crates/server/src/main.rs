@@ -382,6 +382,11 @@ async fn worker_pool(
     );
 
     workers.spawn(trend_scheduler_loop(db.clone(), shutdown_rx.clone()));
+    workers.spawn(account_suggestion_scheduler_loop(
+        db.clone(),
+        config.account_suggestions_refresh_interval,
+        shutdown_rx.clone(),
+    ));
     for slot in 0..config.worker_concurrency {
         let worker_id = format!("{process_identity}:{slot}");
         workers.spawn(worker_loop(
@@ -399,7 +404,7 @@ async fn worker_pool(
     Ok(())
 }
 
-/// Poll and claim the shared trend schedule without electing a process leader.
+/// Poll the shared trend schedule without electing a process leader.
 async fn trend_scheduler_loop(
     db: roosty_db::DbConnection,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -420,6 +425,35 @@ async fn trend_scheduler_loop(
             () = tokio::time::sleep(Duration::from_secs(5)) => {
             }
         }
+    }
+}
+
+/// Enqueue suggestion refreshes on this process's configured cadence.
+async fn account_suggestion_scheduler_loop(
+    db: roosty_db::DbConnection,
+    refresh_interval: time::Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let refresh_interval = Duration::try_from(refresh_interval).map_err(|_| {
+        RoostyError::Configuration(
+            "ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL must be positive".to_owned(),
+        )
+    })?;
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return Ok(());
+        }
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(refresh_interval) => {
+            }
+        }
+        let job_id = roosty_db::enqueue_account_suggestion_refresh(&db).await?;
+        info!(job_id = %job_id.0, "scheduled account suggestion refresh");
     }
 }
 
@@ -641,6 +675,9 @@ async fn worker_iteration(
                 }
                 Ok(())
             }
+        }
+        roosty_db::JobKind::AccountSuggestionMaintenance => {
+            roosty_db::refresh_account_suggestion_scores(db).await
         }
         roosty_db::JobKind::PreviewCardFetch => {
             let database = DatabaseContext::new(db.clone());
@@ -1132,6 +1169,82 @@ mod tests {
         postgresql.stop().await.unwrap();
     }
 
+    /// Concurrent process schedulers reuse one active refresh and allow work after completion.
+    #[tokio::test]
+    async fn concurrent_suggestion_schedulers_enqueue_one_job() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+
+        let (first, second, third) = tokio::join!(
+            roosty_db::enqueue_account_suggestion_refresh(&db),
+            roosty_db::enqueue_account_suggestion_refresh(&db),
+            roosty_db::enqueue_account_suggestion_refresh(&db),
+        );
+        let jobs = [first.unwrap(), second.unwrap(), third.unwrap()];
+        assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS active_jobs FROM job
+                 WHERE kind = 'account_suggestion_maintenance' AND completed_at IS NULL"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "active_jobs").unwrap(), 1);
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE job SET completed_at = now() WHERE id = $1",
+            vec![jobs[0].0.into()],
+        ))
+        .await
+        .unwrap();
+        let next = roosty_db::enqueue_account_suggestion_refresh(&db)
+            .await
+            .unwrap();
+        assert_ne!(next, jobs[0]);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// A restarted process waits for its configured period before scheduling a refresh.
+    #[tokio::test]
+    async fn suggestion_scheduler_uses_process_local_interval() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(account_suggestion_scheduler_loop(
+            db.clone(),
+            time::Duration::milliseconds(250),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(active_suggestion_refresh_jobs(&db).await, 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(active_suggestion_refresh_jobs(&db).await, 1);
+
+        shutdown_tx.send(true).unwrap();
+        scheduler.await.unwrap().unwrap();
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    async fn active_suggestion_refresh_jobs(db: &roosty_db::DbConnection) -> i64 {
+        db.query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS active_jobs FROM job
+             WHERE kind = 'account_suggestion_maintenance' AND completed_at IS NULL"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "active_jobs")
+        .unwrap()
+    }
+
     /// A scheduler skips a locked due row instead of waiting for another instance.
     #[tokio::test]
     async fn trend_scheduler_skips_a_concurrently_locked_schedule() {
@@ -1306,6 +1419,7 @@ mod tests {
             preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
+            account_suggestions_refresh_interval: time::Duration::hours(24),
             scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
             streaming: crate::config::StreamingConfig::default(),
             instance_name: "Worker test".to_owned(),

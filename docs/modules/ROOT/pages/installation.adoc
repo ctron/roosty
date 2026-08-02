@@ -361,6 +361,12 @@ serializes and rate-limits requests to each remote host across all processes.
 |`5m`
 |Trend scoring cadence. Must be at least `1m`. The database rejects a process whose value differs
 from the shared schedule initialized by another process.
+
+|`ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL`
+|`24h`
+|Per-process cadence for refreshing the global account-suggestion materialized view. Accepts a
+non-zero humantime duration. Changes take effect when the worker process restarts; processes may
+use different values safely.
 |===
 
 When multiple Roosty processes serve media, `ROOSTY_MEDIA_ROOT` must refer to the same shared
