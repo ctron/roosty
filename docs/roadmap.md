@@ -86,12 +86,15 @@
 - [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured tags, and account migration metadata.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
+- [x] Coordinate cold remote avatar, header, attachment, and preview requests through durable job
+  leases so Mastodon clients receive media on the first successful origin fetch.
 
 ## Long Term
 
 - ActivityPub federation: signed delivery, inbound processing, remote actor/object cache, and moderation policy enforcement. Opt-in local WebFinger, actor, Note, outbox, and collection endpoints are available.
 - Production-grade timelines: follow graph fan-out, repair jobs, cursor pagination, remote statuses, and scalable streaming fan-out.
-- Media support: local and S3-compatible storage, validation, thumbnails, processing jobs, and remote media fetch limits.
+- Media support: local and S3-compatible storage, validation, thumbnails, processing jobs,
+  coordinated cold-cache fills, and remote media fetch limits.
 - Moderation and operations: custom administrator roles, metrics, warnings, and broader audit-friendly workflows.
 - Compatibility hardening: broader Mastodon API coverage, versioned response DTOs, pagination headers, scope enforcement, and client regression tests.
 

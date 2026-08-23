@@ -326,7 +326,8 @@ results. Use the same setting on every Roosty process behind a shared hostname.
 
 |`ROOSTY_REMOTE_MEDIA_FETCH_CONCURRENCY`
 |`5`
-|Maximum concurrent remote media downloads per worker process; must be positive.
+|Maximum concurrent remote media downloads per process, shared by durable workers and cold-cache
+HTTP requests; must be positive.
 
 |`ROOSTY_PREVIEW_CARD_FETCH_CONCURRENCY`
 |`5`

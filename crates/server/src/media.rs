@@ -28,7 +28,12 @@ use serde::de::{self, MapAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
-use tokio::{fs, io::AsyncReadExt, task};
+use tokio::{
+    fs,
+    io::AsyncReadExt,
+    task,
+    time::{Instant, sleep},
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -42,6 +47,9 @@ use crate::{
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const DESCRIPTION_LIMIT: usize = 1500;
 const PREVIEW_BOUNDING_BOX: u32 = 400;
+const REMOTE_MEDIA_WAIT_TIMEOUT: Duration = Duration::from_secs(32);
+const REMOTE_MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const REMOTE_MEDIA_JOB_CLAIM_TTL: time::Duration = time::Duration::minutes(5);
 
 /// Image formats accepted by local media upload and advertised to clients.
 pub(crate) const SUPPORTED_IMAGE_FORMATS: &[SupportedImageFormat] = &[
@@ -130,7 +138,7 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// Serve a cached remote avatar or header, scheduling a lazy cache fill on demand.
+/// Serve a remote avatar or header, waiting for a coordinated cold-cache fill when necessary.
 async fn serve_remote_profile_media(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
@@ -142,44 +150,45 @@ async fn serve_remote_profile_media(
     let Some(media) = media else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let Some(path) = media.file_path else {
-        if media.state != RemoteMediaState::Failed {
-            enqueue_remote_profile_media_fetches(&database, media.remote_actor_id)
+    if let Some(response) = read_remote_profile_media(&state, &media).await {
+        if cache_is_expired(media.expires_at) {
+            enqueue_remote_profile_media_fetch(&database, media.id)
                 .await
                 .inspect_err(|error| {
-                    tracing::warn!(%error, "failed to queue remote profile media");
+                    tracing::warn!(%error, "failed to queue remote profile media refresh");
                 })
                 .ok();
         }
-        return Ok(StatusCode::ACCEPTED.into_response());
-    };
-    if media
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
-    {
-        // Continue serving the last known-good image while a deduplicated refresh runs.
-        enqueue_remote_profile_media_fetches(&database, media.remote_actor_id)
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(%error, "failed to queue remote profile media refresh");
-            })
-            .ok();
+        return Ok(response);
     }
-    let bytes = fs::read(media_path(&state, &path)).await.ok();
-    Ok(if let Some(bytes) = bytes {
+    if media.state == RemoteMediaState::Failed {
+        return Ok(remote_media_bad_gateway());
+    }
+
+    enqueue_remote_profile_media_fetch(&database, media.id).await?;
+    claim_remote_media_fetch(&state, &database, format!("profile-media:{}", media.id)).await?;
+    wait_for_remote_profile_media(&state, &database, media.id).await
+}
+
+async fn read_remote_profile_media(
+    state: &AppState,
+    media: &roosty_db::RemoteProfileMedia,
+) -> Option<Response> {
+    let path = media.file_path.as_deref()?;
+    let bytes = fs::read(media_path(state, path)).await.ok()?;
+    Some(
         (
             [(
                 header::CONTENT_TYPE,
                 media
                     .content_type
+                    .clone()
                     .unwrap_or_else(|| "application/octet-stream".to_owned()),
             )],
             bytes,
         )
-            .into_response()
-    } else {
-        StatusCode::ACCEPTED.into_response()
-    })
+            .into_response(),
+    )
 }
 
 /// Queue all discovered profile images for one remote actor.
@@ -217,6 +226,26 @@ pub(crate) async fn enqueue_remote_profile_media_fetches(
     Ok(())
 }
 
+async fn enqueue_remote_profile_media_fetch(
+    database: &DatabaseContext,
+    media_id: Uuid,
+) -> Result<(), RoostyError> {
+    let txn = database.begin_write().await?;
+    roosty_db::queue_remote_profile_media_fetch(
+        &txn,
+        media_id,
+        NewJob {
+            kind: JobKind::FederationRemoteMediaFetch,
+            payload: serde_json::json!({"profile_media_id": media_id}),
+            deduplication_key: Some(format!("profile-media:{media_id}")),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Serve a successfully cached remote attachment from local storage.
 async fn serve_remote_media_attachment(
     State(state): State<AppState>,
@@ -237,39 +266,7 @@ async fn serve_remote_media_attachment_with_context(
     let Some(media) = media else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let Some(path) = media.file_path else {
-        if media.state != RemoteMediaState::Failed {
-            enqueue_remote_media_fetch(database, media_id)
-                .await
-                .inspect_err(|error| tracing::warn!(%error, "failed to queue remote media"))
-                .ok();
-        }
-        return Ok(StatusCode::ACCEPTED.into_response());
-    };
-    if media
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
-    {
-        enqueue_remote_media_fetch(database, media_id)
-            .await
-            .inspect_err(|error| tracing::warn!(%error, "failed to queue remote media refresh"))
-            .ok();
-    }
-    let bytes = fs::read(media_path(state, &path)).await.ok();
-    Ok(if let Some(bytes) = bytes {
-        (
-            [(
-                header::CONTENT_TYPE,
-                media
-                    .content_type
-                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
-            )],
-            bytes,
-        )
-            .into_response()
-    } else {
-        StatusCode::ACCEPTED.into_response()
-    })
+    serve_or_fetch_remote_attachment(state, database, media, RemoteMediaVariant::Original).await
 }
 
 /// Serve the generated preview for a remote image attachment.
@@ -284,15 +281,171 @@ async fn serve_remote_media_preview(
     let Some(media) = media else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let Some(path) = media.preview_file_path else {
-        return serve_remote_media_attachment_with_context(&state, &database, media_id).await;
+    serve_or_fetch_remote_attachment(&state, &database, media, RemoteMediaVariant::Preview).await
+}
+
+#[derive(Clone, Copy)]
+enum RemoteMediaVariant {
+    Original,
+    Preview,
+}
+
+async fn serve_or_fetch_remote_attachment(
+    state: &AppState,
+    database: &DatabaseContext,
+    media: RemoteMediaAttachment,
+    variant: RemoteMediaVariant,
+) -> Result<Response, MediaStoreError> {
+    if let Some(response) = read_remote_attachment(state, &media, variant).await {
+        if cache_is_expired(media.expires_at) {
+            enqueue_remote_media_fetch(database, media.id)
+                .await
+                .inspect_err(|error| tracing::warn!(%error, "failed to queue remote media refresh"))
+                .ok();
+        }
+        return Ok(response);
+    }
+    if media.state == RemoteMediaState::Failed {
+        return Ok(remote_media_bad_gateway());
+    }
+
+    enqueue_remote_media_fetch(database, media.id).await?;
+    claim_remote_media_fetch(state, database, format!("remote-media:{}", media.id)).await?;
+    wait_for_remote_attachment(state, database, media.id, variant).await
+}
+
+async fn read_remote_attachment(
+    state: &AppState,
+    media: &RemoteMediaAttachment,
+    variant: RemoteMediaVariant,
+) -> Option<Response> {
+    let (path, content_type) = match variant {
+        RemoteMediaVariant::Original => (
+            media.file_path.as_deref()?,
+            media
+                .content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        ),
+        RemoteMediaVariant::Preview => match media.preview_file_path.as_deref() {
+            Some(path) => (path, "image/png"),
+            None if !media
+                .content_type
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("image/") =>
+            {
+                (
+                    media.file_path.as_deref()?,
+                    media
+                        .content_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream"),
+                )
+            }
+            None => return None,
+        },
     };
-    let bytes = fs::read(media_path(&state, &path)).await.ok();
-    Ok(if let Some(bytes) = bytes {
-        ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
-    } else {
-        StatusCode::ACCEPTED.into_response()
-    })
+    let bytes = fs::read(media_path(state, path)).await.ok()?;
+    Some(([(header::CONTENT_TYPE, content_type.to_owned())], bytes).into_response())
+}
+
+fn cache_is_expired(expires_at: Option<OffsetDateTime>) -> bool {
+    expires_at.is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
+}
+
+async fn claim_remote_media_fetch(
+    state: &AppState,
+    database: &DatabaseContext,
+    deduplication_key: String,
+) -> Result<(), MediaStoreError> {
+    let worker_id = format!("http-media:{}", Uuid::now_v7());
+    let job = roosty_db::claim_due_job_by_key(
+        database.connection(),
+        &worker_id,
+        JobKind::FederationRemoteMediaFetch,
+        &deduplication_key,
+        REMOTE_MEDIA_JOB_CLAIM_TTL,
+    )
+    .await?;
+    if let Some(job) = job {
+        let state = state.clone();
+        let database = database.clone();
+        task::spawn(async move {
+            if let Err(error) = execute_claimed_remote_media_job(&state, &database, &job).await {
+                tracing::error!(job_id = %job.id.0, %error, "could not record remote media job outcome");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn wait_for_remote_profile_media(
+    state: &AppState,
+    database: &DatabaseContext,
+    media_id: Uuid,
+) -> Result<Response, MediaStoreError> {
+    let deadline = Instant::now() + REMOTE_MEDIA_WAIT_TIMEOUT;
+    loop {
+        let txn = database.begin_read().await?;
+        let media = roosty_db::find_remote_profile_media(&txn, media_id).await?;
+        txn.commit().await?;
+        let Some(media) = media else {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        };
+        if let Some(response) = read_remote_profile_media(state, &media).await {
+            return Ok(response);
+        }
+        if media.state == RemoteMediaState::Failed {
+            return Ok(remote_media_bad_gateway());
+        }
+        if Instant::now() >= deadline {
+            return Ok(remote_media_unavailable());
+        }
+        sleep(REMOTE_MEDIA_POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_remote_attachment(
+    state: &AppState,
+    database: &DatabaseContext,
+    media_id: Uuid,
+    variant: RemoteMediaVariant,
+) -> Result<Response, MediaStoreError> {
+    let deadline = Instant::now() + REMOTE_MEDIA_WAIT_TIMEOUT;
+    loop {
+        let txn = database.begin_read().await?;
+        let media = roosty_db::find_remote_media_attachment(&txn, media_id).await?;
+        txn.commit().await?;
+        let Some(media) = media else {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        };
+        if let Some(response) = read_remote_attachment(state, &media, variant).await {
+            return Ok(response);
+        }
+        if media.state == RemoteMediaState::Failed {
+            return Ok(remote_media_bad_gateway());
+        }
+        if Instant::now() >= deadline {
+            return Ok(remote_media_unavailable());
+        }
+        sleep(REMOTE_MEDIA_POLL_INTERVAL).await;
+    }
+}
+
+fn remote_media_bad_gateway() -> Response {
+    StatusCode::BAD_GATEWAY.into_response()
+}
+
+fn remote_media_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::RETRY_AFTER, "1"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+    )
+        .into_response()
 }
 
 /// Queue one remote attachment fetch, deduplicating an in-flight or refresh job.
@@ -349,6 +502,11 @@ pub(crate) async fn fetch_remote_media(
     database: &DatabaseContext,
     payload: Value,
 ) -> Result<(), RoostyError> {
+    let _permit = state
+        .remote_media_fetches
+        .acquire()
+        .await
+        .map_err(|_| RoostyError::Configuration("remote media semaphore closed".to_owned()))?;
     let attachment_id = payload
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -363,7 +521,12 @@ pub(crate) async fn fetch_remote_media(
         if let Some(id) = attachment_id {
             roosty_db::mark_remote_media_failed(&txn, id, &error.to_string()).await?;
         }
-        if let Some(id) = profile_media_id {
+        let profile_url_changed = matches!(
+            error,
+            RoostyError::InvalidInput(reason)
+                if reason == "remote profile media URL changed during fetch"
+        );
+        if let Some(id) = profile_media_id.filter(|_| !profile_url_changed) {
             roosty_db::mark_remote_profile_media_failed(&txn, id, &error.to_string()).await?;
         }
         txn.commit().await?;
@@ -517,9 +680,10 @@ async fn fetch_remote_media_inner(
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     if profile_media {
         let txn = database.begin_write().await?;
-        roosty_db::mark_remote_profile_media_ready(
+        let published = roosty_db::mark_remote_profile_media_ready(
             &txn,
             id,
+            &remote_url,
             content_type,
             path,
             bytes.len() as i64,
@@ -527,7 +691,13 @@ async fn fetch_remote_media_inner(
         )
         .await?;
         txn.commit().await?;
-        Ok(())
+        if published {
+            Ok(())
+        } else {
+            Err(RoostyError::InvalidInput(
+                "remote profile media URL changed during fetch".to_owned(),
+            ))
+        }
     } else {
         let preview_file_path = if let Some(processed) = &processed_image {
             let preview_path = format!("remote/{id}-small.png");
@@ -563,6 +733,47 @@ async fn fetch_remote_media_inner(
         txn.commit().await?;
         Ok(())
     }
+}
+
+/// Finish a claimed media job with the same retry and permanent-failure rules as a worker.
+pub(crate) async fn execute_claimed_remote_media_job(
+    state: &AppState,
+    database: &DatabaseContext,
+    job: &roosty_db::ClaimedJob,
+) -> Result<(), RoostyError> {
+    let result = fetch_remote_media(state, database, job.payload.clone()).await;
+    match result {
+        Ok(()) => {
+            if !roosty_db::mark_job_completed(database.connection(), job).await? {
+                tracing::warn!(job_id = %job.id.0, "discarded stale remote media job completion");
+            }
+        }
+        Err(error) => {
+            let permanent = roosty_db::job_has_exceeded_max_age(
+                job.created_at,
+                state.config.federation_delivery_max_age,
+            ) || error
+                .to_string()
+                .starts_with("permanent federation fetch failure:");
+            if permanent {
+                if !roosty_db::mark_job_permanently_failed(
+                    database.connection(),
+                    job,
+                    &error.to_string(),
+                )
+                .await?
+                {
+                    tracing::warn!(job_id = %job.id.0, "discarded stale remote media permanent failure");
+                }
+            } else if roosty_db::mark_job_failed(database.connection(), job, &error.to_string())
+                .await?
+                .is_none()
+            {
+                tracing::warn!(job_id = %job.id.0, "discarded stale remote media retry");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Project a remote cache entry into Mastodon's media attachment shape.

@@ -86,7 +86,9 @@ expiration/closure, tally `Update` delivery, and Mastodon-compatible `Create(Not
 
 |🟡
 |Remote fetch/cache
-|Account moves do not migrate follows.
+|Cold avatar, header, attachment, and attachment-preview proxy requests wait for one coordinated
+durable fetch and return usable media immediately when the origin succeeds. Stale cached media is
+served while refreshing. Account moves do not migrate follows.
 
 |===
 

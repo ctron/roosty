@@ -3162,29 +3162,36 @@ pub async fn queue_remote_profile_media_fetch(
     Ok(())
 }
 
-/// Record a completed remote profile-image cache write.
+/// Record a completed profile-image cache write only if the actor still advertises its source URL.
 pub async fn mark_remote_profile_media_ready(
     db: &impl ConnectionTrait,
     id: Uuid,
+    expected_remote_url: &str,
     content_type: String,
     file_path: String,
     file_size: i64,
     expires_at: OffsetDateTime,
-) -> Result<()> {
-    let Some(model) = remote_profile_media::Entity::find_by_id(id).one(db).await? else {
-        return Ok(());
-    };
-    let mut active = model.into_active_model();
-    active.state = Set(RemoteMediaState::Ready);
-    active.content_type = Set(Some(content_type));
-    active.file_path = Set(Some(file_path));
-    active.file_size = Set(Some(file_size));
-    active.fetched_at = Set(Some(OffsetDateTime::now_utc()));
-    active.expires_at = Set(Some(expires_at));
-    active.last_error = Set(None);
-    active.updated_at = Set(OffsetDateTime::now_utc());
-    active.update(db).await?;
-    Ok(())
+) -> Result<bool> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            UPDATE remote_profile_media
+            SET state = 'ready', content_type = $3, file_path = $4, file_size = $5,
+                fetched_at = now(), expires_at = $6, last_error = NULL, updated_at = now()
+            WHERE id = $1 AND remote_url = $2
+            "#,
+            vec![
+                id.into(),
+                expected_remote_url.to_owned().into(),
+                content_type.into(),
+                file_path.into(),
+                file_size.into(),
+                expires_at.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Record a failed remote profile-image fetch.
@@ -20209,6 +20216,68 @@ pub async fn claim_due_job(
                 claim_id.0.into(),
                 expired_before.into(),
                 known_kinds.into(),
+            ],
+        ))
+        .await?;
+
+    row.map(|row| {
+        let id: Uuid = row.try_get("", "id")?;
+        let kind: JobKind = row.try_get("", "kind")?;
+        let payload: JsonValue = row.try_get("", "payload")?;
+        let attempts: i32 = row.try_get("", "attempts")?;
+        let attempts = u32::try_from(attempts).map_err(|_| {
+            RoostyError::InvalidInput("stored job attempts must not be negative".to_owned())
+        })?;
+        let created_at: OffsetDateTime = row.try_get("", "created_at")?;
+        let claim_id: Uuid = row.try_get("", "claim_id")?;
+
+        Ok(ClaimedJob {
+            id: JobId(id),
+            claim_id: JobClaimId(claim_id),
+            kind,
+            payload,
+            attempts,
+            created_at,
+        })
+    })
+    .transpose()
+}
+
+/// Claim one specific due job without stealing an active lease held by another process.
+pub async fn claim_due_job_by_key(
+    db: &DbConnection,
+    worker_id: &str,
+    kind: JobKind,
+    deduplication_key: &str,
+    claim_ttl: Duration,
+) -> Result<Option<ClaimedJob>> {
+    let expired_before = OffsetDateTime::now_utc() - claim_ttl;
+    let claim_id = JobClaimId(Uuid::now_v7());
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            UPDATE job
+            SET locked_at = now(), locked_by = $1, claim_id = $2
+            WHERE id IN (
+                SELECT id
+                FROM job
+                WHERE completed_at IS NULL
+                  AND run_after <= now()
+                  AND (locked_at IS NULL OR locked_at < $3)
+                  AND kind = $4::job_kind
+                  AND deduplication_key = $5
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, kind::text AS kind, payload, attempts, created_at, claim_id
+            "#,
+            vec![
+                worker_id.to_owned().into(),
+                claim_id.0.into(),
+                expired_before.into(),
+                kind.as_str().to_owned().into(),
+                deduplication_key.to_owned().into(),
             ],
         ))
         .await?;

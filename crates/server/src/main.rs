@@ -306,7 +306,7 @@ async fn serve(
         info!("starting in-process durable worker");
         Some(tokio::spawn(worker_pool(
             db.clone(),
-            config.clone(),
+            state.clone(),
             shutdown_rx.clone(),
         )))
     } else {
@@ -347,7 +347,8 @@ async fn worker() -> Result<()> {
     roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(wait_for_shutdown(shutdown_tx));
-    let result = worker_pool(db, config, shutdown_rx).await;
+    let state = AppState::new(config, db.clone());
+    let result = worker_pool(db, state, shutdown_rx).await;
     shutdown_task.abort();
     result
 }
@@ -385,7 +386,7 @@ async fn wait_for_shutdown(shutdown_tx: watch::Sender<bool>) {
 /// Run the configured number of independent durable-job loops.
 async fn worker_pool(
     db: roosty_db::DbConnection,
-    config: Config,
+    state: AppState,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let process_identity = format!(
@@ -396,21 +397,21 @@ async fn worker_pool(
     );
     let mut workers = JoinSet::new();
     info!(
-        workers = config.worker_concurrency,
+        workers = state.config.worker_concurrency,
         "starting durable worker pool"
     );
 
     workers.spawn(trend_scheduler_loop(db.clone(), shutdown_rx.clone()));
     workers.spawn(account_suggestion_scheduler_loop(
         db.clone(),
-        config.account_suggestions_refresh_interval,
+        state.config.account_suggestions_refresh_interval,
         shutdown_rx.clone(),
     ));
-    for slot in 0..config.worker_concurrency {
+    for slot in 0..state.config.worker_concurrency {
         let worker_id = format!("{process_identity}:{slot}");
         workers.spawn(worker_loop(
             db.clone(),
-            config.clone(),
+            state.clone(),
             worker_id,
             shutdown_rx.clone(),
         ));
@@ -479,7 +480,7 @@ async fn account_suggestion_scheduler_loop(
 /// Repeatedly claim and execute one durable job for a single worker identity.
 async fn worker_loop(
     db: roosty_db::DbConnection,
-    config: Config,
+    state: AppState,
     worker_id: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -489,7 +490,7 @@ async fn worker_loop(
             return Ok(());
         }
 
-        if worker_iteration(&db, &config, &worker_id).await? {
+        if worker_iteration(&db, &state, &worker_id).await? {
             continue;
         }
 
@@ -509,7 +510,7 @@ async fn worker_loop(
 /// Claim and process one due job, returning whether work was found.
 async fn worker_iteration(
     db: &roosty_db::DbConnection,
-    config: &Config,
+    state: &AppState,
     worker_id: &str,
 ) -> Result<bool> {
     let claim_ttl = time::Duration::minutes(5);
@@ -517,50 +518,51 @@ async fn worker_iteration(
         return Ok(false);
     };
 
-    let state = AppState::new(config.clone(), db.clone());
     let database = DatabaseContext::new(db.clone());
+    if job.kind == roosty_db::JobKind::FederationRemoteMediaFetch {
+        media::execute_claimed_remote_media_job(state, &database, &job).await?;
+        return Ok(true);
+    }
     let result = match job.kind {
         roosty_db::JobKind::FederationFollowResponse => {
-            federation::deliver_follow_response(&state, &database, job.payload.clone()).await
+            federation::deliver_follow_response(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationStatusDelivery => {
-            federation::deliver_status_activity(&state, &database, job.payload.clone()).await
+            federation::deliver_status_activity(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationQuoteDelivery => {
-            federation::deliver_quote_activity(&state, &database, job.payload.clone()).await
+            federation::deliver_quote_activity(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFollowDelivery => {
-            federation::deliver_follow_activity(&state, &database, job.payload.clone()).await
+            federation::deliver_follow_activity(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFavouriteDelivery => {
-            federation::deliver_favourite_activity(&state, &database, job.payload.clone()).await
+            federation::deliver_favourite_activity(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationReblogDelivery => {
-            federation::deliver_reblog_activity(&state, &database, job.payload.clone()).await
+            federation::deliver_reblog_activity(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationActorUpdateDelivery => {
-            federation::deliver_actor_update(&state, &database, job.payload.clone()).await
+            federation::deliver_actor_update(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationModerationDelivery => {
-            federation::deliver_moderation_activity(&state, &database, job.payload.clone()).await
+            federation::deliver_moderation_activity(state, &database, job.payload.clone()).await
         }
-        roosty_db::JobKind::FederationRemoteMediaFetch => {
-            media::fetch_remote_media(&state, &database, job.payload.clone()).await
-        }
+        roosty_db::JobKind::FederationRemoteMediaFetch => Ok(()),
         roosty_db::JobKind::FederationFeaturedRefresh => {
-            federation::refresh_remote_featured(&state, &database, job.payload.clone()).await
+            federation::refresh_remote_featured(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationFeaturedTagsRefresh => {
-            federation::refresh_remote_featured_tags(&state, &database, job.payload.clone()).await
+            federation::refresh_remote_featured_tags(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationThreadResolve => {
-            federation::resolve_remote_status_thread(&state, &database, job.payload.clone()).await
+            federation::resolve_remote_status_thread(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationRepliesFetch => {
-            federation::fetch_remote_status_replies(&state, &database, job.payload.clone()).await
+            federation::fetch_remote_status_replies(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationReplyFetch => {
-            federation::fetch_remote_status_reply(&state, &database, job.payload.clone()).await
+            federation::fetch_remote_status_reply(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::WebPushDelivery => state
             .push
@@ -634,7 +636,7 @@ async fn worker_iteration(
             let paths = roosty_db::purge_suspended_local_account(&txn, account_id).await?;
             txn.commit().await?;
             for path in paths {
-                let _ = remove_file(Path::new(&config.media_root).join(path)).await;
+                let _ = remove_file(Path::new(&state.config.media_root).join(path)).await;
             }
             Ok(())
         }
@@ -661,17 +663,17 @@ async fn worker_iteration(
         }
         roosty_db::JobKind::ScheduledStatusPublish => {
             let database = DatabaseContext::new(db.clone());
-            statuses::publish_scheduled_status(&state, &database, job.payload.clone()).await
+            statuses::publish_scheduled_status(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::PollExpiration => {
             let database = DatabaseContext::new(db.clone());
-            polls::expire_poll_job(&state, &database, job.payload.clone()).await
+            polls::expire_poll_job(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::PollUpdate => {
-            polls::publish_poll_update_job(&state, db, job.payload.clone()).await
+            polls::publish_poll_update_job(state, db, job.payload.clone()).await
         }
         roosty_db::JobKind::FederationPollVoteDelivery => {
-            federation::deliver_poll_vote(&state, &database, job.payload.clone()).await
+            federation::deliver_poll_vote(state, &database, job.payload.clone()).await
         }
         roosty_db::JobKind::TrendMaintenance => {
             let outcome = roosty_db::maintain_trends(db).await?;
@@ -687,9 +689,9 @@ async fn worker_iteration(
                 .map(|_| ())
             } else {
                 let expired_before =
-                    time::OffsetDateTime::now_utc() - config.remote_media_cache_ttl;
+                    time::OffsetDateTime::now_utc() - state.config.remote_media_cache_ttl;
                 for path in roosty_db::prune_preview_cards(db, expired_before).await? {
-                    media::remove_preview_card_image(&state, &path).await;
+                    media::remove_preview_card_image(state, &path).await;
                 }
                 Ok(())
             }
@@ -699,7 +701,7 @@ async fn worker_iteration(
         }
         roosty_db::JobKind::PreviewCardFetch => {
             let database = DatabaseContext::new(db.clone());
-            preview_cards::fetch_preview_card(&state, &database, job.payload.clone(), job.attempts)
+            preview_cards::fetch_preview_card(state, &database, job.payload.clone(), job.attempts)
                 .await
         }
         roosty_db::JobKind::PreviewCardBackfill => {
@@ -730,7 +732,7 @@ async fn worker_iteration(
             let permanent = is_federation_job
                 && (roosty_db::job_has_exceeded_max_age(
                     job.created_at,
-                    config.federation_delivery_max_age,
+                    state.config.federation_delivery_max_age,
                 ) || error
                     .to_string()
                     .starts_with("permanent federation delivery failure:")
@@ -997,8 +999,9 @@ mod tests {
         .await
         .unwrap();
 
+        let state = AppState::new(test_worker_config(), db.clone());
         assert!(
-            worker_iteration(&db, &test_worker_config(), "permanent-test-worker")
+            worker_iteration(&db, &state, "permanent-test-worker")
                 .await
                 .unwrap()
         );
@@ -1053,8 +1056,9 @@ mod tests {
         .await
         .unwrap();
 
+        let state = AppState::new(test_worker_config(), db.clone());
         assert!(
-            worker_iteration(&db, &test_worker_config(), "recovery-test-worker")
+            worker_iteration(&db, &state, "recovery-test-worker")
                 .await
                 .unwrap()
         );
@@ -1202,6 +1206,146 @@ mod tests {
 
         assert_eq!(ids.len(), 3);
         assert_eq!(claims.len(), 3);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given a media job with an unexpired lease, a targeted HTTP claimant cannot steal it; once
+    /// expired, the same kind and deduplication key can be reclaimed.
+    #[tokio::test]
+    async fn targeted_job_claim_respects_active_lease() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let key = "remote-media:targeted-claim";
+        roosty_db::enqueue_job(
+            &db,
+            roosty_db::JobKind::FederationRemoteMediaFetch,
+            serde_json::json!({"attachment_id": uuid::Uuid::now_v7()}),
+            Some(key),
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+        let first = roosty_db::claim_due_job_by_key(
+            &db,
+            "media-request-a",
+            roosty_db::JobKind::FederationRemoteMediaFetch,
+            key,
+            time::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let leased = roosty_db::claim_due_job_by_key(
+            &db,
+            "media-request-b",
+            roosty_db::JobKind::FederationRemoteMediaFetch,
+            key,
+            time::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+        assert!(leased.is_none());
+
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE job SET locked_at = now() - interval '10 minutes' WHERE id = $1",
+            vec![first.id.0.into()],
+        ))
+        .await
+        .unwrap();
+        let reclaimed = roosty_db::claim_due_job_by_key(
+            &db,
+            "media-request-b",
+            roosty_db::JobKind::FederationRemoteMediaFetch,
+            key,
+            time::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(reclaimed.id, first.id);
+        assert_ne!(reclaimed.claim_id, first.claim_id);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given an actor image URL changes while old bytes are downloading, completion for the old
+    /// URL cannot publish those bytes into the actor's current cache entry.
+    #[tokio::test]
+    async fn profile_media_completion_requires_the_fetched_url() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let actor_id = AccountId(uuid::Uuid::now_v7());
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url, public_key_id,
+                public_key_pem, expires_at
+            )
+            VALUES ($1, $2, 'alice', 'remote.test', $3, $4, 'test-key', now() + interval '1 day')
+            "#,
+            vec![
+                actor_id.0.into(),
+                "https://remote.test/users/alice".into(),
+                "https://remote.test/users/alice/inbox".into(),
+                "https://remote.test/users/alice#main-key".into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        let old_url = "https://remote.test/old-avatar.png";
+        let new_url = "https://remote.test/new-avatar.png";
+        roosty_db::replace_remote_profile_media(
+            &db,
+            actor_id,
+            roosty_db::NewRemoteProfileMedia {
+                avatar_url: Some(old_url.to_owned()),
+                header_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let media = roosty_db::remote_profile_media_for_actor(&db, actor_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        roosty_db::replace_remote_profile_media(
+            &db,
+            actor_id,
+            roosty_db::NewRemoteProfileMedia {
+                avatar_url: Some(new_url.to_owned()),
+                header_url: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let published = roosty_db::mark_remote_profile_media_ready(
+            &db,
+            media.id,
+            old_url,
+            "image/png".to_owned(),
+            format!("remote/profile/{}.png", media.id),
+            4,
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        let current = roosty_db::find_remote_profile_media(&db, media.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!published);
+        assert_eq!(current.remote_url, new_url);
+        assert_eq!(current.state, roosty_db::RemoteMediaState::Pending);
+        assert!(current.file_path.is_none());
 
         db.close().await.unwrap();
         postgresql.stop().await.unwrap();

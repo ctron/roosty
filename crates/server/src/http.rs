@@ -177,6 +177,8 @@ pub struct AppState {
     pub streaming_connections: Arc<Semaphore>,
     /// Per-process bound on concurrent outbound preview-card requests.
     pub preview_card_fetches: Arc<Semaphore>,
+    /// Per-process bound shared by worker- and request-triggered remote media fetches.
+    pub remote_media_fetches: Arc<Semaphore>,
     /// Web Push API, credential protection, and delivery service.
     pub push: PushService,
     /// Asset and hydration settings for the first-party web UI.
@@ -193,12 +195,14 @@ impl AppState {
         );
         let streaming_connections = Arc::new(Semaphore::new(config.streaming.max_connections));
         let preview_card_fetches = Arc::new(Semaphore::new(config.preview_card_fetch_concurrency));
+        let remote_media_fetches = Arc::new(Semaphore::new(config.remote_media_fetch_concurrency));
         let push = PushService::new(&config, db.clone());
         Self {
             config: Arc::new(config),
             streaming_events,
             streaming_connections,
             preview_card_fetches,
+            remote_media_fetches,
             push,
             leptos_options: LeptosOptions::builder()
                 .output_name("roosty-web")
@@ -245,6 +249,11 @@ impl DatabaseContext {
     /// Wrap a connection pool without exposing transaction-free query access.
     pub fn new(db: DbConnection) -> Self {
         Self { db }
+    }
+
+    /// Borrow the pool for operations that atomically coordinate outside a transaction.
+    pub(crate) fn connection(&self) -> &DbConnection {
+        &self.db
     }
 
     /// Start a short read-only transaction for an isolated lookup.
