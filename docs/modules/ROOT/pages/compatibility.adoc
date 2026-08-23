@@ -41,7 +41,8 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 
 |🟡
 |Outbox
-|Only local public activities are exposed.
+|Mastodon-compatible cursor pages expose requester-visible `Create` and `Announce` activities.
+Other published activity types are not archived.
 
 |🟢
 |Status object pages

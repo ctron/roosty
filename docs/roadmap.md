@@ -34,6 +34,8 @@
   OAuth, local profile timelines, and bounded status-thread views; public pages hydrate with SEO
   metadata, cursor loading, deep-link support, and session-aware visibility served by the backend.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
+- Mastodon-compatible local actor outboxes expose cursor-paginated status `Create` and boost
+  `Announce` activities, with HTTP-signature-aware follower and mention visibility.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
 - Mastodon-compatible status search uses PostgreSQL trigram documents and exposes only a

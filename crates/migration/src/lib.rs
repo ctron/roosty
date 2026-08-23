@@ -1,4 +1,9 @@
-#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![deny(
+    clippy::absolute_paths,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
 pub use sea_orm_migration::prelude::*;
 
@@ -81,6 +86,7 @@ mod m20260701_000076_create_reports_and_instance_rules;
 mod m20260701_000077_create_polls;
 mod m20260701_000078_create_account_suggestion_dismissals;
 mod m20260701_000079_create_account_suggestion_cache;
+mod m20260701_000080_add_outbox_indexes;
 
 pub struct Migrator;
 
@@ -167,6 +173,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000077_create_polls::Migration),
             Box::new(m20260701_000078_create_account_suggestion_dismissals::Migration),
             Box::new(m20260701_000079_create_account_suggestion_cache::Migration),
+            Box::new(m20260701_000080_add_outbox_indexes::Migration),
         ]
     }
 }

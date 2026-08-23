@@ -57,6 +57,15 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
         .await
     );
     assert!(index_exists(database.connection(), "account_suggestion_score_rank_idx").await);
+    assert!(index_exists(database.connection(), "local_status_outbox_cursor_idx").await);
+    assert!(
+        index_exists(
+            database.connection(),
+            "local_status_reblog_account_cursor_idx"
+        )
+        .await
+    );
+    assert!(index_exists(database.connection(), "remote_actor_public_key_id_idx").await);
     assert!(index_exists(database.connection(), "local_follow_suggestion_edge_idx").await);
     assert!(
         index_exists(

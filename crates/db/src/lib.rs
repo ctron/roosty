@@ -1,4 +1,9 @@
-#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![deny(
+    clippy::absolute_paths,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -13,7 +18,7 @@ use sea_orm::{
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
     FromQueryResult, IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
-    sea_query::{Expr, Func, OnConflict, Query},
+    sea_query::{Expr, Func, OnConflict, Query, SelectStatement, SimpleExpr},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -21,8 +26,10 @@ use sha2::{Digest, Sha256};
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
+    iter::once,
     mem,
     net::IpAddr,
+    result,
     str::FromStr,
 };
 use strum::{Display, EnumString, IntoStaticStr};
@@ -1441,7 +1448,7 @@ pub async fn list_admin_accounts(
     Ok(accounts)
 }
 
-fn lower_contains<C>(column: C, pattern: &str) -> sea_orm::sea_query::SimpleExpr
+fn lower_contains<C>(column: C, pattern: &str) -> SimpleExpr
 where
     C: ColumnTrait,
 {
@@ -3833,7 +3840,7 @@ async fn repair_one_remote_status_delete(
     remote_status::Entity::update_many()
         .col_expr(
             remote_status::Column::InReplyToRemoteStatusId,
-            sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+            Expr::value(Option::<Uuid>::None),
         )
         .filter(remote_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
         .exec(txn)
@@ -3841,7 +3848,7 @@ async fn repair_one_remote_status_delete(
     local_status::Entity::update_many()
         .col_expr(
             local_status::Column::InReplyToRemoteStatusId,
-            sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+            Expr::value(Option::<Uuid>::None),
         )
         .filter(local_status::Column::InReplyToRemoteStatusId.eq(status_id.0))
         .exec(txn)
@@ -3871,6 +3878,23 @@ pub async fn find_remote_actor_by_activitypub_id(
         .one(db)
         .await?
         .map(remote_actor_from_model))
+}
+
+/// Find a unique active cached actor declaring the supplied HTTP-signature key ID.
+pub async fn find_remote_actor_by_public_key_id(
+    db: &impl ConnectionTrait,
+    public_key_id: &str,
+) -> Result<Option<RemoteActor>> {
+    let actors = remote_actor::Entity::find()
+        .filter(remote_actor::Column::PublicKeyId.eq(public_key_id))
+        .filter(remote_actor::Column::DeletedAt.is_null())
+        .limit(2)
+        .all(db)
+        .await?;
+    if actors.len() != 1 {
+        return Ok(None);
+    }
+    Ok(actors.into_iter().next().map(remote_actor_from_model))
 }
 
 /// Find a remote actor by its UUID-backed API identifier.
@@ -5465,6 +5489,43 @@ pub struct LocalRemoteStatusReblog {
     pub created_at: OffsetDateTime,
 }
 
+/// One activity exposed through a local actor's ActivityPub outbox.
+#[derive(Clone, Debug)]
+pub enum LocalOutboxItem {
+    /// A locally authored status projected as a `Create` activity.
+    Status(LocalStatus),
+    /// A local boost of another locally authored status.
+    LocalReblog {
+        reblog: LocalStatusReblog,
+        status: LocalStatus,
+    },
+    /// A local boost of a cached remote status.
+    RemoteReblog {
+        reblog: LocalRemoteStatusReblog,
+        status: RemoteStatus,
+    },
+}
+
+impl LocalOutboxItem {
+    /// Return the UUIDv7 cursor shared by statuses and boost rows.
+    pub fn cursor(&self) -> Uuid {
+        match self {
+            Self::Status(status) => status.id.0,
+            Self::LocalReblog { reblog, .. } => reblog.id,
+            Self::RemoteReblog { reblog, .. } => reblog.id,
+        }
+    }
+}
+
+/// One cursor-paginated ActivityPub outbox page.
+#[derive(Clone, Debug)]
+pub struct LocalOutboxPage {
+    pub items: Vec<LocalOutboxItem>,
+    pub first_cursor: Option<Uuid>,
+    pub last_cursor: Option<Uuid>,
+    pub has_more: bool,
+}
+
 /// Target of an inbound remote Announce activity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteStatusReblogTarget {
@@ -6517,7 +6578,7 @@ pub enum LocalTimeline {
 }
 
 impl TryFromU64 for LocalTimeline {
-    fn try_from_u64(_: u64) -> std::result::Result<Self, DbErr> {
+    fn try_from_u64(_: u64) -> result::Result<Self, DbErr> {
         Err(DbErr::ConvertFromU64("LocalTimeline"))
     }
 }
@@ -10969,7 +11030,7 @@ pub async fn trending_statuses(
                     }),
             )
         })
-        .collect::<std::result::Result<Vec<_>, DbErr>>()
+        .collect::<result::Result<Vec<_>, DbErr>>()
         .map_err(Into::into)
 }
 
@@ -12452,11 +12513,11 @@ async fn local_tags_by_names(db: &impl ConnectionTrait, names: &[String]) -> Res
     Ok(tags)
 }
 
-fn status_tag_subquery(tag_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+fn status_tag_subquery(tag_id: Uuid) -> SelectStatement {
     status_tags_subquery(vec![tag_id])
 }
 
-fn status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::SelectStatement {
+fn status_tags_subquery(tag_ids: Vec<Uuid>) -> SelectStatement {
     Query::select()
         .column(local_status_tag::Column::StatusId)
         .from(local_status_tag::Entity)
@@ -12464,11 +12525,11 @@ fn status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::SelectStateme
         .to_owned()
 }
 
-fn remote_status_tag_subquery(tag_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+fn remote_status_tag_subquery(tag_id: Uuid) -> SelectStatement {
     remote_status_tags_subquery(vec![tag_id])
 }
 
-fn remote_status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::SelectStatement {
+fn remote_status_tags_subquery(tag_ids: Vec<Uuid>) -> SelectStatement {
     Query::select()
         .column(remote_status_tag::Column::RemoteStatusId)
         .from(remote_status_tag::Entity)
@@ -12476,7 +12537,7 @@ fn remote_status_tags_subquery(tag_ids: Vec<Uuid>) -> sea_orm::sea_query::Select
         .to_owned()
 }
 
-fn media_status_subquery() -> sea_orm::sea_query::SelectStatement {
+fn media_status_subquery() -> SelectStatement {
     Query::select()
         .column(local_media_attachment::Column::StatusId)
         .from(local_media_attachment::Entity)
@@ -14579,13 +14640,10 @@ pub async fn mark_quotes_target_deleted(
         StatusReference::Remote(id) => status_quote::Column::QuotedRemoteStatusId.eq(id.0),
     };
     status_quote::Entity::update_many()
-        .col_expr(
-            status_quote::Column::State,
-            sea_orm::sea_query::Expr::value("deleted"),
-        )
+        .col_expr(status_quote::Column::State, Expr::value("deleted"))
         .col_expr(
             status_quote::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(OffsetDateTime::now_utc()),
+            Expr::value(OffsetDateTime::now_utc()),
         )
         .filter(filter)
         .filter(status_quote::Column::State.eq(QuoteState::Accepted))
@@ -14693,6 +14751,250 @@ pub async fn count_public_local_statuses_by_account(
         .filter(local_status::Column::DeletedAt.is_null())
         .count(db)
         .await?)
+}
+
+fn local_outbox_status_visibility(remote_viewer: Option<AccountId>) -> Condition {
+    let public = Condition::any()
+        .add(local_status::Column::Visibility.eq(StatusVisibility::Public))
+        .add(local_status::Column::Visibility.eq(StatusVisibility::Unlisted));
+    let Some(remote_viewer) = remote_viewer else {
+        return public;
+    };
+
+    let mentioned = Query::select()
+        .column(local_status_remote_mention::Column::StatusId)
+        .from(local_status_remote_mention::Entity)
+        .and_where(local_status_remote_mention::Column::RemoteActorId.eq(remote_viewer.0))
+        .to_owned();
+    let followed_accounts = Query::select()
+        .column(remote_follow::Column::LocalAccountId)
+        .from(remote_follow::Entity)
+        .and_where(remote_follow::Column::RemoteActorId.eq(remote_viewer.0))
+        .and_where(remote_follow::Column::State.eq(RemoteFollowState::Accepted))
+        .to_owned();
+    public
+        .add(
+            Condition::all()
+                .add(local_status::Column::Visibility.eq(StatusVisibility::Private))
+                .add(
+                    Condition::any()
+                        .add(local_status::Column::AccountId.in_subquery(followed_accounts))
+                        .add(local_status::Column::Id.in_subquery(mentioned.clone())),
+                ),
+        )
+        .add(
+            Condition::all()
+                .add(local_status::Column::Visibility.eq(StatusVisibility::Direct))
+                .add(local_status::Column::Id.in_subquery(mentioned)),
+        )
+}
+
+fn apply_outbox_uuid_cursor<E>(
+    mut query: Select<E>,
+    column: E::Column,
+    cursor: CollectionCursor,
+) -> Select<E>
+where
+    E: EntityTrait,
+    E::Column: ColumnTrait,
+{
+    if let Some(max_id) = cursor.max_id {
+        query = query.filter(column.clone().lt(max_id));
+    }
+    if let Some(since_id) = cursor.since_id {
+        query = query.filter(column.clone().gt(since_id));
+    }
+    if let Some(min_id) = cursor.min_id {
+        query = query.filter(column.gt(min_id));
+    }
+    query
+}
+
+/// Count activities visible in a local actor's outbox for an optional signed requester.
+pub async fn count_local_actor_outbox_items(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    remote_viewer: Option<AccountId>,
+) -> Result<u64> {
+    let visible_local_statuses = || {
+        Query::select()
+            .column(local_status::Column::Id)
+            .from(local_status::Entity)
+            .and_where(local_status::Column::DeletedAt.is_null())
+            .cond_where(local_outbox_status_visibility(remote_viewer))
+            .to_owned()
+    };
+    let statuses = local_status::Entity::find()
+        .filter(local_status::Column::AccountId.eq(account_id.0))
+        .filter(local_status::Column::DeletedAt.is_null())
+        .filter(local_outbox_status_visibility(remote_viewer))
+        .count(db)
+        .await?;
+    let local_reblogs = local_status_reblog::Entity::find()
+        .filter(local_status_reblog::Column::AccountId.eq(account_id.0))
+        .filter(local_status_reblog::Column::StatusId.in_subquery(visible_local_statuses()))
+        .count(db)
+        .await?;
+    let remote_reblogs = local_remote_status_reblog::Entity::find()
+        .filter(local_remote_status_reblog::Column::LocalAccountId.eq(account_id.0))
+        .filter(
+            local_remote_status_reblog::Column::RemoteStatusId.in_subquery(
+                Query::select()
+                    .column(remote_status::Column::Id)
+                    .from(remote_status::Entity)
+                    .and_where(remote_status::Column::DeletedAt.is_null())
+                    .and_where(
+                        remote_status::Column::Visibility
+                            .is_in([StatusVisibility::Public, StatusVisibility::Unlisted]),
+                    )
+                    .to_owned(),
+            ),
+        )
+        .count(db)
+        .await?;
+    Ok(statuses + local_reblogs + remote_reblogs)
+}
+
+/// Return one mixed, reverse-chronological ActivityPub outbox page.
+pub async fn local_actor_outbox_page(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    remote_viewer: Option<AccountId>,
+    limit: u64,
+    cursor: CollectionCursor,
+) -> Result<LocalOutboxPage> {
+    let ascending = cursor.min_id.is_some();
+    let query_limit = page_query_limit(limit);
+    let visible_local_statuses = || {
+        Query::select()
+            .column(local_status::Column::Id)
+            .from(local_status::Entity)
+            .and_where(local_status::Column::DeletedAt.is_null())
+            .cond_where(local_outbox_status_visibility(remote_viewer))
+            .to_owned()
+    };
+
+    let status_query = apply_outbox_uuid_cursor(
+        local_status::Entity::find()
+            .filter(local_status::Column::AccountId.eq(account_id.0))
+            .filter(local_status::Column::DeletedAt.is_null())
+            .filter(local_outbox_status_visibility(remote_viewer)),
+        local_status::Column::Id,
+        cursor,
+    );
+    let status_models = if ascending {
+        status_query.order_by_asc(local_status::Column::Id)
+    } else {
+        status_query.order_by_desc(local_status::Column::Id)
+    }
+    .limit(query_limit)
+    .all(db)
+    .await?;
+
+    let local_reblog_query = apply_outbox_uuid_cursor(
+        local_status_reblog::Entity::find()
+            .filter(local_status_reblog::Column::AccountId.eq(account_id.0))
+            .filter(local_status_reblog::Column::StatusId.in_subquery(visible_local_statuses())),
+        local_status_reblog::Column::Id,
+        cursor,
+    );
+    let local_reblog_models = if ascending {
+        local_reblog_query.order_by_asc(local_status_reblog::Column::Id)
+    } else {
+        local_reblog_query.order_by_desc(local_status_reblog::Column::Id)
+    }
+    .limit(query_limit)
+    .all(db)
+    .await?;
+
+    let remote_reblog_query = apply_outbox_uuid_cursor(
+        local_remote_status_reblog::Entity::find()
+            .filter(local_remote_status_reblog::Column::LocalAccountId.eq(account_id.0))
+            .filter(
+                local_remote_status_reblog::Column::RemoteStatusId.in_subquery(
+                    Query::select()
+                        .column(remote_status::Column::Id)
+                        .from(remote_status::Entity)
+                        .and_where(remote_status::Column::DeletedAt.is_null())
+                        .and_where(
+                            remote_status::Column::Visibility
+                                .is_in([StatusVisibility::Public, StatusVisibility::Unlisted]),
+                        )
+                        .to_owned(),
+                ),
+            ),
+        local_remote_status_reblog::Column::Id,
+        cursor,
+    );
+    let remote_reblog_models = if ascending {
+        remote_reblog_query.order_by_asc(local_remote_status_reblog::Column::Id)
+    } else {
+        remote_reblog_query.order_by_desc(local_remote_status_reblog::Column::Id)
+    }
+    .limit(query_limit)
+    .all(db)
+    .await?;
+
+    let local_target_ids = local_reblog_models
+        .iter()
+        .map(|reblog| reblog.status_id)
+        .collect::<Vec<_>>();
+    let mut local_targets = local_status::Entity::find()
+        .filter(local_status::Column::Id.is_in(local_target_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| local_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let remote_target_ids = remote_reblog_models
+        .iter()
+        .map(|reblog| reblog.remote_status_id)
+        .collect::<Vec<_>>();
+    let mut remote_targets = remote_status::Entity::find()
+        .filter(remote_status::Column::Id.is_in(remote_target_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| remote_status_from_model(model).map(|status| (status.id.0, status)))
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    let mut items = status_models
+        .into_iter()
+        .map(local_status_from_model)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(LocalOutboxItem::Status)
+        .collect::<Vec<_>>();
+    items.extend(local_reblog_models.into_iter().filter_map(|model| {
+        let status = local_targets.remove(&model.status_id)?;
+        Some(LocalOutboxItem::LocalReblog {
+            reblog: local_status_reblog_from_model(model),
+            status,
+        })
+    }));
+    items.extend(remote_reblog_models.into_iter().filter_map(|model| {
+        let status = remote_targets.remove(&model.remote_status_id)?;
+        Some(LocalOutboxItem::RemoteReblog {
+            reblog: local_remote_status_reblog_from_model(model),
+            status,
+        })
+    }));
+    items.sort_by_key(LocalOutboxItem::cursor);
+    if !ascending {
+        items.reverse();
+    }
+    let (mut items, has_more) = trim_to_page(items, limit);
+    if ascending {
+        items.reverse();
+    }
+    let first_cursor = items.first().map(LocalOutboxItem::cursor);
+    let last_cursor = items.last().map(LocalOutboxItem::cursor);
+    Ok(LocalOutboxPage {
+        items,
+        first_cursor,
+        last_cursor,
+        has_more,
+    })
 }
 
 /// Count active statuses authored by a local account.
@@ -14949,7 +15251,7 @@ pub async fn attach_direct_status_to_conversation(
         .iter()
         .filter(|participant| participant.account_id == author_id.0)
         .map(|participant| AccountId(participant.account_id))
-        .chain(std::iter::once(author_id))
+        .chain(once(author_id))
         .chain(participant_ids.iter().copied())
         .collect::<Vec<_>>();
     account_ids.sort_by_key(|account_id| account_id.0);
@@ -15013,7 +15315,7 @@ pub async fn sync_edited_direct_status_conversation(
         .filter(local_conversation_account::Column::ConversationId.eq(conversation_id))
         .all(txn)
         .await?;
-    let mut account_ids = std::iter::once(author_id)
+    let mut account_ids = once(author_id)
         .chain(participant_ids.iter().copied())
         .collect::<Vec<_>>();
     account_ids.sort_by_key(|account_id| account_id.0);
@@ -15358,7 +15660,7 @@ pub async fn repair_direct_conversation_after_delete(
     )).await?
         .into_iter()
         .map(|row| row.try_get::<Uuid>("", "account_id").map(AccountId))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<result::Result<Vec<_>, _>>()?;
     let removed_account_ids = txn.query_all(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"
@@ -15391,7 +15693,7 @@ pub async fn repair_direct_conversation_after_delete(
     )).await?
         .into_iter()
         .map(|row| row.try_get::<Uuid>("", "account_id").map(AccountId))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<result::Result<Vec<_>, _>>()?;
     Ok(Some(DirectConversationRefresh {
         conversation_id,
         updated_account_ids,
@@ -16845,7 +17147,7 @@ async fn active_statuses_by_id(
 }
 
 /// Return local accounts in the same order as the provided ids.
-async fn local_accounts_by_id(
+pub async fn local_accounts_by_id(
     db: &impl ConnectionTrait,
     account_ids: Vec<AccountId>,
 ) -> Result<Vec<LocalAccount>> {
@@ -18105,7 +18407,7 @@ pub async fn home_timeline_for_account(
         .limit(page_query_limit(limit))
         .all(db)
         .await?;
-    let reblog_account_ids = std::iter::once(account_id.0)
+    let reblog_account_ids = once(account_id.0)
         .chain(reblog_followed_ids.iter().copied())
         .collect::<Vec<_>>();
     let mut reblog_query = apply_reblog_timeline_cursor(

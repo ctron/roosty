@@ -2,8 +2,11 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt::Display,
+    str::from_utf8,
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration as StdDuration, SystemTime},
 };
 
 pub(crate) mod discovery;
@@ -14,26 +17,28 @@ use axum::{
     Extension, Json, Router,
     body::to_bytes,
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header, request::Parts},
+    http::{HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand_core::{OsRng, RngCore};
+use reqwest::{Client, redirect::Policy};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
     CollectionCursor, DirectConversationRefresh, FeaturedTag, FollowCollectionAccount,
     InboxActivityMetadata, InboxActivityOutcome, InboxActivityType, InboxReplayResult, JobKind,
-    LocalAccount, LocalActorKey, LocalNotification, LocalNotificationType, LocalRemoteAccountBlock,
-    LocalRemoteStatusFavourite, LocalRemoteStatusReblog, LocalStatus, NewJob, NewModerationReport,
-    NewRemoteCustomEmoji, NewRemoteMediaAttachment, NewRemoteStatus, PollStatus,
-    QuoteApprovalPolicy, QuoteState, RemoteActor, RemoteConversationParticipant,
-    RemoteDeleteRepair, RemoteFeaturedTagInput, RemoteFollowResponseJob, RemoteFollowing,
-    RemoteStatus, RemoteStatusPoll, RemoteStatusReblogTarget, RemoteStatusUpsertResult,
-    ReportAccount, ReportCategory, ReportStatus, StatusPoll, StatusQuote, StatusReference,
-    StatusVisibility, StreamingStatusOrigin, TimelineCursor, create_moderation_report,
-    federation_domain_policy, find_local_status_by_id, notify_administrators_of_report,
+    LocalAccount, LocalActorKey, LocalNotification, LocalNotificationType, LocalOutboxItem,
+    LocalOutboxPage, LocalRemoteAccountBlock, LocalRemoteStatusFavourite, LocalRemoteStatusReblog,
+    LocalStatus, NewJob, NewModerationReport, NewRemoteCustomEmoji, NewRemoteMediaAttachment,
+    NewRemoteStatus, PollStatus, QuoteApprovalPolicy, QuoteState, RemoteActor,
+    RemoteConversationParticipant, RemoteDeleteRepair, RemoteFeaturedTagInput,
+    RemoteFollowResponseJob, RemoteFollowing, RemoteStatus, RemoteStatusPoll,
+    RemoteStatusReblogTarget, RemoteStatusUpsertResult, ReportAccount, ReportCategory,
+    ReportStatus, StatusPoll, StatusQuote, StatusReference, StatusVisibility,
+    StreamingStatusOrigin, TimelineCursor, create_moderation_report, federation_domain_policy,
+    find_local_status_by_id, notify_administrators_of_report,
 };
 use rsa::{
     RsaPrivateKey,
@@ -52,8 +57,12 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    conversations::publish_conversation_updates,
+    featured_tags::MAX_FEATURED_TAGS,
     http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
+    media,
     notifications::publish_committed_notification,
+    statuses,
 };
 
 const ACTIVITYSTREAMS_CONTENT_TYPE: &str = "application/activity+json";
@@ -922,6 +931,7 @@ struct InboundFeaturedActivity {
 enum CollectionType {
     Collection,
     OrderedCollection,
+    OrderedCollectionPage,
 }
 
 /// Build opt-in ActivityPub discovery and local actor routes.
@@ -1280,12 +1290,51 @@ struct Delete {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OrderedCollection {
+struct OutboxCollection {
     #[serde(rename = "@context")]
     context: &'static str,
+    id: String,
     r#type: CollectionType,
     total_items: u64,
-    ordered_items: Vec<Create>,
+    first: String,
+    last: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OutboxActivity {
+    Create(Box<Create>),
+    Announce(OutboxAnnounce),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutboxAnnounce {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: OutboundReblogType,
+    actor: String,
+    published: String,
+    to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cc: Vec<String>,
+    object: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutboxCollectionPage {
+    #[serde(rename = "@context")]
+    context: &'static str,
+    id: String,
+    r#type: CollectionType,
+    part_of: String,
+    ordered_items: Vec<OutboxActivity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prev: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1344,6 +1393,14 @@ struct OrderedCollectionPage {
 struct CollectionQuery {
     page: Option<bool>,
     max_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct OutboxQuery {
+    page: Option<bool>,
+    max_id: Option<String>,
+    min_id: Option<String>,
+    since_id: Option<String>,
 }
 
 /// Serve a local WebFinger identity. Remote and malformed resources are never resolved here.
@@ -1431,17 +1488,17 @@ fn actor_document(state: &AppState, account: LocalAccount, public_key_pem: Strin
         url: public_url(state, &format!("@{}", account.username)),
         manually_approves_followers: account.locked,
         discoverable: account.discoverable,
-        published: crate::statuses::format_timestamp(account.created_at),
+        published: statuses::format_timestamp(account.created_at),
         attachment: actor_profile_fields(&account.profile_fields),
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
-            media_type: crate::media::media_content_type(path).to_owned(),
-            url: crate::media::media_url(state, path),
+            media_type: media::media_content_type(path).to_owned(),
+            url: media::media_url(state, path),
         }),
         image: account.header_file_path.as_deref().map(|path| ActorImage {
             r#type: ActorImageType::Image,
-            media_type: crate::media::media_content_type(path).to_owned(),
-            url: crate::media::media_url(state, path),
+            media_type: media::media_content_type(path).to_owned(),
+            url: media::media_url(state, path),
         }),
         public_key: PublicKey {
             id: format!("{id}#main-key"),
@@ -1468,7 +1525,7 @@ async fn featured(
     let page = roosty_db::pinned_local_statuses_by_account(
         &txn,
         account.id,
-        crate::statuses::MAX_PINNED_STATUSES,
+        statuses::MAX_PINNED_STATUSES,
         TimelineCursor::default(),
     )
     .await?;
@@ -1558,7 +1615,7 @@ fn actor_profile_fields(profile_fields: &JsonValue) -> Vec<ActorProfileField> {
             Some(ActorProfileField {
                 r#type: ActorProfileFieldType::PropertyValue,
                 name: field.get("name")?.as_str()?.to_owned(),
-                value: crate::statuses::escape_html(field.get("value")?.as_str()?),
+                value: statuses::escape_html(field.get("value")?.as_str()?),
             })
         })
         .collect()
@@ -1569,28 +1626,195 @@ async fn outbox(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
     Path(username): Path<String>,
+    Query(query): Query<OutboxQuery>,
+    request: Request,
 ) -> ApiResult<Response> {
     if !state.config.federation_enabled {
         return Err(ApiError::NotFound("Record not found".into()));
     }
+    let (parts, _) = request.into_parts();
+    let requester = signed_outbox_requester(&state, &database, &parts).await?;
     let txn = database.begin_snapshot().await?;
     let account = roosty_db::find_local_account_by_username(&txn, &username)
         .await?
         .filter(|account| account.suspended_at.is_none())
         .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
-    let statuses = roosty_db::public_local_statuses_by_account(&txn, account.id, 20).await?;
-    let mut items = Vec::with_capacity(statuses.len());
-    for status in statuses {
-        items.push(create(&state, &txn, &account.username, status).await?);
-    }
-    let total_items = roosty_db::count_public_local_statuses_by_account(&txn, account.id).await?;
+    let requester_id = requester.as_ref().map(|actor| actor.id);
+    let blocked = if let Some(requester_id) = requester_id {
+        roosty_db::local_remote_accounts_are_blocked(&txn, account.id, requester_id).await?
+    } else {
+        false
+    };
+    let outbox_id = format!("{}/outbox", actor_url(&state, &account.username));
+    let response = if query.page == Some(true) {
+        let cursor = outbox_cursor(&query)?;
+        let page = if blocked {
+            LocalOutboxPage {
+                items: Vec::new(),
+                first_cursor: None,
+                last_cursor: None,
+                has_more: false,
+            }
+        } else {
+            roosty_db::local_actor_outbox_page(&txn, account.id, requester_id, 20, cursor).await?
+        };
+        let target_account_ids = page
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                LocalOutboxItem::LocalReblog { status, .. } => Some(status.account_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let target_accounts = roosty_db::local_accounts_by_id(&txn, target_account_ids)
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.username))
+            .collect::<HashMap<_, _>>();
+        let mut ordered_items = Vec::with_capacity(page.items.len());
+        for item in page.items {
+            ordered_items.push(match item {
+                LocalOutboxItem::Status(status) => OutboxActivity::Create(Box::new(
+                    create(&state, &txn, &account.username, status).await?,
+                )),
+                LocalOutboxItem::LocalReblog { reblog, status } => {
+                    let target_username =
+                        target_accounts.get(&status.account_id).ok_or_else(|| {
+                            RoostyError::InvalidInput(
+                                "outbox boost target account is missing".to_owned(),
+                            )
+                        })?;
+                    OutboxActivity::Announce(outbox_announce(
+                        &state,
+                        &account.username,
+                        format!(
+                            "{}/statuses/{}",
+                            actor_url(&state, target_username),
+                            status.id.0
+                        ),
+                        format!(
+                            "{}#announce-{}",
+                            actor_url(&state, &account.username),
+                            reblog.id
+                        ),
+                        reblog.created_at,
+                        status.visibility,
+                    ))
+                }
+                LocalOutboxItem::RemoteReblog { reblog, status } => {
+                    OutboxActivity::Announce(outbox_announce(
+                        &state,
+                        &account.username,
+                        status.activitypub_id,
+                        reblog.activity_id,
+                        reblog.created_at,
+                        status.visibility,
+                    ))
+                }
+            });
+        }
+        let page_id = outbox_page_url(&outbox_id, &query);
+        let next = (ordered_items.len() == 20)
+            .then_some(page.last_cursor)
+            .flatten()
+            .map(|cursor| format!("{outbox_id}?page=true&max_id={cursor}"));
+        let prev = page
+            .first_cursor
+            .map(|cursor| format!("{outbox_id}?page=true&min_id={cursor}"));
+        activity_response(OutboxCollectionPage {
+            context: ACTIVITYSTREAMS_CONTEXT,
+            id: page_id,
+            r#type: CollectionType::OrderedCollectionPage,
+            part_of: outbox_id.clone(),
+            ordered_items,
+            next,
+            prev,
+        })
+    } else {
+        let total_items = if blocked {
+            0
+        } else {
+            roosty_db::count_local_actor_outbox_items(&txn, account.id, requester_id).await?
+        };
+        activity_response(OutboxCollection {
+            context: ACTIVITYSTREAMS_CONTEXT,
+            id: outbox_id.clone(),
+            r#type: CollectionType::OrderedCollection,
+            total_items,
+            first: format!("{outbox_id}?page=true"),
+            last: format!("{outbox_id}?page=true&min_id=0"),
+        })
+    };
     txn.commit().await?;
-    Ok(activity_response(OrderedCollection {
+    Ok(outbox_cache_headers(response, requester.is_some()))
+}
+
+fn outbox_cursor(query: &OutboxQuery) -> ApiResult<CollectionCursor> {
+    let parse = |value: Option<&str>, allow_zero: bool| -> ApiResult<Option<Uuid>> {
+        value
+            .map(|value| {
+                if allow_zero && value == "0" {
+                    Ok(Uuid::nil())
+                } else {
+                    Uuid::parse_str(value)
+                        .map_err(|_| ApiError::BadRequest("Outbox cursor is invalid".into()))
+                }
+            })
+            .transpose()
+    };
+    Ok(CollectionCursor {
+        max_id: parse(query.max_id.as_deref(), false)?,
+        min_id: parse(query.min_id.as_deref(), true)?,
+        since_id: parse(query.since_id.as_deref(), false)?,
+    })
+}
+
+fn outbox_page_url(outbox_id: &str, query: &OutboxQuery) -> String {
+    let mut values = vec!["page=true".to_owned()];
+    for (name, value) in [
+        ("max_id", query.max_id.as_deref()),
+        ("min_id", query.min_id.as_deref()),
+        ("since_id", query.since_id.as_deref()),
+    ] {
+        if let Some(value) = value {
+            values.push(format!("{name}={value}"));
+        }
+    }
+    format!("{outbox_id}?{}", values.join("&"))
+}
+
+fn outbox_announce(
+    state: &AppState,
+    username: &str,
+    object: String,
+    id: String,
+    published: OffsetDateTime,
+    visibility: StatusVisibility,
+) -> OutboxAnnounce {
+    let (to, cc) = status_audience(state, username, visibility);
+    OutboxAnnounce {
         context: ACTIVITYSTREAMS_CONTEXT,
-        r#type: CollectionType::OrderedCollection,
-        total_items,
-        ordered_items: items,
-    }))
+        id,
+        r#type: OutboundReblogType::Announce,
+        actor: actor_url(state, username),
+        published: statuses::format_timestamp(published),
+        to,
+        cc,
+        object,
+    }
+}
+
+fn outbox_cache_headers(mut response: Response, signed: bool) -> Response {
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Signature"));
+    if signed {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
 }
 
 /// Serve a public local status as a Note.
@@ -1728,7 +1952,7 @@ async fn activity_collection_page(
     Ok(activity_response(OrderedCollectionPage {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: format!("{}/{name}?page=true", actor_url(state, username)),
-        r#type: CollectionType::OrderedCollection,
+        r#type: CollectionType::OrderedCollectionPage,
         ordered_items,
         next,
     }))
@@ -2461,11 +2685,8 @@ async fn process_inbox(
                 }
                 if accepted
                     && activity_type == Some(InboundActivityType::Accept)
-                    && let Err(error) = crate::media::enqueue_remote_profile_media_fetches(
-                        database,
-                        remote_actor.id,
-                    )
-                    .await
+                    && let Err(error) =
+                        media::enqueue_remote_profile_media_fetches(database, remote_actor.id).await
                 {
                     tracing::warn!(%error, "could not queue remote profile media fetches");
                 }
@@ -2654,8 +2875,7 @@ async fn process_inbox(
                 tracing::warn!(%error, activity_id, "could not publish remote reblog notification");
             }
             if let Err(error) =
-                crate::statuses::publish_remote_reblog_update(state, remote_actor.id, &activity_id)
-                    .await
+                statuses::publish_remote_reblog_update(state, remote_actor.id, &activity_id).await
             {
                 tracing::warn!(%error, activity_id, "could not stream remote reblog");
             }
@@ -2686,8 +2906,7 @@ async fn process_inbox(
                     return internal_error(error);
                 }
                 if let Err(error) =
-                    crate::statuses::publish_remote_reblog_delete(state, remote_actor.id, reblog.id)
-                        .await
+                    statuses::publish_remote_reblog_delete(state, remote_actor.id, reblog.id).await
                 {
                     tracing::warn!(%error, activity_id, "could not stream remote unboost");
                 }
@@ -3176,7 +3395,7 @@ async fn process_remote_actor_lifecycle(
                     .await?;
             txn.commit().await?;
             if let Err(error) =
-                crate::media::enqueue_remote_profile_media_fetches(database, refreshed.id).await
+                media::enqueue_remote_profile_media_fetches(database, refreshed.id).await
             {
                 tracing::warn!(%error, remote_actor_id = %refreshed.id.0, "could not queue refreshed profile media");
             }
@@ -3558,8 +3777,7 @@ async fn process_remote_status_activity(
                     .await?
                     .is_empty();
             if has_local_recipients || has_local_followers {
-                crate::media::enqueue_remote_status_media_fetches_in_transaction(&txn, status.id)
-                    .await?;
+                media::enqueue_remote_status_media_fetches_in_transaction(&txn, status.id).await?;
             }
             txn.commit().await?;
             Ok(RemoteStatusChange::Upsert {
@@ -4053,8 +4271,7 @@ async fn publish_remote_status_change(
                 }
             }
             let recipients = filtered;
-            let response =
-                crate::statuses::remote_status_response(state, (*status).clone()).await?;
+            let response = statuses::remote_status_response(state, (*status).clone()).await?;
             let mention_recipients =
                 roosty_db::active_local_mentions_for_remote_status(db, status.id).await?;
             if let Some(refresh) = refresh {
@@ -4069,13 +4286,8 @@ async fn publish_remote_status_change(
                 );
                 account_ids.sort_by_key(|id| id.0);
                 account_ids.dedup();
-                crate::conversations::publish_conversation_updates(
-                    state,
-                    db,
-                    refresh.conversation_id,
-                    &account_ids,
-                )
-                .await?;
+                publish_conversation_updates(state, db, refresh.conversation_id, &account_ids)
+                    .await?;
             }
             if status.visibility == StatusVisibility::Public
                 || !recipients.is_empty()
@@ -4158,7 +4370,7 @@ async fn publish_delete_repair(
         }
     }
     for refresh in repair.conversation_refreshes {
-        crate::conversations::publish_conversation_updates(
+        publish_conversation_updates(
             state,
             state.db,
             refresh.conversation_id,
@@ -4404,15 +4616,18 @@ fn verify_legacy_signature(
     body: &[u8],
     actor: &RemoteActor,
 ) -> Result<bool, RoostyError> {
-    let digest = parts
-        .headers
-        .get("digest")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let expected_digest = format!("SHA-256={}", STANDARD.encode(Sha256::digest(body)));
-    if digest != expected_digest {
-        return Ok(false);
-    }
+    verify_legacy_request_signature(parts, Some(body), actor)
+}
+
+fn verify_legacy_get_signature(parts: &Parts, actor: &RemoteActor) -> Result<bool, RoostyError> {
+    verify_legacy_request_signature(parts, None, actor)
+}
+
+fn verify_legacy_request_signature(
+    parts: &Parts,
+    body: Option<&[u8]>,
+    actor: &RemoteActor,
+) -> Result<bool, RoostyError> {
     let date = parts
         .headers
         .get("date")
@@ -4420,11 +4635,11 @@ fn verify_legacy_signature(
         .ok_or_else(|| RoostyError::InvalidInput("missing HTTP date".to_owned()))?;
     let date = httpdate::parse_http_date(date)
         .map_err(|_| RoostyError::InvalidInput("invalid HTTP date".to_owned()))?;
-    let skew = std::time::SystemTime::now()
+    let skew = SystemTime::now()
         .duration_since(date)
-        .or_else(|_| date.duration_since(std::time::SystemTime::now()))
+        .or_else(|_| date.duration_since(SystemTime::now()))
         .map_err(|_| RoostyError::InvalidInput("invalid HTTP date".to_owned()))?;
-    if skew > std::time::Duration::from_secs(300) {
+    if skew > StdDuration::from_secs(300) {
         return Ok(false);
     }
     let signature = parts
@@ -4440,7 +4655,12 @@ fn verify_legacy_signature(
         .get("headers")
         .map(String::as_str)
         .unwrap_or("(request-target)");
-    for required in ["(request-target)", "host", "date", "digest"] {
+    let required_headers = if body.is_some() {
+        &["(request-target)", "host", "date", "digest"][..]
+    } else {
+        &["(request-target)", "host", "date"][..]
+    };
+    for required in required_headers {
         if !headers
             .split_whitespace()
             .any(|header| header.eq_ignore_ascii_case(required))
@@ -4452,7 +4672,8 @@ fn verify_legacy_signature(
     for header_name in headers.split_whitespace() {
         let value = if header_name.eq_ignore_ascii_case("(request-target)") {
             format!(
-                "post {}",
+                "{} {}",
+                parts.method.as_str().to_ascii_lowercase(),
                 parts
                     .uri
                     .path_and_query()
@@ -4472,6 +4693,17 @@ fn verify_legacy_signature(
         }
         signed.push(format!("{}: {value}", header_name.to_ascii_lowercase()));
     }
+    if let Some(body) = body {
+        let digest = parts
+            .headers
+            .get("digest")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let expected_digest = format!("SHA-256={}", STANDARD.encode(Sha256::digest(body)));
+        if digest != expected_digest {
+            return Ok(false);
+        }
+    }
     let signature_bytes = attributes
         .get("signature")
         .and_then(|value| STANDARD.decode(value).ok())
@@ -4485,7 +4717,60 @@ fn verify_legacy_signature(
         .is_ok())
 }
 
-fn signature_attributes(value: &str) -> std::collections::BTreeMap<String, String> {
+async fn signed_outbox_requester(
+    state: &AppState,
+    database: &DatabaseContext,
+    parts: &Parts,
+) -> ApiResult<Option<RemoteActor>> {
+    let Some(signature) = parts
+        .headers
+        .get("signature")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let key_id = signature_attributes(signature)
+        .remove("keyId")
+        .ok_or_else(|| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
+    let txn = database.begin_read().await?;
+    let cached = roosty_db::find_remote_actor_by_public_key_id(&txn, &key_id).await?;
+    txn.commit().await?;
+    if let Some(actor) = cached {
+        return if verify_legacy_get_signature(parts, &actor).unwrap_or(false) {
+            Ok(Some(actor))
+        } else {
+            Err(ApiError::Unauthorized("HTTP signature is invalid".into()))
+        };
+    }
+    let mut actor_url = Url::parse(&key_id)
+        .map_err(|_| ApiError::Unauthorized("HTTP signature key is invalid".into()))?;
+    if actor_url.scheme() != "https" || actor_url.host_str().is_none() {
+        return Err(ApiError::Unauthorized(
+            "HTTP signature key is invalid".into(),
+        ));
+    }
+    actor_url.set_fragment(None);
+    let mut actor = discovery::resolve_remote_actor_by_id(state, database, actor_url.as_str())
+        .await
+        .map_err(|_| ApiError::Unauthorized("HTTP signature key is unknown".into()))?;
+    if actor.public_key_id != key_id {
+        actor = discovery::refresh_remote_actor_by_id(state, database, actor_url.as_str())
+            .await
+            .map_err(|_| ApiError::Unauthorized("HTTP signature key is unknown".into()))?;
+    }
+    if actor.public_key_id != key_id {
+        return Err(ApiError::Unauthorized(
+            "HTTP signature key does not match its owner".into(),
+        ));
+    }
+    if verify_legacy_get_signature(parts, &actor).unwrap_or(false) {
+        Ok(Some(actor))
+    } else {
+        Err(ApiError::Unauthorized("HTTP signature is invalid".into()))
+    }
+}
+
+fn signature_attributes(value: &str) -> BTreeMap<String, String> {
     value
         .split(',')
         .filter_map(|part| {
@@ -4641,8 +4926,7 @@ pub(crate) async fn refresh_remote_featured(
             && note_value.get("type").and_then(JsonValue::as_str) == Some("Hashtag")
         {
             let tag = validated_remote_hashtag(&featured, &note_value)?;
-            if seen_tags.insert(tag.name.clone())
-                && legacy_tags.len() < crate::featured_tags::MAX_FEATURED_TAGS as usize
+            if seen_tags.insert(tag.name.clone()) && legacy_tags.len() < MAX_FEATURED_TAGS as usize
             {
                 legacy_tags.push(tag);
             }
@@ -4739,8 +5023,8 @@ pub(crate) async fn refresh_remote_featured_tags(
             })?;
             item_values.extend(items.iter().cloned());
         }
-        if item_values.len() >= crate::featured_tags::MAX_FEATURED_TAGS as usize {
-            item_values.truncate(crate::featured_tags::MAX_FEATURED_TAGS as usize);
+        if item_values.len() >= MAX_FEATURED_TAGS as usize {
+            item_values.truncate(MAX_FEATURED_TAGS as usize);
             break;
         }
         let next = document
@@ -4850,7 +5134,7 @@ async fn process_inbound_featured_tag_activity(
             actor.id,
             &input,
             feature,
-            crate::featured_tags::MAX_FEATURED_TAGS,
+            MAX_FEATURED_TAGS,
         )
         .await?;
     }
@@ -6068,7 +6352,7 @@ pub(crate) async fn resolve_remote_mentions(
 
 /// Return syntactic remote `@user@domain` handles in first-seen order.
 fn remote_mention_handles(content: &str) -> Vec<String> {
-    crate::statuses::remote_mention_handles(content)
+    statuses::remote_mention_handles(content)
 }
 
 /// Kinds of status lifecycle activities emitted to remote followers.
@@ -6356,7 +6640,7 @@ fn decrypt_private_key(
             &mut bytes,
         )
         .map_err(|_| RoostyError::InvalidInput("could not decrypt actor key".to_owned()))?;
-    let pem = std::str::from_utf8(plain)
+    let pem = from_utf8(plain)
         .map_err(|_| RoostyError::InvalidInput("stored actor key is invalid".to_owned()))?;
     RsaPrivateKey::from_pkcs8_pem(pem)
         .map_err(|_| RoostyError::InvalidInput("stored actor key is invalid".to_owned()))
@@ -6379,7 +6663,7 @@ async fn signed_post(
     let body = serde_json::to_vec(activity)
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     let digest = format!("SHA-256={}", STANDARD.encode(Sha256::digest(&body)));
-    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+    let date = httpdate::fmt_http_date(SystemTime::now());
     let path = match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_owned(),
@@ -6399,10 +6683,10 @@ async fn signed_post(
         return result;
     }
     let address = discovery::validate_remote_url(state, db, &url).await?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(15))
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(StdDuration::from_secs(5))
+        .timeout(StdDuration::from_secs(15))
         .resolve(&host, address)
         .build()
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
@@ -6540,7 +6824,7 @@ async fn note_object_with_remote_audience(
     };
     let mut tag = Vec::new();
     let mut local_mentions = Vec::new();
-    for username in crate::statuses::mention_usernames(&status.content) {
+    for username in statuses::mention_usernames(&status.content) {
         if let Some(account) = roosty_db::find_local_account_by_username(db, &username).await? {
             tag.push(MentionTag {
                 r#type: MentionType::Mention,
@@ -6590,13 +6874,13 @@ async fn note_object_with_remote_audience(
         .map(|media| NoteAttachment {
             r#type: NoteAttachmentType::Document,
             media_type: media.content_type,
-            url: crate::media::media_url(state, &media.file_path),
+            url: media::media_url(state, &media.file_path),
             name: media.description,
         })
         .collect();
     let render_context = TransactionContext::new(state, db);
-    let tags = crate::statuses::local_status_content_tag_links(&render_context, &status.content);
-    let mut content = crate::statuses::status_content_html_with_mentions_and_tags(
+    let tags = statuses::local_status_content_tag_links(&render_context, &status.content);
+    let mut content = statuses::status_content_html_with_mentions_and_tags(
         &render_context,
         &status.content,
         &local_mentions,
@@ -6646,8 +6930,8 @@ async fn note_object_with_remote_audience(
             NoteType::Question,
             one_of,
             any_of,
-            poll.expires_at.map(crate::statuses::format_timestamp),
-            poll.closed_at.map(crate::statuses::format_timestamp),
+            poll.expires_at.map(statuses::format_timestamp),
+            poll.closed_at.map(statuses::format_timestamp),
             (!hide_totals).then_some(poll.voters_count).flatten(),
         )
     } else {
@@ -6670,8 +6954,8 @@ async fn note_object_with_remote_audience(
         r#type: note_type,
         attributed_to: actor_url(state, username),
         content,
-        published: crate::statuses::format_timestamp(status.created_at),
-        updated: crate::statuses::format_timestamp(status.updated_at),
+        published: statuses::format_timestamp(status.created_at),
+        updated: statuses::format_timestamp(status.updated_at),
         in_reply_to,
         tag,
         attachment,
@@ -6767,7 +7051,7 @@ fn parse_acct(resource: &str) -> Option<(&str, &str)> {
     (!username.is_empty() && !domain.is_empty() && !username.contains('/') && !domain.contains('/'))
         .then_some((username, domain))
 }
-fn internal_error(error: impl std::fmt::Display) -> Response {
+fn internal_error(error: impl Display) -> Response {
     tracing::error!(%error, "federation request failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
@@ -6834,11 +7118,19 @@ async fn ensure_actor_key(
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::create_dir_all,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         ops::Deref,
         sync::LazyLock,
+        time::{Duration as StdDuration, SystemTime},
     };
 
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, Response, StatusCode, header},
+    };
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_db::{
@@ -6846,29 +7138,41 @@ mod tests {
         QuoteApprovalPolicy, StatusVisibility,
     };
     use roosty_migration::Migrator;
+    use rsa::{
+        RsaPrivateKey,
+        pkcs1v15::SigningKey,
+        pkcs8::{EncodePublicKey, LineEnding},
+        signature::{SignatureEncoding, Signer},
+    };
     use sea_orm::{DatabaseConnection, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use serde_json::json;
-    use tempfile::TempDir;
+    use sha2::Sha256;
+    use tempfile::{Builder, TempDir};
+    use tokio::{sync::Mutex, time::timeout};
+    use tower::ServiceExt;
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
         InboundFollowActivity, InboundInteractionPolicy, InboundNote, InboundReplies, InboundTag,
         InboundUndoAnnounceActivity, InboundUndoBlockActivity, InboundUndoFollowActivity,
         MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note, NoteContext, NoteExtensionsContext,
-        NoteType, OrderedCollection, PublicKey, actor_context, actor_profile_fields,
-        canonical_activity_digest, is_remote_actor_lifecycle_activity, local_actor_type,
-        parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
+        NoteType, OutboxActivity, OutboxCollectionPage, PublicKey, actor_context,
+        actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
+        local_actor_type, parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
     };
     use crate::{
-        config::Config,
+        config::{
+            Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,
+        },
         federation::test_transport,
-        http::{AppState, DatabaseContext},
+        http::{AppState, DatabaseContext, app_router},
+        media, statuses,
+        test_postgres::settings,
     };
 
     /// Serializes scenarios which share the in-process recipient registry.
-    static FEDERATION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    static FEDERATION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// Object key order is insignificant while array order remains part of replay identity.
     #[test]
@@ -7559,7 +7863,7 @@ mod tests {
         assert!(cached_edit.content.contains(
             "href=\"https://example.test/edited\" target=\"_blank\" rel=\"nofollow noopener\""
         ));
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        let event = timeout(StdDuration::from_secs(1), receiver.recv())
             .await
             .unwrap()
             .unwrap();
@@ -7573,7 +7877,7 @@ mod tests {
         assert_eq!(message["event"], "status.update");
         assert_eq!(
             payload["content"],
-            crate::statuses::sanitize_remote_status_html(&cached_edit.content)
+            statuses::sanitize_remote_status_html(&cached_edit.content)
         );
         let notifications = roosty_db::local_notifications_for_account(
             &context.beta.db,
@@ -8186,11 +8490,12 @@ mod tests {
                 voters_count: None,
             }),
         };
-        let collection = OrderedCollection {
+        let collection = OutboxCollectionPage {
             context: "https://www.w3.org/ns/activitystreams",
-            r#type: CollectionType::OrderedCollection,
-            total_items: 1,
-            ordered_items: vec![Create {
+            id: "https://example.test/users/alice/outbox?page=true".to_owned(),
+            r#type: CollectionType::OrderedCollectionPage,
+            part_of: "https://example.test/users/alice/outbox".to_owned(),
+            ordered_items: vec![OutboxActivity::Create(Box::new(Create {
                 context: "https://www.w3.org/ns/activitystreams",
                 r#type: CreateType::Create,
                 id: "https://example.test/users/alice/statuses/1#create".to_owned(),
@@ -8199,7 +8504,9 @@ mod tests {
                 to: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
                 cc: Vec::new(),
                 object: note,
-            }],
+            }))],
+            next: None,
+            prev: None,
         };
 
         let actor = serde_json::to_value(actor).unwrap();
@@ -8295,10 +8602,50 @@ mod tests {
         }
     }
 
+    impl FederationTestState {
+        fn app(&self) -> Router {
+            app_router(self.state.clone(), self.database.clone(), false)
+        }
+
+        async fn get(&self, uri: &str) -> Response<Body> {
+            self.app()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        async fn signed_get(
+            &self,
+            uri: &str,
+            host: &str,
+            key_id: &str,
+            private_key: &RsaPrivateKey,
+        ) -> Response<Body> {
+            let date = httpdate::fmt_http_date(SystemTime::now());
+            let signing = format!("(request-target): get {uri}\nhost: {host}\ndate: {date}");
+            let signature = SigningKey::<Sha256>::new(private_key.clone()).sign(signing.as_bytes());
+            let signature = format!(
+                "keyId=\"{key_id}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"{}\"",
+                STANDARD.encode(signature.to_vec())
+            );
+            self.app()
+                .oneshot(
+                    Request::get(uri)
+                        .header(header::HOST, host)
+                        .header("date", date)
+                        .header("signature", signature)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    }
+
     impl FederationTestContext {
         /// Start two migrated databases with distinct public federation identities.
         async fn setup() -> Self {
-            let temp_dir = tempfile::Builder::new()
+            let temp_dir = Builder::new()
                 .prefix("roosty-federation-")
                 .tempdir()
                 .unwrap();
@@ -8306,9 +8653,9 @@ mod tests {
             let beta_database = format!("beta_{}", uuid::Uuid::now_v7().simple());
             let data_dir = temp_dir.path().join("data");
             let password_file = temp_dir.path().join("passwords").join("pgpass");
-            std::fs::create_dir_all(password_file.parent().unwrap()).unwrap();
+            create_dir_all(password_file.parent().unwrap()).unwrap();
 
-            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let settings = settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
             postgresql.setup().await.unwrap();
             postgresql.start().await.unwrap();
@@ -8359,6 +8706,170 @@ mod tests {
         }
     }
 
+    /// Given mixed public and restricted activity, the outbox follows Mastodon's collection,
+    /// pagination, boost, and signed-fetch visibility behavior.
+    #[tokio::test]
+    async fn outbox_is_paginated_and_requester_aware() {
+        let context = FederationTestContext::setup().await;
+        let alice = create_test_account(&context.alpha, "alice").await;
+        let bob = create_test_account(&context.alpha, "bob").await;
+        for index in 0..21 {
+            create_public_test_status(&context.alpha, alice.id, &format!("public {index}")).await;
+        }
+        create_test_status(
+            &context.alpha,
+            alice.id,
+            "unlisted",
+            StatusVisibility::Unlisted,
+        )
+        .await;
+        let boost_target = create_public_test_status(&context.alpha, bob.id, "boost target").await;
+        roosty_db::reblog_local_status(&context.alpha.db, alice.id, boost_target.id)
+            .await
+            .unwrap();
+
+        let root = context.alpha.get("/users/alice/outbox").await;
+        assert_eq!(root.status(), StatusCode::OK);
+        assert_eq!(root.headers().get(header::VARY).unwrap(), "Signature");
+        let root: serde_json::Value =
+            serde_json::from_slice(&to_bytes(root.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(root["type"], "OrderedCollection");
+        assert_eq!(root["id"], "https://alpha.test/users/alice/outbox");
+        assert_eq!(root["totalItems"], 23);
+        assert!(root.get("orderedItems").is_none());
+        assert_eq!(
+            root["last"],
+            "https://alpha.test/users/alice/outbox?page=true&min_id=0"
+        );
+
+        let first = context.alpha.get("/users/alice/outbox?page=true").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(first["type"], "OrderedCollectionPage");
+        assert_eq!(first["orderedItems"].as_array().unwrap().len(), 20);
+        assert_eq!(first["orderedItems"][0]["type"], "Announce");
+        assert!(first["next"].as_str().unwrap().contains("max_id="));
+        assert!(first["prev"].as_str().unwrap().contains("min_id="));
+
+        let last = context
+            .alpha
+            .get("/users/alice/outbox?page=true&min_id=0")
+            .await;
+        let last: serde_json::Value =
+            serde_json::from_slice(&to_bytes(last.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(last["orderedItems"].as_array().unwrap().len(), 20);
+
+        let private = create_test_status(
+            &context.alpha,
+            alice.id,
+            "followers only",
+            StatusVisibility::Private,
+        )
+        .await;
+        let direct = create_test_status(
+            &context.alpha,
+            alice.id,
+            "direct mention",
+            StatusVisibility::Direct,
+        )
+        .await;
+        let private_key = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+        let public_key = private_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let requester = cache_test_actor(&context.alpha, "reader", "reader.test", public_key).await;
+        roosty_db::upsert_remote_follow(
+            &context.alpha.db,
+            requester.id,
+            alice.id,
+            "https://reader.test/follows/1",
+            json!({}),
+            roosty_db::RemoteFollowState::Accepted,
+        )
+        .await
+        .unwrap();
+        roosty_db::replace_local_status_remote_mentions(
+            &context.alpha.db,
+            direct.id,
+            &[requester.id],
+        )
+        .await
+        .unwrap();
+        roosty_db::replace_local_status_remote_mentions(
+            &context.alpha.db,
+            private.id,
+            &[requester.id],
+        )
+        .await
+        .unwrap();
+
+        let signed = context
+            .alpha
+            .signed_get(
+                "/users/alice/outbox",
+                "alpha.test",
+                &requester.public_key_id,
+                &private_key,
+            )
+            .await;
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(
+            signed.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        let signed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(signed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(signed["totalItems"], 25);
+
+        let signed_page = context
+            .alpha
+            .signed_get(
+                "/users/alice/outbox?page=true",
+                "alpha.test",
+                &requester.public_key_id,
+                &private_key,
+            )
+            .await;
+        let signed_page: serde_json::Value =
+            serde_json::from_slice(&to_bytes(signed_page.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let contents = signed_page["orderedItems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|activity| activity["object"]["content"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("followers only"))
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("direct mention"))
+        );
+
+        let invalid = context
+            .alpha
+            .app()
+            .oneshot(
+                Request::get("/users/alice/outbox?page=true")
+                    .header("signature", "invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+        context.teardown().await;
+    }
+
     fn test_config(database_url: String, public_base_url: &str) -> Config {
         Config {
             database_url,
@@ -8368,9 +8879,9 @@ mod tests {
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: crate::config::ObjectStorageBackend::Local,
+            object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
-            registration_mode: crate::config::RegistrationMode::Closed,
+            registration_mode: RegistrationMode::Closed,
             federation_enabled: true,
             federation_key_encryption_secret: Some(
                 "test-federation-key-encryption-secret-000".to_owned(),
@@ -8384,8 +8895,8 @@ mod tests {
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
             account_suggestions_refresh_interval: time::Duration::hours(24),
-            scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-            streaming: crate::config::StreamingConfig::default(),
+            scheduled_statuses: ScheduledStatusConfig::default(),
+            streaming: StreamingConfig::default(),
             instance_name: "Federation test".to_owned(),
             instance_description: None,
         }
@@ -8643,7 +9154,7 @@ mod tests {
                 .unwrap();
             }
             roosty_db::JobKind::FederationRemoteMediaFetch => {
-                Box::pin(crate::media::fetch_remote_media(
+                Box::pin(media::fetch_remote_media(
                     state,
                     &state.database,
                     job.payload.clone(),
