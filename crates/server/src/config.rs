@@ -1,4 +1,12 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    env,
+    fmt::Display as FmtDisplay,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
+    str::FromStr,
+    thread,
+    time::Duration,
+};
 
 use roosty_core::{Result, RoostyError};
 use strum::{Display, EnumString};
@@ -327,8 +335,8 @@ fn resolve_worker_concurrency(configured: usize) -> Result<usize> {
         return Ok(configured);
     }
 
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
+    thread::available_parallelism()
+        .map(NonZeroUsize::get)
         .map_err(|error| {
             RoostyError::Configuration(format!(
                 "could not determine available worker CPUs: {error}"
@@ -386,7 +394,7 @@ fn optional_domain_list(name: &str) -> Result<Vec<String>> {
                 .map(|domain| {
                     if domain.contains('/')
                         || domain.contains('@')
-                        || domain.parse::<std::net::IpAddr>().is_ok()
+                        || domain.parse::<IpAddr>().is_ok()
                     {
                         return Err(RoostyError::Configuration(format!(
                             "{name} contains an invalid domain"
@@ -405,8 +413,8 @@ pub fn database_url_from_env() -> Result<String> {
 }
 
 fn required_env(name: &str) -> Result<String> {
-    let value = std::env::var(name)
-        .map_err(|_| RoostyError::Configuration(format!("{name} is required")))?;
+    let value =
+        env::var(name).map_err(|_| RoostyError::Configuration(format!("{name} is required")))?;
     if value.trim().is_empty() {
         return Err(RoostyError::Configuration(format!(
             "{name} must not be empty"
@@ -428,15 +436,13 @@ fn required_secret(name: &str) -> Result<String> {
 }
 
 fn optional_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn parse_env<T>(name: &str, default: &str) -> Result<T>
 where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
+    T: FromStr,
+    T::Err: FmtDisplay,
 {
     optional_env(name)
         .unwrap_or_else(|| default.to_owned())
@@ -446,8 +452,8 @@ where
 
 fn optional_parse_env<T>(name: &str) -> Result<Option<T>>
 where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
+    T: FromStr,
+    T::Err: FmtDisplay,
 {
     optional_env(name)
         .map(|value| {
@@ -532,7 +538,7 @@ mod tests {
         assert_eq!(resolve_worker_concurrency(3).unwrap(), 3);
         assert_eq!(
             resolve_worker_concurrency(0).unwrap(),
-            std::thread::available_parallelism().unwrap().get()
+            thread::available_parallelism().unwrap().get()
         );
     }
 

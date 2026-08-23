@@ -1,6 +1,7 @@
 //! Server-rendered and hydrated browser UI for Roosty.
 
 #![recursion_limit = "256"]
+#![deny(clippy::absolute_paths)]
 
 mod app;
 #[cfg(feature = "ssr")]

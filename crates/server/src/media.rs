@@ -1,7 +1,8 @@
 use std::{
     borrow::Cow,
-    io::Cursor,
-    path::{Path, PathBuf},
+    fmt::{Formatter, Result as FmtResult},
+    io::{Cursor, Error as IoError},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -15,6 +16,7 @@ use axum::{
 };
 use axum_params::{Params, UploadFile};
 use image::{GenericImageView, ImageFormat, ImageReader};
+use reqwest::{Client, redirect::Policy};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
     JobKind, LocalMediaAttachment, LocalMediaAttachmentUpdate, LocalMediaPreviewUpdate, NewJob,
@@ -22,17 +24,18 @@ use roosty_db::{
     StatusEditMedia,
 };
 use sea_orm::{DatabaseTransaction, DbErr};
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{self, MapAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
-use tokio::task;
+use tokio::{fs, io::AsyncReadExt, task};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
     auth::{AuthenticatedAccount, OptionalAuthenticatedAccount},
     config::ObjectStorageBackend,
+    federation::discovery::validate_remote_url,
     http::{AppState, DatabaseContext},
 };
 
@@ -152,7 +155,7 @@ async fn serve_remote_profile_media(
     };
     if media
         .expires_at
-        .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
     {
         // Continue serving the last known-good image while a deduplicated refresh runs.
         enqueue_remote_profile_media_fetches(&database, media.remote_actor_id)
@@ -162,7 +165,7 @@ async fn serve_remote_profile_media(
             })
             .ok();
     }
-    let bytes = tokio::fs::read(media_path(&state, &path)).await.ok();
+    let bytes = fs::read(media_path(&state, &path)).await.ok();
     Ok(if let Some(bytes) = bytes {
         (
             [(
@@ -194,7 +197,7 @@ pub(crate) async fn enqueue_remote_profile_media_fetches(
         if entry.state == RemoteMediaState::Ready
             && entry
                 .expires_at
-                .is_some_and(|expires_at| expires_at > time::OffsetDateTime::now_utc())
+                .is_some_and(|expires_at| expires_at > OffsetDateTime::now_utc())
         {
             continue;
         }
@@ -205,7 +208,7 @@ pub(crate) async fn enqueue_remote_profile_media_fetches(
                 kind: JobKind::FederationRemoteMediaFetch,
                 payload: serde_json::json!({"profile_media_id": entry.id}),
                 deduplication_key: Some(format!("profile-media:{}", entry.id)),
-                run_after: time::OffsetDateTime::now_utc(),
+                run_after: OffsetDateTime::now_utc(),
             },
         )
         .await?;
@@ -245,14 +248,14 @@ async fn serve_remote_media_attachment_with_context(
     };
     if media
         .expires_at
-        .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
     {
         enqueue_remote_media_fetch(database, media_id)
             .await
             .inspect_err(|error| tracing::warn!(%error, "failed to queue remote media refresh"))
             .ok();
     }
-    let bytes = tokio::fs::read(media_path(state, &path)).await.ok();
+    let bytes = fs::read(media_path(state, &path)).await.ok();
     Ok(if let Some(bytes) = bytes {
         (
             [(
@@ -284,7 +287,7 @@ async fn serve_remote_media_preview(
     let Some(path) = media.preview_file_path else {
         return serve_remote_media_attachment_with_context(&state, &database, media_id).await;
     };
-    let bytes = tokio::fs::read(media_path(&state, &path)).await.ok();
+    let bytes = fs::read(media_path(&state, &path)).await.ok();
     Ok(if let Some(bytes) = bytes {
         ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
     } else {
@@ -305,7 +308,7 @@ async fn enqueue_remote_media_fetch(
             kind: JobKind::FederationRemoteMediaFetch,
             payload: serde_json::json!({"attachment_id": media_id}),
             deduplication_key: Some(format!("remote-media:{media_id}")),
-            run_after: time::OffsetDateTime::now_utc(),
+            run_after: OffsetDateTime::now_utc(),
         },
     )
     .await?;
@@ -322,7 +325,7 @@ pub(crate) async fn enqueue_remote_status_media_fetches_in_transaction(
         if media.state != RemoteMediaState::Ready
             || media
                 .expires_at
-                .is_none_or(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+                .is_none_or(|expires_at| expires_at <= OffsetDateTime::now_utc())
         {
             roosty_db::queue_remote_media_fetch(
                 txn,
@@ -331,7 +334,7 @@ pub(crate) async fn enqueue_remote_status_media_fetches_in_transaction(
                     kind: JobKind::FederationRemoteMediaFetch,
                     payload: serde_json::json!({"attachment_id": media.id}),
                     deduplication_key: Some(format!("remote-media:{}", media.id)),
-                    run_after: time::OffsetDateTime::now_utc(),
+                    run_after: OffsetDateTime::now_utc(),
                 },
             )
             .await?;
@@ -421,10 +424,10 @@ async fn fetch_remote_media_inner(
             "remote media is rejected by federation policy".to_owned(),
         ));
     }
-    let address = crate::federation::discovery::validate_remote_url(state, &txn, &url).await?;
+    let address = validate_remote_url(state, &txn, &url).await?;
     txn.commit().await?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let client = Client::builder()
+        .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .resolve(&host, address)
@@ -509,7 +512,7 @@ async fn fetch_remote_media_inner(
     create_media_parent(&full_path)
         .await
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    tokio::fs::write(full_path, &bytes)
+    fs::write(full_path, &bytes)
         .await
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     if profile_media {
@@ -532,7 +535,7 @@ async fn fetch_remote_media_inner(
             create_media_parent(&preview_full_path)
                 .await
                 .map_err(media_store_error_to_roosty)?;
-            tokio::fs::write(preview_full_path, &processed.preview_bytes)
+            fs::write(preview_full_path, &processed.preview_bytes)
                 .await
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
             Some(preview_path)
@@ -663,7 +666,7 @@ struct OptionalUploadFileVisitor;
 impl<'de> Visitor<'de> for OptionalUploadFileVisitor {
     type Value = Option<UploadFile>;
 
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.write_str("a multipart upload file or a null-like text field")
     }
 
@@ -710,7 +713,7 @@ impl<'de> Visitor<'de> for OptionalUploadFileVisitor {
     where
         A: MapAccess<'de>,
     {
-        UploadFile::deserialize(de::value::MapAccessDeserializer::new(map)).map(Some)
+        UploadFile::deserialize(MapAccessDeserializer::new(map)).map(Some)
     }
 }
 
@@ -906,11 +909,11 @@ async fn delete_media(
     let Some(media) = media else {
         return Ok(not_found());
     };
-    tokio::fs::remove_file(media_path(&state, &media.file_path))
+    fs::remove_file(media_path(&state, &media.file_path))
         .await
         .ok();
     if let Some(preview_path) = media.preview_file_path {
-        tokio::fs::remove_file(media_path(&state, &preview_path))
+        fs::remove_file(media_path(&state, &preview_path))
             .await
             .ok();
     }
@@ -927,7 +930,7 @@ async fn serve_media_attachment(
     };
     let full_path = Path::new(&state.config.media_root).join(relative_path);
     let content_type = content_type_from_path(&full_path);
-    match tokio::fs::read(full_path).await {
+    match fs::read(full_path).await {
         Ok(bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, content_type)],
@@ -1047,8 +1050,8 @@ async fn store_upload(
     )
     .await?;
 
-    tokio::fs::write(&full_path, &original_bytes).await?;
-    tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
+    fs::write(&full_path, &original_bytes).await?;
+    fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
     let media = NewLocalMediaAttachment {
         account_id,
@@ -1092,7 +1095,7 @@ async fn replacement_preview(
         format.image_format,
     )
     .await?;
-    tokio::fs::write(&preview_full_path, &processed.preview_bytes).await?;
+    fs::write(&preview_full_path, &processed.preview_bytes).await?;
 
     Ok(Some(LocalMediaPreviewUpdate {
         preview_file_path: preview_path,
@@ -1116,14 +1119,14 @@ async fn read_optional_upload(
 async fn read_upload(file: UploadFile) -> Result<Vec<u8>, MediaStoreError> {
     let mut input = file.open().await?;
     let mut bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut input, &mut bytes).await?;
+    AsyncReadExt::read_to_end(&mut input, &mut bytes).await?;
     Ok(bytes)
 }
 
 /// Create the parent directory for a media file when it is nested by UUID shards.
 async fn create_media_parent(path: &Path) -> Result<(), MediaStoreError> {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        fs::create_dir_all(parent).await?;
     }
     Ok(())
 }
@@ -1228,7 +1231,7 @@ pub(crate) async fn store_preview_card_image(
     create_media_parent(&full_path)
         .await
         .map_err(media_store_error_to_roosty)?;
-    tokio::fs::write(full_path, processed.preview_bytes)
+    fs::write(full_path, processed.preview_bytes)
         .await
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     Ok((
@@ -1244,7 +1247,7 @@ pub(crate) async fn store_preview_card_image(
 /// Remove an orphaned preview image; absence is already the desired state.
 pub(crate) async fn remove_preview_card_image(state: &AppState, relative_path: &str) {
     if let Some(path) = safe_relative_path(relative_path) {
-        let _ = tokio::fs::remove_file(Path::new(&state.config.media_root).join(path)).await;
+        let _ = fs::remove_file(Path::new(&state.config.media_root).join(path)).await;
     }
 }
 
@@ -1380,7 +1383,7 @@ fn safe_relative_path(path: &str) -> Option<PathBuf> {
     let mut safe = PathBuf::new();
     for component in path.components() {
         match component {
-            std::path::Component::Normal(segment) => safe.push(segment),
+            Component::Normal(segment) => safe.push(segment),
             _ => return None,
         }
     }
@@ -1448,8 +1451,8 @@ impl IntoResponse for MediaStoreError {
     }
 }
 
-impl From<std::io::Error> for MediaStoreError {
-    fn from(error: std::io::Error) -> Self {
+impl From<IoError> for MediaStoreError {
+    fn from(error: IoError) -> Self {
         Self::Roosty(RoostyError::from(error))
     }
 }

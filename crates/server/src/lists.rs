@@ -11,6 +11,7 @@ use axum::{
 use roosty_core::{AccountId, StatusId};
 use roosty_db::{AddListAccountsResult, ListRepliesPolicy, LocalList};
 use serde::{Deserialize, Serialize};
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
@@ -378,7 +379,7 @@ async fn parse_account_ids(request: Request) -> Result<AccountIdsInput, String> 
         return serde_json::from_slice(&body)
             .map_err(|error| format!("invalid request body: {error}"));
     }
-    let account_ids = url::form_urlencoded::parse(&body)
+    let account_ids = form_urlencoded::parse(&body)
         .filter(|(key, _)| key == "account_ids[]" || key == "account_ids")
         .map(|(_, value)| {
             Uuid::parse_str(&value).map_err(|_| "account_ids[] contains an invalid id".to_owned())

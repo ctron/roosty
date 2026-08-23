@@ -1,6 +1,6 @@
 //! Administrator authorization, APIs, and transactional account operations.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, path::Path as FsPath};
 
 use axum::{
     Extension, Form, Json, Router,
@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
@@ -962,7 +963,7 @@ async fn delete_suspended_account(
     .await?;
     txn.commit().await?;
     for path in paths {
-        tokio::fs::remove_file(std::path::Path::new(&state.config.media_root).join(path))
+        fs::remove_file(FsPath::new(&state.config.media_root).join(path))
             .await
             .ok();
     }
@@ -1268,7 +1269,7 @@ impl From<AdminAuditEntry> for AdminAuditResponse {
 
 fn format_timestamp(timestamp: OffsetDateTime) -> String {
     timestamp
-        .format(&time::format_description::well_known::Rfc3339)
+        .format(&Rfc3339)
         .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
 }
 

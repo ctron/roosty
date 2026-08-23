@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
@@ -12,7 +12,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::{sync::OwnedSemaphorePermit, time::Instant};
+use tokio::{
+    sync::{OwnedSemaphorePermit, broadcast::error::RecvError},
+    time::{self, Instant},
+};
 use tracing::{debug, warn};
 
 use roosty_core::AccountId;
@@ -136,9 +139,9 @@ async fn handle_streaming_socket(
     debug!(?streams, "streaming client subscribed");
 
     let mut receiver = events.subscribe();
-    let mut ping_interval = tokio::time::interval(config.ping_interval);
+    let mut ping_interval = time::interval(config.ping_interval);
     ping_interval.tick().await;
-    let idle_timer = tokio::time::sleep(config.idle_timeout);
+    let idle_timer = time::sleep(config.idle_timeout);
     tokio::pin!(idle_timer);
     loop {
         tokio::select! {
@@ -187,11 +190,11 @@ async fn handle_streaming_socket(
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    Err(RecvError::Lagged(skipped)) => {
                         metrics.receiver_lagged();
                         warn!(skipped, "streaming websocket receiver lagged");
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(RecvError::Closed) => {
                         break;
                     }
                 }
@@ -239,10 +242,10 @@ impl Drop for ActiveConnection {
 async fn send_socket_message(
     socket: &mut WebSocket,
     message: Message,
-    timeout: std::time::Duration,
+    timeout: Duration,
     metrics: &StreamingMetrics,
 ) -> bool {
-    match tokio::time::timeout(timeout, socket.send(message)).await {
+    match time::timeout(timeout, socket.send(message)).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
             debug!(%error, "streaming socket send failed");
@@ -339,35 +342,53 @@ fn websocket_protocol_token(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        fs,
         future::Future,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         pin::Pin,
+        process,
+        result::Result as StdResult,
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
         Json, Router,
         body::{Body, to_bytes},
-        http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
+        http::{
+            HeaderMap, Method, Request, Response, StatusCode,
+            header::{AUTHORIZATION, CONTENT_TYPE, SEC_WEBSOCKET_PROTOCOL},
+        },
     };
     use postgresql_embedded::PostgreSQL;
-    use roosty_core::AccountId;
+    use roosty_core::{AccountId, RoostyError};
     use roosty_migration::Migrator;
+    use roosty_web_push::{DeliveryOutcome, SendOptions, Subscription, WebPushError};
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
     use tempfile::TempDir;
     use test_context::{AsyncTestContext, test_context};
+    use tokio::{
+        task::yield_now,
+        time::{sleep, timeout},
+    };
     use tower::ServiceExt;
+    use url::form_urlencoded;
 
     use super::{
         StreamingControlAction, custom_emojis, streaming_token, update_stream_subscription,
     };
     use crate::{
-        config::Config,
-        http::{AppState, DatabaseContext},
+        config::{
+            Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,
+        },
+        http::{AppState, DatabaseContext, app_router},
+        notifications::push_payload,
         password,
+        push::{PushDeliveryError, PushSender, PushService},
+        test_postgres::settings,
     };
 
     #[test_context(CompatContext)]
@@ -675,7 +696,7 @@ mod tests {
         let token = context.access_token().await;
         let response = context
             .authenticated_form_request(
-                axum::http::Method::POST,
+                Method::POST,
                 "/api/v1/push/subscription",
                 &token,
                 valid_push_form("https://1.1.1.1/push"),
@@ -696,13 +717,13 @@ mod tests {
         assert_eq!(created_id.get_version_num(), 7);
 
         let first = context.authenticated_form_request(
-            axum::http::Method::POST,
+            Method::POST,
             "/api/v1/push/subscription",
             &token,
             valid_push_form("https://8.8.8.8/push"),
         );
         let second = context.authenticated_form_request(
-            axum::http::Method::POST,
+            Method::POST,
             "/api/v1/push/subscription",
             &token,
             valid_push_form("https://9.9.9.9/push"),
@@ -754,7 +775,7 @@ mod tests {
         ] {
             let mut typed_notification = notification.clone();
             typed_notification.notification_type = notification_type;
-            let payload = crate::notifications::push_payload(
+            let payload = push_payload(
                 &context.db,
                 &context.config.public_base_url,
                 typed_notification,
@@ -776,14 +797,14 @@ mod tests {
         let mut invalid_actor = notification.clone();
         invalid_actor.remote_actor_id = Some(AccountId(uuid::Uuid::now_v7()));
         assert!(matches!(
-            crate::notifications::push_payload(
+            push_payload(
                 &context.db,
                 &context.config.public_base_url,
                 invalid_actor,
                 token.clone(),
             )
             .await,
-            Err(roosty_core::RoostyError::InvalidInput(_))
+            Err(RoostyError::InvalidInput(_))
         ));
         assert!(
             roosty_db::push_policy_allows(&context.db, &notification, roosty_db::PushPolicy::All)
@@ -857,7 +878,7 @@ mod tests {
 
         let response = context
             .authenticated_form_request(
-                axum::http::Method::PUT,
+                Method::PUT,
                 "/api/v1/push/subscription",
                 &token,
                 "data%5Bpolicy%5D=followed&data%5Balerts%5D%5Bmention%5D=false&data%5Balerts%5D%5Bfollow%5D=1".to_owned(),
@@ -872,7 +893,7 @@ mod tests {
         for _ in 0..2 {
             let response = context
                 .authenticated_request(
-                    axum::http::Method::DELETE,
+                    Method::DELETE,
                     "/api/v1/push/subscription",
                     &token,
                     Body::empty(),
@@ -884,7 +905,7 @@ mod tests {
         }
         let response = context
             .authenticated_form_request(
-                axum::http::Method::POST,
+                Method::POST,
                 "/api/v1/push/subscription",
                 &token,
                 valid_push_form("https://1.0.0.1/push"),
@@ -914,7 +935,7 @@ mod tests {
         let token = context.access_token().await;
         let response = context
             .authenticated_json_request(
-                axum::http::Method::POST,
+                Method::POST,
                 "/api/v1/push/subscription",
                 &token,
                 serde_json::json!({
@@ -948,7 +969,7 @@ mod tests {
 
         let response = context
             .authenticated_json_request(
-                axum::http::Method::PUT,
+                Method::PUT,
                 "/api/v1/push/subscription",
                 &token,
                 serde_json::json!({
@@ -989,12 +1010,7 @@ mod tests {
             }),
         ] {
             let response = context
-                .authenticated_json_request(
-                    axum::http::Method::POST,
-                    "/api/v1/push/subscription",
-                    &token,
-                    body,
-                )
+                .authenticated_json_request(Method::POST, "/api/v1/push/subscription", &token, body)
                 .await;
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
             assert!(json_body(response).await["error"].as_str().is_some());
@@ -1049,12 +1065,7 @@ mod tests {
         ];
         for body in cases {
             let response = context
-                .authenticated_form_request(
-                    axum::http::Method::POST,
-                    "/api/v1/push/subscription",
-                    &token,
-                    body,
-                )
+                .authenticated_form_request(Method::POST, "/api/v1/push/subscription", &token, body)
                 .await;
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
             assert!(json_body(response).await["error"].as_str().is_some());
@@ -1093,7 +1104,7 @@ mod tests {
         .token;
         let response = context
             .authenticated_form_request(
-                axum::http::Method::POST,
+                Method::POST,
                 "/api/v1/push/subscription",
                 &token,
                 valid_push_form("https://1.1.1.1/push"),
@@ -1110,7 +1121,7 @@ mod tests {
         let token = context.access_token().await;
         let response = context
             .authenticated_form_request(
-                axum::http::Method::POST,
+                Method::POST,
                 "/api/v1/push/subscription",
                 &token,
                 valid_push_form("https://1.1.1.1/push"),
@@ -1142,34 +1153,32 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-        let service = crate::push::PushService::with_sender(
+        let service = PushService::with_sender(
             &context.config,
             context.db.clone(),
-            Arc::new(StaticPushSender(roosty_web_push::DeliveryOutcome::Success)),
+            Arc::new(StaticPushSender(DeliveryOutcome::Success)),
         );
         service.deliver(job.payload.clone()).await.unwrap();
 
-        let retry = crate::push::PushService::with_sender(
+        let retry = PushService::with_sender(
             &context.config,
             context.db.clone(),
-            Arc::new(StaticPushSender(
-                roosty_web_push::DeliveryOutcome::Retryable {
-                    status: Some(429),
-                    retry_after: Some(std::time::Duration::from_secs(30)),
-                },
-            )),
+            Arc::new(StaticPushSender(DeliveryOutcome::Retryable {
+                status: Some(429),
+                retry_after: Some(Duration::from_secs(30)),
+            })),
         );
         assert!(matches!(
             retry.deliver(job.payload.clone()).await,
-            Err(crate::push::PushDeliveryError::Retryable { status: Some(429) })
+            Err(PushDeliveryError::Retryable { status: Some(429) })
         ));
 
-        let permanent = crate::push::PushService::with_sender(
+        let permanent = PushService::with_sender(
             &context.config,
             context.db.clone(),
-            Arc::new(StaticPushSender(
-                roosty_web_push::DeliveryOutcome::PermanentFailure { status: 410 },
-            )),
+            Arc::new(StaticPushSender(DeliveryOutcome::PermanentFailure {
+                status: 410,
+            })),
         );
         permanent.deliver(job.payload).await.unwrap();
         let grant =
@@ -1214,7 +1223,7 @@ mod tests {
         beta.streaming_events.initialize_listener().await.unwrap();
         let mut receiver = beta.streaming_events.subscribe();
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), receiver.recv())
+            timeout(Duration::from_millis(150), receiver.recv())
                 .await
                 .is_err()
         );
@@ -1264,7 +1273,7 @@ mod tests {
         ];
         let mut event_names = Vec::new();
         for _ in 0..5 {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            let event = timeout(Duration::from_secs(5), receiver.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1292,17 +1301,17 @@ mod tests {
             ]
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), receiver.recv())
+            timeout(Duration::from_millis(150), receiver.recv())
                 .await
                 .is_err()
         );
 
         alpha.streaming_events.shutdown();
         beta.streaming_events.shutdown();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         drop(alpha);
         drop(beta);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     #[test]
@@ -1310,7 +1319,7 @@ mod tests {
         // Browser WebSocket clients cannot set arbitrary Authorization headers,
         // so Mastodon-compatible clients may use query or protocol locations.
         let mut headers = HeaderMap::new();
-        let mut query = std::collections::HashMap::new();
+        let mut query = HashMap::new();
         query.insert("access_token".to_owned(), "query-token".to_owned());
         assert_eq!(
             streaming_token(&headers, &query),
@@ -1326,7 +1335,7 @@ mod tests {
 
         headers.clear();
         headers.insert(
-            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            SEC_WEBSOCKET_PROTOCOL,
             "Bearer, protocol-token".parse().unwrap(),
         );
         assert_eq!(
@@ -1386,10 +1395,10 @@ mod tests {
                 .join(format!("{database_name}.pgpass"));
 
             if let Some(parent) = password_file.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                fs::create_dir_all(parent).unwrap();
             }
 
-            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let settings = settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
@@ -1431,9 +1440,9 @@ mod tests {
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 // Fixed test-only PKCS#8 key. pragma: allowlist secret
                 vapid_private_key: Some(TEST_VAPID_PRIVATE_KEY.to_owned()),
-                object_storage_backend: crate::config::ObjectStorageBackend::Local,
+                object_storage_backend: ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
-                registration_mode: crate::config::RegistrationMode::Closed,
+                registration_mode: RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
@@ -1445,8 +1454,8 @@ mod tests {
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
                 account_suggestions_refresh_interval: time::Duration::hours(24),
-                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-                streaming: crate::config::StreamingConfig::default(),
+                scheduled_statuses: ScheduledStatusConfig::default(),
+                streaming: StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
@@ -1469,18 +1478,18 @@ mod tests {
 
     impl CompatContext {
         fn app(&self) -> Router {
-            crate::http::app_router(
+            app_router(
                 AppState::new(self.config.clone(), self.db.clone()),
                 DatabaseContext::new(self.db.clone()),
                 false,
             )
         }
 
-        async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
+        async fn request(&self, request: Request<Body>) -> Response<Body> {
             self.app().oneshot(request).await.unwrap()
         }
 
-        async fn get(&self, uri: &str) -> axum::http::Response<Body> {
+        async fn get(&self, uri: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -1491,7 +1500,7 @@ mod tests {
             .await
         }
 
-        async fn authenticated_get(&self, uri: &str, token: &str) -> axum::http::Response<Body> {
+        async fn authenticated_get(&self, uri: &str, token: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -1509,16 +1518,13 @@ mod tests {
             uri: &str,
             token: &str,
             body: String,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("POST")
                     .uri(uri)
                     .header(AUTHORIZATION, format!("Bearer {token}"))
-                    .header(
-                        axum::http::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    )
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1527,29 +1533,29 @@ mod tests {
 
         async fn authenticated_request(
             &self,
-            method: axum::http::Method,
+            method: Method,
             uri: &str,
             token: &str,
             body: Body,
             content_type: Option<&str>,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             let mut request = Request::builder()
                 .method(method)
                 .uri(uri)
                 .header(AUTHORIZATION, format!("Bearer {token}"));
             if let Some(content_type) = content_type {
-                request = request.header(axum::http::header::CONTENT_TYPE, content_type);
+                request = request.header(CONTENT_TYPE, content_type);
             }
             self.request(request.body(body).unwrap()).await
         }
 
         async fn authenticated_form_request(
             &self,
-            method: axum::http::Method,
+            method: Method,
             uri: &str,
             token: &str,
             body: String,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.authenticated_request(
                 method,
                 uri,
@@ -1562,11 +1568,11 @@ mod tests {
 
         async fn authenticated_json_request(
             &self,
-            method: axum::http::Method,
+            method: Method,
             uri: &str,
             token: &str,
             body: Value,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.authenticated_request(
                 method,
                 uri,
@@ -1591,13 +1597,13 @@ mod tests {
         }
     }
 
-    async fn json_body(response: axum::http::Response<Body>) -> Value {
+    async fn json_body(response: Response<Body>) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
     }
 
     async fn wait_for_streaming_sequence(db: &roosty_db::DbConnection, expected: i64) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        timeout(Duration::from_secs(5), async {
             loop {
                 if roosty_db::latest_streaming_event_sequence(db)
                     .await
@@ -1606,7 +1612,7 @@ mod tests {
                 {
                     return;
                 }
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         })
         .await
@@ -1619,7 +1625,7 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roosty_compat_{}_{}", std::process::id(), timestamp)
+        format!("roosty_compat_{}_{}", process::id(), timestamp)
     }
 
     const TEST_VAPID_PRIVATE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7ki2JNeU+GLhnNacatYTpVJNFd3uIKWr+Inj/vYFMAShRANCAAQyUFnxhJ7CSBxmKk5Qj6d0UWOBJ68nwsB+XAxsp4hAJ/mVfmeryWYGKx9JaZaAWBfSybFhK0inH6o1XIJH5CRW";
@@ -1628,31 +1634,22 @@ mod tests {
         "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
 
     fn valid_push_form(endpoint: &str) -> String {
-        let endpoint: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
+        let endpoint: String = form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
         format!(
             "subscription%5Bendpoint%5D={endpoint}&subscription%5Bkeys%5D%5Bp256dh%5D={PUSH_P256DH}&subscription%5Bkeys%5D%5Bauth%5D={PUSH_AUTH}&subscription%5Bstandard%5D=true&data%5Bpolicy%5D=all&data%5Balerts%5D%5Bmention%5D=true&data%5Balerts%5D%5Bfollow%5D=true"
         )
     }
 
-    struct StaticPushSender(roosty_web_push::DeliveryOutcome);
+    struct StaticPushSender(DeliveryOutcome);
 
-    impl crate::push::PushSender for StaticPushSender {
+    impl PushSender for StaticPushSender {
         fn send<'a>(
             &'a self,
-            _subscription: &'a roosty_web_push::Subscription,
+            _subscription: &'a Subscription,
             _payload: &'a [u8],
-            _options: roosty_web_push::SendOptions,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = std::result::Result<
-                            roosty_web_push::DeliveryOutcome,
-                            roosty_web_push::WebPushError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        > {
+            _options: SendOptions,
+        ) -> Pin<Box<dyn Future<Output = StdResult<DeliveryOutcome, WebPushError>> + Send + 'a>>
+        {
             Box::pin(async move { Ok(self.0) })
         }
 

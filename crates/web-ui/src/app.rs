@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+#[cfg(feature = "ssr")]
+use std::{env, fs, path::Path};
+
 use leptos::prelude::*;
 use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, Script, Title, provide_meta_context};
 use leptos_router::{
@@ -18,8 +22,8 @@ use crate::{
     },
     forms::{LoginError, PasswordChangeResult},
     public_pages::{
-        AtUsernameSegment, UiMediaKind, UiProfileHeader, UiProfileTab, UiProfileTimeline, UiStatus,
-        UiStatusThread, UiStatusVisibility, load_profile_header, load_profile_statuses,
+        AtUsernameSegment, UiMedia, UiMediaKind, UiProfileHeader, UiProfileTab, UiProfileTimeline,
+        UiStatus, UiStatusThread, UiStatusVisibility, load_profile_header, load_profile_statuses,
         load_profile_timeline, load_status_thread,
     },
     ui::{
@@ -57,12 +61,12 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn stylesheet_href(options: &LeptosOptions) -> String {
     let mut filename = options.output_name.to_string();
     if options.hash_files {
-        let hash_path = std::env::current_exe()
+        let hash_path = env::current_exe()
             .ok()
-            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .and_then(|path| path.parent().map(Path::to_path_buf))
             .unwrap_or_default()
             .join(options.hash_file.as_ref());
-        if let Ok(hashes) = std::fs::read_to_string(hash_path)
+        if let Ok(hashes) = fs::read_to_string(hash_path)
             && let Some(hash) = hashes.lines().find_map(|line| {
                 let (file, hash) = line.trim().split_once(':')?;
                 (file == "css").then_some(hash.trim())
@@ -436,7 +440,7 @@ fn append_unique_statuses(current: &mut Vec<UiStatus>, incoming: &[UiStatus]) {
     let existing = current
         .iter()
         .map(|status| status.id)
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<HashSet<_>>();
     current.extend(
         incoming
             .iter()
@@ -564,7 +568,7 @@ fn public_status_card(status: UiStatus) -> AnyView {
     .into_any()
 }
 
-fn public_status_media(media: Vec<crate::public_pages::UiMedia>) -> AnyView {
+fn public_status_media(media: Vec<UiMedia>) -> AnyView {
     view! {
         <div class="grid gap-2 sm:grid-cols-2">
             {media.into_iter().map(|item| {

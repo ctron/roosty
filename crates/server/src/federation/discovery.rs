@@ -9,19 +9,23 @@ use std::{
 use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE},
+    redirect::Policy,
 };
 use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
 use roosty_db::{NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor};
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::net::lookup_host;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    accounts::remote_custom_emojis,
     federation::ActorType,
     http::{AppState, DatabaseContext},
+    media::enqueue_remote_profile_media_fetches,
 };
 
 const MAX_FEDERATION_RESPONSE_BYTES: usize = 1_048_576;
@@ -326,7 +330,7 @@ pub async fn refresh_remote_actor_by_id(
 pub async fn refresh_remote_actor_by_id_in_transaction(
     state: &AppState,
     activitypub_id: &str,
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
 ) -> Result<RemoteActor> {
     let (actor, icon, image) = fetch_remote_actor_by_id(state, txn, activitypub_id).await?;
     store_remote_actor_on(
@@ -509,13 +513,13 @@ async fn enqueue_profile_media_if_followed(
             .is_empty();
     read_txn.commit().await?;
     if has_accepted_followers {
-        crate::media::enqueue_remote_profile_media_fetches(database, actor_id).await?;
+        enqueue_remote_profile_media_fetches(database, actor_id).await?;
     }
     Ok(())
 }
 
 async fn store_remote_actor_on(
-    txn: &sea_orm::DatabaseTransaction,
+    txn: &DatabaseTransaction,
     actor: RemoteActor,
     icon: Option<RemoteActorImage>,
     image: Option<RemoteActorImage>,
@@ -529,7 +533,7 @@ async fn store_remote_actor_on(
             roosty_db::refresh_remote_actor(txn, &actor).await?
         }
     };
-    let emojis = crate::accounts::remote_custom_emojis(&actor.emojis)
+    let emojis = remote_custom_emojis(&actor.emojis)
         .into_iter()
         .filter_map(|emoji| {
             Some(NewRemoteCustomEmoji {
@@ -647,7 +651,7 @@ pub(crate) async fn fetch_json<T: for<'de> Deserialize<'de>>(
         .host_str()
         .ok_or_else(|| invalid("remote URL has no host"))?;
     let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .resolve(host, address)
@@ -715,7 +719,7 @@ pub(crate) async fn validate_remote_url(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| invalid("remote URL has no port"))?;
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+    let addresses: Vec<SocketAddr> = lookup_host((host.as_str(), port))
         .await
         .map_err(|_| invalid("remote domain could not be resolved"))?
         .collect();

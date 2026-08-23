@@ -11,10 +11,12 @@ use axum::{
 use roosty_core::AccountId;
 use roosty_db::{FeatureTagResult, FeaturedTag};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedAccount,
+    federation::enqueue_featured_tag_activity,
     http::{ApiError, ApiResult, AppState, DatabaseContext},
     statuses::TagResponse,
 };
@@ -83,8 +85,7 @@ async fn create(
         }
     };
     if created {
-        crate::federation::enqueue_featured_tag_activity(&state, &txn, &account, &tag, true)
-            .await?;
+        enqueue_featured_tag_activity(&state, &txn, &account, &tag, true).await?;
     }
     txn.commit().await?;
     Ok(Json(local_response(&state, &account.username, tag)))
@@ -95,15 +96,14 @@ async fn destroy(
     Extension(database): Extension<DatabaseContext>,
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(featured_tag_id): Path<Uuid>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Value>> {
     let txn = database.begin_write().await?;
     let removed = roosty_db::unfeature_local_tag(&txn, account.id, featured_tag_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
-    crate::federation::enqueue_featured_tag_activity(&state, &txn, &account, &removed, false)
-        .await?;
+    enqueue_featured_tag_activity(&state, &txn, &account, &removed, false).await?;
     txn.commit().await?;
-    Ok(Json(serde_json::json!({})))
+    Ok(Json(json!({})))
 }
 
 async fn suggestions(

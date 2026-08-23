@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
+use tokio::net::lookup_host;
 use url::{Host, Url};
 
 use crate::WebPushError;
@@ -33,7 +34,7 @@ pub(crate) async fn resolve_public(url: &Url) -> Result<Vec<SocketAddr>, WebPush
         .host_str()
         .ok_or(WebPushError::InvalidEndpoint("host is missing".into()))?;
     let port = url.port_or_known_default().unwrap_or(443);
-    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+    let addresses: Vec<_> = lookup_host((host, port))
         .await
         .map_err(|_| WebPushError::UnresolvedEndpoint)?
         .collect();

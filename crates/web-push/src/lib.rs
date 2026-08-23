@@ -1,4 +1,9 @@
-#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![deny(
+    clippy::absolute_paths,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
 //! Web Push encryption, VAPID authentication, and hardened delivery.
 
@@ -11,7 +16,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use reqwest::{StatusCode, header};
+use reqwest::{StatusCode, header, redirect::Policy};
 use thiserror::Error;
 use url::Url;
 
@@ -159,7 +164,7 @@ impl Client {
             .host_str()
             .ok_or(WebPushError::InvalidEndpoint("host is missing".into()))?;
         let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(Policy::none())
             .connect_timeout(self.connect_timeout)
             .timeout(self.request_timeout)
             .resolve_to_addrs(host, &resolved)

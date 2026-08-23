@@ -1,5 +1,7 @@
 //! Typed persistence and concurrency control for local and federated status polls.
 
+use std::result;
+
 use crate::{
     JobKind, LocalNotification, LocalNotificationType, NewJob, enqueue_job_in_transaction,
     entity::{
@@ -297,7 +299,7 @@ pub async fn vote_in_poll(
     poll_id: Uuid,
     account_id: AccountId,
     choices: &[u32],
-) -> std::result::Result<StatusPoll, PollVoteError> {
+) -> result::Result<StatusPoll, PollVoteError> {
     vote(txn, poll_id, Some(account_id), None, choices, None).await
 }
 
@@ -308,7 +310,7 @@ pub async fn record_remote_poll_vote(
     actor_id: AccountId,
     choice: u32,
     activitypub_id: &str,
-) -> std::result::Result<StatusPoll, PollVoteError> {
+) -> result::Result<StatusPoll, PollVoteError> {
     vote(
         txn,
         poll_id,
@@ -327,7 +329,7 @@ async fn vote(
     remote_actor_id: Option<AccountId>,
     choices: &[u32],
     activitypub_id: Option<&str>,
-) -> std::result::Result<StatusPoll, PollVoteError> {
+) -> result::Result<StatusPoll, PollVoteError> {
     let Some(model) = status_poll::Entity::find_by_id(poll_id)
         .lock_exclusive()
         .one(txn)

@@ -6,6 +6,7 @@ use crate::{
     config::{Config, RegistrationMode},
     http::{ApiResult, AppState, DatabaseContext},
     media,
+    statuses::MAX_PINNED_STATUSES,
 };
 
 const NODEINFO_REL_2_1: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
@@ -203,7 +204,7 @@ fn configuration(config: &Config) -> Value {
         },
         "accounts": {
             "max_featured_tags": 10,
-            "max_pinned_statuses": crate::statuses::MAX_PINNED_STATUSES,
+            "max_pinned_statuses": MAX_PINNED_STATUSES,
         },
         "statuses": {
             "max_characters": 500,
@@ -298,6 +299,8 @@ mod tests {
         sync::Arc,
     };
 
+    use crate::config::{ObjectStorageBackend, ScheduledStatusConfig, StreamingConfig};
+
     use super::*;
 
     #[test]
@@ -372,7 +375,7 @@ mod tests {
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: crate::config::ObjectStorageBackend::Local,
+            object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode,
             federation_enabled: false,
@@ -386,8 +389,8 @@ mod tests {
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
             account_suggestions_refresh_interval: time::Duration::hours(24),
-            scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-            streaming: crate::config::StreamingConfig::default(),
+            scheduled_statuses: ScheduledStatusConfig::default(),
+            streaming: StreamingConfig::default(),
             instance_name: "Roosty Test".to_owned(),
             instance_description: Some("Endpoint test instance".to_owned()),
         })

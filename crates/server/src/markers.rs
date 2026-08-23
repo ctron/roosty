@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     auth::AuthenticatedAccount,
     http::{ApiError, ApiResult, AppState, DatabaseContext},
+    statuses::format_timestamp,
 };
 
 /// Build routes for Mastodon-compatible home and notification timeline markers.
@@ -132,7 +133,7 @@ fn marker_response_map(markers: Vec<LocalTimelineMarker>) -> BTreeMap<String, Ma
                 MarkerResponse {
                     last_read_id: marker.last_read_id.to_string(),
                     version: marker.version,
-                    updated_at: crate::statuses::format_timestamp(marker.updated_at),
+                    updated_at: format_timestamp(marker.updated_at),
                 },
             )
         })

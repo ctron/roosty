@@ -14,6 +14,7 @@ use crate::{
     auth::{
         AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response_on,
     },
+    federation::discovery::{exact_remote_handle, resolve_remote_actor_for_search},
     http::{ApiError, ApiResult, AppState, DatabaseContext},
     statuses::{StatusRenderContext, StatusResponse, TagResponse, search_status_models},
 };
@@ -164,11 +165,9 @@ async fn search_accounts(
     };
     if params.resolve.unwrap_or(false)
         && state.config.federation_enabled
-        && crate::federation::discovery::exact_remote_handle(&query).is_some()
+        && exact_remote_handle(&query).is_some()
     {
-        match crate::federation::discovery::resolve_remote_actor_for_search(state, database, &query)
-            .await
-        {
+        match resolve_remote_actor_for_search(state, database, &query).await {
             Ok(_)
             | Err(RoostyError::FederationDiscovery(FederationDiscoveryError::PolicyRejected(_))) => {
             }
@@ -353,30 +352,40 @@ fn non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::create_dir_all,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        process::id as process_id,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
         Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        http::{Request, Response, StatusCode, header},
     };
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
-    use roosty_db::StatusVisibility;
+    use roosty_db::{
+        DomainBlockSeverity, LocalAccountSettingsUpdate, NewFederationDomainBlock, NewLocalStatus,
+        NewRemoteStatus, QuoteApprovalPolicy, RemoteActor, StatusVisibility,
+    };
     use roosty_migration::Migrator;
     use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
     use serde_json::Value;
-    use tempfile::TempDir;
+    use tempfile::{Builder, TempDir};
     use test_context::{AsyncTestContext, test_context};
+    use time::{Duration, OffsetDateTime};
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use crate::{
-        config::Config,
-        http::{AppState, DatabaseContext},
+        config::{
+            Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,
+        },
+        http::{AppState, DatabaseContext, app_router},
         password,
+        test_postgres::settings,
     };
 
     #[test_context(SearchContext)]
@@ -437,17 +446,17 @@ mod tests {
         context.config.federation_allowed_domains = vec!["*".to_owned()];
         let token = context.access_token().await;
         let actor = context.cache_remote_actor("alice", "remote.test").await;
-        let now = time::OffsetDateTime::now_utc();
+        let now = OffsetDateTime::now_utc();
         for number in 1..=2 {
             roosty_db::upsert_remote_status(
                 &context.db,
-                roosty_db::NewRemoteStatus {
+                NewRemoteStatus {
                     activitypub_id: format!("https://remote.test/statuses/{number}"),
                     remote_actor_id: actor.id,
                     content: format!("remote status {number}"),
                     visibility: StatusVisibility::Public,
-                    published_at: now + time::Duration::seconds(number),
-                    updated_at: now + time::Duration::seconds(number),
+                    published_at: now + Duration::seconds(number),
+                    updated_at: now + Duration::seconds(number),
                     in_reply_to: None,
                     in_reply_to_local_status_id: None,
                     in_reply_to_remote_status_id: None,
@@ -496,9 +505,9 @@ mod tests {
         let txn = context.db.begin().await.unwrap();
         roosty_db::create_federation_domain_block(
             &txn,
-            roosty_db::NewFederationDomainBlock {
+            NewFederationDomainBlock {
                 domain: "remote.test".to_owned(),
-                severity: roosty_db::DomainBlockSeverity::Suspend,
+                severity: DomainBlockSeverity::Suspend,
                 reject_media: false,
                 reject_reports: false,
                 private_comment: None,
@@ -528,7 +537,7 @@ mod tests {
         let token = context.access_token().await;
         let status = roosty_db::create_local_status(
             &context.db,
-            roosty_db::NewLocalStatus {
+            NewLocalStatus {
                 id: None,
                 account_id: context.account_id,
                 content: "searchable #RoostTag".to_owned(),
@@ -538,7 +547,7 @@ mod tests {
                 language: None,
                 in_reply_to_id: None,
                 in_reply_to_remote_status_id: None,
-                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+                quote_approval_policy: QuoteApprovalPolicy::Nobody,
             },
         )
         .await
@@ -585,7 +594,7 @@ mod tests {
             .await;
         let owned = roosty_db::create_local_status(
             &context.db,
-            roosty_db::NewLocalStatus {
+            NewLocalStatus {
                 id: None,
                 account_id: context.account_id,
                 content: "A searchable platypus".to_owned(),
@@ -595,14 +604,14 @@ mod tests {
                 language: None,
                 in_reply_to_id: None,
                 in_reply_to_remote_status_id: None,
-                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+                quote_approval_policy: QuoteApprovalPolicy::Nobody,
             },
         )
         .await
         .unwrap();
         let interacted = roosty_db::create_local_status(
             &context.db,
-            roosty_db::NewLocalStatus {
+            NewLocalStatus {
                 id: None,
                 account_id: author_id,
                 content: "Another PLATYPUS report".to_owned(),
@@ -612,7 +621,7 @@ mod tests {
                 language: None,
                 in_reply_to_id: None,
                 in_reply_to_remote_status_id: None,
-                quote_approval_policy: roosty_db::QuoteApprovalPolicy::Nobody,
+                quote_approval_policy: QuoteApprovalPolicy::Nobody,
             },
         )
         .await
@@ -671,16 +680,13 @@ mod tests {
         db: roosty_db::DbConnection,
         config: Config,
         account_id: AccountId,
-        application_id: uuid::Uuid,
+        application_id: Uuid,
         _temp_dir: TempDir,
     }
 
     impl AsyncTestContext for SearchContext {
         async fn setup() -> Self {
-            let temp_dir = tempfile::Builder::new()
-                .prefix("roosty-search-")
-                .tempdir()
-                .unwrap();
+            let temp_dir = Builder::new().prefix("roosty-search-").tempdir().unwrap();
             let database_name = unique_name();
             let data_dir = temp_dir.path().join("data").join(&database_name);
             let password_file = temp_dir
@@ -689,10 +695,10 @@ mod tests {
                 .join(format!("{database_name}.pgpass"));
 
             if let Some(parent) = password_file.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                create_dir_all(parent).unwrap();
             }
 
-            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let settings = settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
@@ -733,22 +739,22 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: crate::config::ObjectStorageBackend::Local,
+                object_storage_backend: ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
-                registration_mode: crate::config::RegistrationMode::Closed,
+                registration_mode: RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
-                federation_delivery_max_age: time::Duration::days(7),
-                remote_media_cache_ttl: time::Duration::days(30),
+                federation_delivery_max_age: Duration::days(7),
+                remote_media_cache_ttl: Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,
                 preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
-                trends_refresh_interval: time::Duration::minutes(5),
-                account_suggestions_refresh_interval: time::Duration::hours(24),
-                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-                streaming: crate::config::StreamingConfig::default(),
+                trends_refresh_interval: Duration::minutes(5),
+                account_suggestions_refresh_interval: Duration::hours(24),
+                scheduled_statuses: ScheduledStatusConfig::default(),
+                streaming: StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
@@ -771,18 +777,18 @@ mod tests {
 
     impl SearchContext {
         fn app(&self) -> Router {
-            crate::http::app_router(
+            app_router(
                 AppState::new(self.config.clone(), self.db.clone()),
                 DatabaseContext::new(self.db.clone()),
                 false,
             )
         }
 
-        async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
+        async fn request(&self, request: Request<Body>) -> Response<Body> {
             self.app().oneshot(request).await.unwrap()
         }
 
-        async fn get(&self, uri: &str) -> axum::http::Response<Body> {
+        async fn get(&self, uri: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -793,7 +799,7 @@ mod tests {
             .await
         }
 
-        async fn authenticated_get(&self, uri: &str, token: &str) -> axum::http::Response<Body> {
+        async fn authenticated_get(&self, uri: &str, token: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -833,7 +839,7 @@ mod tests {
             roosty_db::update_local_account_settings(
                 &self.db,
                 account_id,
-                roosty_db::LocalAccountSettingsUpdate {
+                LocalAccountSettingsUpdate {
                     display_name: Some(display_name.to_owned()),
                     ..Default::default()
                 },
@@ -843,9 +849,9 @@ mod tests {
             account_id
         }
 
-        async fn cache_remote_actor(&self, username: &str, domain: &str) -> roosty_db::RemoteActor {
-            let actor = roosty_db::RemoteActor {
-                id: AccountId(uuid::Uuid::now_v7()),
+        async fn cache_remote_actor(&self, username: &str, domain: &str) -> RemoteActor {
+            let actor = RemoteActor {
+                id: AccountId(Uuid::now_v7()),
                 activitypub_id: format!("https://{domain}/users/{username}"),
                 username: username.to_owned(),
                 domain: domain.to_owned(),
@@ -859,9 +865,9 @@ mod tests {
                 featured_tags_url: None,
                 public_key_id: format!("https://{domain}/users/{username}#main-key"),
                 public_key_pem: "test-public-key".to_owned(),
-                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                expires_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 profile_created_at: None,
-                first_seen_at: time::OffsetDateTime::now_utc(),
+                first_seen_at: OffsetDateTime::now_utc(),
                 deleted_at: None,
                 moved_to_remote_actor_id: None,
                 limited_at: None,
@@ -875,7 +881,7 @@ mod tests {
         }
     }
 
-    async fn json_body(response: axum::http::Response<Body>) -> Value {
+    async fn json_body(response: Response<Body>) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
     }
@@ -886,6 +892,6 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roosty_search_{}_{}", std::process::id(), timestamp)
+        format!("roosty_search_{}_{}", process_id(), timestamp)
     }
 }

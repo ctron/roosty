@@ -11,7 +11,10 @@ use roosty_db::{NewStreamingEvent, StatusVisibility, StreamingEventKind, Streami
 use serde::Serialize;
 use sqlx::postgres::PgListener;
 use strum::EnumString;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::{
+    sync::{broadcast, mpsc, watch},
+    time::{interval, sleep},
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -468,7 +471,7 @@ async fn listener_loop(
                 warn!(%error, "PostgreSQL streaming listener disconnected");
                 loop {
                     tokio::select! {
-                        () = tokio::time::sleep(reconnect_delay) => {}
+                        () = sleep(reconnect_delay) => {}
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 return;
@@ -522,7 +525,7 @@ async fn deliver_after(events: &StreamingEvents, sequence: &mut i64) -> RoostyRe
 
 async fn cleanup_loop(events: StreamingEvents, mut shutdown_rx: watch::Receiver<bool>) {
     let cleanup_interval = events.inner.event_retention.min(Duration::from_secs(60));
-    let mut interval = tokio::time::interval(cleanup_interval);
+    let mut interval = interval(cleanup_interval);
     loop {
         tokio::select! {
             _ = interval.tick() => {}

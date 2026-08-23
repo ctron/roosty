@@ -20,7 +20,7 @@ use std::{
     collections::HashSet,
     future::Future,
     pin::Pin,
-    str::{FromStr, Utf8Error},
+    str::{FromStr, Utf8Error, from_utf8},
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -28,10 +28,13 @@ use url::Url;
 use uuid::{Error, Uuid};
 
 use crate::{
-    accounts::RemoteAccountResponse,
+    accounts::{RemoteAccountResponse, remote_account_response, remote_account_response_on},
     auth::{AccountResponse, AuthenticatedAccount, account_response},
     http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
-    statuses::{CollectionLink, StatusResponse, remote_status_response},
+    statuses::{
+        CollectionLink, StatusResponse, format_timestamp, remote_status_response,
+        status_visible_to_viewer, status_with_author,
+    },
 };
 
 const DEFAULT_NOTIFICATION_LIMIT: u64 = 40;
@@ -539,9 +542,9 @@ async fn notification_request_response(
     };
     let last_status = if let Some(status_id) = request.last_status_id {
         if let Some(status) = roosty_db::find_local_status_by_id(state.db, status_id).await?
-            && crate::statuses::status_visible_to_viewer(state.db, &status, Some(viewer_id)).await?
+            && status_visible_to_viewer(state.db, &status, Some(viewer_id)).await?
         {
-            Some(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?)
+            Some(status_with_author(state, status, Some(viewer_id)).await?)
         } else {
             None
         }
@@ -558,8 +561,8 @@ async fn notification_request_response(
     };
     Ok(Some(NotificationRequestResponse {
         id: request.id.to_string(),
-        created_at: crate::statuses::format_timestamp(request.created_at),
-        updated_at: crate::statuses::format_timestamp(request.updated_at),
+        created_at: format_timestamp(request.created_at),
+        updated_at: format_timestamp(request.updated_at),
         notifications_count: request.notifications_count.to_string(),
         account,
         last_status,
@@ -980,10 +983,9 @@ async fn grouped_response(
                 statuses.push(remote_status_response(state, status).await?);
             }
         } else if let Some(status) = roosty_db::find_local_status_by_id(state.db, status_id).await?
-            && crate::statuses::status_visible_to_viewer(state.db, &status, Some(viewer_id)).await?
+            && status_visible_to_viewer(state.db, &status, Some(viewer_id)).await?
         {
-            statuses
-                .push(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?);
+            statuses.push(status_with_author(state, status, Some(viewer_id)).await?);
         }
     }
     let notification_groups = groups
@@ -996,7 +998,7 @@ async fn grouped_response(
             page_min_id: paginated.then(|| group.page_min_id.to_string()),
             page_max_id: paginated.then(|| group.page_max_id.to_string()),
             latest_page_notification_at: paginated
-                .then(|| crate::statuses::format_timestamp(group.latest_page_notification_at)),
+                .then(|| format_timestamp(group.latest_page_notification_at)),
             sample_account_ids: group
                 .sample_account_ids
                 .into_iter()
@@ -1035,7 +1037,7 @@ async fn notification_accounts(
                     .is_suspended();
             if !suspended {
                 accounts.push(NotificationAccountResponse::Remote(Box::new(
-                    crate::accounts::remote_account_response_on(state, state.db, actor).await?,
+                    remote_account_response_on(state, state.db, actor).await?,
                 )));
             }
         }
@@ -1089,7 +1091,7 @@ async fn notification_response(
                 return Ok(None);
             };
             NotificationAccountResponse::Remote(Box::new(
-                crate::accounts::remote_account_response(state, actor).await?,
+                remote_account_response(state, actor).await?,
             ))
         }
         _ => return Ok(None),
@@ -1100,12 +1102,10 @@ async fn notification_response(
             else {
                 return Ok(None);
             };
-            if !crate::statuses::status_visible_to_viewer(state.db, &status, Some(viewer_id))
-                .await?
-            {
+            if !status_visible_to_viewer(state.db, &status, Some(viewer_id)).await? {
                 return Ok(None);
             }
-            Some(crate::statuses::status_with_author(state, status, Some(viewer_id)).await?)
+            Some(status_with_author(state, status, Some(viewer_id)).await?)
         }
         (None, Some(status_id)) => {
             let Some(status) = roosty_db::find_remote_status_by_id(state.db, status_id).await?
@@ -1131,7 +1131,7 @@ async fn notification_response(
         id: notification.id.to_string(),
         notification_type: notification.notification_type,
         group_key: notification.group_key(),
-        created_at: crate::statuses::format_timestamp(notification.created_at),
+        created_at: format_timestamp(notification.created_at),
         account: actor,
         status,
         report,
@@ -1280,7 +1280,7 @@ fn request_collection_cursor(
 fn notification_request_batch(
     body: &[u8],
 ) -> Result<NotificationRequestBatch, NotificationInputError> {
-    let body = std::str::from_utf8(body)?;
+    let body = from_utf8(body)?;
     Ok(serde_qs::Config::new()
         .array_format(serde_qs::ArrayFormat::EmptyIndexed)
         .use_form_encoding(true)

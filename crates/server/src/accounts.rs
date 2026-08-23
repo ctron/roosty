@@ -21,6 +21,7 @@ use serde_json::{Error as JsonError, Value, json};
 use serde_qs::{ArrayFormat, Config as QueryStringConfig, Error as QueryStringError};
 use serde_urlencoded::de::Error as FormError;
 use thiserror::Error;
+use time::OffsetDateTime;
 use tracing::warn;
 use uuid::{Error, Uuid};
 
@@ -30,8 +31,14 @@ use crate::{
         OAuthScopeResource, OptionalAuthenticatedAccount, account_response, account_response_on,
         account_response_with_stats, format_account_date,
     },
+    federation::{self, discovery},
     http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
-    statuses::{CollectionLink, StatusRenderContext},
+    media::remote_profile_media_url,
+    notifications::create_and_stream_notification,
+    statuses::{
+        CollectionLink, StatusRenderContext, format_timestamp, remote_timeline_response,
+        timeline_limit, timeline_response,
+    },
 };
 
 const DEFAULT_ACCOUNT_LIMIT: u64 = 40;
@@ -343,7 +350,7 @@ async fn directory(
                     remote_media
                         .iter()
                         .find(|media| media.remote_actor_id == actor.id && media.kind == kind)
-                        .map(|media| crate::media::remote_profile_media_url(&state, media.id))
+                        .map(|media| remote_profile_media_url(&state, media.id))
                         .unwrap_or_default()
                 };
                 let avatar = media_url(RemoteProfileMediaKind::Avatar);
@@ -537,7 +544,7 @@ async fn suggestion_account_responses(
                     remote_media
                         .iter()
                         .find(|media| media.remote_actor_id == actor.id && media.kind == kind)
-                        .map(|media| crate::media::remote_profile_media_url(state, media.id))
+                        .map(|media| remote_profile_media_url(state, media.id))
                         .unwrap_or_default()
                 };
                 let avatar = media_url(RemoteProfileMediaKind::Avatar);
@@ -608,14 +615,14 @@ async fn lookup_account(
     if let Some((username, domain)) = params
         .acct
         .as_deref()
-        .and_then(crate::federation::discovery::exact_remote_handle)
+        .and_then(discovery::exact_remote_handle)
     {
         cached_actor = roosty_db::find_remote_actor_by_handle(&txn, &username, &domain).await?;
     }
     if let Some(actor) = cached_actor {
         let unavailable = remote_actor_is_suspended_on(&txn, &actor).await?;
         let stale =
-            params.resolve.unwrap_or(false) && actor.expires_at <= time::OffsetDateTime::now_utc();
+            params.resolve.unwrap_or(false) && actor.expires_at <= OffsetDateTime::now_utc();
         if !unavailable && !stale {
             let response = remote_account_response(&context, actor).await?;
             return Ok(Json(response).into_response());
@@ -630,7 +637,7 @@ async fn lookup_account(
         .as_deref()
         .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
     txn.commit().await?;
-    let actor = crate::federation::discovery::resolve_remote_actor(&state, &database, acct).await?;
+    let actor = discovery::resolve_remote_actor(&state, &database, acct).await?;
     if actor.deleted_at.is_some() {
         return Err(ApiError::NotFound("Record not found".into()));
     }
@@ -668,7 +675,7 @@ pub(crate) async fn remote_account_response_on(
         profile_media
             .iter()
             .find(|media| media.kind == kind)
-            .map(|media| crate::media::remote_profile_media_url(state, media.id))
+            .map(|media| remote_profile_media_url(state, media.id))
             .unwrap_or_default()
     };
     let avatar = media_url(RemoteProfileMediaKind::Avatar);
@@ -713,7 +720,7 @@ pub(crate) fn unresolved_remote_account_response(
         limited: false,
         suspended: None,
         group: false,
-        created_at: crate::statuses::format_timestamp(time::OffsetDateTime::now_utc()),
+        created_at: format_timestamp(OffsetDateTime::now_utc()),
         note: String::new(),
         url: activitypub_id.to_owned(),
         avatar: String::new(),
@@ -751,9 +758,7 @@ fn remote_account_response_from_media(
         limited: actor.limited_at.is_some(),
         suspended: suspended.then_some(true),
         group: false,
-        created_at: crate::statuses::format_timestamp(
-            actor.profile_created_at.unwrap_or(actor.first_seen_at),
-        ),
+        created_at: format_timestamp(actor.profile_created_at.unwrap_or(actor.first_seen_at)),
         note: if suspended {
             String::new()
         } else {
@@ -873,7 +878,7 @@ async fn account_statuses(
     let context = StatusRenderContext::new(&state, &txn);
     let account_id = AccountId(path.account_id);
     let cursor = timeline_cursor(&params)?;
-    let limit = crate::statuses::timeline_limit(params.limit);
+    let limit = timeline_limit(params.limit);
     let local_account = roosty_db::find_local_account_by_id(&txn, account_id).await?;
     if local_account
         .as_ref()
@@ -911,7 +916,7 @@ async fn account_statuses(
         } else {
             ""
         };
-        return Ok(crate::statuses::remote_timeline_response(
+        return Ok(remote_timeline_response(
             &context,
             page,
             limit,
@@ -942,7 +947,7 @@ async fn account_statuses(
     } else {
         ""
     };
-    Ok(crate::statuses::timeline_response(
+    Ok(timeline_response(
         &context,
         page,
         limit,
@@ -975,7 +980,7 @@ async fn follow(
             return Err(AccountRelationshipError::FollowBlocked.into());
         }
         let (activity_id, job) =
-            crate::federation::prepare_remote_follow(&state, &txn, account.id, target_id).await?;
+            federation::prepare_remote_follow(&state, &txn, account.id, target_id).await?;
         roosty_db::create_remote_following_with_job(
             &txn,
             account.id,
@@ -999,7 +1004,7 @@ async fn follow(
     )
     .await?;
     txn.commit().await?;
-    crate::notifications::create_and_stream_notification(
+    create_and_stream_notification(
         &state,
         &database,
         target_id,
@@ -1027,7 +1032,7 @@ async fn block(
             return Err(ApiError::NotFound("Record not found".into()));
         }
         let (activity_id, job) =
-            crate::federation::prepare_remote_block(&state, &txn, account.id, target_id).await?;
+            federation::prepare_remote_block(&state, &txn, account.id, target_id).await?;
         roosty_db::block_remote_account(&txn, account.id, target_id, &activity_id, job).await?;
         txn.commit().await?;
         return relationship_response(&state, &database, account.id, target_id).await;
@@ -1049,7 +1054,7 @@ async fn unblock(
     if let Some(block) =
         roosty_db::find_local_remote_account_block(&txn, account.id, target_id).await?
     {
-        let job = crate::federation::prepare_remote_unblock(&state, &txn, &block).await?;
+        let job = federation::prepare_remote_unblock(&state, &txn, &block).await?;
         roosty_db::unblock_remote_account(&txn, account.id, target_id, job).await?;
         txn.commit().await?;
         return relationship_response(&state, &database, account.id, target_id).await;
@@ -1130,7 +1135,7 @@ async fn unfollow(
     let txn = database.begin_write().await?;
     let remote_following = roosty_db::find_remote_following(&txn, account.id, target_id).await?;
     if let Some(following) = remote_following {
-        let job = crate::federation::prepare_remote_unfollow(&state, &txn, following).await?;
+        let job = federation::prepare_remote_unfollow(&state, &txn, following).await?;
         roosty_db::delete_remote_following_with_job(&txn, account.id, target_id, job).await?;
     } else {
         roosty_db::unfollow_local_account(&txn, account.id, target_id).await?;
@@ -1199,12 +1204,9 @@ async fn authorize_follow_request(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
 ) -> ApiResult<Response> {
-    let accepted = crate::federation::accept_remote_follow_request(
-        &database,
-        account.id,
-        AccountId(path.account_id),
-    )
-    .await?;
+    let accepted =
+        federation::accept_remote_follow_request(&database, account.id, AccountId(path.account_id))
+            .await?;
     if !accepted {
         return Err(ApiError::NotFound("Record not found".into()));
     }
@@ -1220,7 +1222,7 @@ async fn reject_follow_request(
 ) -> ApiResult<Response> {
     let remote_id = AccountId(path.account_id);
     let rejected =
-        crate::federation::reject_remote_follow_request(&database, account.id, remote_id).await?;
+        federation::reject_remote_follow_request(&database, account.id, remote_id).await?;
     if !rejected {
         return Err(ApiError::NotFound("Record not found".into()));
     }
@@ -1522,7 +1524,7 @@ async fn relationship_model_on(
         muting_expires_at: mute
             .and_then(|mute| mute.expires_at)
             .or_else(|| remote_mute.and_then(|mute| mute.expires_at))
-            .map(crate::statuses::format_timestamp),
+            .map(format_timestamp),
         requested: remote_following
             .as_ref()
             .is_some_and(|follow| follow.state == RemoteFollowState::Pending),
@@ -1639,14 +1641,16 @@ fn non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        process,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
         Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        http::{Request, Response, StatusCode, header},
     };
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
@@ -1659,11 +1663,14 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
-    use super::{remote_account_response_from_media, remote_custom_emojis};
+    use super::{format_timestamp, remote_account_response_from_media, remote_custom_emojis};
     use crate::{
-        config::Config,
-        http::{AppState, DatabaseContext},
+        config::{
+            Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,
+        },
+        http::{AppState, DatabaseContext, app_router},
         password,
+        test_postgres::settings,
     };
 
     #[test]
@@ -1704,10 +1711,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(
-            response["created_at"],
-            crate::statuses::format_timestamp(profile_created_at)
-        );
+        assert_eq!(response["created_at"], format_timestamp(profile_created_at));
     }
 
     #[test]
@@ -1761,10 +1765,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(
-            response["created_at"],
-            crate::statuses::format_timestamp(first_seen_at)
-        );
+        assert_eq!(response["created_at"], format_timestamp(first_seen_at));
     }
 
     #[test_context(AccountContext)]
@@ -2929,7 +2930,7 @@ mod tests {
     }
 
     /// Extract a cursor query parameter from a Mastodon Link header.
-    fn link_cursor(response: &axum::http::Response<Body>, rel: &str, param: &str) -> String {
+    fn link_cursor(response: &Response<Body>, rel: &str, param: &str) -> String {
         let link = response
             .headers()
             .get(header::LINK)
@@ -2971,10 +2972,10 @@ mod tests {
                 .join(format!("{database_name}.pgpass"));
 
             if let Some(parent) = password_file.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                fs::create_dir_all(parent).unwrap();
             }
 
-            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let settings = settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
@@ -3004,9 +3005,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: crate::config::ObjectStorageBackend::Local,
+                object_storage_backend: ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
-                registration_mode: crate::config::RegistrationMode::Closed,
+                registration_mode: RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
@@ -3018,8 +3019,8 @@ mod tests {
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
                 account_suggestions_refresh_interval: time::Duration::hours(24),
-                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-                streaming: crate::config::StreamingConfig::default(),
+                scheduled_statuses: ScheduledStatusConfig::default(),
+                streaming: StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
@@ -3050,7 +3051,7 @@ mod tests {
     impl AccountContext {
         /// Build an app router backed by this test database.
         fn app(&self) -> Router {
-            crate::http::app_router(
+            app_router(
                 self.state.clone(),
                 DatabaseContext::new(self.db.clone()),
                 false,
@@ -3058,12 +3059,12 @@ mod tests {
         }
 
         /// Send a raw request through the test router.
-        async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
+        async fn request(&self, request: Request<Body>) -> Response<Body> {
             self.app().oneshot(request).await.unwrap()
         }
 
         /// Send an anonymous GET request.
-        async fn get(&self, uri: &str) -> axum::http::Response<Body> {
+        async fn get(&self, uri: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -3075,7 +3076,7 @@ mod tests {
         }
 
         /// Send an authenticated GET request.
-        async fn authenticated_get(&self, uri: &str, token: &str) -> axum::http::Response<Body> {
+        async fn authenticated_get(&self, uri: &str, token: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -3093,7 +3094,7 @@ mod tests {
             method: &str,
             uri: &str,
             token: &str,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method(method)
@@ -3112,7 +3113,7 @@ mod tests {
             uri: &str,
             token: &str,
             body: serde_json::Value,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method(method)
@@ -3253,7 +3254,7 @@ mod tests {
     }
 
     /// Decode a JSON response body.
-    async fn json_body(response: axum::http::Response<Body>) -> Value {
+    async fn json_body(response: Response<Body>) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
     }
@@ -3265,6 +3266,6 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roosty_accounts_{}_{}", std::process::id(), timestamp)
+        format!("roosty_accounts_{}_{}", process::id(), timestamp)
     }
 }

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
 };
 
@@ -29,7 +30,7 @@ use roosty_db::{
 use sea_orm::{ConnectionTrait, DatabaseTransaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{Error as JsonError, Value};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::warn;
 use url::Url;
 use uuid::Uuid;
@@ -43,10 +44,10 @@ use crate::{
     conversations::{publish_conversation_update, publish_conversation_updates},
     explore::PreviewCardResponse,
     federation::{
-        StatusActivityKind, enqueue_quote_request_in_transaction,
-        enqueue_quote_revocation_in_transaction, enqueue_status_activity_in_transaction,
-        prepare_remote_favourite, prepare_remote_reblog, prepare_remote_unfavourite,
-        prepare_remote_unreblog, resolve_remote_mentions,
+        StatusActivityKind, enqueue_pin_activity_in_transaction,
+        enqueue_quote_request_in_transaction, enqueue_quote_revocation_in_transaction,
+        enqueue_status_activity_in_transaction, prepare_remote_favourite, prepare_remote_reblog,
+        prepare_remote_unfavourite, prepare_remote_unreblog, resolve_remote_mentions,
     },
     http::{ApiError, ApiResult, AppState, DatabaseContext},
     media::{
@@ -1528,8 +1529,7 @@ fn parse_scheduled_at(value: Option<&str>) -> Result<OffsetDateTime, &'static st
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or("scheduled_at is required")?;
-    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-        .map_err(|_| "scheduled_at must be an RFC 3339 timestamp")
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| "scheduled_at must be an RFC 3339 timestamp")
 }
 
 pub(crate) async fn parse_request_body<T: for<'de> Deserialize<'de>>(
@@ -1731,7 +1731,7 @@ async fn mutate_status_pin(
         let status = roosty_db::find_local_status_by_id(txn, status_id)
             .await?
             .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
-        crate::federation::enqueue_pin_activity_in_transaction(state, txn, &status, pin).await?;
+        enqueue_pin_activity_in_transaction(state, txn, &status, pin).await?;
     }
     let status = roosty_db::find_local_status_by_id(txn, status_id)
         .await?
@@ -5924,7 +5924,7 @@ pub(crate) fn status_content_html_with_mentions_and_tags(
         )
         .chain(url_matches(content).into_iter().map(TextLinkMatch::Url))
         .collect::<Vec<_>>();
-    matches.sort_by_key(|link| (link.start(), std::cmp::Reverse(link.end())));
+    matches.sort_by_key(|link| (link.start(), Reverse(link.end())));
     let mut html = String::new();
     let mut last = 0;
 
@@ -6384,30 +6384,34 @@ fn error_response(status: StatusCode, error: &str, description: &str) -> Respons
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::create_dir_all,
         io::Cursor,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        process::id as process_id,
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
         Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        http::{Request, Response, StatusCode, header},
     };
     use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
     use roosty_core::{AccountId, StatusId};
     use roosty_db::{
-        CollectionCursor, NewRemoteMediaAttachment, NewRemoteStatus, RemoteActor, RemoteStatus,
-        RemoteStatusReblogTarget, RemoteStatusUpsertResult, StatusContextParent, StatusVisibility,
+        CollectionCursor, LocalNotificationType, NewRemoteMediaAttachment, NewRemoteStatus,
+        NotificationFilter, RemoteActor, RemoteStatus, RemoteStatusReblogTarget,
+        RemoteStatusUpsertResult, StatusContextParent, StatusVisibility,
     };
     use roosty_migration::Migrator;
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
-    use tempfile::TempDir;
+    use tempfile::{Builder, TempDir};
     use test_context::{AsyncTestContext, test_context};
-    use time::{Duration as TimeDuration, OffsetDateTime};
+    use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -6418,9 +6422,13 @@ mod tests {
         sanitize_remote_status_html, status_content_html, timeline_limit, url_matches,
     };
     use crate::{
-        config::Config,
-        http::{AppState, DatabaseContext},
+        config::{
+            Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,
+        },
+        http::{AppState, DatabaseContext, app_router},
         password,
+        polls::expire_poll_job,
+        test_postgres::settings,
     };
 
     #[test]
@@ -6647,10 +6655,10 @@ mod tests {
             .unwrap();
         let payload = json!({"poll_id": poll_id});
         let database = DatabaseContext::new(context.db.clone());
-        crate::polls::expire_poll_job(&context.state, &database, payload.clone())
+        expire_poll_job(&context.state, &database, payload.clone())
             .await
             .unwrap();
-        crate::polls::expire_poll_job(&context.state, &database, payload)
+        expire_poll_job(&context.state, &database, payload)
             .await
             .unwrap();
 
@@ -6660,14 +6668,14 @@ mod tests {
                 account_id,
                 30,
                 CollectionCursor::default(),
-                roosty_db::NotificationFilter::default(),
+                NotificationFilter::default(),
             )
             .await
             .unwrap();
             assert_eq!(notifications.items.len(), 1);
             assert_eq!(
                 notifications.items[0].notification_type,
-                roosty_db::LocalNotificationType::Poll
+                LocalNotificationType::Poll
             );
         }
     }
@@ -6678,7 +6686,7 @@ mod tests {
     async fn scheduled_status_lifecycle_is_mastodon_compatible(context: &mut StatusContext) {
         let token = context.access_token().await;
         let first_time = (OffsetDateTime::now_utc() + TimeDuration::minutes(10))
-            .format(&time::format_description::well_known::Rfc3339)
+            .format(&Rfc3339)
             .unwrap();
         let request = |scheduled_at: &str| {
             Request::builder()
@@ -6708,7 +6716,7 @@ mod tests {
         assert_eq!(json_body(list).await.as_array().unwrap().len(), 1);
 
         let second_time = (OffsetDateTime::now_utc() + TimeDuration::minutes(20))
-            .format(&time::format_description::well_known::Rfc3339)
+            .format(&Rfc3339)
             .unwrap();
         let update = context
             .authenticated_json(
@@ -6738,8 +6746,7 @@ mod tests {
     #[tokio::test]
     /// Cached public Notes join the federated timeline while origin filters and reply exclusion remain compatible.
     async fn public_timeline_merges_cached_remote_statuses(context: &mut StatusContext) {
-        std::sync::Arc::make_mut(&mut context.state.config).federation_allowed_domains =
-            vec!["*".to_owned()];
+        Arc::make_mut(&mut context.state.config).federation_allowed_domains = vec!["*".to_owned()];
         let token = context.access_token().await;
         let local = context
             .create_status(&token, "local public", Some("public"), None)
@@ -7305,8 +7312,7 @@ mod tests {
     async fn cached_remote_hashtags_integrate_with_timelines_search_and_follows(
         context: &mut StatusContext,
     ) {
-        std::sync::Arc::make_mut(&mut context.state.config).federation_allowed_domains =
-            vec!["*".to_owned()];
+        Arc::make_mut(&mut context.state.config).federation_allowed_domains = vec!["*".to_owned()];
         let bob_token = context
             .access_token_for("remote_tag_follower", "remote-tag@example.com")
             .await;
@@ -10884,7 +10890,7 @@ mod tests {
     }
 
     /// Extract a cursor query parameter from a Mastodon Link header.
-    fn link_cursor(response: &axum::http::Response<Body>, rel: &str, param: &str) -> String {
+    fn link_cursor(response: &Response<Body>, rel: &str, param: &str) -> String {
         let link = response
             .headers()
             .get(header::LINK)
@@ -10983,10 +10989,7 @@ mod tests {
 
     impl AsyncTestContext for StatusContext {
         async fn setup() -> Self {
-            let temp_dir = tempfile::Builder::new()
-                .prefix("roosty-status-")
-                .tempdir()
-                .unwrap();
+            let temp_dir = Builder::new().prefix("roosty-status-").tempdir().unwrap();
             let database_name = unique_name();
             let data_dir = temp_dir.path().join("data").join(&database_name);
             let password_file = temp_dir
@@ -10995,10 +10998,10 @@ mod tests {
                 .join(format!("{database_name}.pgpass"));
 
             if let Some(parent) = password_file.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                create_dir_all(parent).unwrap();
             }
 
-            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let settings = settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
@@ -11039,9 +11042,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: crate::config::ObjectStorageBackend::Local,
+                object_storage_backend: ObjectStorageBackend::Local,
                 media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
-                registration_mode: crate::config::RegistrationMode::Closed,
+                registration_mode: RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
@@ -11053,8 +11056,8 @@ mod tests {
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
                 account_suggestions_refresh_interval: time::Duration::hours(24),
-                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-                streaming: crate::config::StreamingConfig::default(),
+                scheduled_statuses: ScheduledStatusConfig::default(),
+                streaming: StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
@@ -11085,18 +11088,18 @@ mod tests {
 
     impl StatusContext {
         fn app(&self) -> Router {
-            crate::http::app_router(
+            app_router(
                 self.state.clone(),
                 DatabaseContext::new(self.db.clone()),
                 false,
             )
         }
 
-        async fn request(&self, request: Request<Body>) -> axum::http::Response<Body> {
+        async fn request(&self, request: Request<Body>) -> Response<Body> {
             self.app().oneshot(request).await.unwrap()
         }
 
-        async fn get(&self, uri: &str) -> axum::http::Response<Body> {
+        async fn get(&self, uri: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -11107,7 +11110,7 @@ mod tests {
             .await
         }
 
-        async fn authenticated_get(&self, uri: &str, token: &str) -> axum::http::Response<Body> {
+        async fn authenticated_get(&self, uri: &str, token: &str) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method("GET")
@@ -11119,7 +11122,7 @@ mod tests {
             .await
         }
 
-        async fn json(&self, method: &str, uri: &str, body: Value) -> axum::http::Response<Body> {
+        async fn json(&self, method: &str, uri: &str, body: Value) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method(method)
@@ -11137,7 +11140,7 @@ mod tests {
             uri: &str,
             token: &str,
             body: Value,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method(method)
@@ -11155,7 +11158,7 @@ mod tests {
             uri: &str,
             token: &str,
             parts: &[MultipartPart<'_>],
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.authenticated_multipart_method("POST", uri, token, parts)
                 .await
         }
@@ -11166,7 +11169,7 @@ mod tests {
             uri: &str,
             token: &str,
             parts: &[MultipartPart<'_>],
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             let boundary = "roosty-test-boundary";
             let mut body = Vec::new();
             for part in parts {
@@ -11219,7 +11222,7 @@ mod tests {
             method: &str,
             uri: &str,
             token: &str,
-        ) -> axum::http::Response<Body> {
+        ) -> Response<Body> {
             self.request(
                 Request::builder()
                     .method(method)
@@ -11371,7 +11374,7 @@ mod tests {
         }
     }
 
-    async fn json_body(response: axum::http::Response<Body>) -> Value {
+    async fn json_body(response: Response<Body>) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
     }
@@ -11382,6 +11385,6 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        format!("roosty_status_{}_{}", std::process::id(), timestamp)
+        format!("roosty_status_{}_{}", process_id(), timestamp)
     }
 }

@@ -1,3 +1,4 @@
+use std::result::Result as StdResult;
 use std::{
     borrow::Cow, collections::HashMap, fmt, future::Future, pin::Pin, str::FromStr, sync::Arc,
 };
@@ -17,10 +18,11 @@ use ring::{
 };
 use roosty_core::{Result, RoostyError};
 use roosty_db::{
-    LocalNotificationType, PushAlerts, PushPolicy, PushSubscription, PushSubscriptionEncoding,
+    DbConnection, LocalNotificationType, PushAlerts, PushPolicy, PushSubscription,
+    PushSubscriptionEncoding,
 };
 use roosty_web_push::{
-    Client, DeliveryOutcome, Encoding, SendOptions, Subscription, VapidIdentity,
+    Client, DeliveryOutcome, Encoding, SendOptions, Subscription, VapidIdentity, WebPushError,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -28,7 +30,9 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{auth::AuthenticatedAccessToken, http::AppState};
+use crate::{
+    auth::AuthenticatedAccessToken, config::Config, http::AppState, notifications::push_payload,
+};
 
 const ALERT_PREFIX: &str = "data[alerts][";
 const TOKEN_ENCRYPTION_CONTEXT: &[u8] = b"roosty/web-push/access-token/v1";
@@ -36,14 +40,14 @@ const TOKEN_ENCRYPTION_CONTEXT: &[u8] = b"roosty/web-push/access-token/v1";
 /// Application Web Push component with no dependency on aggregate HTTP state.
 #[derive(Clone)]
 pub struct PushService {
-    db: roosty_db::DbConnection,
+    db: DbConnection,
     client: Option<Arc<dyn PushSender>>,
     token_key: [u8; 32],
     public_base_url: Url,
 }
 
 impl PushService {
-    pub fn new(config: &crate::config::Config, db: roosty_db::DbConnection) -> Self {
+    pub fn new(config: &Config, db: DbConnection) -> Self {
         let derivation_key =
             ring_hmac::Key::new(ring_hmac::HMAC_SHA256, config.session_secret.as_bytes());
         let derived = ring_hmac::sign(&derivation_key, TOKEN_ENCRYPTION_CONTEXT);
@@ -65,8 +69,8 @@ impl PushService {
 
     #[cfg(test)]
     pub(crate) fn with_sender(
-        config: &crate::config::Config,
-        db: roosty_db::DbConnection,
+        config: &Config,
+        db: DbConnection,
         sender: Arc<dyn PushSender>,
     ) -> Self {
         let mut service = Self::new(config, db);
@@ -129,7 +133,7 @@ impl PushService {
     }
 
     /// Execute one durable push delivery job.
-    pub async fn deliver(&self, payload: Value) -> std::result::Result<(), PushDeliveryError> {
+    pub async fn deliver(&self, payload: Value) -> StdResult<(), PushDeliveryError> {
         let job: DeliveryJob = serde_json::from_value(payload)
             .map_err(|error| RoostyError::InvalidInput(format!("invalid Web Push job: {error}")))?;
         let Some((notification, subscription)) =
@@ -152,13 +156,8 @@ impl PushService {
                 return Ok(());
             }
         };
-        let payload = crate::notifications::push_payload(
-            &self.db,
-            &self.public_base_url,
-            notification,
-            access_token,
-        )
-        .await?;
+        let payload =
+            push_payload(&self.db, &self.public_base_url, notification, access_token).await?;
         let endpoint = Url::from_str(&subscription.endpoint)
             .map_err(|_| RoostyError::InvalidInput("stored push endpoint is invalid".to_owned()))?;
         let encoding = match subscription.encoding {
@@ -187,7 +186,7 @@ impl PushService {
             Ok(DeliveryOutcome::Retryable { status, .. }) => {
                 Err(PushDeliveryError::Retryable { status })
             }
-            Err(roosty_web_push::WebPushError::UnsafeEndpoint) => {
+            Err(WebPushError::UnsafeEndpoint) => {
                 roosty_db::delete_push_subscription_by_id(&self.db, subscription.id).await?;
                 Ok(())
             }
@@ -213,13 +212,7 @@ pub(crate) trait PushSender: Send + Sync {
         subscription: &'a Subscription,
         payload: &'a [u8],
         options: SendOptions,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = std::result::Result<DeliveryOutcome, roosty_web_push::WebPushError>>
-                + Send
-                + 'a,
-        >,
-    >;
+    ) -> Pin<Box<dyn Future<Output = StdResult<DeliveryOutcome, WebPushError>> + Send + 'a>>;
 
     fn public_key(&self) -> String;
 }
@@ -230,13 +223,7 @@ impl PushSender for Client {
         subscription: &'a Subscription,
         payload: &'a [u8],
         options: SendOptions,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = std::result::Result<DeliveryOutcome, roosty_web_push::WebPushError>>
-                + Send
-                + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = StdResult<DeliveryOutcome, WebPushError>> + Send + 'a>> {
         Box::pin(Client::send(self, subscription, payload, options))
     }
 
@@ -251,7 +238,7 @@ pub enum PushDeliveryError {
     #[error(transparent)]
     Storage(#[from] RoostyError),
     #[error(transparent)]
-    Protocol(#[from] roosty_web_push::WebPushError),
+    Protocol(#[from] WebPushError),
     #[error("retryable Web Push delivery failure with status {status:?}")]
     Retryable { status: Option<u16> },
 }
@@ -296,7 +283,7 @@ enum PushApiError {
     #[error(transparent)]
     Database(#[from] RoostyError),
     #[error(transparent)]
-    Protocol(#[from] roosty_web_push::WebPushError),
+    Protocol(#[from] WebPushError),
 }
 
 impl IntoResponse for PushApiError {
@@ -447,7 +434,7 @@ struct CreateSubscriptionInput {
 async fn get_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
-) -> std::result::Result<Json<SubscriptionResponse>, PushApiError> {
+) -> StdResult<Json<SubscriptionResponse>, PushApiError> {
     require_push_scope(&token)?;
     let client = state.push.client().ok_or(PushApiError::NotFound)?;
     let subscription =
@@ -461,7 +448,7 @@ async fn create_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
     request: PushRequest<CreateSubscriptionJson>,
-) -> std::result::Result<Json<SubscriptionResponse>, PushApiError> {
+) -> StdResult<Json<SubscriptionResponse>, PushApiError> {
     require_push_scope(&token)?;
     let client = state.push.client().ok_or(PushApiError::NotFound)?;
     let input = create_subscription_input(request)?;
@@ -502,7 +489,7 @@ async fn update_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
     request: PushRequest<UpdateSubscriptionJson>,
-) -> std::result::Result<Json<SubscriptionResponse>, PushApiError> {
+) -> StdResult<Json<SubscriptionResponse>, PushApiError> {
     require_push_scope(&token)?;
     let client = state.push.client().ok_or(PushApiError::NotFound)?;
     let existing = roosty_db::push_subscription_for_access_token(&state.push.db, token.grant.id)
@@ -529,13 +516,13 @@ async fn update_subscription(
 async fn delete_subscription(
     State(state): State<AppState>,
     token: AuthenticatedAccessToken,
-) -> std::result::Result<Json<Value>, PushApiError> {
+) -> StdResult<Json<Value>, PushApiError> {
     require_push_scope(&token)?;
     roosty_db::delete_push_subscription(&state.push.db, token.grant.id).await?;
     Ok(Json(json!({})))
 }
 
-fn require_push_scope(token: &AuthenticatedAccessToken) -> std::result::Result<(), PushApiError> {
+fn require_push_scope(token: &AuthenticatedAccessToken) -> StdResult<(), PushApiError> {
     token
         .grant
         .scopes
@@ -561,7 +548,7 @@ fn subscription_response(
 
 fn create_subscription_input(
     request: PushRequest<CreateSubscriptionJson>,
-) -> std::result::Result<CreateSubscriptionInput, PushApiError> {
+) -> StdResult<CreateSubscriptionInput, PushApiError> {
     match request {
         PushRequest::Json(request) => {
             let endpoint = parse_endpoint(&request.subscription.endpoint)?;
@@ -604,7 +591,7 @@ fn create_subscription_input(
     }
 }
 
-fn parse_endpoint(value: &str) -> std::result::Result<Url, PushApiError> {
+fn parse_endpoint(value: &str) -> StdResult<Url, PushApiError> {
     Url::parse(value)
         .map_err(|_| PushApiError::InvalidInput("subscription endpoint is invalid".into()))
 }
@@ -612,7 +599,7 @@ fn parse_endpoint(value: &str) -> std::result::Result<Url, PushApiError> {
 fn required_field<'a>(
     fields: &'a HashMap<String, String>,
     name: &'static str,
-) -> std::result::Result<&'a str, PushApiError> {
+) -> StdResult<&'a str, PushApiError> {
     fields
         .get(name)
         .map(String::as_str)
@@ -626,12 +613,12 @@ fn decode_key(
     fields: &HashMap<String, String>,
     name: &'static str,
     length: usize,
-) -> std::result::Result<Vec<u8>, PushApiError> {
+) -> StdResult<Vec<u8>, PushApiError> {
     let value = required_field(fields, name)?;
     decode_key_value(value, length)
 }
 
-fn decode_key_value(value: &str, length: usize) -> std::result::Result<Vec<u8>, PushApiError> {
+fn decode_key_value(value: &str, length: usize) -> StdResult<Vec<u8>, PushApiError> {
     let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
         PushApiError::InvalidInput("subscription key is not valid base64url".into())
     })?;
@@ -643,7 +630,7 @@ fn decode_key_value(value: &str, length: usize) -> std::result::Result<Vec<u8>, 
     Ok(decoded)
 }
 
-fn policy(fields: &HashMap<String, String>) -> std::result::Result<PushPolicy, PushApiError> {
+fn policy(fields: &HashMap<String, String>) -> StdResult<PushPolicy, PushApiError> {
     let value = fields
         .get("data[policy]")
         .map(String::as_str)
@@ -654,7 +641,7 @@ fn policy(fields: &HashMap<String, String>) -> std::result::Result<PushPolicy, P
 
 fn optional_policy(
     fields: &HashMap<String, String>,
-) -> std::result::Result<Option<PushPolicy>, PushApiError> {
+) -> StdResult<Option<PushPolicy>, PushApiError> {
     fields
         .get("data[policy]")
         .map(|value| {
@@ -667,7 +654,7 @@ fn optional_policy(
 fn boolean_field(
     fields: &HashMap<String, String>,
     name: &str,
-) -> std::result::Result<Option<bool>, PushApiError> {
+) -> StdResult<Option<bool>, PushApiError> {
     fields
         .get(name)
         .map(|value| match value.as_str() {
@@ -680,14 +667,14 @@ fn boolean_field(
         .transpose()
 }
 
-fn alerts(fields: &HashMap<String, String>) -> std::result::Result<PushAlerts, PushApiError> {
+fn alerts(fields: &HashMap<String, String>) -> StdResult<PushAlerts, PushApiError> {
     alerts_with_defaults(fields, PushAlerts::default())
 }
 
 fn alerts_with_defaults(
     fields: &HashMap<String, String>,
     mut alerts: PushAlerts,
-) -> std::result::Result<PushAlerts, PushApiError> {
+) -> StdResult<PushAlerts, PushApiError> {
     for (key, value) in fields {
         let Some(name) = key
             .strip_prefix(ALERT_PREFIX)
@@ -730,7 +717,7 @@ mod tests {
         PushApiError, PushDeliveryError, PushService, alerts, alerts_with_defaults, decode_key,
         optional_policy, policy,
     };
-    use axum::response::IntoResponse;
+    use axum::{http::StatusCode, response::IntoResponse};
     use roosty_core::RoostyError;
     use roosty_db::{PushAlerts, PushPolicy, PushSubscription, PushSubscriptionEncoding};
     use sea_orm::DatabaseConnection;
@@ -780,17 +767,17 @@ mod tests {
     fn typed_api_errors_select_the_http_status() {
         assert_eq!(
             PushApiError::NotFound.into_response().status(),
-            axum::http::StatusCode::NOT_FOUND
+            StatusCode::NOT_FOUND
         );
         assert_eq!(
             PushApiError::InvalidInput("bad subscription".into())
                 .into_response()
                 .status(),
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
             PushApiError::InsufficientScope.into_response().status(),
-            axum::http::StatusCode::FORBIDDEN
+            StatusCode::FORBIDDEN
         );
     }
 

@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    io::Error as IoError,
     net::{IpAddr, SocketAddr},
     string::FromUtf8Error,
     time::Duration,
@@ -18,7 +19,7 @@ use scraper::{Html, Selector};
 use sea_orm::DbErr;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::AcquireError;
+use tokio::{net::lookup_host, sync::AcquireError};
 use url::{ParseError as UrlParseError, Url};
 use uuid::{Error, Uuid};
 
@@ -52,7 +53,7 @@ enum PreviewCardError {
     #[error("preview response header is invalid: {0}")]
     Header(#[from] ToStrError),
     #[error("preview network lookup failed: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     #[error("{0}")]
     Invalid(Cow<'static, str>),
 }
@@ -219,7 +220,7 @@ async fn fetch_bytes(
         let port = url
             .port_or_known_default()
             .ok_or(PreviewCardError::Invalid("preview URL has no port".into()))?;
-        let addresses = tokio::net::lookup_host((host.as_str(), port))
+        let addresses = lookup_host((host.as_str(), port))
             .await?
             .collect::<Vec<_>>();
         if addresses.is_empty()

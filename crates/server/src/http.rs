@@ -13,6 +13,7 @@ use roosty_core::{
     RoostyError,
 };
 use roosty_db::{DbConnection, StatusCreationReservation};
+use roosty_db::{begin_status_creation, ping};
 use sea_orm::{AccessMode, DatabaseTransaction, DbErr, IsolationLevel, TransactionTrait};
 use serde_json::Error as JsonError;
 use thiserror::Error;
@@ -22,7 +23,12 @@ use tower_http::{
 };
 use tracing::Level;
 
-use crate::{config::Config, streaming::StreamingEvents};
+use crate::{
+    accounts, admin, auth, compat, config::Config, conversations, explore, featured_tags,
+    federation, instance, lists, markers, media, notifications, polls, push, push::PushService,
+    reports, search, statuses, streaming::StreamingEvents, version, web,
+};
+use leptos::config::LeptosOptions;
 
 pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
@@ -172,9 +178,9 @@ pub struct AppState {
     /// Per-process bound on concurrent outbound preview-card requests.
     pub preview_card_fetches: Arc<Semaphore>,
     /// Web Push API, credential protection, and delivery service.
-    pub push: crate::push::PushService,
+    pub push: PushService,
     /// Asset and hydration settings for the first-party web UI.
-    pub leptos_options: leptos::config::LeptosOptions,
+    pub leptos_options: LeptosOptions,
 }
 
 impl AppState {
@@ -187,14 +193,14 @@ impl AppState {
         );
         let streaming_connections = Arc::new(Semaphore::new(config.streaming.max_connections));
         let preview_card_fetches = Arc::new(Semaphore::new(config.preview_card_fetch_concurrency));
-        let push = crate::push::PushService::new(&config, db.clone());
+        let push = PushService::new(&config, db.clone());
         Self {
             config: Arc::new(config),
             streaming_events,
             streaming_connections,
             preview_card_fetches,
             push,
-            leptos_options: leptos::config::LeptosOptions::builder()
+            leptos_options: LeptosOptions::builder()
                 .output_name("roosty-web")
                 .site_root("target/site")
                 .site_pkg_dir("pkg")
@@ -203,7 +209,7 @@ impl AppState {
     }
 
     /// Override the default UI settings with Cargo Leptos build configuration.
-    pub fn with_leptos_options(mut self, leptos_options: leptos::config::LeptosOptions) -> Self {
+    pub fn with_leptos_options(mut self, leptos_options: LeptosOptions) -> Self {
         self.leptos_options = leptos_options;
         self
     }
@@ -269,11 +275,11 @@ impl DatabaseContext {
         account_id: AccountId,
         key: &str,
     ) -> RoostyResult<StatusCreationReservation> {
-        roosty_db::begin_status_creation(&self.db, account_id, key).await
+        begin_status_creation(&self.db, account_id, key).await
     }
 }
 
-impl FromRef<AppState> for leptos::config::LeptosOptions {
+impl FromRef<AppState> for LeptosOptions {
     fn from_ref(state: &AppState) -> Self {
         state.leptos_options.clone()
     }
@@ -286,26 +292,26 @@ pub fn app_router(
     include_infra_routes: bool,
 ) -> Router {
     let public_router = Router::<AppState>::new()
-        .merge(crate::accounts::router())
-        .merge(crate::admin::router())
-        .merge(crate::featured_tags::router())
-        .merge(crate::auth::router())
-        .merge(crate::compat::router())
-        .merge(crate::conversations::router())
-        .merge(crate::explore::router())
-        .merge(crate::federation::router())
-        .merge(crate::instance::router())
-        .merge(crate::lists::router())
-        .merge(crate::media::router())
-        .merge(crate::markers::router())
-        .merge(crate::notifications::router())
-        .merge(crate::polls::router())
-        .merge(crate::push::router())
-        .merge(crate::reports::router())
-        .merge(crate::search::router())
-        .merge(crate::statuses::router())
-        .merge(crate::version::router())
-        .merge(crate::web::router(&state, &database))
+        .merge(accounts::router())
+        .merge(admin::router())
+        .merge(featured_tags::router())
+        .merge(auth::router())
+        .merge(compat::router())
+        .merge(conversations::router())
+        .merge(explore::router())
+        .merge(federation::router())
+        .merge(instance::router())
+        .merge(lists::router())
+        .merge(media::router())
+        .merge(markers::router())
+        .merge(notifications::router())
+        .merge(polls::router())
+        .merge(push::router())
+        .merge(reports::router())
+        .merge(search::router())
+        .merge(statuses::router())
+        .merge(version::router())
+        .merge(web::router(&state, &database))
         .fallback(public_fallback)
         .layer(request_trace_layer())
         .layer(public_cors_layer());
@@ -383,7 +389,7 @@ async fn readyz(
         return Err(ReadinessError::Streaming);
     }
     let txn = database.begin_read().await?;
-    roosty_db::ping(&txn).await?;
+    ping(&txn).await?;
     txn.commit().await?;
     Ok("ok\n")
 }
@@ -402,7 +408,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         ),
         federation_enabled
     );
-    body.push_str(&crate::federation::metrics_text());
+    body.push_str(&federation::metrics_text());
     body.push_str(&state.streaming_events.metrics().text());
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)

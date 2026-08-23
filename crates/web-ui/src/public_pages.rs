@@ -1,4 +1,9 @@
-use std::{borrow::Cow, future::Future, pin::Pin};
+use std::{
+    borrow::Cow,
+    fmt::{self, Display, Formatter},
+    future::Future,
+    pin::Pin,
+};
 
 use leptos::{
     prelude::*,
@@ -233,8 +238,8 @@ pub enum UiPublicPageError {
     Internal,
 }
 
-impl std::fmt::Display for UiPublicPageError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for UiPublicPageError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::BadRequest => "invalid public page request",
             Self::NotFound => "public page not found",

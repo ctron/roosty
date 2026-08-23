@@ -1,3 +1,5 @@
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-unwrap-in-tests = true
+absolute-paths-max-segments = 2
+absolute-paths-allowed-crates = ["leptos"]

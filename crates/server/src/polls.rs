@@ -2,14 +2,14 @@
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use roosty_core::{AccountId, RoostyError};
 use roosty_db::{
-    DbConnection, PollStatus, PollViewerState, PollVoteError, StatusPoll,
+    DbConnection, PollStatus, PollViewerState, PollVoteError, StatusPoll, StatusVisibility,
     enqueue_job_in_transaction, enqueue_poll_update, find_local_status_by_id, find_poll_by_id,
     find_remote_status_by_id, poll_viewer_state, remote_status_visible_to_account, vote_in_poll,
 };
@@ -129,7 +129,7 @@ async fn vote_poll(
     Extension(database): Extension<DatabaseContext>,
     token: AuthenticatedAccessToken,
     Path(path): Path<PollPath>,
-    request: axum::extract::Request,
+    request: Request,
 ) -> Result<Json<PollResponse>, PollApiError> {
     if !has_write_status_scope(&token.grant.scopes) {
         return Err(PollApiError::Forbidden(
@@ -228,7 +228,7 @@ async fn ensure_visible(
                 }
                 None => matches!(
                     status.visibility,
-                    roosty_db::StatusVisibility::Public | roosty_db::StatusVisibility::Unlisted
+                    StatusVisibility::Public | StatusVisibility::Unlisted
                 ),
             }
         }

@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{fmt, io::Error as IoError, path::Path};
 
 use axum::{
     Extension, Form, Json, Router,
@@ -13,7 +13,11 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use roosty_core::{AccountId, RoostyError};
-use roosty_db::StatusVisibility;
+use roosty_db::{
+    AccessTokenGrant, LocalAccount, LocalAccountSettingsUpdate, NewAuthorizationCode,
+    OAuthApplication, OAuthTokenType, PkceCodeChallengeMethod, QuoteApprovalPolicy,
+    StatusVisibility,
+};
 use roosty_web_ui::{
     AuthorizationConsent, AuthorizationDecision, AuthorizationPageContext, AuthorizationPermission,
     AuthorizationResult, LoginError, OutOfBandAuthorization, PasswordChangeResult,
@@ -22,18 +26,22 @@ use roosty_web_ui::{
 use sea_orm::ConnectionTrait;
 use serde::{
     Deserialize, Serialize,
-    de::{self, DeserializeOwned, MapAccess, Visitor},
+    de::{self, DeserializeOwned, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use serde_json::{Value, json};
 use sha2::Sha256;
 use strum::{Display, IntoStaticStr};
 use time::{Duration, OffsetDateTime};
+use tokio::{fs, io::AsyncReadExt};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
+    federation::enqueue_actor_update_in_transaction,
     http::{ApiError, ApiResult, AppState, DatabaseContext},
+    media::{media_url, supported_image_format},
     password,
+    statuses::format_timestamp,
     version::build_identifier,
 };
 
@@ -43,11 +51,11 @@ const SESSION_COOKIE: &str = "roosty_session";
 const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 
 /// Authenticated local account extracted from an OAuth bearer token.
-pub(crate) struct AuthenticatedAccount(pub roosty_db::LocalAccount);
+pub(crate) struct AuthenticatedAccount(pub LocalAccount);
 
 /// OAuth grant extractor for endpoints tied to a specific access token.
 pub(crate) struct AuthenticatedAccessToken {
-    pub grant: roosty_db::AccessTokenGrant,
+    pub grant: AccessTokenGrant,
     pub raw_token: String,
 }
 
@@ -98,7 +106,7 @@ impl<'a> OAuthScopeResource<'a> {
 }
 
 /// Optional local account extracted from an OAuth bearer token when present.
-pub(crate) struct OptionalAuthenticatedAccount(pub Option<roosty_db::LocalAccount>);
+pub(crate) struct OptionalAuthenticatedAccount(pub Option<LocalAccount>);
 
 impl<S> FromRequestParts<S> for AuthenticatedAccount
 where
@@ -510,7 +518,7 @@ impl AuthorizeForm {
 }
 
 struct ValidatedAuthorizeRequest {
-    app: roosty_db::OAuthApplication,
+    app: OAuthApplication,
     redirect_uri: String,
 }
 
@@ -676,9 +684,9 @@ async fn authorize(
     let scope = params.scope.as_deref().unwrap_or(app.scopes.as_str());
     let challenge = optional_non_empty(params.code_challenge.as_deref()).unwrap_or_default();
     let method = if challenge.is_empty() {
-        roosty_db::PkceCodeChallengeMethod::None
+        PkceCodeChallengeMethod::None
     } else {
-        roosty_db::PkceCodeChallengeMethod::S256
+        PkceCodeChallengeMethod::S256
     };
     let txn = match database.begin_write().await {
         Ok(txn) => txn,
@@ -687,7 +695,7 @@ async fn authorize(
     let code = match roosty_db::create_authorization_code(
         &txn,
         &state.config.token_pepper,
-        roosty_db::NewAuthorizationCode {
+        NewAuthorizationCode {
             account_id,
             application_id: app.id,
             redirect_uri: &validated.redirect_uri,
@@ -821,7 +829,7 @@ struct TokenForm {
 #[derive(Serialize)]
 struct TokenResponse {
     access_token: String,
-    token_type: roosty_db::OAuthTokenType,
+    token_type: OAuthTokenType,
     scope: String,
     created_at: i64,
 }
@@ -893,7 +901,7 @@ async fn token(
     };
 
     if !challenge.is_empty()
-        && (method != roosty_db::PkceCodeChallengeMethod::S256
+        && (method != PkceCodeChallengeMethod::S256
             || form
                 .code_verifier
                 .as_deref()
@@ -990,10 +998,10 @@ pub(crate) struct AccountResponse {
 pub(crate) struct AccountSource {
     note: String,
     fields: Vec<serde_json::Value>,
-    privacy: roosty_db::StatusVisibility,
+    privacy: StatusVisibility,
     sensitive: bool,
     language: String,
-    quote_policy: roosty_db::QuoteApprovalPolicy,
+    quote_policy: QuoteApprovalPolicy,
     follow_requests_count: u64,
 }
 
@@ -1010,13 +1018,13 @@ pub(crate) struct AccountRole {
 #[derive(Serialize)]
 struct PreferencesResponse {
     #[serde(rename = "posting:default:visibility")]
-    posting_default_visibility: roosty_db::StatusVisibility,
+    posting_default_visibility: StatusVisibility,
     #[serde(rename = "posting:default:sensitive")]
     posting_default_sensitive: bool,
     #[serde(rename = "posting:default:language")]
     posting_default_language: Option<String>,
     #[serde(rename = "posting:default:quote_policy")]
-    posting_default_quote_policy: roosty_db::QuoteApprovalPolicy,
+    posting_default_quote_policy: QuoteApprovalPolicy,
     #[serde(rename = "reading:expand:media")]
     reading_expand_media: &'static str,
     #[serde(rename = "reading:expand:spoilers")]
@@ -1085,7 +1093,7 @@ struct OptionalUploadFileVisitor;
 impl<'de> Visitor<'de> for OptionalUploadFileVisitor {
     type Value = Option<UploadFile>;
 
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a multipart upload file or a null-like text field")
     }
 
@@ -1132,7 +1140,7 @@ impl<'de> Visitor<'de> for OptionalUploadFileVisitor {
     where
         A: MapAccess<'de>,
     {
-        UploadFile::deserialize(de::value::MapAccessDeserializer::new(map)).map(Some)
+        UploadFile::deserialize(MapAccessDeserializer::new(map)).map(Some)
     }
 }
 
@@ -1242,9 +1250,7 @@ async fn update_credentials(
         Ok(account) => account,
         Err(error) => return server_error(error),
     };
-    if let Err(error) =
-        crate::federation::enqueue_actor_update_in_transaction(&state, &txn, updated.clone()).await
-    {
+    if let Err(error) = enqueue_actor_update_in_transaction(&state, &txn, updated.clone()).await {
         return server_error(error);
     }
     let response = match account_response(&state, &txn, updated).await {
@@ -1262,7 +1268,7 @@ pub(crate) async fn authenticated_account(
     state: &AppState,
     database: &DatabaseContext,
     headers: &HeaderMap,
-) -> ApiResult<roosty_db::LocalAccount> {
+) -> ApiResult<LocalAccount> {
     let bearer = bearer_token(headers).ok_or_else(|| ApiError::OAuth {
         error: "invalid_token".into(),
         description: "missing bearer token".into(),
@@ -1276,7 +1282,7 @@ pub(crate) async fn optional_authenticated_account(
     state: &AppState,
     database: &DatabaseContext,
     headers: &HeaderMap,
-) -> ApiResult<Option<roosty_db::LocalAccount>> {
+) -> ApiResult<Option<LocalAccount>> {
     let Some(bearer) = bearer_token(headers) else {
         return Ok(None);
     };
@@ -1291,7 +1297,7 @@ pub(crate) async fn account_from_bearer_token(
     state: &AppState,
     database: &DatabaseContext,
     bearer: &str,
-) -> ApiResult<roosty_db::LocalAccount> {
+) -> ApiResult<LocalAccount> {
     let txn = database.begin_read().await?;
     let account = roosty_db::find_account_by_access_token(&txn, &state.config.token_pepper, bearer)
         .await?
@@ -1308,7 +1314,7 @@ pub(crate) async fn account_from_bearer_token(
 pub(crate) async fn account_response(
     state: &AppState,
     db: &impl ConnectionTrait,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
 ) -> Result<AccountResponse, RoostyError> {
     account_response_on(state, db, account).await
 }
@@ -1317,7 +1323,7 @@ pub(crate) async fn account_response(
 pub(crate) async fn account_response_on(
     state: &AppState,
     db: &impl ConnectionTrait,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
 ) -> Result<AccountResponse, RoostyError> {
     let statuses_count = roosty_db::count_local_statuses_by_account(db, account.id).await?;
     let followers_count = roosty_db::count_local_followers(db, account.id).await?
@@ -1338,7 +1344,7 @@ pub(crate) async fn account_response_on(
 /// Build an account response from counters loaded by a containing collection query.
 pub(crate) fn account_response_with_stats(
     state: &AppState,
-    account: roosty_db::LocalAccount,
+    account: LocalAccount,
     followers_count: u64,
     following_count: u64,
     statuses_count: u64,
@@ -1372,7 +1378,7 @@ pub(crate) fn account_response_with_stats(
         account
             .avatar_file_path
             .as_deref()
-            .map(|path| crate::media::media_url(state, path))
+            .map(|path| media_url(state, path))
             .unwrap_or_default()
     };
     let header = if suspended {
@@ -1381,7 +1387,7 @@ pub(crate) fn account_response_with_stats(
         account
             .header_file_path
             .as_deref()
-            .map(|path| crate::media::media_url(state, path))
+            .map(|path| media_url(state, path))
             .unwrap_or_default()
     };
 
@@ -1396,7 +1402,7 @@ pub(crate) fn account_response_with_stats(
         limited: account.limited_at.is_some(),
         suspended: suspended.then_some(true),
         group: false,
-        created_at: crate::statuses::format_timestamp(account.created_at),
+        created_at: format_timestamp(account.created_at),
         note: if suspended {
             String::new()
         } else {
@@ -1464,7 +1470,7 @@ pub(crate) fn format_account_date(timestamp: OffsetDateTime) -> String {
 /// Convert parsed update input into a validated database update.
 fn settings_update_from_input(
     input: UpdateCredentialsInput,
-) -> Result<roosty_db::LocalAccountSettingsUpdate, UpdateCredentialsError> {
+) -> Result<LocalAccountSettingsUpdate, UpdateCredentialsError> {
     let default_visibility = input
         .default_visibility
         .as_deref()
@@ -1474,14 +1480,14 @@ fn settings_update_from_input(
     let default_quote_policy = input
         .default_quote_policy
         .as_deref()
-        .map(roosty_db::QuoteApprovalPolicy::parse)
+        .map(QuoteApprovalPolicy::parse)
         .transpose()
         .map_err(|_| UpdateCredentialsError::QuotePolicy)?;
     if let Some(Some(language)) = input.default_language.as_ref() {
         validate_language(language)?;
     }
 
-    Ok(roosty_db::LocalAccountSettingsUpdate {
+    Ok(LocalAccountSettingsUpdate {
         display_name: input.display_name,
         note: input.note,
         locked: input.locked,
@@ -1534,13 +1540,13 @@ async fn update_credentials_input_from_params(
 /// Read an optional profile image upload before its temporary file is removed.
 async fn profile_image_upload(
     upload: Option<UploadFile>,
-) -> Result<Option<ProfileImageUpload>, std::io::Error> {
+) -> Result<Option<ProfileImageUpload>, IoError> {
     let Some(upload) = upload else {
         return Ok(None);
     };
     let mut file = upload.open().await?;
     let mut bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+    file.read_to_end(&mut bytes).await?;
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -1557,7 +1563,7 @@ async fn store_profile_image(
     kind: ProfileImageKind,
     upload: ProfileImageUpload,
 ) -> Result<String, RoostyError> {
-    let format = crate::media::supported_image_format(&upload.content_type)
+    let format = supported_image_format(&upload.content_type)
         .ok_or_else(|| RoostyError::InvalidInput("profile image type is invalid".to_owned()))?;
     image::load_from_memory_with_format(&upload.bytes, format.image_format)
         .map_err(|error| RoostyError::InvalidInput(format!("profile image is invalid: {error}")))?;
@@ -1571,9 +1577,9 @@ async fn store_profile_image(
     );
     let full_path = Path::new(&state.config.media_root).join(&relative_path);
     if let Some(parent) = full_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(full_path, upload.bytes).await?;
+    fs::write(full_path, upload.bytes).await?;
 
     Ok(relative_path)
 }
@@ -1893,8 +1899,10 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::Cursor,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        process,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1902,7 +1910,7 @@ mod tests {
         Router,
         body::{Body, to_bytes},
         http::{
-            Request, Response, StatusCode,
+            HeaderName, Request, Response, StatusCode,
             header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         },
     };
@@ -1917,9 +1925,13 @@ mod tests {
     use url::{Url, form_urlencoded};
 
     use crate::{
-        config::Config,
-        http::{AppState, DatabaseContext},
+        config::{
+            Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,
+        },
+        http::{AppState, DatabaseContext, app_router},
         password,
+        statuses::format_timestamp,
+        test_postgres::settings,
     };
 
     const REDIRECT_URI: &str = "https://localhost:4001/oauth";
@@ -2619,10 +2631,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            body["created_at"],
-            crate::statuses::format_timestamp(account.created_at)
-        );
+        assert_eq!(body["created_at"], format_timestamp(account.created_at));
     }
 
     #[test_context(EndpointContext)]
@@ -3360,10 +3369,10 @@ mod tests {
                 .join(format!("{database_name}.pgpass"));
 
             if let Some(parent) = password_file.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                fs::create_dir_all(parent).unwrap();
             }
 
-            let settings = crate::test_postgres::settings(&data_dir, password_file);
+            let settings = settings(&data_dir, password_file);
             let mut postgresql = PostgreSQL::new(settings);
 
             postgresql.setup().await.unwrap();
@@ -3387,9 +3396,9 @@ mod tests {
                 session_secret: "test-session-secret-change-me-000".to_owned(),
                 token_pepper: "test-token-pepper-change-me-0000".to_owned(),
                 vapid_private_key: None,
-                object_storage_backend: crate::config::ObjectStorageBackend::Local,
+                object_storage_backend: ObjectStorageBackend::Local,
                 media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
-                registration_mode: crate::config::RegistrationMode::Closed,
+                registration_mode: RegistrationMode::Closed,
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
@@ -3401,8 +3410,8 @@ mod tests {
                 worker_concurrency: 4,
                 trends_refresh_interval: time::Duration::minutes(5),
                 account_suggestions_refresh_interval: time::Duration::hours(24),
-                scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-                streaming: crate::config::StreamingConfig::default(),
+                scheduled_statuses: ScheduledStatusConfig::default(),
+                streaming: StreamingConfig::default(),
                 instance_name: "Roosty Test".to_owned(),
                 instance_description: Some("Endpoint test instance".to_owned()),
             };
@@ -3423,7 +3432,7 @@ mod tests {
 
     impl EndpointContext {
         fn app(&self) -> Router {
-            crate::http::app_router(
+            app_router(
                 AppState::new(self.config.clone(), self.db.clone()),
                 DatabaseContext::new(self.db.clone()),
                 false,
@@ -3673,7 +3682,7 @@ mod tests {
         format!("/oauth/authorize/?{query}")
     }
 
-    fn header_value(response: &Response<Body>, name: axum::http::header::HeaderName) -> String {
+    fn header_value(response: &Response<Body>, name: HeaderName) -> String {
         response
             .headers()
             .get(name)
@@ -3707,6 +3716,6 @@ mod tests {
             .expect("system time is before the Unix epoch")
             .as_nanos();
 
-        format!("roosty_server_{}_{}", std::process::id(), timestamp)
+        format!("roosty_server_{}_{}", process::id(), timestamp)
     }
 }

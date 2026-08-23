@@ -1,12 +1,17 @@
-#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![deny(
+    clippy::absolute_paths,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io, result};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub type Result<T, E = RoostyError> = std::result::Result<T, E>;
+pub type Result<T, E = RoostyError> = result::Result<T, E>;
 
 /// Typed failures produced while applying remote federation discovery policy.
 #[derive(Debug, Error)]
@@ -51,7 +56,7 @@ pub enum RoostyError {
     StatusVisibility(#[from] strum::ParseError),
 
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

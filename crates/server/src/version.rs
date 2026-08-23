@@ -79,7 +79,11 @@ impl<'a> From<&'a BuildInfo> for VersionResponse<'a> {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use serde_json::{Value, from_slice};
     use tower::ServiceExt;
 
     use super::*;
@@ -99,10 +103,8 @@ mod tests {
             .unwrap();
 
         assert!(response.status().is_success());
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = from_slice(&body).unwrap();
 
         assert_eq!(body["name"], env!("CARGO_PKG_NAME"));
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));

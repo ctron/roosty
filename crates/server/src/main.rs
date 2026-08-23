@@ -1,6 +1,11 @@
-#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![deny(
+    clippy::absolute_paths,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
-use std::{net::SocketAddr, time::Duration};
+use std::{env, net::SocketAddr, path::Path, process, time::Duration};
 
 use axum::Router;
 use clap::{Parser, Subcommand};
@@ -10,7 +15,9 @@ use roosty_db::NotificationPolicyUpdate;
 use roosty_migration::Migrator;
 use sea_orm::TransactionTrait;
 use sea_orm_migration::MigratorTrait;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    fs::remove_file, net::TcpListener, signal::ctrl_c, sync::watch, task::JoinSet, time::sleep,
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -45,6 +52,11 @@ mod web;
 use crate::{
     config::{Config, database_url_from_env},
     http::{AppState, DatabaseContext},
+};
+#[cfg(test)]
+use crate::{
+    config::{ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig},
+    test_postgres::settings,
 };
 
 #[derive(Debug, Parser)]
@@ -275,7 +287,7 @@ async fn serve(
     if !cfg!(debug_assertions) {
         leptos_options.env = leptos::config::Env::PROD;
     }
-    if let Ok(site_root) = std::env::var("ROOSTY_WEB_ROOT") {
+    if let Ok(site_root) = env::var("ROOSTY_WEB_ROOT") {
         leptos_options.site_root = site_root.into();
     }
     let state = state.with_leptos_options(leptos_options);
@@ -338,7 +350,7 @@ async fn serve_router(
     app: Router,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(listen)
+    let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| RoostyError::Configuration(error.to_string()))?;
 
@@ -357,7 +369,7 @@ async fn serve_router(
 }
 
 async fn wait_for_shutdown(shutdown_tx: watch::Sender<bool>) {
-    if let Err(error) = tokio::signal::ctrl_c().await {
+    if let Err(error) = ctrl_c().await {
         warn!(%error, "failed to listen for shutdown signal");
     }
     let _ = shutdown_tx.send(true);
@@ -371,8 +383,8 @@ async fn worker_pool(
 ) -> Result<()> {
     let process_identity = format!(
         "{}:{}:{}",
-        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
-        std::process::id(),
+        env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
+        process::id(),
         uuid::Uuid::now_v7()
     );
     let mut workers = JoinSet::new();
@@ -422,7 +434,7 @@ async fn trend_scheduler_loop(
                     return Ok(());
                 }
             }
-            () = tokio::time::sleep(Duration::from_secs(5)) => {
+            () = sleep(Duration::from_secs(5)) => {
             }
         }
     }
@@ -449,7 +461,7 @@ async fn account_suggestion_scheduler_loop(
                     return Ok(());
                 }
             }
-            () = tokio::time::sleep(refresh_interval) => {
+            () = sleep(refresh_interval) => {
             }
         }
         let job_id = roosty_db::enqueue_account_suggestion_refresh(&db).await?;
@@ -481,7 +493,7 @@ async fn worker_loop(
                     return Ok(());
                 }
             }
-            () = tokio::time::sleep(Duration::from_secs(5)) => {
+            () = sleep(Duration::from_secs(5)) => {
             }
         }
     }
@@ -615,8 +627,7 @@ async fn worker_iteration(
             let paths = roosty_db::purge_suspended_local_account(&txn, account_id).await?;
             txn.commit().await?;
             for path in paths {
-                let _ = tokio::fs::remove_file(std::path::Path::new(&config.media_root).join(path))
-                    .await;
+                let _ = remove_file(Path::new(&config.media_root).join(path)).await;
             }
             Ok(())
         }
@@ -768,6 +779,7 @@ mod tests {
 
     use std::{
         collections::HashSet,
+        fs,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -776,6 +788,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
+    use tokio::time::{sleep, timeout};
 
     /// Protects the local username rules used by admin account creation commands.
     #[test]
@@ -1220,9 +1233,9 @@ mod tests {
             shutdown_rx,
         ));
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(active_suggestion_refresh_jobs(&db).await, 0);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
         assert_eq!(active_suggestion_refresh_jobs(&db).await, 1);
 
         shutdown_tx.send(true).unwrap();
@@ -1260,7 +1273,7 @@ mod tests {
         .await
         .unwrap();
 
-        let claim = tokio::time::timeout(
+        let claim = timeout(
             Duration::from_secs(1),
             roosty_db::enqueue_due_trend_refresh(&db),
         )
@@ -1404,9 +1417,9 @@ mod tests {
             session_secret: "test-session-secret-change-me-000".to_owned(),
             token_pepper: "test-token-pepper-change-me-0000".to_owned(),
             vapid_private_key: None,
-            object_storage_backend: crate::config::ObjectStorageBackend::Local,
+            object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
-            registration_mode: crate::config::RegistrationMode::Closed,
+            registration_mode: RegistrationMode::Closed,
             federation_enabled: true,
             federation_key_encryption_secret: Some(
                 "test-federation-key-encryption-secret-000".to_owned(),
@@ -1420,8 +1433,8 @@ mod tests {
             worker_concurrency: 4,
             trends_refresh_interval: time::Duration::minutes(5),
             account_suggestions_refresh_interval: time::Duration::hours(24),
-            scheduled_statuses: crate::config::ScheduledStatusConfig::default(),
-            streaming: crate::config::StreamingConfig::default(),
+            scheduled_statuses: ScheduledStatusConfig::default(),
+            streaming: StreamingConfig::default(),
             instance_name: "Worker test".to_owned(),
             instance_description: None,
         }
@@ -1441,10 +1454,10 @@ mod tests {
             .join(format!("{database_name}.pgpass"));
 
         if let Some(parent) = password_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            fs::create_dir_all(parent).unwrap();
         }
 
-        let settings = crate::test_postgres::settings(&data_dir, password_file);
+        let settings = settings(&data_dir, password_file);
         let mut postgresql = PostgreSQL::new(settings);
 
         postgresql.setup().await.unwrap();

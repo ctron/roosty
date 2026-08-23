@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     future::Future,
+    path::Path as FilePath,
     pin::Pin,
     sync::{Arc, OnceLock},
 };
@@ -41,7 +42,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use strum::ParseError;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
@@ -51,7 +52,11 @@ use crate::{
     admin::{self, AdminSource},
     auth::{account_id_from_session, csrf_token_from_session, validate_csrf_token},
     http::{ApiError, ApiResult, AppState, DatabaseContext, TransactionContext},
-    statuses::delete_reported_status,
+    statuses::{
+        MAX_PINNED_STATUSES, delete_reported_status, sanitize_remote_status_html,
+        status_content_html_with_mentions_and_tags, status_context_item_visible,
+        status_visible_to_viewer_on, visible_status_thread_on,
+    },
 };
 
 static UI_ROUTES: OnceLock<Vec<AxumRouteListing>> = OnceLock::new();
@@ -68,8 +73,7 @@ pub fn router(state: &AppState, database: &DatabaseContext) -> Router<AppState> 
         state: state.clone(),
         database: database.clone(),
     }));
-    let assets =
-        ServeDir::new(std::path::Path::new(&*options.site_root).join(&*options.site_pkg_dir));
+    let assets = ServeDir::new(FilePath::new(&*options.site_root).join(&*options.site_pkg_dir));
 
     Router::new()
         .route("/admin/accounts", post(create_admin_account))
@@ -205,7 +209,7 @@ impl UiBackend for RoostyUiBackend {
                         avatar_url: account
                             .avatar_file_path
                             .as_deref()
-                            .map(|path| crate::media::media_url(&state, path)),
+                            .map(|path| media_url(&state, path)),
                         is_admin: account.is_admin,
                     })
                 }
@@ -310,7 +314,7 @@ impl UiBackend for RoostyUiBackend {
                 let pins = roosty_db::pinned_local_statuses_by_account(
                     &txn,
                     account.id,
-                    crate::statuses::MAX_PINNED_STATUSES,
+                    MAX_PINNED_STATUSES,
                     TimelineCursor::default(),
                 )
                 .await
@@ -400,7 +404,7 @@ impl UiBackend for RoostyUiBackend {
             let viewer = ui_viewer(&state, &txn, cookie_header).await?;
             let account = active_local_profile(&txn, &username).await?;
             let Some((focus, ancestors, descendants)) =
-                crate::statuses::visible_status_thread_on(&txn, status_id, viewer)
+                visible_status_thread_on(&txn, status_id, viewer)
                     .await
                     .map_err(|_| UiPublicPageError::Internal)?
             else {
@@ -782,7 +786,7 @@ async fn ui_local_statuses(
 ) -> Result<Vec<UiStatus>, UiPublicPageError> {
     let mut result = Vec::with_capacity(statuses.len());
     for status in statuses {
-        if crate::statuses::status_visible_to_viewer_on(db, &status, viewer)
+        if status_visible_to_viewer_on(db, &status, viewer)
             .await
             .map_err(|_| UiPublicPageError::Internal)?
         {
@@ -831,11 +835,11 @@ async fn ui_local_status(
         .into_iter()
         .map(|media| UiMedia {
             kind: ui_media_kind(Some(&media.content_type)),
-            url: crate::media::media_url(state, &media.file_path),
+            url: media_url(state, &media.file_path),
             preview_url: media
                 .preview_file_path
                 .as_deref()
-                .map(|path| crate::media::media_url(state, path)),
+                .map(|path| media_url(state, path)),
             description: media.description,
         })
         .collect();
@@ -865,12 +869,12 @@ async fn ui_local_status(
             avatar_url: account
                 .avatar_file_path
                 .as_deref()
-                .map(|path| crate::media::media_url(state, path)),
+                .map(|path| media_url(state, path)),
             local: true,
         },
         url: public_page_url(state, &path),
         activitypub_url,
-        content_html: crate::statuses::status_content_html_with_mentions_and_tags(
+        content_html: status_content_html_with_mentions_and_tags(
             &TransactionContext::new(state, db),
             &status.content,
             &[],
@@ -926,12 +930,12 @@ async fn ui_remote_status(
             url: media
                 .file_path
                 .as_deref()
-                .map(|path| crate::media::media_url(state, path))
+                .map(|path| media_url(state, path))
                 .unwrap_or(media.remote_url),
             preview_url: media
                 .preview_file_path
                 .as_deref()
-                .map(|path| crate::media::media_url(state, path)),
+                .map(|path| media_url(state, path)),
             description: media.description,
         })
         .collect();
@@ -972,7 +976,7 @@ async fn ui_remote_status(
         },
         url: status.activitypub_id.clone(),
         activitypub_url: status.activitypub_id,
-        content_html: crate::statuses::sanitize_remote_status_html(&status.content),
+        content_html: sanitize_remote_status_html(&status.content),
         spoiler_text,
         sensitive,
         visibility: ui_visibility(status.visibility),
@@ -1059,7 +1063,7 @@ async fn ui_preview_card(
             image_url: card
                 .image_file_path
                 .as_deref()
-                .map(|path| crate::media::media_url(state, path)),
+                .map(|path| media_url(state, path)),
         }))
 }
 
@@ -1094,7 +1098,7 @@ async fn ui_status_quote(
     let Some(item) = item else {
         return Ok(None);
     };
-    if !crate::statuses::status_context_item_visible(db, &item, viewer)
+    if !status_context_item_visible(db, &item, viewer)
         .await
         .map_err(|_| UiPublicPageError::Internal)?
     {
@@ -1230,7 +1234,7 @@ fn cookie_headers(cookie_header: Option<String>) -> Result<HeaderMap, String> {
 
 fn format_timestamp(timestamp: OffsetDateTime) -> String {
     timestamp
-        .format(&time::format_description::well_known::Rfc3339)
+        .format(&Rfc3339)
         .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
 }
 
@@ -1781,7 +1785,7 @@ fn temporary_password_page(
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, pin::Pin, sync::Arc};
+    use std::{future::Future, path::Path, pin::Pin, sync::Arc};
 
     use axum::{
         Router,
@@ -2337,8 +2341,7 @@ mod tests {
             .nest_service(
                 "/pkg",
                 ServeDir::new(
-                    std::path::Path::new(&*state.options.site_root)
-                        .join(&*state.options.site_pkg_dir),
+                    Path::new(&*state.options.site_root).join(&*state.options.site_pkg_dir),
                 ),
             )
             .with_state(state)
