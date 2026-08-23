@@ -19845,6 +19845,20 @@ pub struct AdminJobDiagnostic {
     pub permanently_failed_at: Option<OffsetDateTime>,
 }
 
+/// Counts returned after one bounded durable-job retention cleanup batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobCleanupOutcome {
+    pub successful: u64,
+    pub permanently_failed: u64,
+}
+
+impl JobCleanupOutcome {
+    /// Total rows removed by this cleanup batch.
+    pub fn total(self) -> u64 {
+        self.successful + self.permanently_failed
+    }
+}
+
 #[derive(FromQueryResult)]
 struct AdminJobDiagnosticRow {
     id: Uuid,
@@ -20366,6 +20380,70 @@ pub async fn mark_job_permanently_failed(
         vec![job.id.0.into(), error.to_owned().into(), job.claim_id.0.into()],
     )).await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Delete one bounded batch of completed jobs whose diagnostic retention has elapsed.
+///
+/// Row locks are skipped so cleanup may run concurrently in multiple worker processes.
+/// Pending, retrying, scheduled, and claimed jobs are never eligible.
+pub async fn cleanup_expired_jobs(
+    db: &DbConnection,
+    successful_retention: Duration,
+    permanently_failed_retention: Duration,
+    batch_size: u64,
+) -> Result<JobCleanupOutcome> {
+    if successful_retention <= Duration::ZERO || permanently_failed_retention <= Duration::ZERO {
+        return Err(RoostyError::InvalidInput(
+            "job retention durations must be positive".to_owned(),
+        ));
+    }
+    let batch_size = i64::try_from(batch_size)
+        .ok()
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("job cleanup batch size must be positive".to_owned())
+        })?;
+    let now = OffsetDateTime::now_utc();
+    let successful_before = now - successful_retention;
+    let permanently_failed_before = now - permanently_failed_retention;
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            WITH candidates AS MATERIALIZED (
+                SELECT id
+                FROM job
+                WHERE (permanently_failed_at IS NULL AND completed_at <= $1)
+                   OR permanently_failed_at <= $2
+                ORDER BY COALESCE(permanently_failed_at, completed_at), id
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            ), deleted AS (
+                DELETE FROM job
+                USING candidates
+                WHERE job.id = candidates.id
+                RETURNING job.permanently_failed_at
+            )
+            SELECT
+                count(*) FILTER (WHERE permanently_failed_at IS NULL) AS successful,
+                count(*) FILTER (WHERE permanently_failed_at IS NOT NULL) AS permanently_failed
+            FROM deleted
+            "#,
+            vec![
+                successful_before.into(),
+                permanently_failed_before.into(),
+                batch_size.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound("job cleanup returned no row".to_owned()))?;
+
+    Ok(JobCleanupOutcome {
+        successful: u64::try_from(row.try_get::<i64>("", "successful")?)
+            .map_err(|_| DbErr::Type("negative successful job cleanup count".to_owned()))?,
+        permanently_failed: u64::try_from(row.try_get::<i64>("", "permanently_failed")?)
+            .map_err(|_| DbErr::Type("negative failed job cleanup count".to_owned()))?,
+    })
 }
 
 /// Return whether a job has exceeded its configured retry age.

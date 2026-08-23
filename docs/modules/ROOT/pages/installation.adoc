@@ -190,6 +190,14 @@ Parameters marked _Required_ have no role default and must be supplied by the in
 |`roosty_worker_concurrency`
 |`4`
 |Durable worker loops per Roosty process. `0` selects the available logical CPU count.
+
+|`roosty_successful_job_retention`
+|`24h`
+|Retention period for successfully completed durable jobs.
+
+|`roosty_permanently_failed_job_retention`
+|`30d`
+|Retention period for permanently failed jobs and their diagnostics.
 |===
 
 ==== Scheduled statuses and streaming
@@ -366,6 +374,14 @@ serializes and rate-limits requests to each remote host across all processes.
 |`ROOSTY_WORKER_CONCURRENCY`
 |`4`
 |Durable worker loops per process. `0` selects the available logical CPU count.
+
+|`ROOSTY_SUCCESSFUL_JOB_RETENTION`
+|`24h`
+|How long successfully completed durable jobs remain in PostgreSQL. Must be a non-zero humantime duration.
+
+|`ROOSTY_PERMANENTLY_FAILED_JOB_RETENTION`
+|`30d`
+|How long permanently failed jobs and their diagnostics remain in PostgreSQL. Must be a non-zero humantime duration.
 
 |`ROOSTY_TRENDS_REFRESH_INTERVAL`
 |`5m`

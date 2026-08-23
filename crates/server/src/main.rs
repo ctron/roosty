@@ -16,7 +16,12 @@ use roosty_migration::Migrator;
 use sea_orm::TransactionTrait;
 use sea_orm_migration::MigratorTrait;
 use tokio::{
-    fs::remove_file, net::TcpListener, signal::ctrl_c, sync::watch, task::JoinSet, time::sleep,
+    fs::remove_file,
+    net::TcpListener,
+    signal::ctrl_c,
+    sync::watch,
+    task::{JoinSet, yield_now},
+    time::sleep,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -49,6 +54,9 @@ mod streaming;
 mod test_postgres;
 mod version;
 mod web;
+
+const JOB_CLEANUP_BATCH_SIZE: u64 = 1_000;
+const JOB_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 use crate::{
     config::{Config, DefaultEnabled, database_url_from_env},
@@ -407,6 +415,12 @@ async fn worker_pool(
         state.config.account_suggestions_refresh_interval,
         shutdown_rx.clone(),
     ));
+    workers.spawn(job_cleanup_loop(
+        db.clone(),
+        state.config.successful_job_retention,
+        state.config.permanently_failed_job_retention,
+        shutdown_rx.clone(),
+    ));
     for slot in 0..state.config.worker_concurrency {
         let worker_id = format!("{process_identity}:{slot}");
         workers.spawn(worker_loop(
@@ -422,6 +436,65 @@ async fn worker_pool(
     }
 
     Ok(())
+}
+
+/// Periodically drain expired job diagnostics in bounded, multi-process-safe batches.
+async fn job_cleanup_loop(
+    db: roosty_db::DbConnection,
+    successful_retention: time::Duration,
+    permanently_failed_retention: time::Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return Ok(());
+        }
+
+        let mut successful = 0_u64;
+        let mut permanently_failed = 0_u64;
+        loop {
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
+            match roosty_db::cleanup_expired_jobs(
+                &db,
+                successful_retention,
+                permanently_failed_retention,
+                JOB_CLEANUP_BATCH_SIZE,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    successful += outcome.successful;
+                    permanently_failed += outcome.permanently_failed;
+                    if outcome.total() < JOB_CLEANUP_BATCH_SIZE {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "durable job cleanup failed; will retry later");
+                    break;
+                }
+            }
+            yield_now().await;
+        }
+        if successful > 0 || permanently_failed > 0 {
+            info!(
+                successful,
+                permanently_failed, "cleaned up expired durable jobs"
+            );
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            () = sleep(JOB_CLEANUP_INTERVAL) => {
+            }
+        }
+    }
 }
 
 /// Poll the shared trend schedule without electing a process leader.
@@ -1033,6 +1106,101 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given jobs in every terminal and active state, when retention cleanup runs, then only
+    /// terminal jobs older than their respective retention periods are removed.
+    #[tokio::test]
+    async fn cleans_up_only_expired_terminal_jobs() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let old_success = uuid::Uuid::now_v7();
+        let recent_success = uuid::Uuid::now_v7();
+        let old_failure = uuid::Uuid::now_v7();
+        let recent_failure = uuid::Uuid::now_v7();
+        let pending = uuid::Uuid::now_v7();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO job (
+                id, kind, payload, run_after, completed_at, permanently_failed_at, locked_at
+            ) VALUES
+                ($1, 'web_push_delivery', '{}'::jsonb, now(), now() - interval '25 hours', NULL, NULL),
+                ($2, 'web_push_delivery', '{}'::jsonb, now(), now() - interval '23 hours', NULL, NULL),
+                ($3, 'web_push_delivery', '{}'::jsonb, now(), now() - interval '31 days', now() - interval '31 days', NULL),
+                ($4, 'web_push_delivery', '{}'::jsonb, now(), now() - interval '29 days', now() - interval '29 days', NULL),
+                ($5, 'web_push_delivery', '{}'::jsonb, now() - interval '40 days', NULL, NULL, now())
+            "#,
+            vec![
+                old_success.into(),
+                recent_success.into(),
+                old_failure.into(),
+                recent_failure.into(),
+                pending.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+        let outcome = roosty_db::cleanup_expired_jobs(
+            &db,
+            time::Duration::hours(24),
+            time::Duration::days(30),
+            100,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.successful, 1);
+        assert_eq!(outcome.permanently_failed, 1);
+        let remaining: i64 = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS count FROM job".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "count")
+            .unwrap();
+        assert_eq!(remaining, 3);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// Given more expired jobs than one batch, concurrent cleaners respect the bound and safely
+    /// partition or observe the shared work without double-counting rows.
+    #[tokio::test]
+    async fn bounds_and_coordinates_concurrent_job_cleanup() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        for _ in 0..5 {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO job (id, kind, payload, run_after, completed_at) VALUES ($1, 'web_push_delivery', '{}'::jsonb, now(), now() - interval '2 days')",
+                vec![uuid::Uuid::now_v7().into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let cleanup = || {
+            roosty_db::cleanup_expired_jobs(
+                &db,
+                time::Duration::hours(24),
+                time::Duration::days(30),
+                3,
+            )
+        };
+        let (first, second) = tokio::join!(cleanup(), cleanup());
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert!(first.total() <= 3);
+        assert!(second.total() <= 3);
+        assert_eq!(first.total() + second.total(), 5);
 
         db.close().await.unwrap();
         postgresql.stop().await.unwrap();
@@ -1707,6 +1875,8 @@ mod tests {
             remote_media_fetch_concurrency: 5,
             preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
+            successful_job_retention: time::Duration::hours(24),
+            permanently_failed_job_retention: time::Duration::days(30),
             trends_refresh_interval: time::Duration::minutes(5),
             account_suggestions_refresh_interval: time::Duration::hours(24),
             scheduled_statuses: ScheduledStatusConfig::default(),

@@ -102,6 +102,9 @@ The work queue summarizes durable queue health and provides sanitized job diagno
 Use it to identify delayed or repeatedly failing federation, media, notification, and scheduled-status work.
 
 Diagnostics omit raw job payloads and secrets.
+Successful jobs are retained for `24h` by default, while permanently failed diagnostics are retained
+for `30d`. Worker processes clean both categories in bounded batches; operators can change the
+periods with `ROOSTY_SUCCESSFUL_JOB_RETENTION` and `ROOSTY_PERMANENTLY_FAILED_JOB_RETENTION`.
 Administrator mutations are recorded in the audit log, including whether the action came from the web interface, API, or command line.
 
 For deployment logs, container operations, upgrades, and configuration changes, follow the procedures in xref:installation.adoc[Installation].

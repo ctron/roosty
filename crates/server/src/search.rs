@@ -752,6 +752,8 @@ mod tests {
                 remote_media_fetch_concurrency: 5,
                 preview_card_fetch_concurrency: 5,
                 worker_concurrency: 4,
+                successful_job_retention: Duration::hours(24),
+                permanently_failed_job_retention: Duration::days(30),
                 trends_refresh_interval: Duration::minutes(5),
                 account_suggestions_refresh_interval: Duration::hours(24),
                 scheduled_statuses: ScheduledStatusConfig::default(),

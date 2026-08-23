@@ -19,6 +19,8 @@ const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
 const DEFAULT_REGISTRATION_MODE: &str = "closed";
 const DEFAULT_WORKER_CONCURRENCY: &str = "4";
 const DEFAULT_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL: &str = "24h";
+const DEFAULT_SUCCESSFUL_JOB_RETENTION: &str = "24h";
+const DEFAULT_PERMANENTLY_FAILED_JOB_RETENTION: &str = "30d";
 
 /// Operator-configurable policy limits for future publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +232,10 @@ pub struct Config {
     pub preview_card_fetch_concurrency: usize,
     /// Number of durable job loops to run in this process; zero in configuration uses available CPUs.
     pub worker_concurrency: usize,
+    /// Retention period for successfully completed durable jobs.
+    pub successful_job_retention: time::Duration,
+    /// Retention period for permanently failed durable jobs and their diagnostics.
+    pub permanently_failed_job_retention: time::Duration,
     /// Shared cadence for eventually consistent trend refreshes.
     pub trends_refresh_interval: time::Duration,
     /// Per-process cadence for refreshing global account-suggestion scores.
@@ -290,6 +296,14 @@ impl Config {
             "ROOSTY_WORKER_CONCURRENCY",
             DEFAULT_WORKER_CONCURRENCY,
         )?)?;
+        let successful_job_retention = optional_humantime_duration_env(
+            "ROOSTY_SUCCESSFUL_JOB_RETENTION",
+            DEFAULT_SUCCESSFUL_JOB_RETENTION,
+        )?;
+        let permanently_failed_job_retention = optional_humantime_duration_env(
+            "ROOSTY_PERMANENTLY_FAILED_JOB_RETENTION",
+            DEFAULT_PERMANENTLY_FAILED_JOB_RETENTION,
+        )?;
         let trends_refresh_interval = trends_refresh_interval_env()?;
         let account_suggestions_refresh_interval = optional_humantime_duration_env(
             "ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL",
@@ -346,6 +360,8 @@ impl Config {
             remote_media_fetch_concurrency,
             preview_card_fetch_concurrency,
             worker_concurrency,
+            successful_job_retention,
+            permanently_failed_job_retention,
             trends_refresh_interval,
             account_suggestions_refresh_interval,
             scheduled_statuses: ScheduledStatusConfig::from_env()?,
@@ -581,6 +597,8 @@ mod tests {
             remote_media_fetch_concurrency: 5,
             preview_card_fetch_concurrency: 5,
             worker_concurrency: 4,
+            successful_job_retention: time::Duration::hours(24),
+            permanently_failed_job_retention: time::Duration::days(30),
             trends_refresh_interval: time::Duration::minutes(5),
             account_suggestions_refresh_interval: time::Duration::hours(24),
             scheduled_statuses: ScheduledStatusConfig::default(),
@@ -660,6 +678,33 @@ mod tests {
                     .to_string()
                     .contains("ROOSTY_ACCOUNT_SUGGESTIONS_REFRESH_INTERVAL")
             );
+        }
+    }
+
+    #[test]
+    fn job_retention_defaults_are_positive_humantime_durations() {
+        assert_eq!(
+            nonzero_duration(
+                "ROOSTY_SUCCESSFUL_JOB_RETENTION",
+                DEFAULT_SUCCESSFUL_JOB_RETENTION,
+            )
+            .unwrap(),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(
+            nonzero_duration(
+                "ROOSTY_PERMANENTLY_FAILED_JOB_RETENTION",
+                DEFAULT_PERMANENTLY_FAILED_JOB_RETENTION,
+            )
+            .unwrap(),
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
+        for name in [
+            "ROOSTY_SUCCESSFUL_JOB_RETENTION",
+            "ROOSTY_PERMANENTLY_FAILED_JOB_RETENTION",
+        ] {
+            let error = nonzero_duration(name, "0s").unwrap_err();
+            assert!(error.to_string().contains(name));
         }
     }
 

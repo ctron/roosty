@@ -63,6 +63,13 @@ http://localhost:3001/metrics
 
 Roosty stores uploaded media in the `roosty-media` compose volume. Elk stores local client settings in the `elk-data` compose volume. The backend does not serve, package, or embed Elk.
 
+== Durable-job retention
+
+Worker processes remove successfully completed jobs after `24h` and permanently failed jobs after
+`30d` by default. Override these non-zero humantime durations with
+`ROOSTY_SUCCESSFUL_JOB_RETENTION` and `ROOSTY_PERMANENTLY_FAILED_JOB_RETENTION`. Cleanup runs in
+bounded batches and is safe when multiple worker processes share the database.
+
 == Streaming controls
 
 Streaming uses PostgreSQL for ordered, best-effort fan-out between server

@@ -141,6 +141,8 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(table_exists(database.connection(), "trend_refresh_schedule").await);
     assert!(!roosty_trend_routines_exist(database.connection()).await);
     assert!(column_exists(database.connection(), "job", "permanently_failed_at").await);
+    assert!(index_exists(database.connection(), "job_successful_cleanup_idx").await);
+    assert!(index_exists(database.connection(), "job_permanently_failed_cleanup_idx").await);
     assert!(column_exists(database.connection(), "local_notification", "filtered").await);
     assert!(
         column_exists(
