@@ -1,4 +1,4 @@
-use std::{fmt, io::Error as IoError, path::Path};
+use std::{borrow::Cow, fmt, io::Error as IoError, path::Path};
 
 use axum::{
     Extension, Form, Json, Router,
@@ -522,6 +522,31 @@ struct ValidatedAuthorizeRequest {
     redirect_uri: String,
 }
 
+/// OAuth authorization-request failures translated at the HTTP boundary.
+#[derive(Debug, thiserror::Error)]
+enum AuthorizeRequestError {
+    #[error("{0}")]
+    InvalidRequest(Cow<'static, str>),
+    #[error("{0}")]
+    InvalidClient(Cow<'static, str>),
+    #[error(transparent)]
+    Internal(#[from] RoostyError),
+}
+
+impl IntoResponse for AuthorizeRequestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InvalidRequest(description) => {
+                oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &description)
+            }
+            Self::InvalidClient(description) => {
+                oauth_error(StatusCode::BAD_REQUEST, "invalid_client", &description)
+            }
+            Self::Internal(error) => server_error(error),
+        }
+    }
+}
+
 enum AuthorizationCallback<'a> {
     Approved { code: &'a str },
     Denied,
@@ -590,7 +615,7 @@ async fn authorize_form(
 
     let validated = match validate_authorize_request(&database, &params).await {
         Ok(validated) => validated,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let app = validated.app;
 
@@ -661,7 +686,7 @@ async fn authorize(
 
     let validated = match validate_authorize_request(&database, &params).await {
         Ok(validated) => validated,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let app = validated.app;
 
@@ -732,45 +757,34 @@ async fn authorize(
 async fn validate_authorize_request(
     database: &DatabaseContext,
     params: &AuthorizeParams,
-) -> Result<ValidatedAuthorizeRequest, Response> {
+) -> Result<ValidatedAuthorizeRequest, AuthorizeRequestError> {
     if params.response_type != OAuthResponseType::Code {
-        return Err(oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "unsupported authorization request",
+        return Err(AuthorizeRequestError::InvalidRequest(
+            "unsupported authorization request".into(),
         ));
     }
     let challenge = optional_non_empty(params.code_challenge.as_deref());
     let method = params.code_challenge_method;
     if challenge.is_some() && method.unwrap_or(PkceMethod::S256) != PkceMethod::S256 {
-        return Err(oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "PKCE S256 is required",
+        return Err(AuthorizeRequestError::InvalidRequest(
+            "PKCE S256 is required".into(),
         ));
     }
 
-    let txn = database
-        .begin_read()
-        .await
-        .map_err(|error| server_error(error.into()))?;
+    let txn = database.begin_read().await.map_err(RoostyError::from)?;
     let app = roosty_db::find_oauth_application_by_client_id(&txn, &params.client_id)
         .await
-        .map_err(server_error)?
-        .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client"))?;
+        .map_err(AuthorizeRequestError::from)?
+        .ok_or_else(|| AuthorizeRequestError::InvalidClient("unknown client".into()))?;
     let Some(redirect_uri) =
         matching_redirect_uri(&app.redirect_uri, &params.redirect_uri).map(str::to_owned)
     else {
-        return Err(oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "redirect_uri mismatch",
+        return Err(AuthorizeRequestError::InvalidRequest(
+            "redirect_uri mismatch".into(),
         ));
     };
 
-    txn.commit()
-        .await
-        .map_err(|error| server_error(error.into()))?;
+    txn.commit().await.map_err(RoostyError::from)?;
     Ok(ValidatedAuthorizeRequest { app, redirect_uri })
 }
 
