@@ -164,6 +164,7 @@ pub async fn resolve_remote_actor(
         activitypub_id: document.id,
         username: document.preferred_username,
         domain,
+        invalid_handle: false,
         display_name: document.name,
         summary: document.summary,
         emojis: JsonValue::Array(document.tag),
@@ -382,12 +383,29 @@ async fn fetch_remote_actor_by_id(
     {
         return Err(invalid("remote actor inbox is outside its actor domain"));
     }
+    let cached = roosty_db::find_remote_actor_by_activitypub_id(db, activitypub_id).await?;
+    let handle_domain = cached
+        .as_ref()
+        .map_or_else(|| domain.clone(), |actor| actor.domain.clone());
+    let handle_unchanged = cached.as_ref().is_some_and(|actor| {
+        !actor.invalid_handle && actor.username == document.preferred_username
+    });
+    let handle_valid = handle_unchanged
+        || verify_remote_handle(
+            state,
+            db,
+            &document.preferred_username,
+            &handle_domain,
+            activitypub_id,
+        )
+        .await;
     Ok((
         RemoteActor {
             id: AccountId(Uuid::now_v7()),
             activitypub_id: document.id,
             username: document.preferred_username,
-            domain,
+            domain: handle_domain,
+            invalid_handle: !handle_valid,
             display_name: document.name,
             summary: document.summary,
             emojis: JsonValue::Array(document.tag),
@@ -411,6 +429,28 @@ async fn fetch_remote_actor_by_id(
         document.icon,
         document.image,
     ))
+}
+
+/// Verify that WebFinger still maps a refreshed human-readable handle to the immutable actor ID.
+async fn verify_remote_handle(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    username: &str,
+    domain: &str,
+    activitypub_id: &str,
+) -> bool {
+    let resource = format!("acct:{username}@{domain}");
+    let Ok(webfinger_url) = Url::parse(&format!("https://{domain}/.well-known/webfinger")) else {
+        return false;
+    };
+    let Ok(webfinger) =
+        fetch_json::<WebFingerResponse>(state, db, webfinger_url, Some((&resource, "resource")))
+            .await
+    else {
+        return false;
+    };
+    webfinger.subject.eq_ignore_ascii_case(&resource)
+        && activitypub_actor_href(webfinger).as_deref() == Some(activitypub_id)
 }
 
 /// Resolve a Move target only when it reciprocally declares the source actor.
@@ -460,6 +500,7 @@ pub async fn resolve_remote_move_target(
             activitypub_id: document.id,
             username: document.preferred_username,
             domain,
+            invalid_handle: false,
             display_name: document.name,
             summary: document.summary,
             emojis: JsonValue::Array(document.tag),

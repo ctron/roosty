@@ -59,7 +59,14 @@ expiration/closure, tally `Update` delivery, and Mastodon-compatible `Create(Not
 
 |🟢
 |Actor keys
-|
+|Legacy ActivityStreams RSA `publicKey` material is supported. FEP-521a key collections and
+Ed25519 keys are not yet supported.
+
+|🟢
+|FEP-8967 link previews
+|Inbound Notes prefer the first valid `Link.href` attachment and fall back to scanning linked
+content. Outbound Notes include the locally selected preview URL as a `Link` while retaining media
+`Document` attachments. Preview metadata is always fetched through Roosty's SSRF-safe pipeline.
 
 |===
 
@@ -78,7 +85,8 @@ expiration/closure, tally `Update` delivery, and Mastodon-compatible `Create(Not
 
 |🟢
 |Signed HTTP requests
-|
+|Legacy Cavage RSA signatures are supported. RFC 9421 signatures and RFC 9530
+`Content-Digest` are planned but not yet accepted or emitted.
 
 |🟢
 |Outbound delivery
@@ -223,7 +231,9 @@ page is read.
 
 |🟡
 |Account metadata
-|Remote counts reflect only content cached by this instance.
+|Remote counts reflect only content cached by this instance. Verified handle refreshes retain the
+stable account ID; conflicting or temporarily unverifiable handles expose `invalid_handle: true`
+with a server-unique placeholder `acct`.
 
 |🟢
 |Admin accounts API

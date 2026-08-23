@@ -950,6 +950,8 @@ pub struct RemoteActor {
     pub username: String,
     /// Remote actor's DNS domain.
     pub domain: String,
+    /// Whether the actor's current human-readable handle could not be verified.
+    pub invalid_handle: bool,
     /// Display name from the actor document.
     pub display_name: String,
     /// Profile summary from the actor document.
@@ -3293,11 +3295,14 @@ pub async fn upsert_remote_status(
     Box::pin(replace_status_preview_card(
         &txn,
         PreviewStatusTarget::Remote(status.id),
-        &status.content,
+        PreviewSource {
+            content: &status.content,
+            remote_html: true,
+            preferred_url: None,
+        },
         utc_date(status.published_at),
         PreviewActorOrigin::Remote,
         status.remote_actor_id.0,
-        true,
     ))
     .await?;
     refresh_status_search_document(&txn, StatusReference::Remote(status.id)).await?;
@@ -3372,6 +3377,7 @@ pub async fn process_remote_status_upsert(
     txn: &sea_orm::DatabaseTransaction,
     status: NewRemoteStatus,
     attachments: &[NewRemoteMediaAttachment],
+    preview_url: Option<&str>,
 ) -> Result<RemoteStatusUpsertResult> {
     let tag_names = status.tag_names.clone();
     let existing = remote_status::Entity::find()
@@ -3386,11 +3392,14 @@ pub async fn process_remote_status_upsert(
         Box::pin(replace_status_preview_card(
             txn,
             PreviewStatusTarget::Remote(status.id),
-            &status.content,
+            PreviewSource {
+                content: &status.content,
+                remote_html: true,
+                preferred_url: preview_url,
+            },
             utc_date(status.published_at),
             PreviewActorOrigin::Remote,
             status.remote_actor_id.0,
-            true,
         ))
         .await?;
         refresh_status_search_document(txn, StatusReference::Remote(status.id)).await?;
@@ -3419,6 +3428,7 @@ pub async fn process_remote_status_upsert(
         || existing.object.get("summary") != status.object.get("summary")
         || existing.object.get("sensitive") != status.object.get("sensitive")
         || existing.object.get("tag") != status.object.get("tag")
+        || existing.object.get("attachment") != status.object.get("attachment")
         || existing.object.get("quote") != status.object.get("quote")
         || existing.object.get("quoteUri") != status.object.get("quoteUri")
         || existing.object.get("quoteAuthorization") != status.object.get("quoteAuthorization")
@@ -3472,11 +3482,14 @@ pub async fn process_remote_status_upsert(
     Box::pin(replace_status_preview_card(
         txn,
         PreviewStatusTarget::Remote(status.id),
-        &status.content,
+        PreviewSource {
+            content: &status.content,
+            remote_html: true,
+            preferred_url: preview_url,
+        },
         utc_date(status.published_at),
         PreviewActorOrigin::Remote,
         status.remote_actor_id.0,
-        true,
     ))
     .await?;
     refresh_status_search_document(txn, StatusReference::Remote(status.id)).await?;
@@ -3968,12 +3981,12 @@ pub async fn upsert_remote_actor(
     upsert_remote_actor_with_identity(db, actor, true).await
 }
 
-/// Refresh an actor document without replacing its separately discovered WebFinger handle.
+/// Refresh an actor document and reconcile a separately verified WebFinger handle.
 pub async fn refresh_remote_actor(
     db: &impl ConnectionTrait,
     actor: &RemoteActor,
 ) -> Result<RemoteActor> {
-    upsert_remote_actor_with_identity(db, actor, false).await
+    upsert_remote_actor_with_identity(db, actor, true).await
 }
 
 async fn upsert_remote_actor_with_identity(
@@ -3987,10 +4000,24 @@ async fn upsert_remote_actor_with_identity(
         .one(db)
         .await?;
     let model = if let Some(existing) = existing {
+        let existing_id = existing.id;
         let mut active = existing.into_active_model();
         if replace_identity {
-            active.username = Set(actor.username.clone());
-            active.domain = Set(actor.domain.clone());
+            let conflict = !actor.invalid_handle
+                && remote_actor::Entity::find()
+                    .filter(remote_actor::Column::Username.eq(&actor.username))
+                    .filter(remote_actor::Column::Domain.eq(&actor.domain))
+                    .filter(remote_actor::Column::Id.ne(existing_id))
+                    .one(db)
+                    .await?
+                    .is_some();
+            if actor.invalid_handle || conflict {
+                active.invalid_handle = Set(true);
+            } else {
+                active.username = Set(actor.username.clone());
+                active.domain = Set(actor.domain.clone());
+                active.invalid_handle = Set(false);
+            }
         }
         active.display_name = Set(actor.display_name.clone());
         active.summary = Set(actor.summary.clone());
@@ -4011,11 +4038,24 @@ async fn upsert_remote_actor_with_identity(
         active.updated_at = Set(now);
         active.update(db).await?
     } else {
+        let invalid_handle = actor.invalid_handle
+            || remote_actor::Entity::find()
+                .filter(remote_actor::Column::Username.eq(&actor.username))
+                .filter(remote_actor::Column::Domain.eq(&actor.domain))
+                .one(db)
+                .await?
+                .is_some();
+        let stored_username = if invalid_handle {
+            format!("invalid-{}", actor.id.0)
+        } else {
+            actor.username.clone()
+        };
         remote_actor::ActiveModel {
             id: Set(actor.id.0),
             activitypub_id: Set(actor.activitypub_id.clone()),
-            username: Set(actor.username.clone()),
+            username: Set(stored_username),
             domain: Set(actor.domain.clone()),
+            invalid_handle: Set(invalid_handle),
             display_name: Set(actor.display_name.clone()),
             summary: Set(actor.summary.clone()),
             emojis: Set(actor.emojis.clone()),
@@ -4471,6 +4511,12 @@ enum PreviewStatusTarget {
     Remote(StatusId),
 }
 
+struct PreviewSource<'a> {
+    content: &'a str,
+    remote_html: bool,
+    preferred_url: Option<&'a str>,
+}
+
 impl PreviewStatusTarget {
     fn ids(self) -> (Option<Uuid>, Option<Uuid>) {
         match self {
@@ -4592,11 +4638,10 @@ where
 async fn replace_status_preview_card(
     txn: &DatabaseTransaction,
     target: PreviewStatusTarget,
-    content: &str,
+    source: PreviewSource<'_>,
     usage_day: Date,
     actor_origin: PreviewActorOrigin,
     actor_id: Uuid,
-    remote_html: bool,
 ) -> Result<()> {
     let (local_status_id, remote_status_id) = target.ids();
     let mut association_query = status_preview_card::Entity::find();
@@ -4609,11 +4654,16 @@ async fn replace_status_preview_card(
         None => association_query.filter(status_preview_card::Column::RemoteStatusId.is_null()),
     };
     let existing = association_query.one(txn).await?;
-    let url = if remote_html {
-        first_remote_preview_url(content)
-    } else {
-        first_local_preview_url(content)
-    };
+    let url = source
+        .preferred_url
+        .and_then(normalize_preview_url)
+        .or_else(|| {
+            if source.remote_html {
+                first_remote_preview_url(source.content)
+            } else {
+                first_local_preview_url(source.content)
+            }
+        });
     let scanned_at = OffsetDateTime::now_utc();
     let mut scan_query = status_preview_scan::Entity::find();
     scan_query = match local_status_id {
@@ -6071,16 +6121,28 @@ pub async fn pending_remote_follow_requests(
     let (rows, has_more) = trim_to_page(rows, limit);
     let first_cursor = rows.first().map(|row| row.id);
     let last_cursor = rows.last().map(|row| row.id);
-    let mut actors = Vec::with_capacity(rows.len());
-    for row in rows {
-        let actor = remote_actor::Entity::find_by_id(row.remote_actor_id)
-            .one(db)
-            .await?
-            .ok_or_else(|| {
-                RoostyError::InvalidInput("remote follow actor is missing".to_owned())
-            })?;
-        actors.push(remote_actor_from_model(actor));
-    }
+    let actor_ids = rows
+        .iter()
+        .map(|row| row.remote_actor_id)
+        .collect::<Vec<_>>();
+    let mut actors_by_id = remote_actor::Entity::find()
+        .filter(remote_actor::Column::Id.is_in(actor_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|actor| (actor.id, actor))
+        .collect::<HashMap<_, _>>();
+    let actors = rows
+        .into_iter()
+        .map(|row| {
+            actors_by_id
+                .remove(&row.remote_actor_id)
+                .map(remote_actor_from_model)
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("remote follow actor is missing".to_owned())
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(CollectionPage {
         items: actors,
@@ -10291,11 +10353,14 @@ pub async fn create_local_status(
     Box::pin(replace_status_preview_card(
         &txn,
         PreviewStatusTarget::Local(StatusId(status_id)),
-        &preview_content,
+        PreviewSource {
+            content: &preview_content,
+            remote_html: false,
+            preferred_url: None,
+        },
         utc_date(created_at),
         PreviewActorOrigin::Local,
         account_id.0,
-        false,
     ))
     .await?;
     refresh_status_search_document(&txn, StatusReference::Local(StatusId(status_id))).await?;
@@ -10364,11 +10429,14 @@ pub async fn create_local_status_with_media(
     Box::pin(replace_status_preview_card(
         txn,
         PreviewStatusTarget::Local(StatusId(status_id)),
-        &preview_content,
+        PreviewSource {
+            content: &preview_content,
+            remote_html: false,
+            preferred_url: None,
+        },
         utc_date(created_at),
         PreviewActorOrigin::Local,
         account_id.0,
-        false,
     ))
     .await?;
 
@@ -11455,11 +11523,14 @@ pub async fn backfill_preview_cards(db: &DbConnection) -> Result<TrendRefreshOut
         Box::pin(replace_status_preview_card(
             &txn,
             target,
-            &row.content,
+            PreviewSource {
+                content: &row.content,
+                remote_html,
+                preferred_url: None,
+            },
             utc_date(row.published_at),
             origin,
             row.actor_id,
-            remote_html,
         ))
         .await?;
     }
@@ -13134,11 +13205,14 @@ pub async fn update_owned_local_status(
     Box::pin(replace_status_preview_card(
         txn,
         PreviewStatusTarget::Local(status_id),
-        &status.content,
+        PreviewSource {
+            content: &status.content,
+            remote_html: false,
+            preferred_url: None,
+        },
         utc_date(status.created_at),
         PreviewActorOrigin::Local,
         status.account_id,
-        false,
     ))
     .await?;
     refresh_status_search_document(txn, StatusReference::Local(status_id)).await?;
@@ -19387,6 +19461,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         activitypub_id: actor.activitypub_id,
         username: actor.username,
         domain: actor.domain,
+        invalid_handle: actor.invalid_handle,
         display_name: actor.display_name,
         summary: actor.summary,
         emojis: actor.emojis,

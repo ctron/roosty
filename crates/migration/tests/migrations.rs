@@ -160,6 +160,7 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "remote_actor", "data_purged_at").await);
     assert!(column_exists(database.connection(), "local_account", "last_status_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "discoverable").await);
+    assert!(column_exists(database.connection(), "remote_actor", "invalid_handle").await);
     assert!(column_exists(database.connection(), "remote_actor", "last_status_at").await);
     assert!(index_exists(database.connection(), "local_account_directory_active_idx").await);
     assert!(index_exists(database.connection(), "local_account_directory_new_idx").await);

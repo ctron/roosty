@@ -47,6 +47,19 @@
 
 ### Federation gaps
 
+- [x] Support FEP-8967 preview selection and publication while keeping preview metadata behind the
+  existing SSRF-safe local fetch pipeline.
+- [x] Preserve immutable remote actor IDs during verified handle refreshes and expose conflicting
+  handles through Mastodon's optional `invalid_handle` account field.
+- [x] Batch follow-request actor hydration so page query count is independent of page size.
+- [x] Accept deterministic ActivityStreams language-valued attachment descriptions and ignore
+  malformed optional description metadata.
+- [ ] Add inbound RFC 9421 RSA HTTP Message Signatures and RFC 9530 `Content-Digest`, followed by
+  legacy-first outbound retry on HTTP 400/401.
+- [ ] Add FEP-521a RSA/Ed25519 key collections and local key lifecycle metadata.
+- [ ] Add FEP-8b32 `eddsa-jcs-2022` Object Integrity Proofs after FEP-521a/Ed25519 support; defer
+  `mldsa44-jcs-2024` until deployment prerequisites and relay interoperability justify it.
+
 - [x] Refresh expired cached remote actors during exact-handle resolution, with bounded discovery observability and cross-process deduplication.
 - [x] Include cached and resolved remote accounts in Mastodon account search, with pagination and deterministic ranking.
 - [x] Add signed outbound `Follow` and `Undo(Follow)` delivery, including durable delivery jobs, destination deduplication, retries, and permanent-failure diagnostics.

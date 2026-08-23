@@ -165,6 +165,8 @@ pub(crate) struct RemoteAccountResponse {
     id: String,
     username: String,
     acct: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalid_handle: Option<bool>,
     display_name: String,
     locked: bool,
     bot: bool,
@@ -713,6 +715,7 @@ pub(crate) fn unresolved_remote_account_response(
         id: activitypub_id.to_owned(),
         username,
         acct,
+        invalid_handle: None,
         display_name: String::new(),
         locked: false,
         bot: false,
@@ -746,7 +749,12 @@ fn remote_account_response_from_media(
     RemoteAccountResponse {
         id: actor.id.0.to_string(),
         username: actor.username.clone(),
-        acct: format!("{}@{}", actor.username, actor.domain),
+        acct: if actor.invalid_handle {
+            format!("invalid-{}@invalid.invalid", actor.id.0)
+        } else {
+            format!("{}@{}", actor.username, actor.domain)
+        },
+        invalid_handle: actor.invalid_handle.then_some(true),
         display_name: if suspended {
             String::new()
         } else {
@@ -1683,6 +1691,7 @@ mod tests {
             activitypub_id: "https://remote.test/users/alice".to_owned(),
             username: "alice".to_owned(),
             domain: "remote.test".to_owned(),
+            invalid_handle: false,
             display_name: "Alice".to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -1737,6 +1746,7 @@ mod tests {
             activitypub_id: "https://remote.test/users/alice".to_owned(),
             username: "alice".to_owned(),
             domain: "remote.test".to_owned(),
+            invalid_handle: false,
             display_name: "Alice".to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -1766,6 +1776,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(response["created_at"], format_timestamp(first_seen_at));
+    }
+
+    #[test]
+    /// Given a conflicting remote handle, the API emits Mastodon's optional validity flag and a
+    /// server-unique placeholder without changing the stable account ID.
+    fn invalid_remote_handle_uses_placeholder_acct() {
+        let actor_id = AccountId(uuid::Uuid::now_v7());
+        let actor = roosty_db::RemoteActor {
+            id: actor_id,
+            activitypub_id: "https://remote.test/users/alice".to_owned(),
+            username: "alice".to_owned(),
+            domain: "remote.test".to_owned(),
+            invalid_handle: true,
+            display_name: "Alice".to_owned(),
+            summary: String::new(),
+            emojis: json!([]),
+            inbox_url: "https://remote.test/users/alice/inbox".to_owned(),
+            shared_inbox_url: None,
+            followers_url: None,
+            featured_url: None,
+            featured_tags_url: None,
+            public_key_id: "https://remote.test/users/alice#main-key".to_owned(),
+            public_key_pem: String::new(),
+            expires_at: time::OffsetDateTime::UNIX_EPOCH,
+            profile_created_at: None,
+            first_seen_at: time::OffsetDateTime::UNIX_EPOCH,
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
+            limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
+            discoverable: None,
+        };
+
+        let value = serde_json::to_value(remote_account_response_from_media(
+            actor,
+            String::new(),
+            String::new(),
+        ))
+        .unwrap();
+        assert_eq!(value["id"], actor_id.0.to_string());
+        assert_eq!(value["invalid_handle"], true);
+        assert_eq!(
+            value["acct"],
+            format!("invalid-{}@invalid.invalid", actor_id.0)
+        );
     }
 
     #[test_context(AccountContext)]
@@ -3190,6 +3246,7 @@ mod tests {
                 activitypub_id: format!("https://{domain}/users/{username}"),
                 username: username.to_owned(),
                 domain: domain.to_owned(),
+                invalid_handle: false,
                 display_name: username.to_owned(),
                 summary: String::new(),
                 emojis: json!([]),

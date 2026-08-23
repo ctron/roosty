@@ -7421,6 +7421,7 @@ mod tests {
                 quote_manual_policy: Vec::new(),
             },
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8538,6 +8539,7 @@ mod tests {
                 content_type: Some("image/png".to_owned()),
                 description: Some("second image".to_owned()),
             }],
+            None,
         )
         .await
         .unwrap();
@@ -11299,6 +11301,7 @@ mod tests {
                 activitypub_id: actor_url.clone(),
                 username: username.to_owned(),
                 domain: "remote.test".to_owned(),
+                invalid_handle: false,
                 display_name: "Remote Alice".to_owned(),
                 summary: String::new(),
                 emojis: json!([]),

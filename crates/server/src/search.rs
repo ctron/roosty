@@ -858,6 +858,7 @@ mod tests {
                 activitypub_id: format!("https://{domain}/users/{username}"),
                 username: username.to_owned(),
                 domain: domain.to_owned(),
+                invalid_handle: false,
                 display_name: "Remote Alice".to_owned(),
                 summary: String::new(),
                 emojis: serde_json::json!([]),

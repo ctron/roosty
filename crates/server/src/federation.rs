@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
+    net::IpAddr,
     str::from_utf8,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration as StdDuration, SystemTime},
@@ -829,12 +830,18 @@ struct InboundAttachment {
     r#type: InboundAttachmentType,
     media_type: Option<String>,
     url: Option<JsonValue>,
-    name: Option<String>,
+    #[serde(default)]
+    href: Option<String>,
+    #[serde(default)]
+    name: Option<JsonValue>,
+    #[serde(default)]
+    summary: Option<JsonValue>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq)]
 enum InboundAttachmentType {
     Document,
+    Link,
     #[serde(other)]
     Other,
 }
@@ -849,6 +856,52 @@ impl InboundAttachment {
                 .map(str::to_owned),
             _ => None,
         }
+    }
+
+    /// Select a stable plain-text description from a string or language map.
+    fn description(&self) -> Option<String> {
+        self.name
+            .as_ref()
+            .and_then(language_value)
+            .or_else(|| self.summary.as_ref().and_then(language_value))
+    }
+
+    fn preview_href(&self) -> Option<String> {
+        if self.r#type != InboundAttachmentType::Link {
+            return None;
+        }
+        let url = Url::parse(self.href.as_deref()?).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str()?.parse::<IpAddr>().is_ok()
+        {
+            return None;
+        }
+        Some(url.to_string())
+    }
+}
+
+fn language_value(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(value) if !value.is_empty() => Some(value.clone()),
+        JsonValue::Object(values) => values
+            .get("und")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                let mut languages = values.keys().collect::<Vec<_>>();
+                languages.sort_unstable();
+                languages.into_iter().find_map(|language| {
+                    values
+                        .get(language)
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                })
+            }),
+        _ => None,
     }
 }
 
@@ -1204,18 +1257,18 @@ struct NoteExtensionsContext {
 
 /// ActivityStreams document attached to a locally authored Note.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NoteAttachment {
-    r#type: NoteAttachmentType,
-    media_type: String,
-    url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-}
-
-#[derive(Serialize)]
-enum NoteAttachmentType {
-    Document,
+#[serde(tag = "type")]
+enum NoteAttachment {
+    Document {
+        #[serde(rename = "mediaType")]
+        media_type: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    Link {
+        href: String,
+    },
 }
 
 /// Typed ActivityPub mention tag emitted on locally authored Notes.
@@ -3549,6 +3602,10 @@ async fn process_remote_status_activity(
                 .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
             let note = inbound.object;
             let poll = remote_poll_from_note(&note)?;
+            let preview_url = note
+                .attachment
+                .iter()
+                .find_map(InboundAttachment::preview_href);
             let attachments = note
                 .attachment
                 .iter()
@@ -3557,7 +3614,7 @@ async fn process_remote_status_activity(
                     attachment.url().map(|remote_url| NewRemoteMediaAttachment {
                         remote_url,
                         content_type: attachment.media_type.clone(),
-                        description: attachment.name.clone(),
+                        description: attachment.description(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3650,6 +3707,7 @@ async fn process_remote_status_activity(
                         .unwrap_or_default(),
                 },
                 &attachments,
+                preview_url.as_deref(),
             )
             .await?;
             let (status, edited, unchanged) = match upsert {
@@ -3980,6 +4038,10 @@ async fn fetch_public_remote_status(
         .transpose()
         .map_err(|_| permanent_fetch_failure("remote Note updated timestamp is invalid"))?
         .unwrap_or(published_at);
+    let preview_url = note
+        .attachment
+        .iter()
+        .find_map(InboundAttachment::preview_href);
     let attachments = note
         .attachment
         .iter()
@@ -3988,7 +4050,7 @@ async fn fetch_public_remote_status(
             attachment.url().map(|remote_url| NewRemoteMediaAttachment {
                 remote_url,
                 content_type: attachment.media_type.clone(),
-                description: attachment.name.clone(),
+                description: attachment.description(),
             })
         })
         .collect::<Vec<_>>();
@@ -4035,6 +4097,7 @@ async fn fetch_public_remote_status(
             quote_manual_policy,
         },
         &attachments,
+        preview_url.as_deref(),
     )
     .await?;
     let status = match upsert {
@@ -6870,16 +6933,20 @@ async fn note_object_with_remote_audience(
     to.dedup();
     cc.sort();
     cc.dedup();
-    let attachment = roosty_db::local_media_attachments_for_status(db, status.id)
+    let mut attachment = roosty_db::local_media_attachments_for_status(db, status.id)
         .await?
         .into_iter()
-        .map(|media| NoteAttachment {
-            r#type: NoteAttachmentType::Document,
+        .map(|media| NoteAttachment::Document {
             media_type: media.content_type,
             url: media::media_url(state, &media.file_path),
             name: media.description,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if let Some(card) =
+        roosty_db::preview_card_for_status(db, StatusReference::Local(status.id)).await?
+    {
+        attachment.push(NoteAttachment::Link { href: card.url });
+    }
     let render_context = TransactionContext::new(state, db);
     let tags = statuses::local_status_content_tag_links(&render_context, &status.content);
     let mut content = statuses::status_content_html_with_mentions_and_tags(
@@ -7156,12 +7223,13 @@ mod tests {
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundFollowActivity, InboundInteractionPolicy, InboundNote, InboundReplies, InboundTag,
-        InboundUndoAnnounceActivity, InboundUndoBlockActivity, InboundUndoFollowActivity,
-        MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note, NoteContext, NoteExtensionsContext,
-        NoteType, OutboxActivity, OutboxCollection, OutboxCollectionPage, PublicKey, actor_context,
-        actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
-        local_actor_type, parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
+        InboundAttachment, InboundFollowActivity, InboundInteractionPolicy, InboundNote,
+        InboundReplies, InboundTag, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
+        InboundUndoFollowActivity, MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note,
+        NoteAttachment, NoteContext, NoteExtensionsContext, NoteType, OutboxActivity,
+        OutboxCollection, OutboxCollectionPage, PublicKey, actor_context, actor_profile_fields,
+        canonical_activity_digest, is_remote_actor_lifecycle_activity, local_actor_type,
+        parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
     };
     use crate::{
         config::{
@@ -8410,6 +8478,53 @@ mod tests {
         assert_eq!(urls[1], "https://remote.example/statuses/3");
     }
 
+    /// Given FEP-8967 and media attachments, valid Links and language maps are selected without
+    /// allowing malformed optional metadata to reject the Note.
+    #[test]
+    fn note_attachments_select_preview_links_and_language_values() {
+        let attachments: Vec<InboundAttachment> = serde_json::from_value(json!([
+            {"type": "Link", "href": "file:///unsafe"},
+            {"type": "Link", "href": "https://links.example/article#section"},
+            {
+                "type": "Document",
+                "mediaType": "image/png",
+                "url": "https://media.example/image.png",
+                "name": {"fr": "Description", "en": "Alt text"}
+            },
+            {"type": "Document", "url": "https://media.example/broken.png", "name": [1, 2]}
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            attachments.iter().find_map(InboundAttachment::preview_href),
+            Some("https://links.example/article#section".to_owned())
+        );
+        assert_eq!(attachments[2].description().as_deref(), Some("Alt text"));
+        assert_eq!(attachments[3].description(), None);
+    }
+
+    /// Given media and preview attachments, outbound Notes retain ActivityStreams field names and
+    /// preserve attachment ordering.
+    #[test]
+    fn serializes_document_and_link_attachments() {
+        let value = serde_json::to_value(vec![
+            NoteAttachment::Document {
+                media_type: "image/png".to_owned(),
+                url: "https://example.test/image.png".to_owned(),
+                name: Some("Alt text".to_owned()),
+            },
+            NoteAttachment::Link {
+                href: "https://example.test/article".to_owned(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(value[0]["type"], "Document");
+        assert_eq!(value[0]["mediaType"], "image/png");
+        assert_eq!(value[1]["type"], "Link");
+        assert_eq!(value[1]["href"], "https://example.test/article");
+    }
+
     /// Given public ActivityStreams payloads, when serialized, then their property names use the
     /// ActivityStreams camelCase spelling required by Mastodon.
     #[test]
@@ -8984,6 +9099,7 @@ mod tests {
             activitypub_id: format!("https://{domain}/users/{username}"),
             username: username.to_owned(),
             domain: domain.to_owned(),
+            invalid_handle: false,
             display_name: username.to_owned(),
             summary: String::new(),
             emojis: json!([]),

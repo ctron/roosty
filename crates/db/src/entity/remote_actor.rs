@@ -10,6 +10,7 @@ pub struct Model {
     pub activitypub_id: String,
     pub username: String,
     pub domain: String,
+    pub invalid_handle: bool,
     pub display_name: String,
     pub summary: String,
     pub emojis: Json,
