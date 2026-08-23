@@ -7159,7 +7159,7 @@ mod tests {
         InboundFollowActivity, InboundInteractionPolicy, InboundNote, InboundReplies, InboundTag,
         InboundUndoAnnounceActivity, InboundUndoBlockActivity, InboundUndoFollowActivity,
         MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note, NoteContext, NoteExtensionsContext,
-        NoteType, OutboxActivity, OutboxCollectionPage, PublicKey, actor_context,
+        NoteType, OutboxActivity, OutboxCollection, OutboxCollectionPage, PublicKey, actor_context,
         actor_profile_fields, canonical_activity_digest, is_remote_actor_lifecycle_activity,
         local_actor_type, parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
     };
@@ -8492,7 +8492,15 @@ mod tests {
                 voters_count: None,
             }),
         };
-        let collection = OutboxCollectionPage {
+        let collection = OutboxCollection {
+            context: "https://www.w3.org/ns/activitystreams",
+            id: "https://example.test/users/alice/outbox".to_owned(),
+            r#type: CollectionType::OrderedCollection,
+            total_items: 1,
+            first: "https://example.test/users/alice/outbox?page=true".to_owned(),
+            last: "https://example.test/users/alice/outbox?page=true&min_id=0".to_owned(),
+        };
+        let page = OutboxCollectionPage {
             context: "https://www.w3.org/ns/activitystreams",
             id: "https://example.test/users/alice/outbox?page=true".to_owned(),
             r#type: CollectionType::OrderedCollectionPage,
@@ -8514,6 +8522,7 @@ mod tests {
 
         let actor = serde_json::to_value(actor).unwrap();
         let collection = serde_json::to_value(collection).unwrap();
+        let page = serde_json::to_value(page).unwrap();
 
         assert_eq!(actor["preferredUsername"], "alice");
         assert_eq!(
@@ -8568,17 +8577,21 @@ mod tests {
         );
         assert_eq!(collection["totalItems"], 1);
         assert!(collection.get("total_items").is_none());
-        assert!(collection.get("ordered_items").is_none());
+        assert_eq!(page["partOf"], "https://example.test/users/alice/outbox");
+        assert_eq!(page["totalItems"], 1);
+        assert!(page.get("total_items").is_none());
+        assert!(page.get("part_of").is_none());
+        assert!(page.get("ordered_items").is_none());
         assert_eq!(
-            collection["orderedItems"][0]["object"]["attributedTo"],
+            page["orderedItems"][0]["object"]["attributedTo"],
             "https://example.test/users/alice"
         );
         assert_eq!(
-            collection["orderedItems"][0]["object"]["tag"][0]["type"],
+            page["orderedItems"][0]["object"]["tag"][0]["type"],
             "Mention"
         );
         assert!(
-            collection["orderedItems"][0]["object"]
+            page["orderedItems"][0]["object"]
                 .get("attributed_to")
                 .is_none()
         );
