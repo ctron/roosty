@@ -260,6 +260,7 @@ impl UiBackend for RoostyUiBackend {
                 featured_tags,
                 profile_url: public_page_url(&state, &format!("/@{username}")),
                 activitypub_url: public_page_url(&state, &format!("/users/{username}")),
+                search_indexing_enabled: state.config.search_indexing_enabled.is_enabled(),
             })
         })
     }
@@ -442,10 +443,14 @@ impl UiBackend for RoostyUiBackend {
                 .map_err(|_| UiPublicPageError::Internal)?;
             let canonical_url = public_page_url(&state, &format!("/@{username}/{}", status_id.0));
             Ok(UiStatusThread {
-                noindex: !matches!(
-                    focus.visibility,
-                    UiStatusVisibility::Public | UiStatusVisibility::Unlisted
-                ),
+                noindex: !state.config.search_indexing_enabled.is_enabled()
+                    || account.limited_at.is_some()
+                    || !account.discoverable
+                    || !matches!(
+                        focus.visibility,
+                        UiStatusVisibility::Public | UiStatusVisibility::Unlisted
+                    ),
+                search_indexing_enabled: state.config.search_indexing_enabled.is_enabled(),
                 activitypub_url: public_page_url(
                     &state,
                     &format!("/users/{username}/statuses/{}", status_id.0),
@@ -835,12 +840,15 @@ async fn ui_local_status(
         .into_iter()
         .map(|media| UiMedia {
             kind: ui_media_kind(Some(&media.content_type)),
+            content_type: Some(media.content_type.clone()),
             url: media_url(state, &media.file_path),
             preview_url: media
                 .preview_file_path
                 .as_deref()
                 .map(|path| media_url(state, path)),
             description: media.description,
+            width: media.width.and_then(|value| u32::try_from(value).ok()),
+            height: media.height.and_then(|value| u32::try_from(value).ok()),
         })
         .collect();
     let poll = ui_poll(db, PollStatus::Local(id)).await?;
@@ -856,6 +864,13 @@ async fn ui_local_status(
     } else {
         None
     };
+    let content_html = status_content_html_with_mentions_and_tags(
+        &TransactionContext::new(state, db),
+        &status.content,
+        &[],
+        &[],
+        &[],
+    );
     Ok(UiStatus {
         id: id.0,
         author: UiStatusAuthor {
@@ -874,13 +889,8 @@ async fn ui_local_status(
         },
         url: public_page_url(state, &path),
         activitypub_url,
-        content_html: status_content_html_with_mentions_and_tags(
-            &TransactionContext::new(state, db),
-            &status.content,
-            &[],
-            &[],
-            &[],
-        ),
+        content_text: plain_text(&content_html),
+        content_html,
         spoiler_text: status.spoiler_text,
         sensitive: status.sensitive,
         visibility: ui_visibility(status.visibility),
@@ -927,6 +937,7 @@ async fn ui_remote_status(
         .into_iter()
         .map(|media| UiMedia {
             kind: ui_media_kind(media.content_type.as_deref()),
+            content_type: media.content_type.clone(),
             url: media
                 .file_path
                 .as_deref()
@@ -937,6 +948,8 @@ async fn ui_remote_status(
                 .as_deref()
                 .map(|path| media_url(state, path)),
             description: media.description,
+            width: media.width.and_then(|value| u32::try_from(value).ok()),
+            height: media.height.and_then(|value| u32::try_from(value).ok()),
         })
         .collect();
     let sensitive = status
@@ -961,6 +974,7 @@ async fn ui_remote_status(
     } else {
         None
     };
+    let content_html = sanitize_remote_status_html(&status.content);
     Ok(UiStatus {
         id: id.0,
         author: UiStatusAuthor {
@@ -976,7 +990,8 @@ async fn ui_remote_status(
         },
         url: status.activitypub_id.clone(),
         activitypub_url: status.activitypub_id,
-        content_html: sanitize_remote_status_html(&status.content),
+        content_text: plain_text(&content_html),
+        content_html,
         spoiler_text,
         sensitive,
         visibility: ui_visibility(status.visibility),
@@ -996,6 +1011,17 @@ async fn ui_remote_status(
             .await
             .map_err(|_| UiPublicPageError::Internal)?,
     })
+}
+
+/// Extract decoded, complete visible text from sanitized status HTML.
+fn plain_text(html: &str) -> String {
+    scraper::Html::parse_fragment(html)
+        .root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_owned()
 }
 
 async fn ui_context_status(
@@ -2114,18 +2140,31 @@ mod tests {
             assert!(html.contains("fediverse:creator"));
             assert!(html.contains("h-card"));
             assert!(html.contains("h-entry"));
+            let script_type = "type=\"application/ld+json\"";
+            let type_position = html
+                .find(script_type)
+                .expect("public-page JSON-LD script type");
+            let script_content = html[type_position..]
+                .split_once('>')
+                .and_then(|(_, rest)| rest.split_once("</script>"))
+                .map(|(script, _)| script)
+                .expect("public-page JSON-LD script content");
+            let structured_data: Value =
+                serde_json::from_str(script_content).expect("valid public-page JSON-LD");
             if path == "/@alice" {
-                let script_type = "type=\"application/ld+json\"";
-                let type_position = html.find(script_type).expect("profile JSON-LD script type");
-                let script_content = html[type_position..]
-                    .split_once('>')
-                    .and_then(|(_, rest)| rest.split_once("</script>"))
-                    .map(|(script, _)| script)
-                    .expect("profile JSON-LD script content");
-                let structured_data: Value =
-                    serde_json::from_str(script_content).expect("valid profile JSON-LD");
                 assert_eq!(structured_data["@type"], "ProfilePage");
                 assert_eq!(structured_data["mainEntity"]["@type"], "Person");
+                assert_eq!(structured_data["url"], canonical);
+                assert!(structured_data["mainEntity"]["agentInteractionStatistic"].is_array());
+            } else {
+                assert_eq!(structured_data["@type"], "SocialMediaPosting");
+                assert_eq!(structured_data["url"], canonical);
+                assert_eq!(structured_data["articleBody"], "Focused status");
+                assert_eq!(
+                    structured_data["author"]["url"],
+                    "https://roosty.test/@alice"
+                );
+                assert!(structured_data["interactionStatistic"].is_array());
             }
         }
     }
@@ -2143,6 +2182,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn disabled_search_indexing_omits_json_ld_and_marks_public_pages_noindex() {
+        for path in ["/@alice", "/@alice/0198a31c-2c00-7000-8000-000000000001"] {
+            let response = test_router_with_search_indexing(false)
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let html = String::from_utf8(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains("content=\"noindex, nofollow\""));
+            assert!(!html.contains("application/ld+json"));
+        }
+    }
+
     #[derive(Clone)]
     struct TestState {
         options: LeptosOptions,
@@ -2157,6 +2215,7 @@ mod tests {
     #[derive(Clone)]
     struct TestBackend {
         instance_description: Option<String>,
+        search_indexing_enabled: bool,
     }
 
     impl UiBackend for TestBackend {
@@ -2193,6 +2252,7 @@ mod tests {
         ) -> Pin<
             Box<dyn Future<Output = Result<UiProfileHeader, UiPublicPageError>> + Send + 'static>,
         > {
+            let search_indexing_enabled = self.search_indexing_enabled;
             Box::pin(async move {
                 if username != "alice" {
                     return Err(UiPublicPageError::NotFound);
@@ -2202,6 +2262,7 @@ mod tests {
                     featured_tags: Vec::new(),
                     profile_url: "https://roosty.test/@alice".to_owned(),
                     activitypub_url: "https://roosty.test/users/alice".to_owned(),
+                    search_indexing_enabled,
                 })
             })
         }
@@ -2245,6 +2306,7 @@ mod tests {
             status_id: String,
         ) -> Pin<Box<dyn Future<Output = Result<UiStatusThread, UiPublicPageError>> + Send + 'static>>
         {
+            let search_indexing_enabled = self.search_indexing_enabled;
             Box::pin(async move {
                 if username != "alice" || status_id != "0198a31c-2c00-7000-8000-000000000001" {
                     return Err(UiPublicPageError::NotFound);
@@ -2258,7 +2320,8 @@ mod tests {
                     activitypub_url: format!(
                         "https://roosty.test/users/alice/statuses/{status_id}"
                     ),
-                    noindex: false,
+                    noindex: !search_indexing_enabled,
+                    search_indexing_enabled,
                 })
             })
         }
@@ -2296,6 +2359,7 @@ mod tests {
             url: format!("https://roosty.test/@alice/{id}"),
             activitypub_url: format!("https://roosty.test/users/alice/statuses/{id}"),
             content_html: format!("<p>{content}</p>"),
+            content_text: content.to_owned(),
             spoiler_text: String::new(),
             sensitive: false,
             visibility: UiStatusVisibility::Public,
@@ -2317,6 +2381,20 @@ mod tests {
     }
 
     fn test_router_with_description(instance_description: Option<String>) -> Router {
+        test_router_with_options(instance_description, true)
+    }
+
+    fn test_router_with_search_indexing(search_indexing_enabled: bool) -> Router {
+        test_router_with_options(
+            Some("A test social server".to_owned()),
+            search_indexing_enabled,
+        )
+    }
+
+    fn test_router_with_options(
+        instance_description: Option<String>,
+        search_indexing_enabled: bool,
+    ) -> Router {
         let options = LeptosOptions::builder()
             .output_name("roosty-web")
             .site_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/site"))
@@ -2329,6 +2407,7 @@ mod tests {
         };
         let context = UiServerContext(Arc::new(TestBackend {
             instance_description,
+            search_indexing_enabled,
         }));
 
         Router::new()

@@ -378,6 +378,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode,
+            search_indexing_enabled: true.into(),
             federation_enabled: false,
             federation_key_encryption_secret: None,
             federation_allowed_domains: Vec::new(),

@@ -119,9 +119,12 @@ pub enum UiMediaKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UiMedia {
     pub kind: UiMediaKind,
+    pub content_type: Option<String>,
     pub url: String,
     pub preview_url: Option<String>,
     pub description: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// One read-only poll option.
@@ -168,6 +171,8 @@ pub struct UiStatus {
     pub url: String,
     pub activitypub_url: String,
     pub content_html: String,
+    /// Complete plain-text content for metadata consumers; unlike descriptions, this is not truncated.
+    pub content_text: String,
     pub spoiler_text: String,
     pub sensitive: bool,
     pub visibility: UiStatusVisibility,
@@ -207,6 +212,7 @@ pub struct UiProfileHeader {
     pub featured_tags: Vec<UiFeaturedTag>,
     pub profile_url: String,
     pub activitypub_url: String,
+    pub search_indexing_enabled: bool,
 }
 
 /// One selected public profile timeline and its document metadata.
@@ -228,6 +234,7 @@ pub struct UiStatusThread {
     pub canonical_url: String,
     pub activitypub_url: String,
     pub noindex: bool,
+    pub search_indexing_enabled: bool,
 }
 
 /// Error class returned by the native public-page backend.

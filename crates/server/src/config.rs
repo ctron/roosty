@@ -3,6 +3,7 @@ use std::{
     fmt::Display as FmtDisplay,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    result::Result as StdResult,
     str::FromStr,
     thread,
     time::Duration,
@@ -75,6 +76,46 @@ pub enum RegistrationMode {
     Closed,
     Open,
     Approval,
+}
+
+/// Boolean configuration whose absent value enables the feature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DefaultEnabled(bool);
+
+impl DefaultEnabled {
+    pub const fn is_enabled(self) -> bool {
+        self.0
+    }
+
+    fn resolve(
+        override_value: Option<Self>,
+        environment_value: impl FnOnce() -> Result<Option<Self>>,
+    ) -> Result<Self> {
+        match override_value {
+            Some(value) => Ok(value),
+            None => Ok(environment_value()?.unwrap_or_default()),
+        }
+    }
+}
+
+impl Default for DefaultEnabled {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+impl From<bool> for DefaultEnabled {
+    fn from(value: bool) -> Self {
+        Self(value)
+    }
+}
+
+impl FromStr for DefaultEnabled {
+    type Err = <bool as FromStr>::Err;
+
+    fn from_str(value: &str) -> StdResult<Self, Self::Err> {
+        value.parse().map(Self)
+    }
 }
 
 /// Per-process limits and timers for Mastodon-compatible streaming sockets.
@@ -170,6 +211,8 @@ pub struct Config {
     pub object_storage_backend: ObjectStorageBackend,
     pub media_root: String,
     pub registration_mode: RegistrationMode,
+    /// Whether public pages may be indexed and advertised to search crawlers.
+    pub search_indexing_enabled: DefaultEnabled,
     pub federation_enabled: bool,
     /// Secret used to encrypt persisted local actor private keys.
     pub federation_key_encryption_secret: Option<String>,
@@ -198,7 +241,10 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env(listen_override: Option<SocketAddr>) -> Result<Self> {
+    pub fn from_env(
+        listen_override: Option<SocketAddr>,
+        search_indexing_override: Option<DefaultEnabled>,
+    ) -> Result<Self> {
         let listen_addr = match listen_override {
             Some(listen) => listen,
             None => parse_env("ROOSTY_LISTEN_ADDR", DEFAULT_LISTEN_ADDR)?,
@@ -288,6 +334,9 @@ impl Config {
             media_root: optional_env("ROOSTY_MEDIA_ROOT")
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_owned()),
             registration_mode: parse_env("ROOSTY_REGISTRATION_MODE", DEFAULT_REGISTRATION_MODE)?,
+            search_indexing_enabled: DefaultEnabled::resolve(search_indexing_override, || {
+                optional_parse_env("ROOSTY_SEARCH_INDEXING_ENABLED")
+            })?,
             federation_enabled,
             federation_key_encryption_secret,
             federation_allowed_domains,
@@ -444,10 +493,10 @@ where
     T: FromStr,
     T::Err: FmtDisplay,
 {
-    optional_env(name)
-        .unwrap_or_else(|| default.to_owned())
-        .parse()
-        .map_err(|error| RoostyError::Configuration(format!("{name} is invalid: {error}")))
+    parse_value(
+        name,
+        &optional_env(name).unwrap_or_else(|| default.to_owned()),
+    )
 }
 
 fn optional_parse_env<T>(name: &str) -> Result<Option<T>>
@@ -456,24 +505,22 @@ where
     T::Err: FmtDisplay,
 {
     optional_env(name)
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| RoostyError::Configuration(format!("{name} is invalid: {error}")))
-        })
+        .map(|value| parse_value(name, &value))
         .transpose()
 }
 
 fn optional_bool_env(name: &str) -> Result<Option<bool>> {
-    optional_env(name)
-        .map(|value| match value.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
-            _ => Err(RoostyError::Configuration(format!(
-                "{name} must be a boolean"
-            ))),
-        })
-        .transpose()
+    optional_parse_env(name)
+}
+
+fn parse_value<T>(name: &str, value: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: FmtDisplay,
+{
+    value
+        .parse()
+        .map_err(|error| RoostyError::Configuration(format!("{name} is invalid: {error}")))
 }
 
 fn positive_concurrency(name: &str, value: usize) -> Result<usize> {
@@ -492,9 +539,23 @@ mod tests {
 
     #[test]
     fn parses_boolean_values() {
-        assert!(optional_bool_value("true").unwrap());
-        assert!(!optional_bool_value("0").unwrap());
-        assert!(optional_bool_value("sometimes").is_err());
+        assert!(DefaultEnabled::from_str("true").unwrap().is_enabled());
+        assert!(!DefaultEnabled::from_str("false").unwrap().is_enabled());
+        assert!(DefaultEnabled::from_str("sometimes").is_err());
+    }
+
+    #[test]
+    fn search_indexing_defaults_enabled_and_cli_value_precedes_environment() {
+        assert!(
+            DefaultEnabled::resolve(None, || Ok(None))
+                .unwrap()
+                .is_enabled()
+        );
+        assert!(
+            !DefaultEnabled::resolve(Some(false.into()), || unreachable!())
+                .unwrap()
+                .is_enabled()
+        );
     }
 
     #[test]
@@ -510,6 +571,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode: RegistrationMode::Closed,
+            search_indexing_enabled: true.into(),
             federation_enabled: true,
             federation_key_encryption_secret: Some("test-federation-secret".to_owned()),
             federation_allowed_domains: vec!["*".to_owned()],
@@ -687,16 +749,6 @@ mod tests {
                 .to_string()
                 .contains("ROOSTY_STREAMING_IDLE_TIMEOUT")
             );
-        }
-    }
-
-    fn optional_bool_value(value: &str) -> Result<bool> {
-        match value {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
-            _ => Err(RoostyError::Configuration(
-                "ROOSTY_FEDERATION_ENABLED must be a boolean".to_owned(),
-            )),
         }
     }
 }

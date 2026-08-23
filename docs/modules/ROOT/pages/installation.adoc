@@ -286,10 +286,19 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 |`closed`
 |Advertised mode: `closed`, `open`, or `approval`. Public registration is not yet implemented.
 
+|`ROOSTY_SEARCH_INDEXING_ENABLED`
+|`true`
+|Advertise eligible public profiles and statuses to search engines. `serve --search-indexing-enabled <true|false>` overrides the environment for that process.
+
 |`ROOSTY_WEB_ROOT`
 |Build-dependent
 |Directory containing the packaged first-party web assets.
 |===
+
+When search indexing is disabled, every public profile and status document emits
+`noindex, nofollow`, JSON-LD is omitted, sitemap routes return `404`, and `robots.txt` no longer
+advertises a sitemap. Crawling remains allowed so engines can observe `noindex` and remove old
+results. Use the same setting on every Roosty process behind a shared hostname.
 
 === Media and Web Push
 

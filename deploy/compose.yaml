@@ -18,6 +18,7 @@ services:
       ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
       ROOSTY_WEB_ROOT: /usr/local/share/roosty/site
       ROOSTY_REGISTRATION_MODE: closed
+      ROOSTY_SEARCH_INDEXING_ENABLED: "true"
       ROOSTY_WORKER_CONCURRENCY: "4"
       ROOSTY_FEDERATION_ENABLED: "false"
     ports:

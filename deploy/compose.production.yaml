@@ -10,6 +10,7 @@ services:
       ROOSTY_INFRA_LISTEN_ADDR: 0.0.0.0:3001
       ROOSTY_MEDIA_ROOT: /var/lib/roosty/media
       ROOSTY_WEB_ROOT: /usr/local/share/roosty/site
+      ROOSTY_SEARCH_INDEXING_ENABLED: ${ROOSTY_SEARCH_INDEXING_ENABLED:-true}
     volumes:
       - roosty-media:/var/lib/roosty/media
     depends_on:

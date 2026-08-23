@@ -9,6 +9,7 @@ roosty_docker_packages:
   - docker-compose-v2
   - openssl
 roosty_worker_concurrency: 4
+roosty_search_indexing_enabled: true
 roosty_scheduled_status_minimum_offset: 5m
 roosty_scheduled_status_total_limit: 300
 roosty_scheduled_status_daily_limit: 25

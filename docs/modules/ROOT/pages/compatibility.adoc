@@ -581,7 +581,9 @@ Bare domains without a URL scheme remain plain text.
 |🟢
 |Profile and status pages
 |Local profile tabs and bounded status threads are server rendered, session-aware, and
-UUID-cursor paginated. ActivityPub actor and Note endpoints remain JSON-only.
+UUID-cursor paginated. Eligible public documents expose `ProfilePage` and `SocialMediaPosting`
+JSON-LD plus bounded sitemap discovery; sensitive posts are excluded from structured data and
+sitemaps. ActivityPub actor and Note endpoints remain JSON-only.
 
 |===
 

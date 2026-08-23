@@ -9,6 +9,7 @@ mod authorization;
 mod bootstrap;
 mod forms;
 mod public_pages;
+mod structured_data;
 mod ui;
 
 #[cfg(feature = "ssr")]

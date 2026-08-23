@@ -3413,6 +3413,7 @@ mod tests {
                 object_storage_backend: ObjectStorageBackend::Local,
                 media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
                 registration_mode: RegistrationMode::Closed,
+                search_indexing_enabled: true.into(),
                 federation_enabled: false,
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),

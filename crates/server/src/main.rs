@@ -42,6 +42,7 @@ mod preview_cards;
 mod push;
 mod reports;
 mod search;
+mod search_discovery;
 mod statuses;
 mod streaming;
 #[cfg(test)]
@@ -50,7 +51,7 @@ mod version;
 mod web;
 
 use crate::{
-    config::{Config, database_url_from_env},
+    config::{Config, DefaultEnabled, database_url_from_env},
     http::{AppState, DatabaseContext},
 };
 #[cfg(test)]
@@ -81,6 +82,10 @@ enum Command {
 
         #[arg(long)]
         listen: Option<SocketAddr>,
+
+        /// Enable or disable public search-engine indexing and sitemap discovery.
+        #[arg(long, value_name = "true|false", num_args = 1)]
+        search_indexing_enabled: Option<DefaultEnabled>,
     },
 
     /// Run only durable background jobs.
@@ -150,7 +155,8 @@ async fn main() -> Result<()> {
             migrations,
             with_worker,
             listen,
-        } => serve(listen, migrations, with_worker).await,
+            search_indexing_enabled,
+        } => serve(listen, migrations, with_worker, search_indexing_enabled).await,
         Command::Worker => worker().await,
         Command::Migrate => migrate().await,
         Command::Admin { command } => match command {
@@ -269,8 +275,9 @@ async fn serve(
     listen_override: Option<SocketAddr>,
     run_startup_migrations: bool,
     with_worker: bool,
+    search_indexing_override: Option<DefaultEnabled>,
 ) -> Result<()> {
-    let config = Config::from_env(listen_override)?;
+    let config = Config::from_env(listen_override, search_indexing_override)?;
     let db = roosty_db::connect(&config.database_url).await?;
     if run_startup_migrations {
         info!("running database migrations before server startup");
@@ -334,7 +341,7 @@ async fn serve(
 }
 
 async fn worker() -> Result<()> {
-    let config = Config::from_env(None)?;
+    let config = Config::from_env(None, None)?;
     let db = roosty_db::connect(&config.database_url).await?;
     roosty_db::configure_trend_refresh_schedule(&db, config.trends_refresh_interval).await?;
     roosty_db::enqueue_preview_backfill_if_needed(&db).await?;
@@ -789,6 +796,29 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
+
+    #[test]
+    fn serve_search_indexing_flag_accepts_explicit_booleans() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let cli = Cli::try_parse_from(["roosty", "serve", "--search-indexing-enabled", value])
+                .unwrap();
+            let Command::Serve {
+                search_indexing_enabled,
+                ..
+            } = cli.command
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                search_indexing_enabled.map(DefaultEnabled::is_enabled),
+                Some(expected)
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["roosty", "serve", "--search-indexing-enabled", "sometimes"])
+                .is_err()
+        );
+    }
 
     /// Protects the local username rules used by admin account creation commands.
     #[test]
@@ -1454,6 +1484,61 @@ mod tests {
         postgresql.stop().await.unwrap();
     }
 
+    /// Given mixed account and status eligibility, sitemap queries expose only promotable URLs.
+    #[tokio::test]
+    async fn search_sitemap_queries_filter_profiles_and_statuses() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let alice = roosty_db::create_local_account(
+            &db,
+            "alice",
+            "alice@example.com",
+            "unused-password-hash",
+        )
+        .await
+        .unwrap();
+        let bob =
+            roosty_db::create_local_account(&db, "bob", "bob@example.com", "unused-password-hash")
+                .await
+                .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE local_account SET discoverable = false WHERE id = $1",
+            [bob.into()],
+        ))
+        .await
+        .unwrap();
+        let public_status = uuid::Uuid::now_v7();
+        let sensitive_status = uuid::Uuid::now_v7();
+        for (id, sensitive) in [(public_status, false), (sensitive_status, true)] {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO local_status (id, account_id, content, visibility, sensitive) VALUES ($1, $2, 'hello', 'public', $3)",
+                [id.into(), alice.into(), sensitive.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let profile_chunks = roosty_db::search_profile_sitemap_chunks(&db).await.unwrap();
+        assert_eq!(profile_chunks.len(), 1);
+        let profiles = roosty_db::search_profile_sitemap_urls(&db, profile_chunks[0].cursor)
+            .await
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].username, "alice");
+
+        let status_chunks = roosty_db::search_status_sitemap_chunks(&db).await.unwrap();
+        assert_eq!(status_chunks.len(), 1);
+        let statuses = roosty_db::search_status_sitemap_urls(&db, status_chunks[0].cursor)
+            .await
+            .unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].id, public_status);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
     fn test_worker_config() -> Config {
         Config {
             database_url: "postgres://unused".to_owned(),
@@ -1466,6 +1551,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode: RegistrationMode::Closed,
+            search_indexing_enabled: true.into(),
             federation_enabled: true,
             federation_key_encryption_secret: Some(
                 "test-federation-key-encryption-secret-000".to_owned(),

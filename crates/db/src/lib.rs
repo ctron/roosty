@@ -39,6 +39,9 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+mod search_discovery;
+pub use search_discovery::*;
+
 /// Closed Mastodon status visibility values, serialized as text at persistence and API boundaries.
 #[derive(
     Clone,

@@ -33,6 +33,8 @@
 - A first-party Rust/WebAssembly frontend with server-rendered welcome, about, login, password,
   OAuth, local profile timelines, and bounded status-thread views; public pages hydrate with SEO
   metadata, cursor loading, deep-link support, and session-aware visibility served by the backend.
+  Eligible pages expose typed profile/post JSON-LD and bounded sitemap discovery behind a global
+  indexing switch.
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Mastodon-compatible local actor outboxes expose cursor-paginated status `Create` and boost
   `Announce` activities, with HTTP-signature-aware follower and mention visibility.

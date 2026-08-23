@@ -60,6 +60,20 @@ microformats. Private pages, later cursor pages, limited accounts, and non-disco
 are marked `noindex`. Sensitive status metadata contains only the content warning and never a
 preview image.
 
+When global search indexing is enabled, eligible profile roots include typed `ProfilePage` JSON-LD
+and eligible status permalinks include Google-supported `SocialMediaPosting` JSON-LD with authors,
+interaction counters, media, edits, and safe visible replies. Sensitive posts never receive
+JSON-LD or sitemap promotion. Media-only posts receive posting markup only when an image or a
+complete video representation is available. `/robots.txt` advertises `/sitemap.xml`, whose
+cursor-addressed profile and post sitemap chunks contain at most 50,000 canonical URLs each.
+Profiles must be active, discoverable, and unlimited; promoted posts must additionally be public
+and non-sensitive.
+
+After deployment, validate representative profile, text, image, video, edited, and reply-thread
+URLs with Google's Rich Results Test. Submit `/sitemap.xml` in Search Console, inspect live URLs,
+and request recrawling where appropriate. Search indexing and rich-result display remain at
+Google's discretion.
+
 The welcome and about pages present the operator-configured instance name and description rather
 than Roosty project marketing. A missing or blank description uses neutral social-web copy. Roosty
 appears as software attribution with its release version in the shared footer.

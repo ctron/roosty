@@ -88,6 +88,7 @@ mod m20260701_000078_create_account_suggestion_dismissals;
 mod m20260701_000079_create_account_suggestion_cache;
 mod m20260701_000080_add_outbox_indexes;
 mod m20260701_000081_constrain_job_kind;
+mod m20260701_000082_add_search_discovery_indexes;
 
 pub struct Migrator;
 
@@ -176,6 +177,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000079_create_account_suggestion_cache::Migration),
             Box::new(m20260701_000080_add_outbox_indexes::Migration),
             Box::new(m20260701_000081_constrain_job_kind::Migration),
+            Box::new(m20260701_000082_add_search_discovery_indexes::Migration),
         ]
     }
 }

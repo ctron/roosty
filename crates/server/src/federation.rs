@@ -1330,6 +1330,7 @@ struct OutboxCollectionPage {
     id: String,
     r#type: CollectionType,
     part_of: String,
+    total_items: u64,
     ordered_items: Vec<OutboxActivity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next: Option<String>,
@@ -1726,6 +1727,7 @@ async fn outbox(
             id: page_id,
             r#type: CollectionType::OrderedCollectionPage,
             part_of: outbox_id.clone(),
+            total_items: ordered_items.len() as u64,
             ordered_items,
             next,
             prev,
@@ -8495,6 +8497,7 @@ mod tests {
             id: "https://example.test/users/alice/outbox?page=true".to_owned(),
             r#type: CollectionType::OrderedCollectionPage,
             part_of: "https://example.test/users/alice/outbox".to_owned(),
+            total_items: 1,
             ordered_items: vec![OutboxActivity::Create(Box::new(Create {
                 context: "https://www.w3.org/ns/activitystreams",
                 r#type: CreateType::Create,
@@ -8882,6 +8885,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode: RegistrationMode::Closed,
+            search_indexing_enabled: true.into(),
             federation_enabled: true,
             federation_key_encryption_secret: Some(
                 "test-federation-key-encryption-secret-000".to_owned(),
