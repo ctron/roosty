@@ -29,6 +29,7 @@ argon2 = "0.5.3"
 axum = { version = "0.8.4", features = ["macros", "ws"] }
 axum-params = "0.4.1"
 base64 = "0.22.1"
+ed25519-dalek = { version = "3.0.0", features = ["alloc", "pkcs8", "rand_core"] }
 blurhash = "0.2.3"
 browser-panic-hook = "0.2.0"
 build-info = "0.0.45"
@@ -45,6 +46,7 @@ leptos_axum = "0.8.10"
 leptos_meta = "0.8.5"
 leptos_router = "0.8.6"
 linkify = "0.11.0"
+multibase = "0.9.3"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 ring = "0.17.14"
 rsa = "0.9.10"

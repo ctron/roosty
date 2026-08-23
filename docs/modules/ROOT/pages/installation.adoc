@@ -371,6 +371,14 @@ serializes and rate-limits requests to each remote host across all processes.
 |`7d`
 |Maximum age for retrying a failed delivery.
 
+|`ROOSTY_FEDERATION_KEY_ROTATION_INTERVAL`
+|`90d`
+|Age at which active local RSA and Ed25519 actor keys rotate. Must be positive.
+
+|`ROOSTY_FEDERATION_KEY_OVERLAP`
+|`7d`
+|How long retiring actor keys remain published and usable. Must be positive and shorter than the rotation interval.
+
 |`ROOSTY_WORKER_CONCURRENCY`
 |`4`
 |Durable worker loops per process. `0` selects the available logical CPU count.

@@ -1,18 +1,27 @@
 //! Safe WebFinger and ActivityPub actor discovery for remote accounts.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
+use multibase::Base;
 use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE},
     redirect::Policy,
 };
 use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
-use roosty_db::{NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor};
+use roosty_db::{
+    ActorKeyAlgorithm, NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor, RemoteActorKey,
+};
+use rsa::{
+    RsaPublicKey,
+    pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey},
+    pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding},
+};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -78,7 +87,10 @@ struct RemoteActorDocument {
     featured_tags: Option<String>,
     #[serde(default)]
     endpoints: RemoteEndpoints,
-    public_key: RemotePublicKey,
+    #[serde(default)]
+    public_key: Option<RemoteKeyReference>,
+    #[serde(default)]
+    assertion_method: Vec<RemoteKeyReference>,
 }
 
 /// ActivityStreams allows image references as either URLs or Image objects.
@@ -111,10 +123,194 @@ struct RemotePublicKey {
     public_key_pem: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RemoteKeyReference {
+    Reference(String),
+    Legacy(RemotePublicKey),
+    Multikey(RemoteMultikey),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteMultikey {
+    id: String,
+    r#type: RemoteKeyType,
+    controller: String,
+    public_key_multibase: String,
+    #[serde(default)]
+    expires: Option<String>,
+}
+
+#[derive(Deserialize, Eq, PartialEq)]
+enum RemoteKeyType {
+    Multikey,
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Clone, Copy)]
 enum RemoteActorStoreMode {
     DiscoveredHandle,
     RefreshedDocument,
+}
+
+struct ParsedActorKey {
+    key_id: String,
+    algorithm: ActorKeyAlgorithm,
+    public_key: Vec<u8>,
+    expires_at: Option<OffsetDateTime>,
+}
+
+async fn actor_keys(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    document: &RemoteActorDocument,
+) -> Result<Vec<ParsedActorKey>> {
+    if document.assertion_method.len() > 10 {
+        return Err(invalid("remote actor advertises too many keys"));
+    }
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(reference) = &document.public_key
+        && let Some(key) = parse_key_reference(state, db, reference, &document.id).await?
+    {
+        seen.insert(key.key_id.clone());
+        keys.push(key);
+    }
+    for reference in &document.assertion_method {
+        if let Some(key) = parse_key_reference(state, db, reference, &document.id).await? {
+            if !seen.insert(key.key_id.clone()) {
+                if document
+                    .public_key
+                    .as_ref()
+                    .is_some_and(|legacy| key_reference_id(legacy) == Some(key.key_id.as_str()))
+                {
+                    continue;
+                }
+                return Err(invalid("remote actor key IDs are not unique"));
+            }
+            keys.push(key);
+        }
+    }
+    if keys.len() > 10 {
+        return Err(invalid("remote actor advertises too many usable keys"));
+    }
+    if keys.is_empty() {
+        return Err(invalid("remote actor has no usable verification key"));
+    }
+    Ok(keys)
+}
+
+fn key_reference_id(reference: &RemoteKeyReference) -> Option<&str> {
+    match reference {
+        RemoteKeyReference::Reference(id) => Some(id),
+        RemoteKeyReference::Legacy(key) => Some(&key.id),
+        RemoteKeyReference::Multikey(key) => Some(&key.id),
+    }
+}
+
+async fn parse_key_reference(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    reference: &RemoteKeyReference,
+    controller: &str,
+) -> Result<Option<ParsedActorKey>> {
+    match reference {
+        RemoteKeyReference::Legacy(key) => parse_legacy_key(key, controller).map(Some),
+        RemoteKeyReference::Multikey(key) => parse_multikey(key, controller),
+        RemoteKeyReference::Reference(key_id) => {
+            let url = Url::parse(key_id).map_err(|_| invalid("remote key URL is invalid"))?;
+            if url.scheme() != "https" || url.host_str().is_none() {
+                return Err(invalid("remote key URL must use HTTPS"));
+            }
+            let value: JsonValue = fetch_json(state, db, url, None).await?;
+            if let Ok(key) = serde_json::from_value::<RemoteMultikey>(value.clone()) {
+                if key.id != *key_id {
+                    return Err(invalid("referenced remote key ID does not match"));
+                }
+                parse_multikey(&key, controller)
+            } else {
+                let key: RemotePublicKey = serde_json::from_value(value)
+                    .map_err(|_| invalid("referenced remote key is invalid"))?;
+                if key.id != *key_id {
+                    return Err(invalid("referenced remote key ID does not match"));
+                }
+                parse_legacy_key(&key, controller).map(Some)
+            }
+        }
+    }
+}
+
+fn parse_legacy_key(key: &RemotePublicKey, controller: &str) -> Result<ParsedActorKey> {
+    if key.id.is_empty() || key.owner != controller {
+        return Err(invalid("remote actor public key is invalid"));
+    }
+    let der = RsaPublicKey::from_public_key_pem(&key.public_key_pem)
+        .map_err(|_| invalid("remote actor public key is invalid"))?
+        .to_pkcs1_der()
+        .map_err(|_| invalid("remote actor public key is invalid"))?;
+    Ok(ParsedActorKey {
+        key_id: key.id.clone(),
+        algorithm: ActorKeyAlgorithm::RsaPkcs1Sha256,
+        public_key: der.as_bytes().to_vec(),
+        expires_at: None,
+    })
+}
+
+fn parse_multikey(key: &RemoteMultikey, controller: &str) -> Result<Option<ParsedActorKey>> {
+    if key.r#type != RemoteKeyType::Multikey || key.id.is_empty() || key.controller != controller {
+        return Err(invalid("remote Multikey controller is invalid"));
+    }
+    let expires_at = key
+        .expires
+        .as_deref()
+        .map(|value| {
+            OffsetDateTime::parse(value, &Rfc3339)
+                .map_err(|_| invalid("remote Multikey expiration is invalid"))
+        })
+        .transpose()?;
+    if expires_at.is_some_and(|expires| expires <= OffsetDateTime::now_utc()) {
+        return Ok(None);
+    }
+    let (base, bytes) = multibase::decode(&key.public_key_multibase)
+        .map_err(|_| invalid("remote Multikey encoding is invalid"))?;
+    if !matches!(base, Base::Base58Btc | Base::Base64Url) {
+        return Err(invalid("remote Multikey encoding is unsupported"));
+    }
+    let (algorithm, public_key) = if let Some(public_key) = bytes.strip_prefix(&[0xed, 0x01]) {
+        if public_key.len() != 32 {
+            return Err(invalid("remote Ed25519 Multikey length is invalid"));
+        }
+        (ActorKeyAlgorithm::Ed25519, public_key.to_vec())
+    } else if let Some(public_key) = bytes.strip_prefix(&[0x85, 0x24]) {
+        RsaPublicKey::from_pkcs1_der(public_key)
+            .map_err(|_| invalid("remote RSA Multikey is invalid"))?;
+        (ActorKeyAlgorithm::RsaPkcs1Sha256, public_key.to_vec())
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(ParsedActorKey {
+        key_id: key.id.clone(),
+        algorithm,
+        public_key,
+        expires_at,
+    }))
+}
+
+fn legacy_projection(keys: &[ParsedActorKey]) -> Result<(String, String)> {
+    if let Some(key) = keys
+        .iter()
+        .find(|key| key.algorithm == ActorKeyAlgorithm::RsaPkcs1Sha256)
+    {
+        let pem = RsaPublicKey::from_pkcs1_der(&key.public_key)
+            .map_err(|_| invalid("remote RSA Multikey is invalid"))?
+            .to_public_key_pem(LineEnding::LF)
+            .map_err(|_| invalid("remote RSA Multikey is invalid"))?;
+        Ok((key.key_id.clone(), pem))
+    } else {
+        Ok((keys[0].key_id.clone(), String::new()))
+    }
 }
 
 /// Resolve and cache a remote actor after applying the configured network policy.
@@ -154,6 +350,8 @@ pub async fn resolve_remote_actor(
         Url::parse(&actor_url).map_err(|_| invalid("WebFinger actor URL is invalid"))?;
     let document: RemoteActorDocument = fetch_json(state, &lock, actor_url.clone(), None).await?;
     validate_actor_document(&document, &actor_url, username)?;
+    let keys = actor_keys(state, &lock, &document).await?;
+    let (public_key_id, public_key_pem) = legacy_projection(&keys)?;
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
@@ -173,8 +371,8 @@ pub async fn resolve_remote_actor(
         followers_url,
         featured_url,
         featured_tags_url,
-        public_key_id: document.public_key.id,
-        public_key_pem: document.public_key.public_key_pem,
+        public_key_id,
+        public_key_pem,
         expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
         profile_created_at,
         first_seen_at: OffsetDateTime::now_utc(),
@@ -191,6 +389,7 @@ pub async fn resolve_remote_actor(
         document.icon,
         document.image,
         RemoteActorStoreMode::DiscoveredHandle,
+        keys,
     )
     .await?;
     lock.commit().await?;
@@ -308,6 +507,56 @@ pub async fn resolve_remote_actor_by_id(
     refresh_remote_actor_by_id(state, database, activitypub_id).await
 }
 
+/// Resolve the controller of a cold signed-GET key URL with bidirectional key validation.
+pub async fn resolve_remote_actor_by_key_id(
+    state: &AppState,
+    database: &DatabaseContext,
+    key_id: &str,
+) -> Result<RemoteActor> {
+    let mut key_url = Url::parse(key_id).map_err(|_| invalid("remote key URL is invalid"))?;
+    if key_url.scheme() != "https" || key_url.host_str().is_none() {
+        return Err(invalid("remote key URL must use HTTPS"));
+    }
+    let controller = if key_url.fragment().is_some() {
+        key_url.set_fragment(None);
+        key_url.to_string()
+    } else {
+        let txn = database.begin_read().await?;
+        let value: JsonValue = fetch_json(state, &txn, key_url, None).await?;
+        txn.commit().await?;
+        if let Ok(key) = serde_json::from_value::<RemoteMultikey>(value.clone()) {
+            if key.id != key_id {
+                return Err(invalid("referenced remote key ID does not match"));
+            }
+            key.controller
+        } else {
+            let key: RemotePublicKey = serde_json::from_value(value)
+                .map_err(|_| invalid("referenced remote key is invalid"))?;
+            if key.id != key_id {
+                return Err(invalid("referenced remote key ID does not match"));
+            }
+            key.owner
+        }
+    };
+    let mut actor = resolve_remote_actor_by_id(state, database, &controller).await?;
+    let txn = database.begin_read().await?;
+    let mut key = roosty_db::find_remote_actor_key(&txn, key_id).await?;
+    txn.commit().await?;
+    if key
+        .as_ref()
+        .is_none_or(|key| key.remote_actor_id != actor.id)
+    {
+        actor = refresh_remote_actor_by_id(state, database, &controller).await?;
+        let txn = database.begin_read().await?;
+        key = roosty_db::find_remote_actor_key(&txn, key_id).await?;
+        txn.commit().await?;
+    }
+    if key.is_none_or(|key| key.remote_actor_id != actor.id) {
+        return Err(invalid("remote key is not asserted by its controller"));
+    }
+    Ok(actor)
+}
+
 /// Re-fetch an actor document after a signed lifecycle activity.
 pub async fn refresh_remote_actor_by_id(
     state: &AppState,
@@ -315,7 +564,7 @@ pub async fn refresh_remote_actor_by_id(
     activitypub_id: &str,
 ) -> Result<RemoteActor> {
     let txn = database.begin_read().await?;
-    let (actor, icon, image) = fetch_remote_actor_by_id(state, &txn, activitypub_id).await?;
+    let (actor, icon, image, keys) = fetch_remote_actor_by_id(state, &txn, activitypub_id).await?;
     txn.commit().await?;
     store_remote_actor(
         database,
@@ -323,6 +572,7 @@ pub async fn refresh_remote_actor_by_id(
         icon,
         image,
         RemoteActorStoreMode::RefreshedDocument,
+        keys,
     )
     .await
 }
@@ -333,13 +583,14 @@ pub async fn refresh_remote_actor_by_id_in_transaction(
     activitypub_id: &str,
     txn: &DatabaseTransaction,
 ) -> Result<RemoteActor> {
-    let (actor, icon, image) = fetch_remote_actor_by_id(state, txn, activitypub_id).await?;
+    let (actor, icon, image, keys) = fetch_remote_actor_by_id(state, txn, activitypub_id).await?;
     store_remote_actor_on(
         txn,
         actor,
         icon,
         image,
         RemoteActorStoreMode::RefreshedDocument,
+        keys,
     )
     .await
 }
@@ -352,6 +603,7 @@ async fn fetch_remote_actor_by_id(
     RemoteActor,
     Option<RemoteActorImage>,
     Option<RemoteActorImage>,
+    Vec<ParsedActorKey>,
 )> {
     let actor_url =
         Url::parse(activitypub_id).map_err(|_| invalid("remote actor ID is invalid"))?;
@@ -363,12 +615,11 @@ async fn fetch_remote_actor_by_id(
     if document.r#type != ActorType::Person
         || document.id != activitypub_id
         || document.preferred_username.is_empty()
-        || document.public_key.owner != document.id
-        || document.public_key.id.is_empty()
-        || document.public_key.public_key_pem.is_empty()
     {
         return Err(invalid("remote actor document is invalid"));
     }
+    let keys = actor_keys(state, db, &document).await?;
+    let (public_key_id, public_key_pem) = legacy_projection(&keys)?;
     let profile_created_at = remote_profile_created_at(&document)?;
     let followers_url = validated_followers_url(&document.id, document.followers.as_deref())?;
     let featured_url = validated_featured_url(&document.id, document.featured.as_deref())?;
@@ -414,8 +665,8 @@ async fn fetch_remote_actor_by_id(
             followers_url,
             featured_url,
             featured_tags_url,
-            public_key_id: document.public_key.id,
-            public_key_pem: document.public_key.public_key_pem,
+            public_key_id,
+            public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
             profile_created_at,
             first_seen_at: OffsetDateTime::now_utc(),
@@ -428,6 +679,7 @@ async fn fetch_remote_actor_by_id(
         },
         document.icon,
         document.image,
+        keys,
     ))
 }
 
@@ -468,13 +720,12 @@ pub async fn resolve_remote_move_target(
     let read_txn = database.begin_read().await?;
     let document: RemoteActorDocument =
         fetch_json(state, &read_txn, actor_url.clone(), None).await?;
+    let keys = actor_keys(state, &read_txn, &document).await?;
+    let (public_key_id, public_key_pem) = legacy_projection(&keys)?;
     read_txn.commit().await?;
     if document.r#type != ActorType::Person
         || document.id != target_id
         || document.preferred_username.is_empty()
-        || document.public_key.owner != document.id
-        || document.public_key.id.is_empty()
-        || document.public_key.public_key_pem.is_empty()
         || !document.also_known_as.iter().any(|id| id == source_id)
     {
         return Err(invalid("remote Move target is invalid"));
@@ -509,8 +760,8 @@ pub async fn resolve_remote_move_target(
             followers_url,
             featured_url,
             featured_tags_url,
-            public_key_id: document.public_key.id,
-            public_key_pem: document.public_key.public_key_pem,
+            public_key_id,
+            public_key_pem,
             expires_at: OffsetDateTime::now_utc() + TimeDuration::hours(24),
             profile_created_at,
             first_seen_at: OffsetDateTime::now_utc(),
@@ -524,6 +775,7 @@ pub async fn resolve_remote_move_target(
         document.icon,
         document.image,
         RemoteActorStoreMode::RefreshedDocument,
+        keys,
     )
     .await
 }
@@ -535,9 +787,10 @@ async fn store_remote_actor(
     icon: Option<RemoteActorImage>,
     image: Option<RemoteActorImage>,
     mode: RemoteActorStoreMode,
+    keys: Vec<ParsedActorKey>,
 ) -> Result<RemoteActor> {
     let txn = database.begin_write().await?;
-    let actor = store_remote_actor_on(&txn, actor, icon, image, mode).await?;
+    let actor = store_remote_actor_on(&txn, actor, icon, image, mode, keys).await?;
     txn.commit().await?;
     enqueue_profile_media_if_followed(database, actor.id).await?;
     Ok(actor)
@@ -565,6 +818,7 @@ async fn store_remote_actor_on(
     icon: Option<RemoteActorImage>,
     image: Option<RemoteActorImage>,
     mode: RemoteActorStoreMode,
+    keys: Vec<ParsedActorKey>,
 ) -> Result<RemoteActor> {
     let actor = match mode {
         RemoteActorStoreMode::DiscoveredHandle => {
@@ -574,6 +828,17 @@ async fn store_remote_actor_on(
             roosty_db::refresh_remote_actor(txn, &actor).await?
         }
     };
+    let keys = keys
+        .into_iter()
+        .map(|key| RemoteActorKey {
+            key_id: key.key_id,
+            remote_actor_id: actor.id,
+            algorithm: key.algorithm,
+            public_key: key.public_key,
+            expires_at: key.expires_at,
+        })
+        .collect::<Vec<_>>();
+    roosty_db::replace_remote_actor_keys(txn, actor.id, &keys).await?;
     let emojis = remote_custom_emojis(&actor.emojis)
         .into_iter()
         .filter_map(|emoji| {
@@ -809,12 +1074,6 @@ fn validate_actor_document(
             return Err(invalid("remote actor inbox is outside its actor origin"));
         }
     }
-    if document.public_key.owner != document.id
-        || document.public_key.id.is_empty()
-        || document.public_key.public_key_pem.is_empty()
-    {
-        return Err(invalid("remote actor public key is invalid"));
-    }
     Ok(())
 }
 
@@ -896,10 +1155,14 @@ fn invalid(message: &str) -> RoostyError {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    use multibase::Base;
+    use roosty_db::ActorKeyAlgorithm;
+
     use super::{
-        RemoteActorDocument, WebFingerResponse, activitypub_actor_href, is_activitypub_media_type,
-        is_json_content_type, is_unsafe_address, parse_remote_handle, remote_profile_created_at,
-        validate_actor_document, validated_featured_url, validated_followers_url,
+        RemoteActorDocument, RemoteKeyType, RemoteMultikey, WebFingerResponse,
+        activitypub_actor_href, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
+        parse_multikey, parse_remote_handle, remote_profile_created_at, validate_actor_document,
+        validated_featured_url, validated_followers_url,
     };
 
     #[test]
@@ -928,6 +1191,25 @@ mod tests {
         ));
         assert!(is_json_content_type("application/jrd+json"));
         assert!(!is_json_content_type("text/html"));
+    }
+
+    /// FEP-521a Ed25519 methods accept the specified base58-btc and base64url encodings.
+    #[test]
+    fn parses_supported_ed25519_multibase_encodings() {
+        let mut material = vec![0xed, 0x01];
+        material.extend_from_slice(&[9_u8; 32]);
+        for base in [Base::Base58Btc, Base::Base64Url] {
+            let key = RemoteMultikey {
+                id: "https://social.example/users/alice#ed25519-1".to_owned(),
+                r#type: RemoteKeyType::Multikey,
+                controller: "https://social.example/users/alice".to_owned(),
+                public_key_multibase: multibase::encode(base, &material),
+                expires: None,
+            };
+            let parsed = parse_multikey(&key, &key.controller).unwrap().unwrap();
+            assert_eq!(parsed.algorithm, ActorKeyAlgorithm::Ed25519);
+            assert_eq!(parsed.public_key, [9_u8; 32]);
+        }
     }
 
     /// Given a Mastodon-style actor document, when deserialized, then its canonical

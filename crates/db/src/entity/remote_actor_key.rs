@@ -3,20 +3,15 @@ use time::OffsetDateTime;
 
 use crate::ActorKeyAlgorithm;
 
-/// SeaORM model for versioned encrypted local ActivityPub actor keys.
+/// SeaORM model for a validated FEP-521a or legacy remote actor key.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "local_actor_key")]
+#[sea_orm(table_name = "remote_actor_key")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub id: Uuid,
-    pub account_id: Uuid,
     pub key_id: String,
+    pub remote_actor_id: Uuid,
     pub algorithm: ActorKeyAlgorithm,
     pub public_key: Vec<u8>,
-    pub private_key_ciphertext: Vec<u8>,
-    pub private_key_nonce: Vec<u8>,
-    pub activated_at: OffsetDateTime,
-    pub retiring_at: Option<OffsetDateTime>,
     pub expires_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
 }

@@ -15,9 +15,10 @@ use roosty_core::{
 use scraper::{Html, Selector};
 use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
-    DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
-    EnumIter, FromQueryResult, IntoActiveModel, Iterable, ModelTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
+    DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveActiveEnum,
+    DeriveValueType, EntityTrait, EnumIter, FromQueryResult, IntoActiveModel, Iterable, ModelTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
+    TryFromU64, TryInsertResult,
     sea_query::{Alias, Expr, Func, OnConflict, Query, SelectStatement, SimpleExpr},
 };
 use serde::{Deserialize, Serialize};
@@ -211,12 +212,12 @@ use entity::{
     local_status_local_recipient, local_status_pin, local_status_reblog,
     local_status_remote_mention, local_status_tag, local_tag, local_tag_follow,
     local_timeline_marker, oauth_access_token, oauth_application, oauth_authorization_code,
-    preview_card, processed_inbox_activity, push_subscription, remote_actor, remote_custom_emoji,
-    remote_featured_tag, remote_follow, remote_following, remote_local_account_block,
-    remote_media_attachment, remote_profile_media, remote_status, remote_status_edit,
-    remote_status_edit_media, remote_status_favourite, remote_status_local_mention,
-    remote_status_local_recipient, remote_status_pin, remote_status_reblog,
-    remote_status_remote_recipient, remote_status_tag, scheduled_status,
+    preview_card, processed_inbox_activity, push_subscription, remote_actor, remote_actor_key,
+    remote_custom_emoji, remote_featured_tag, remote_follow, remote_following,
+    remote_local_account_block, remote_media_attachment, remote_profile_media, remote_status,
+    remote_status_edit, remote_status_edit_media, remote_status_favourite,
+    remote_status_local_mention, remote_status_local_recipient, remote_status_pin,
+    remote_status_reblog, remote_status_remote_recipient, remote_status_tag, scheduled_status,
     status_creation_idempotency, status_preview_card, status_preview_scan, status_quote,
     status_search_document, streaming_event,
 };
@@ -928,15 +929,55 @@ pub struct LocalAccount {
     pub created_at: OffsetDateTime,
 }
 
+/// Cryptographic algorithm attached to persisted ActivityPub actor keys.
+#[derive(Clone, Copy, Debug, DeriveActiveEnum, EnumIter, Eq, PartialEq)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
+    enum_name = "actor_key_algorithm"
+)]
+pub enum ActorKeyAlgorithm {
+    #[sea_orm(string_value = "rsa_pkcs1_sha256")]
+    RsaPkcs1Sha256,
+    #[sea_orm(string_value = "ed25519")]
+    Ed25519,
+}
+
+impl ActorKeyAlgorithm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RsaPkcs1Sha256 => "rsa_pkcs1_sha256",
+            Self::Ed25519 => "ed25519",
+        }
+    }
+}
+
 /// Encrypted ActivityPub signing key material for a local actor.
 #[derive(Clone, Debug)]
 pub struct LocalActorKey {
-    /// Actor's public key in PEM SubjectPublicKeyInfo encoding.
-    pub public_key_pem: String,
+    pub id: Uuid,
+    pub account_id: AccountId,
+    pub key_id: String,
+    pub algorithm: ActorKeyAlgorithm,
+    /// Canonical RSA PKCS#1 DER or raw 32-byte Ed25519 public key.
+    pub public_key: Vec<u8>,
     /// Authenticated-encrypted PKCS#8 private key bytes.
     pub private_key_ciphertext: Vec<u8>,
     /// AES-GCM nonce used to encrypt the private material.
     pub private_key_nonce: Vec<u8>,
+    pub activated_at: OffsetDateTime,
+    pub retiring_at: Option<OffsetDateTime>,
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// One validated verification method advertised by a cached remote actor.
+#[derive(Clone, Debug)]
+pub struct RemoteActorKey {
+    pub key_id: String,
+    pub remote_actor_id: AccountId,
+    pub algorithm: ActorKeyAlgorithm,
+    pub public_key: Vec<u8>,
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Validated cached data for a remote ActivityPub actor.
@@ -4184,14 +4225,66 @@ pub async fn find_local_actor_key(
     db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Option<LocalActorKey>> {
-    let key = local_actor_key::Entity::find_by_id(account_id.0)
+    let key = local_actor_key::Entity::find()
+        .filter(local_actor_key::Column::AccountId.eq(account_id.0))
+        .filter(local_actor_key::Column::Algorithm.eq(ActorKeyAlgorithm::RsaPkcs1Sha256))
+        .filter(local_actor_key::Column::RetiringAt.is_null())
         .one(db)
         .await?;
-    Ok(key.map(|key| LocalActorKey {
-        public_key_pem: key.public_key_pem,
+    key.map(local_actor_key_from_model).transpose()
+}
+
+/// Find the current non-retiring key for one account and algorithm.
+pub async fn find_active_local_actor_key(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    algorithm: ActorKeyAlgorithm,
+) -> Result<Option<LocalActorKey>> {
+    local_actor_key::Entity::find()
+        .filter(local_actor_key::Column::AccountId.eq(account_id.0))
+        .filter(local_actor_key::Column::Algorithm.eq(algorithm))
+        .filter(local_actor_key::Column::RetiringAt.is_null())
+        .one(db)
+        .await?
+        .map(local_actor_key_from_model)
+        .transpose()
+}
+
+fn local_actor_key_from_model(key: local_actor_key::Model) -> Result<LocalActorKey> {
+    Ok(LocalActorKey {
+        id: key.id,
+        account_id: AccountId(key.account_id),
+        key_id: key.key_id,
+        algorithm: key.algorithm,
+        public_key: key.public_key,
         private_key_ciphertext: key.private_key_ciphertext,
         private_key_nonce: key.private_key_nonce,
-    }))
+        activated_at: key.activated_at,
+        retiring_at: key.retiring_at,
+        expires_at: key.expires_at,
+    })
+}
+
+/// List active and unexpired retiring keys in publication order.
+pub async fn publishable_local_actor_keys(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+) -> Result<Vec<LocalActorKey>> {
+    let now = OffsetDateTime::now_utc();
+    local_actor_key::Entity::find()
+        .filter(local_actor_key::Column::AccountId.eq(account_id.0))
+        .filter(
+            Condition::any()
+                .add(local_actor_key::Column::RetiringAt.is_null())
+                .add(local_actor_key::Column::ExpiresAt.gt(now)),
+        )
+        .order_by_asc(local_actor_key::Column::RetiringAt)
+        .order_by_desc(local_actor_key::Column::ActivatedAt)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(local_actor_key_from_model)
+        .collect()
 }
 
 /// Persist a newly generated ActivityPub signing key.
@@ -4201,14 +4294,85 @@ pub async fn create_local_actor_key(
     key: &LocalActorKey,
 ) -> Result<()> {
     local_actor_key::ActiveModel {
+        id: Set(key.id),
         account_id: Set(account_id.0),
-        public_key_pem: Set(key.public_key_pem.clone()),
+        key_id: Set(key.key_id.clone()),
+        algorithm: Set(key.algorithm),
+        public_key: Set(key.public_key.clone()),
         private_key_ciphertext: Set(key.private_key_ciphertext.clone()),
         private_key_nonce: Set(key.private_key_nonce.clone()),
+        activated_at: Set(key.activated_at),
+        retiring_at: Set(key.retiring_at),
+        expires_at: Set(key.expires_at),
         ..Default::default()
     }
     .insert(db)
     .await?;
+    Ok(())
+}
+
+/// Replace a migration placeholder with the actor's canonical legacy key ID.
+pub async fn update_local_actor_key_id(
+    db: &impl ConnectionTrait,
+    id: Uuid,
+    key_id: &str,
+) -> Result<()> {
+    let Some(model) = local_actor_key::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.key_id = Set(key_id.to_owned());
+    active.update(db).await?;
+    Ok(())
+}
+
+/// Resolve an unexpired remote verification method by exact global key ID.
+pub async fn find_remote_actor_key(
+    db: &impl ConnectionTrait,
+    key_id: &str,
+) -> Result<Option<RemoteActorKey>> {
+    let key = remote_actor_key::Entity::find_by_id(key_id.to_owned())
+        .filter(
+            Condition::any()
+                .add(remote_actor_key::Column::ExpiresAt.is_null())
+                .add(remote_actor_key::Column::ExpiresAt.gt(OffsetDateTime::now_utc())),
+        )
+        .one(db)
+        .await?;
+    key.map(|key| {
+        Ok(RemoteActorKey {
+            key_id: key.key_id,
+            remote_actor_id: AccountId(key.remote_actor_id),
+            algorithm: key.algorithm,
+            public_key: key.public_key,
+            expires_at: key.expires_at,
+        })
+    })
+    .transpose()
+}
+
+/// Replace all advertised verification methods for one cached actor atomically.
+pub async fn replace_remote_actor_keys(
+    db: &impl ConnectionTrait,
+    actor_id: AccountId,
+    keys: &[RemoteActorKey],
+) -> Result<()> {
+    remote_actor_key::Entity::delete_many()
+        .filter(remote_actor_key::Column::RemoteActorId.eq(actor_id.0))
+        .exec(db)
+        .await?;
+    for key in keys {
+        remote_actor_key::ActiveModel {
+            key_id: Set(key.key_id.clone()),
+            remote_actor_id: Set(actor_id.0),
+            algorithm: Set(key.algorithm),
+            public_key: Set(key.public_key.clone()),
+            expires_at: Set(key.expires_at),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+    }
     Ok(())
 }
 
@@ -5861,6 +6025,7 @@ pub enum JobKind {
     AccountSuggestionMaintenance,
     PreviewCardFetch,
     PreviewCardBackfill,
+    ActorKeyMaintenance,
 }
 
 impl JobKind {
@@ -11812,6 +11977,51 @@ pub async fn enqueue_due_trend_refresh(db: &DbConnection) -> Result<Option<JobId
             kind: JobKind::TrendMaintenance,
             payload: serde_json::json!({}),
             deduplication_key: Some(format!("trend-refresh:{scheduled_milliseconds}")),
+            run_after: now,
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(Some(job_id))
+}
+
+/// Claim the shared hourly actor-key schedule and enqueue at most one active maintenance job.
+pub async fn enqueue_due_actor_key_maintenance(db: &DbConnection) -> Result<Option<JobId>> {
+    #[derive(FromQueryResult)]
+    struct Schedule {
+        next_run_at: OffsetDateTime,
+    }
+    let txn = db.begin().await?;
+    let schedule = Schedule::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT next_run_at FROM actor_key_maintenance_schedule
+           WHERE id = 1 AND next_run_at <= now()
+             AND NOT EXISTS (SELECT 1 FROM job WHERE kind = $1::job_kind AND completed_at IS NULL)
+           FOR UPDATE SKIP LOCKED"#,
+        vec![JobKind::ActorKeyMaintenance.as_str().to_owned().into()],
+    ))
+    .one(&txn)
+    .await?;
+    let Some(schedule) = schedule else {
+        txn.commit().await?;
+        return Ok(None);
+    };
+    let now = OffsetDateTime::now_utc();
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE actor_key_maintenance_schedule SET next_run_at = $1, updated_at = $2 WHERE id = 1",
+        vec![(now + Duration::hours(1)).into(), now.into()],
+    ))
+    .await?;
+    let job_id = enqueue_job_in_transaction(
+        &txn,
+        NewJob {
+            kind: JobKind::ActorKeyMaintenance,
+            payload: serde_json::json!({}),
+            deduplication_key: Some(format!(
+                "actor-key-maintenance:{}",
+                schedule.next_run_at.unix_timestamp()
+            )),
             run_after: now,
         },
     )

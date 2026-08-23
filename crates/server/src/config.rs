@@ -222,6 +222,10 @@ pub struct Config {
     pub federation_allowed_domains: Vec<String>,
     /// Maximum age for retrying a failed federation delivery job.
     pub federation_delivery_max_age: time::Duration,
+    /// Age at which both active actor-key algorithms are rotated.
+    pub federation_key_rotation_interval: time::Duration,
+    /// Publication overlap retained for retiring actor keys.
+    pub federation_key_overlap: time::Duration,
     /// Retention period for successfully fetched remote media.
     pub remote_media_cache_ttl: time::Duration,
     /// Maximum bytes accepted from one remote media response.
@@ -277,6 +281,22 @@ impl Config {
         let federation_allowed_domains = optional_domain_list("ROOSTY_FEDERATION_ALLOWED_DOMAINS")?;
         let federation_delivery_max_age =
             optional_humantime_duration_env("ROOSTY_FEDERATION_DELIVERY_MAX_AGE", "7d")?;
+        let federation_key_rotation_interval =
+            optional_humantime_duration_env("ROOSTY_FEDERATION_KEY_ROTATION_INTERVAL", "90d")?;
+        let federation_key_overlap =
+            optional_humantime_duration_env("ROOSTY_FEDERATION_KEY_OVERLAP", "7d")?;
+        if federation_key_rotation_interval <= time::Duration::ZERO
+            || federation_key_overlap <= time::Duration::ZERO
+        {
+            return Err(RoostyError::Configuration(
+                "federation key rotation interval and overlap must be positive".to_owned(),
+            ));
+        }
+        if federation_key_overlap >= federation_key_rotation_interval {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_FEDERATION_KEY_OVERLAP must be shorter than ROOSTY_FEDERATION_KEY_ROTATION_INTERVAL".to_owned(),
+            ));
+        }
         let remote_media_cache_ttl =
             optional_humantime_duration_env("ROOSTY_REMOTE_MEDIA_CACHE_TTL", "30d")?;
         let remote_media_max_bytes =
@@ -355,6 +375,8 @@ impl Config {
             federation_key_encryption_secret,
             federation_allowed_domains,
             federation_delivery_max_age,
+            federation_key_rotation_interval,
+            federation_key_overlap,
             remote_media_cache_ttl,
             remote_media_max_bytes,
             remote_media_fetch_concurrency,
@@ -592,6 +614,8 @@ mod tests {
             federation_key_encryption_secret: Some("test-federation-secret".to_owned()),
             federation_allowed_domains: vec!["*".to_owned()],
             federation_delivery_max_age: time::Duration::days(7),
+            federation_key_rotation_interval: time::Duration::days(90),
+            federation_key_overlap: time::Duration::days(7),
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,

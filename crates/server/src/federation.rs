@@ -24,29 +24,32 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ed25519_dalek::{SigningKey as Ed25519SigningKey, pkcs8::EncodePrivateKey as _};
+use multibase::Base;
 use rand_core::{OsRng, RngCore};
 use reqwest::{Client, redirect::Policy};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    CollectionCursor, DirectConversationRefresh, FeaturedTag, FollowCollectionAccount,
-    InboxActivityMetadata, InboxActivityOutcome, InboxActivityType, InboxReplayResult, JobKind,
-    LocalAccount, LocalActorKey, LocalNotification, LocalNotificationType, LocalOutboxItem,
-    LocalOutboxPage, LocalRemoteAccountBlock, LocalRemoteStatusFavourite, LocalRemoteStatusReblog,
-    LocalStatus, NewJob, NewModerationReport, NewRemoteCustomEmoji, NewRemoteMediaAttachment,
-    NewRemoteStatus, PollStatus, QuoteApprovalPolicy, QuoteState, RemoteActor,
-    RemoteConversationParticipant, RemoteDeleteRepair, RemoteFeaturedTagInput,
-    RemoteFollowResponseJob, RemoteFollowing, RemoteStatus, RemoteStatusPoll,
-    RemoteStatusReblogTarget, RemoteStatusUpsertResult, ReportAccount, ReportCategory,
-    ReportStatus, StatusPoll, StatusQuote, StatusReference, StatusVisibility,
-    StreamingStatusOrigin, TimelineCursor, create_moderation_report, federation_domain_policy,
-    find_local_status_by_id, notify_administrators_of_report,
+    ActorKeyAlgorithm, CollectionCursor, DirectConversationRefresh, FeaturedTag,
+    FollowCollectionAccount, InboxActivityMetadata, InboxActivityOutcome, InboxActivityType,
+    InboxReplayResult, JobKind, LocalAccount, LocalActorKey, LocalNotification,
+    LocalNotificationType, LocalOutboxItem, LocalOutboxPage, LocalRemoteAccountBlock,
+    LocalRemoteStatusFavourite, LocalRemoteStatusReblog, LocalStatus, NewJob, NewModerationReport,
+    NewRemoteCustomEmoji, NewRemoteMediaAttachment, NewRemoteStatus, PollStatus,
+    QuoteApprovalPolicy, QuoteState, RemoteActor, RemoteActorKey, RemoteConversationParticipant,
+    RemoteDeleteRepair, RemoteFeaturedTagInput, RemoteFollowResponseJob, RemoteFollowing,
+    RemoteStatus, RemoteStatusPoll, RemoteStatusReblogTarget, RemoteStatusUpsertResult,
+    ReportAccount, ReportCategory, ReportStatus, StatusPoll, StatusQuote, StatusReference,
+    StatusVisibility, StreamingStatusOrigin, TimelineCursor, create_moderation_report,
+    federation_domain_policy, find_local_status_by_id, notify_administrators_of_report,
 };
 use rsa::{
-    RsaPrivateKey,
-    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding},
+    RsaPrivateKey, RsaPublicKey,
+    pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey},
+    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -77,6 +80,10 @@ static ACTOR_DELETE_REPAIR: AtomicU64 = AtomicU64::new(0);
 static THREAD_PARENT_RESOLVED: AtomicU64 = AtomicU64::new(0);
 static THREAD_REPLIES_DISCOVERED: AtomicU64 = AtomicU64::new(0);
 static THREAD_FETCH_REJECTED: AtomicU64 = AtomicU64::new(0);
+static ACTOR_KEYS_SEEDED: AtomicU64 = AtomicU64::new(0);
+static ACTOR_KEYS_ROTATED: AtomicU64 = AtomicU64::new(0);
+static ACTOR_KEYS_EXPIRED: AtomicU64 = AtomicU64::new(0);
+static ACTOR_KEY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 const MAX_DISCOVERED_REPLIES: usize = 5;
 
@@ -1106,17 +1113,36 @@ struct Actor {
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<ActorImage>,
     public_key: PublicKey,
+    assertion_method: Vec<Multikey>,
+}
+
+/// FEP-521a verification method published in canonical base58-btc Multikey form.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Multikey {
+    id: String,
+    r#type: MultikeyType,
+    controller: String,
+    public_key_multibase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires: Option<String>,
+}
+
+#[derive(Serialize)]
+enum MultikeyType {
+    Multikey,
 }
 
 /// JSON-LD context for local actors, including Mastodon's profile metadata vocabulary.
 #[derive(Serialize)]
-struct ActorContext([ActorContextEntry; 3]);
+struct ActorContext([ActorContextEntry; 4]);
 
 #[derive(Serialize)]
 #[serde(untagged)]
 enum ActorContextEntry {
     ActivityStreams(&'static str),
     Security(&'static str),
+    Multikey(&'static str),
     Extensions(ActorExtensionsContext),
 }
 
@@ -1509,17 +1535,46 @@ async fn actor(
         return Err(ApiError::NotFound("Record not found".into()));
     }
     let public_key_pem = ensure_actor_key(&state, &txn, account.id).await?;
+    ensure_ed25519_actor_key(&state, &txn, &account).await?;
+    let keys = roosty_db::publishable_local_actor_keys(&txn, account.id).await?;
     txn.commit().await?;
     Ok(activity_response(actor_document(
         &state,
         account,
         public_key_pem,
+        keys,
     )))
 }
 
 /// Build the canonical public actor document used for direct reads and Update activities.
-fn actor_document(state: &AppState, account: LocalAccount, public_key_pem: String) -> Actor {
+fn actor_document(
+    state: &AppState,
+    account: LocalAccount,
+    public_key_pem: String,
+    keys: Vec<LocalActorKey>,
+) -> Actor {
     let id = actor_url(state, &account.username);
+    let legacy_key_id = keys
+        .iter()
+        .find(|key| key.algorithm == ActorKeyAlgorithm::RsaPkcs1Sha256 && key.retiring_at.is_none())
+        .map_or_else(|| format!("{id}#main-key"), |key| key.key_id.clone());
+    let assertion_method = keys
+        .into_iter()
+        .map(|key| {
+            let mut bytes = match key.algorithm {
+                ActorKeyAlgorithm::RsaPkcs1Sha256 => vec![0x85, 0x24],
+                ActorKeyAlgorithm::Ed25519 => vec![0xed, 0x01],
+            };
+            bytes.extend_from_slice(&key.public_key);
+            Multikey {
+                id: key.key_id,
+                r#type: MultikeyType::Multikey,
+                controller: id.clone(),
+                public_key_multibase: multibase::encode(Base::Base58Btc, bytes),
+                expires: key.expires_at.and_then(|value| value.format(&Rfc3339).ok()),
+            }
+        })
+        .collect();
     Actor {
         context: actor_context(),
         id: id.clone(),
@@ -1553,10 +1608,11 @@ fn actor_document(state: &AppState, account: LocalAccount, public_key_pem: Strin
             url: media::media_url(state, path),
         }),
         public_key: PublicKey {
-            id: format!("{id}#main-key"),
+            id: legacy_key_id,
             owner: id,
             public_key_pem,
         },
+        assertion_method,
     }
 }
 
@@ -1642,6 +1698,7 @@ fn actor_context() -> ActorContext {
     ActorContext([
         ActorContextEntry::ActivityStreams(ACTIVITYSTREAMS_CONTEXT),
         ActorContextEntry::Security("https://w3id.org/security/v1"),
+        ActorContextEntry::Multikey("https://w3id.org/security/multikey/v1"),
         ActorContextEntry::Extensions(ActorExtensionsContext {
             manually_approves_followers: "as:manuallyApprovesFollowers",
             toot: "http://joinmastodon.org/ns#",
@@ -2066,12 +2123,46 @@ async fn process_inbox(
             return StatusCode::FORBIDDEN.into_response();
         }
     };
-    let signature_format = match signature::verify(
+    let identity = match signature::identity(&parts) {
+        Ok(Some(identity)) => identity,
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let mut remote_key = match roosty_db::find_remote_actor_key(db, &identity.key_id).await {
+        Ok(key) => key,
+        Err(error) => return internal_error(error),
+    };
+    if remote_key.is_none() && remote_actor.public_key_id == identity.key_id {
+        remote_key = legacy_remote_verification_key(&remote_actor).ok();
+    }
+    if remote_key
+        .as_ref()
+        .is_none_or(|key| key.remote_actor_id != remote_actor.id)
+    {
+        if discovery::refresh_remote_actor_by_id_in_transaction(
+            state.state,
+            &remote_actor.activitypub_id,
+            db,
+        )
+        .await
+        .is_err()
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        remote_key = roosty_db::find_remote_actor_key(db, &identity.key_id)
+            .await
+            .ok()
+            .flatten();
+    }
+    let Some(remote_key) = remote_key.filter(|key| key.remote_actor_id == remote_actor.id) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let signature_format = match signature::verify_actor_key(
         &parts,
         Some(&body),
         &state.config.public_base_url,
-        &remote_actor.public_key_id,
-        &remote_actor.public_key_pem,
+        &remote_key.key_id,
+        remote_key.algorithm,
+        &remote_key.public_key,
     ) {
         Ok(format) => format,
         Err(error) => {
@@ -4701,15 +4792,21 @@ async fn signed_outbox_requester(
     let signature_format = identity.format;
     let key_id = identity.key_id;
     let txn = database.begin_read().await?;
-    let cached = roosty_db::find_remote_actor_by_public_key_id(&txn, &key_id).await?;
+    let cached_key = roosty_db::find_remote_actor_key(&txn, &key_id).await?;
+    let cached = if let Some(key) = &cached_key {
+        roosty_db::find_remote_actor_by_id(&txn, key.remote_actor_id).await?
+    } else {
+        None
+    };
     txn.commit().await?;
-    if let Some(actor) = cached {
-        signature::verify(
+    if let (Some(actor), Some(key)) = (cached, cached_key) {
+        signature::verify_actor_key(
             parts,
             None,
             &state.config.public_base_url,
-            &actor.public_key_id,
-            &actor.public_key_pem,
+            &key.key_id,
+            key.algorithm,
+            &key.public_key,
         )
         .map_err(|_| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
         tracing::debug!(
@@ -4718,33 +4815,52 @@ async fn signed_outbox_requester(
         );
         return Ok(Some(actor));
     }
-    let mut actor_url = Url::parse(&key_id)
-        .map_err(|_| ApiError::Unauthorized("HTTP signature key is invalid".into()))?;
-    if actor_url.scheme() != "https" || actor_url.host_str().is_none() {
-        return Err(ApiError::Unauthorized(
-            "HTTP signature key is invalid".into(),
-        ));
+    let txn = database.begin_read().await?;
+    let legacy_actor = roosty_db::find_remote_actor_by_public_key_id(&txn, &key_id).await?;
+    txn.commit().await?;
+    if let Some(actor) = legacy_actor {
+        let key = legacy_remote_verification_key(&actor)
+            .map_err(|_| ApiError::Unauthorized("HTTP signature key is invalid".into()))?;
+        signature::verify_actor_key(
+            parts,
+            None,
+            &state.config.public_base_url,
+            &key.key_id,
+            key.algorithm,
+            &key.public_key,
+        )
+        .map_err(|_| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
+        return Ok(Some(actor));
     }
-    actor_url.set_fragment(None);
-    let mut actor = discovery::resolve_remote_actor_by_id(state, database, actor_url.as_str())
+    let actor = discovery::resolve_remote_actor_by_key_id(state, database, &key_id)
         .await
         .map_err(|_| ApiError::Unauthorized("HTTP signature key is unknown".into()))?;
-    if actor.public_key_id != key_id {
-        actor = discovery::refresh_remote_actor_by_id(state, database, actor_url.as_str())
+    let txn = database.begin_read().await?;
+    let mut key = roosty_db::find_remote_actor_key(&txn, &key_id).await?;
+    txn.commit().await?;
+    if key
+        .as_ref()
+        .is_none_or(|key| key.remote_actor_id != actor.id)
+    {
+        discovery::refresh_remote_actor_by_id(state, database, &actor.activitypub_id)
             .await
             .map_err(|_| ApiError::Unauthorized("HTTP signature key is unknown".into()))?;
+        let txn = database.begin_read().await?;
+        key = roosty_db::find_remote_actor_key(&txn, &key_id).await?;
+        txn.commit().await?;
     }
-    if actor.public_key_id != key_id {
+    let Some(key) = key.filter(|key| key.remote_actor_id == actor.id) else {
         return Err(ApiError::Unauthorized(
             "HTTP signature key does not match its owner".into(),
         ));
-    }
-    signature::verify(
+    };
+    signature::verify_actor_key(
         parts,
         None,
         &state.config.public_base_url,
-        &actor.public_key_id,
-        &actor.public_key_pem,
+        &key.key_id,
+        key.algorithm,
+        &key.public_key,
     )
     .map_err(|_| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
     tracing::debug!(
@@ -4752,6 +4868,20 @@ async fn signed_outbox_requester(
         "verified signed outbox requester"
     );
     Ok(Some(actor))
+}
+
+fn legacy_remote_verification_key(actor: &RemoteActor) -> Result<RemoteActorKey, RoostyError> {
+    let public_key = RsaPublicKey::from_public_key_pem(&actor.public_key_pem)
+        .map_err(|_| RoostyError::InvalidInput("remote actor public key is invalid".to_owned()))?
+        .to_pkcs1_der()
+        .map_err(|_| RoostyError::InvalidInput("remote actor public key is invalid".to_owned()))?;
+    Ok(RemoteActorKey {
+        key_id: actor.public_key_id.clone(),
+        remote_actor_id: actor.id,
+        algorithm: ActorKeyAlgorithm::RsaPkcs1Sha256,
+        public_key: public_key.as_bytes().to_vec(),
+        expires_at: None,
+    })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -6224,6 +6354,8 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
     }
 
     let public_key_pem = ensure_actor_key(state, txn, account.id).await?;
+    ensure_ed25519_actor_key(state, txn, &account).await?;
+    let keys = roosty_db::publishable_local_actor_keys(txn, account.id).await?;
     let actor = actor_url(state, &account.username);
     let activity = serde_json::to_value(ActorUpdate {
         context: ACTIVITYSTREAMS_CONTEXT,
@@ -6231,7 +6363,7 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
         r#type: UpdateType::Update,
         actor: actor.clone(),
         to: vec![format!("{actor}/followers")],
-        object: actor_document(state, account.clone(), public_key_pem),
+        object: actor_document(state, account.clone(), public_key_pem, keys),
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     let activity_id = activity
@@ -6451,7 +6583,7 @@ pub(crate) async fn deliver_follow_response(
         &txn,
         &remote.inbox_url,
         &private_key,
-        &format!("{}#main-key", actor_url(state, &local.username)),
+        &key.key_id,
         &activity,
     )
     .await;
@@ -6574,7 +6706,7 @@ async fn deliver_activity(
                 .unwrap_or(&remote.inbox_url)
         },
         &private_key,
-        &format!("{}#main-key", actor_url(state, &local.username)),
+        &key.key_id,
         activity,
     )
     .await;
@@ -7071,14 +7203,176 @@ fn signature_format_name(parts: &Parts) -> &'static str {
     }
 }
 
+/// Seed, rotate, and expire local actor keys in a bounded database-coordinated batch.
+pub(crate) async fn maintain_actor_keys(
+    state: &AppState,
+    database: &DatabaseContext,
+) -> Result<(), RoostyError> {
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+    let txn = database.begin_write().await?;
+    let expired = txn
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "DELETE FROM local_actor_key WHERE expires_at <= now()".to_owned(),
+        ))
+        .await?
+        .rows_affected();
+    ACTOR_KEYS_EXPIRED.fetch_add(expired, Ordering::Relaxed);
+    let rows = txn
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"SELECT account.id
+           FROM local_account account
+           WHERE account.suspended_at IS NULL
+             AND EXISTS (SELECT 1 FROM local_actor_key key WHERE key.account_id = account.id)
+           ORDER BY account.id
+           FOR UPDATE OF account SKIP LOCKED LIMIT 50"#
+                .to_owned(),
+        ))
+        .await?;
+    let cutoff = OffsetDateTime::now_utc() - state.config.federation_key_rotation_interval;
+    for row in rows {
+        let account_id = AccountId(row.try_get("", "id")?);
+        let Some(account) = roosty_db::find_local_account_by_id(&txn, account_id).await? else {
+            continue;
+        };
+        if roosty_db::find_active_local_actor_key(&txn, account_id, ActorKeyAlgorithm::Ed25519)
+            .await?
+            .is_none()
+        {
+            if let Err(error) = ensure_ed25519_actor_key(state, &txn, &account).await {
+                ACTOR_KEY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%error, algorithm = "ed25519", account_id = %account_id.0, "failed to seed actor key");
+                continue;
+            }
+            ACTOR_KEYS_SEEDED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(algorithm = "ed25519", account_id = %account_id.0, "seeded actor key");
+        }
+        let Some(rsa) = roosty_db::find_active_local_actor_key(
+            &txn,
+            account_id,
+            ActorKeyAlgorithm::RsaPkcs1Sha256,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(ed25519) =
+            roosty_db::find_active_local_actor_key(&txn, account_id, ActorKeyAlgorithm::Ed25519)
+                .await?
+        else {
+            continue;
+        };
+        if rsa.activated_at > cutoff || ed25519.activated_at > cutoff {
+            continue;
+        }
+        let now = OffsetDateTime::now_utc();
+        let expires = now + state.config.federation_key_overlap;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE local_actor_key SET retiring_at = $1, expires_at = $2 WHERE id IN ($3, $4) AND retiring_at IS NULL",
+            vec![now.into(), expires.into(), rsa.id.into(), ed25519.id.into()],
+        )).await?;
+        let rsa = generate_rsa_actor_key(state, &account, false)?;
+        roosty_db::create_local_actor_key(&txn, account_id, &rsa).await?;
+        let ed25519 = generate_ed25519_actor_key(state, &account)?;
+        roosty_db::create_local_actor_key(&txn, account_id, &ed25519).await?;
+        enqueue_actor_update_in_transaction(state, &txn, account).await?;
+        ACTOR_KEYS_ROTATED.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(account_id = %account_id.0, algorithm = "rsa_pkcs1_sha256,ed25519", "rotated actor key pair");
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+fn generate_rsa_actor_key(
+    state: &AppState,
+    account: &LocalAccount,
+    legacy_id: bool,
+) -> Result<LocalActorKey, RoostyError> {
+    let private_key = RsaPrivateKey::new(&mut OsRng, 2048).map_err(|error| {
+        RoostyError::Configuration(format!("could not generate actor key: {error}"))
+    })?;
+    let public_key = private_key
+        .to_public_key()
+        .to_pkcs1_der()
+        .map_err(|error| {
+            RoostyError::Configuration(format!("could not encode actor public key: {error}"))
+        })?
+        .as_bytes()
+        .to_vec();
+    let private_key = private_key.to_pkcs8_pem(LineEnding::LF).map_err(|error| {
+        RoostyError::Configuration(format!("could not encode actor private key: {error}"))
+    })?;
+    let (ciphertext, nonce) = encrypt_actor_private_key(state, private_key.as_bytes())?;
+    let actor = actor_url(state, &account.username);
+    Ok(LocalActorKey {
+        id: Uuid::now_v7(),
+        account_id: account.id,
+        key_id: if legacy_id {
+            format!("{actor}#main-key")
+        } else {
+            format!("{actor}#rsa-{}", Uuid::now_v7())
+        },
+        algorithm: ActorKeyAlgorithm::RsaPkcs1Sha256,
+        public_key,
+        private_key_ciphertext: ciphertext,
+        private_key_nonce: nonce,
+        activated_at: OffsetDateTime::now_utc(),
+        retiring_at: None,
+        expires_at: None,
+    })
+}
+
+fn generate_ed25519_actor_key(
+    state: &AppState,
+    account: &LocalAccount,
+) -> Result<LocalActorKey, RoostyError> {
+    let mut secret = [0_u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let signing_key = Ed25519SigningKey::from_bytes(&secret);
+    secret.fill(0);
+    let private_key = signing_key.to_pkcs8_der().map_err(|error| {
+        RoostyError::Configuration(format!("could not encode Ed25519 actor key: {error}"))
+    })?;
+    let (ciphertext, nonce) = encrypt_actor_private_key(state, private_key.as_bytes())?;
+    Ok(LocalActorKey {
+        id: Uuid::now_v7(),
+        account_id: account.id,
+        key_id: format!(
+            "{}#ed25519-{}",
+            actor_url(state, &account.username),
+            Uuid::now_v7()
+        ),
+        algorithm: ActorKeyAlgorithm::Ed25519,
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        private_key_ciphertext: ciphertext,
+        private_key_nonce: nonce,
+        activated_at: OffsetDateTime::now_utc(),
+        retiring_at: None,
+        expires_at: None,
+    })
+}
+
 /// Return the public key, generating and encrypting a fresh key only once.
 async fn ensure_actor_key(
     state: &AppState,
     db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<String, RoostyError> {
-    if let Some(key) = roosty_db::find_local_actor_key(db, account_id).await? {
-        return Ok(key.public_key_pem);
+    if let Some(mut key) = roosty_db::find_local_actor_key(db, account_id).await? {
+        if key.key_id.starts_with("urn:roosty:account:") {
+            let account = roosty_db::find_local_account_by_id(db, account_id)
+                .await?
+                .ok_or_else(|| {
+                    RoostyError::InvalidInput("local account does not exist".to_owned())
+                })?;
+            key.key_id = format!("{}#main-key", actor_url(state, &account.username));
+            roosty_db::update_local_actor_key_id(db, key.id, &key.key_id).await?;
+        }
+        return rsa_public_key_pem(&key.public_key);
     }
     let private_key = RsaPrivateKey::new(&mut OsRng, 2048).map_err(|error| {
         RoostyError::Configuration(format!("could not generate actor key: {error}"))
@@ -7089,6 +7383,14 @@ async fn ensure_actor_key(
         .map_err(|error| {
             RoostyError::Configuration(format!("could not encode actor public key: {error}"))
         })?;
+    let public_key = private_key
+        .to_public_key()
+        .to_pkcs1_der()
+        .map_err(|error| {
+            RoostyError::Configuration(format!("could not encode actor public key: {error}"))
+        })?
+        .as_bytes()
+        .to_vec();
     let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).map_err(|error| {
         RoostyError::Configuration(format!("could not encode actor private key: {error}"))
     })?;
@@ -7114,20 +7416,120 @@ async fn ensure_actor_key(
         &mut ciphertext,
     )
     .map_err(|_| RoostyError::Configuration("could not encrypt actor key".to_owned()))?;
+    let account = roosty_db::find_local_account_by_id(db, account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local account does not exist".to_owned()))?;
     let stored = LocalActorKey {
-        public_key_pem: public_key_pem.clone(),
+        id: Uuid::now_v7(),
+        account_id,
+        key_id: format!("{}#main-key", actor_url(state, &account.username)),
+        algorithm: ActorKeyAlgorithm::RsaPkcs1Sha256,
+        public_key,
         private_key_ciphertext: ciphertext,
         private_key_nonce: nonce.to_vec(),
+        activated_at: OffsetDateTime::now_utc(),
+        retiring_at: None,
+        expires_at: None,
     };
     match roosty_db::create_local_actor_key(db, account_id, &stored).await {
         Ok(()) => Ok(public_key_pem),
         Err(_) => roosty_db::find_local_actor_key(db, account_id)
             .await?
-            .map(|key| key.public_key_pem)
+            .map(|key| rsa_public_key_pem(&key.public_key))
+            .transpose()?
             .ok_or_else(|| {
                 RoostyError::Configuration("actor key could not be persisted".to_owned())
             }),
     }
+}
+
+fn rsa_public_key_pem(der: &[u8]) -> Result<String, RoostyError> {
+    RsaPublicKey::from_pkcs1_der(der)
+        .map_err(|_| RoostyError::InvalidInput("stored actor public key is invalid".to_owned()))?
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|_| RoostyError::InvalidInput("stored actor public key is invalid".to_owned()))
+}
+
+/// Seed the FEP-521a Ed25519 method without changing the compatibility RSA key.
+async fn ensure_ed25519_actor_key(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account: &LocalAccount,
+) -> Result<(), RoostyError> {
+    if roosty_db::find_active_local_actor_key(db, account.id, ActorKeyAlgorithm::Ed25519)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let mut secret = [0_u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let signing_key = Ed25519SigningKey::from_bytes(&secret);
+    secret.fill(0);
+    let private_key = signing_key.to_pkcs8_der().map_err(|error| {
+        RoostyError::Configuration(format!("could not encode Ed25519 actor key: {error}"))
+    })?;
+    let (ciphertext, nonce) = encrypt_actor_private_key(state, private_key.as_bytes())?;
+    let stored = LocalActorKey {
+        id: Uuid::now_v7(),
+        account_id: account.id,
+        key_id: format!(
+            "{}#ed25519-{}",
+            actor_url(state, &account.username),
+            Uuid::now_v7()
+        ),
+        algorithm: ActorKeyAlgorithm::Ed25519,
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        private_key_ciphertext: ciphertext,
+        private_key_nonce: nonce,
+        activated_at: OffsetDateTime::now_utc(),
+        retiring_at: None,
+        expires_at: None,
+    };
+    match roosty_db::create_local_actor_key(db, account.id, &stored).await {
+        Ok(()) => Ok(()),
+        Err(_)
+            if roosty_db::find_active_local_actor_key(
+                db,
+                account.id,
+                ActorKeyAlgorithm::Ed25519,
+            )
+            .await?
+            .is_some() =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn encrypt_actor_private_key(
+    state: &AppState,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), RoostyError> {
+    let secret = state
+        .config
+        .federation_key_encryption_secret
+        .as_deref()
+        .ok_or_else(|| {
+            RoostyError::Configuration("federation key encryption secret is unavailable".to_owned())
+        })?;
+    let mut nonce = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let key_bytes = digest::digest(&digest::SHA256, secret.as_bytes());
+    let key = aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_256_GCM, key_bytes.as_ref()).map_err(|_| {
+            RoostyError::Configuration("invalid federation key encryption key".to_owned())
+        })?,
+    );
+    let mut ciphertext = plaintext.to_vec();
+    key.seal_in_place_append_tag(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::empty(),
+        &mut ciphertext,
+    )
+    .map_err(|_| RoostyError::Configuration("could not encrypt actor key".to_owned()))?;
+    Ok((ciphertext, nonce.to_vec()))
 }
 
 #[cfg(test)]
@@ -8565,6 +8967,7 @@ mod tests {
                 owner: "https://example.test/users/alice".to_owned(),
                 public_key_pem: "public-key".to_owned(),
             },
+            assertion_method: Vec::new(),
         };
         let note = Note {
             context: NoteContext((
@@ -8645,18 +9048,22 @@ mod tests {
         );
         assert_eq!(actor["@context"][1], "https://w3id.org/security/v1");
         assert_eq!(
-            actor["@context"][2]["manuallyApprovesFollowers"],
+            actor["@context"][2],
+            "https://w3id.org/security/multikey/v1"
+        );
+        assert_eq!(
+            actor["@context"][3]["manuallyApprovesFollowers"],
             "as:manuallyApprovesFollowers"
         );
-        assert_eq!(actor["@context"][2]["discoverable"], "toot:discoverable");
-        assert_eq!(actor["@context"][2]["schema"], "http://schema.org#");
+        assert_eq!(actor["@context"][3]["discoverable"], "toot:discoverable");
+        assert_eq!(actor["@context"][3]["schema"], "http://schema.org#");
         assert_eq!(
-            actor["@context"][2]["PropertyValue"],
+            actor["@context"][3]["PropertyValue"],
             "schema:PropertyValue"
         );
-        assert_eq!(actor["@context"][2]["value"], "schema:value");
+        assert_eq!(actor["@context"][3]["value"], "schema:value");
         assert_eq!(
-            actor["@context"][2]["featuredTags"]["@id"],
+            actor["@context"][3]["featuredTags"]["@id"],
             "toot:featuredTags"
         );
         assert_eq!(actor["url"], "https://example.test/@alice");
@@ -9069,6 +9476,8 @@ mod tests {
             ),
             federation_allowed_domains: vec!["*".to_owned()],
             federation_delivery_max_age: time::Duration::days(7),
+            federation_key_rotation_interval: time::Duration::days(90),
+            federation_key_overlap: time::Duration::days(7),
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,
@@ -9395,7 +9804,8 @@ mod tests {
             | roosty_db::JobKind::AccountPurge
             | roosty_db::JobKind::DomainModerationReconcile
             | roosty_db::JobKind::PreviewCardFetch
-            | roosty_db::JobKind::PreviewCardBackfill => {}
+            | roosty_db::JobKind::PreviewCardBackfill
+            | roosty_db::JobKind::ActorKeyMaintenance => {}
         }
         assert!(
             roosty_db::mark_job_completed(&state.db, &job)

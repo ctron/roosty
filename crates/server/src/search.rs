@@ -747,6 +747,8 @@ mod tests {
                 federation_key_encryption_secret: None,
                 federation_allowed_domains: Vec::new(),
                 federation_delivery_max_age: Duration::days(7),
+                federation_key_rotation_interval: Duration::days(90),
+                federation_key_overlap: Duration::days(7),
                 remote_media_cache_ttl: Duration::days(30),
                 remote_media_max_bytes: 40 * 1024 * 1024,
                 remote_media_fetch_concurrency: 5,

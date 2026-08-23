@@ -410,6 +410,7 @@ async fn worker_pool(
     );
 
     workers.spawn(trend_scheduler_loop(db.clone(), shutdown_rx.clone()));
+    workers.spawn(actor_key_scheduler_loop(db.clone(), shutdown_rx.clone()));
     workers.spawn(account_suggestion_scheduler_loop(
         db.clone(),
         state.config.account_suggestions_refresh_interval,
@@ -517,6 +518,27 @@ async fn trend_scheduler_loop(
             }
             () = sleep(Duration::from_secs(5)) => {
             }
+        }
+    }
+}
+
+/// Poll the database-owned actor-key maintenance schedule from every process.
+async fn actor_key_scheduler_loop(
+    db: roosty_db::DbConnection,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return Ok(());
+        }
+        if let Some(job_id) = roosty_db::enqueue_due_actor_key_maintenance(&db).await? {
+            info!(job_id = %job_id.0, "enqueued actor key maintenance");
+        }
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() { return Ok(()); }
+            }
+            () = sleep(Duration::from_secs(30)) => {}
         }
     }
 }
@@ -792,6 +814,9 @@ async fn worker_iteration(
             } else {
                 Ok(())
             }
+        }
+        roosty_db::JobKind::ActorKeyMaintenance => {
+            federation::maintain_actor_keys(state, &database).await
         }
     };
     match result {
@@ -1870,6 +1895,8 @@ mod tests {
             ),
             federation_allowed_domains: vec!["*".to_owned()],
             federation_delivery_max_age: time::Duration::days(7),
+            federation_key_rotation_interval: time::Duration::days(90),
+            federation_key_overlap: time::Duration::days(7),
             remote_media_cache_ttl: time::Duration::days(30),
             remote_media_max_bytes: 40 * 1024 * 1024,
             remote_media_fetch_concurrency: 5,

@@ -8,10 +8,13 @@ use std::{
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, request::Parts};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use roosty_db::ActorKeyAlgorithm;
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
+    pkcs1::DecodeRsaPublicKey,
     pkcs1v15::{Signature as RsaSignature, SigningKey, VerifyingKey},
-    pkcs8::DecodePublicKey,
+    pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding},
     signature::{SignatureEncoding, Signer, Verifier},
 };
 use sfv::{BareItem, Dictionary, InnerList, ListEntry, ListSerializer, Parser, Version};
@@ -42,12 +45,14 @@ impl SignatureFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SignatureAlgorithm {
     RsaPkcs1Sha256,
+    Ed25519,
 }
 
 impl SignatureAlgorithm {
     const fn as_str(self) -> &'static str {
         match self {
             Self::RsaPkcs1Sha256 => "rsa-v1_5-sha256",
+            Self::Ed25519 => "ed25519",
         }
     }
 }
@@ -121,6 +126,7 @@ pub(crate) fn identity(parts: &Parts) -> Result<Option<SignatureIdentity>, Signa
 }
 
 /// Verify a signed request against the actor-owned RSA key.
+#[cfg(test)]
 pub(crate) fn verify(
     parts: &Parts,
     body: Option<&[u8]>,
@@ -139,6 +145,34 @@ pub(crate) fn verify(
         Ok(SignatureFormat::Rfc9421)
     } else {
         verify_legacy(parts, body, expected_key_id, public_key_pem)?;
+        Ok(SignatureFormat::Legacy)
+    }
+}
+
+/// Verify using the algorithm and canonical bytes selected from persisted actor-key metadata.
+pub(crate) fn verify_actor_key(
+    parts: &Parts,
+    body: Option<&[u8]>,
+    public_base_url: &Url,
+    expected_key_id: &str,
+    algorithm: ActorKeyAlgorithm,
+    public_key: &[u8],
+) -> Result<SignatureFormat, SignatureError> {
+    if parts.headers.contains_key("signature-input") {
+        verify_rfc9421_key(
+            parts,
+            body,
+            public_base_url,
+            expected_key_id,
+            algorithm,
+            public_key,
+        )?;
+        Ok(SignatureFormat::Rfc9421)
+    } else {
+        if algorithm != ActorKeyAlgorithm::RsaPkcs1Sha256 {
+            return Err(SignatureError::UnsupportedAlgorithm);
+        }
+        verify_legacy_bytes(parts, body, expected_key_id, public_key)?;
         Ok(SignatureFormat::Legacy)
     }
 }
@@ -226,6 +260,7 @@ struct ParsedRfc9421 {
     created: SystemTime,
     key_id: String,
     signature: Vec<u8>,
+    algorithm: Option<SignatureAlgorithm>,
 }
 
 fn parse_rfc9421(parts: &Parts) -> Result<ParsedRfc9421, SignatureError> {
@@ -279,14 +314,18 @@ fn parse_rfc9421(parts: &Parts) -> Result<ParsedRfc9421, SignatureError> {
         .ok_or(SignatureError::InvalidParameter("keyid"))?
         .as_str()
         .to_owned();
-    if let Some(algorithm) = input.params.get("alg") {
+    let algorithm = if let Some(algorithm) = input.params.get("alg") {
         let algorithm = algorithm
             .as_string()
             .ok_or(SignatureError::UnsupportedAlgorithm)?;
-        if algorithm.as_str() != SignatureAlgorithm::RsaPkcs1Sha256.as_str() {
-            return Err(SignatureError::UnsupportedAlgorithm);
-        }
-    }
+        Some(match algorithm.as_str() {
+            "rsa-v1_5-sha256" => SignatureAlgorithm::RsaPkcs1Sha256,
+            "ed25519" => SignatureAlgorithm::Ed25519,
+            _ => return Err(SignatureError::UnsupportedAlgorithm),
+        })
+    } else {
+        None
+    };
     let mut seen = HashSet::new();
     let mut components = Vec::with_capacity(input.items.len());
     for item in &input.items {
@@ -315,9 +354,37 @@ fn parse_rfc9421(parts: &Parts) -> Result<ParsedRfc9421, SignatureError> {
         created,
         key_id,
         signature,
+        algorithm,
     })
 }
 
+fn verify_rfc9421_key(
+    parts: &Parts,
+    body: Option<&[u8]>,
+    public_base_url: &Url,
+    expected_key_id: &str,
+    algorithm: ActorKeyAlgorithm,
+    public_key: &[u8],
+) -> Result<(), SignatureError> {
+    let parsed = parse_rfc9421(parts)?;
+    let expected = match algorithm {
+        ActorKeyAlgorithm::RsaPkcs1Sha256 => SignatureAlgorithm::RsaPkcs1Sha256,
+        ActorKeyAlgorithm::Ed25519 => SignatureAlgorithm::Ed25519,
+    };
+    if parsed.algorithm.is_some_and(|value| value != expected) {
+        return Err(SignatureError::UnsupportedAlgorithm);
+    }
+    verify_rfc9421_parsed(
+        parts,
+        body,
+        public_base_url,
+        expected_key_id,
+        &parsed,
+        |base, signature| verify_key_bytes(algorithm, public_key, base, signature),
+    )
+}
+
+#[cfg(test)]
 fn verify_rfc9421(
     parts: &Parts,
     body: Option<&[u8]>,
@@ -326,6 +393,30 @@ fn verify_rfc9421(
     public_key_pem: &str,
 ) -> Result<(), SignatureError> {
     let parsed = parse_rfc9421(parts)?;
+    if parsed
+        .algorithm
+        .is_some_and(|algorithm| algorithm != SignatureAlgorithm::RsaPkcs1Sha256)
+    {
+        return Err(SignatureError::UnsupportedAlgorithm);
+    }
+    verify_rfc9421_parsed(
+        parts,
+        body,
+        public_base_url,
+        expected_key_id,
+        &parsed,
+        |base, signature| verify_bytes(public_key_pem, base, signature),
+    )
+}
+
+fn verify_rfc9421_parsed(
+    parts: &Parts,
+    body: Option<&[u8]>,
+    public_base_url: &Url,
+    expected_key_id: &str,
+    parsed: &ParsedRfc9421,
+    verify_signature: impl FnOnce(&[u8], &[u8]) -> Result<(), SignatureError>,
+) -> Result<(), SignatureError> {
     check_system_time(parsed.created)?;
     if parsed.key_id != expected_key_id {
         return Err(SignatureError::KeyMismatch);
@@ -358,7 +449,7 @@ fn verify_rfc9421(
         &parsed.components,
         &signature_params,
     )?;
-    verify_bytes(public_key_pem, base.as_bytes(), &parsed.signature)
+    verify_signature(base.as_bytes(), &parsed.signature)
 }
 
 fn sign_legacy_post(
@@ -492,6 +583,51 @@ fn verify_bytes(public_key_pem: &str, base: &[u8], signature: &[u8]) -> Result<(
         .map_err(|_| SignatureError::InvalidSignature)
 }
 
+fn verify_legacy_bytes(
+    parts: &Parts,
+    body: Option<&[u8]>,
+    expected_key_id: &str,
+    public_key: &[u8],
+) -> Result<(), SignatureError> {
+    let key =
+        RsaPublicKey::from_pkcs1_der(public_key).map_err(|_| SignatureError::InvalidPublicKey)?;
+    let pem = key
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|_| SignatureError::InvalidPublicKey)?;
+    verify_legacy(parts, body, expected_key_id, &pem)
+}
+
+fn verify_key_bytes(
+    algorithm: ActorKeyAlgorithm,
+    public_key: &[u8],
+    base: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureError> {
+    match algorithm {
+        ActorKeyAlgorithm::RsaPkcs1Sha256 => {
+            let public_key = RsaPublicKey::from_pkcs1_der(public_key)
+                .map_err(|_| SignatureError::InvalidPublicKey)?;
+            let signature =
+                RsaSignature::try_from(signature).map_err(|_| SignatureError::InvalidSignature)?;
+            VerifyingKey::<Sha256>::new(public_key)
+                .verify(base, &signature)
+                .map_err(|_| SignatureError::InvalidSignature)
+        }
+        ActorKeyAlgorithm::Ed25519 => {
+            let bytes: &[u8; 32] = public_key
+                .try_into()
+                .map_err(|_| SignatureError::InvalidPublicKey)?;
+            let public_key = Ed25519VerifyingKey::from_bytes(bytes)
+                .map_err(|_| SignatureError::InvalidPublicKey)?;
+            let signature = Ed25519Signature::try_from(signature)
+                .map_err(|_| SignatureError::InvalidSignature)?;
+            public_key
+                .verify_strict(base, &signature)
+                .map_err(|_| SignatureError::InvalidSignature)
+        }
+    }
+}
+
 fn check_system_time(timestamp: SystemTime) -> Result<(), SignatureError> {
     let now = SystemTime::now();
     let skew = now
@@ -590,6 +726,7 @@ mod tests {
         body::Body,
         http::{HeaderMap, Method, Request},
     };
+    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
     use rand_core::OsRng;
     use rsa::{
         RsaPrivateKey,
@@ -685,6 +822,56 @@ mod tests {
             .unwrap()
             .as_secs();
         format!(";created={created};keyid=\"{key_id}\"")
+    }
+
+    /// Given a persisted Ed25519 method, RFC 9421 accepts matching or omitted `alg` and rejects RSA.
+    #[test]
+    fn verifies_ed25519_from_persisted_algorithm() {
+        let signing_key = Ed25519SigningKey::from_bytes(&[7_u8; 32]);
+        let key_id = "https://remote.test/users/bob#ed25519-1";
+        let url: Url = "https://local.test/users/alice/outbox?page=true"
+            .parse()
+            .unwrap();
+        for alg in [Some("ed25519"), None] {
+            let created = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let suffix = alg.map_or_else(String::new, |alg| format!(";alg=\"{alg}\""));
+            let params = format!(
+                "(\"@method\" \"@target-uri\");created={created};keyid=\"{key_id}\"{suffix}"
+            );
+            let base = signature_base(
+                &Method::GET,
+                url.as_str(),
+                &HeaderMap::new(),
+                &["@method".to_owned(), "@target-uri".to_owned()],
+                &params,
+            )
+            .unwrap();
+            let signature = signing_key.sign(base.as_bytes());
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, "signature-input", &format!("sig1={params}")).unwrap();
+            insert_header(
+                &mut headers,
+                "signature",
+                &format!("sig1=:{}:", STANDARD.encode(signature.to_bytes())),
+            )
+            .unwrap();
+            let parts = request_parts(Method::GET, "/users/alice/outbox?page=true", headers);
+            assert_eq!(
+                verify_actor_key(
+                    &parts,
+                    None,
+                    &"https://local.test".parse().unwrap(),
+                    key_id,
+                    ActorKeyAlgorithm::Ed25519,
+                    &signing_key.verifying_key().to_bytes()
+                )
+                .unwrap(),
+                SignatureFormat::Rfc9421
+            );
+        }
     }
 
     /// Given valid RSA requests, both RFC POST and digest-free RFC GET profiles verify.

@@ -17,6 +17,7 @@ ammonia = { workspace = true }
 axum = { workspace = true }
 axum-params = { workspace = true }
 base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
 blurhash = { workspace = true }
 build-info = { workspace = true }
 bytesize = { workspace = true }
@@ -28,6 +29,7 @@ image = { workspace = true }
 leptos = { workspace = true, features = ["ssr"] }
 leptos_axum = { workspace = true }
 linkify = { workspace = true }
+multibase = { workspace = true }
 percent-encoding = { workspace = true }
 rand_core = { workspace = true }
 reqwest = { workspace = true }

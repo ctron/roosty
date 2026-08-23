@@ -56,7 +56,8 @@
   malformed optional description metadata.
 - [x] Add inbound RFC 9421 RSA HTTP Message Signatures and RFC 9530 `Content-Digest`, followed by
   legacy-first outbound retry on HTTP 400/401.
-- [ ] Add FEP-521a RSA/Ed25519 key collections and local key lifecycle metadata.
+- [x] Add FEP-521a RSA/Ed25519 key collections, inbound Ed25519 signatures, and automatic local
+  key rotation with an overlap window.
 - [ ] Add FEP-8b32 `eddsa-jcs-2022` Object Integrity Proofs after FEP-521a/Ed25519 support; defer
   `mldsa44-jcs-2024` until deployment prerequisites and relay interoperability justify it.
 
