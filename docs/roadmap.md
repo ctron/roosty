@@ -54,7 +54,7 @@
 - [x] Batch follow-request actor hydration so page query count is independent of page size.
 - [x] Accept deterministic ActivityStreams language-valued attachment descriptions and ignore
   malformed optional description metadata.
-- [ ] Add inbound RFC 9421 RSA HTTP Message Signatures and RFC 9530 `Content-Digest`, followed by
+- [x] Add inbound RFC 9421 RSA HTTP Message Signatures and RFC 9530 `Content-Digest`, followed by
   legacy-first outbound retry on HTTP 400/401.
 - [ ] Add FEP-521a RSA/Ed25519 key collections and local key lifecycle metadata.
 - [ ] Add FEP-8b32 `eddsa-jcs-2022` Object Integrity Proofs after FEP-521a/Ed25519 support; defer

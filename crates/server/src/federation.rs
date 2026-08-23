@@ -2,15 +2,16 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Display,
     net::IpAddr,
     str::from_utf8,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration as StdDuration, SystemTime},
+    time::Duration as StdDuration,
 };
 
 pub(crate) mod discovery;
+mod signature;
 #[cfg(test)]
 mod test_transport;
 
@@ -43,10 +44,7 @@ use roosty_db::{
 };
 use rsa::{
     RsaPrivateKey,
-    pkcs1v15::SigningKey,
-    pkcs1v15::{Signature as RsaSignature, VerifyingKey},
-    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
-    signature::{SignatureEncoding, Signer, Verifier},
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding},
 };
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
@@ -2068,9 +2066,23 @@ async fn process_inbox(
             return StatusCode::FORBIDDEN.into_response();
         }
     };
-    if !verify_legacy_signature(&parts, &body, &remote_actor).unwrap_or(false) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let signature_format = match signature::verify(
+        &parts,
+        Some(&body),
+        &state.config.public_base_url,
+        &remote_actor.public_key_id,
+        &remote_actor.public_key_pem,
+    ) {
+        Ok(format) => format,
+        Err(error) => {
+            tracing::warn!(%error, signature_format = signature_format_name(&parts), "rejected remote inbox signature");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+    tracing::debug!(
+        signature_format = signature_format.as_str(),
+        "verified remote inbox signature"
+    );
     let activity_type = inbound_activity_type(&activity);
     if activity_type.is_none_or(|kind| kind == InboundActivityType::Other) {
         return StatusCode::ACCEPTED.into_response();
@@ -4676,136 +4688,35 @@ async fn local_mention_recipients(
     Ok(recipients)
 }
 
-fn verify_legacy_signature(
-    parts: &Parts,
-    body: &[u8],
-    actor: &RemoteActor,
-) -> Result<bool, RoostyError> {
-    verify_legacy_request_signature(parts, Some(body), actor)
-}
-
-fn verify_legacy_get_signature(parts: &Parts, actor: &RemoteActor) -> Result<bool, RoostyError> {
-    verify_legacy_request_signature(parts, None, actor)
-}
-
-fn verify_legacy_request_signature(
-    parts: &Parts,
-    body: Option<&[u8]>,
-    actor: &RemoteActor,
-) -> Result<bool, RoostyError> {
-    let date = parts
-        .headers
-        .get("date")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| RoostyError::InvalidInput("missing HTTP date".to_owned()))?;
-    let date = httpdate::parse_http_date(date)
-        .map_err(|_| RoostyError::InvalidInput("invalid HTTP date".to_owned()))?;
-    let skew = SystemTime::now()
-        .duration_since(date)
-        .or_else(|_| date.duration_since(SystemTime::now()))
-        .map_err(|_| RoostyError::InvalidInput("invalid HTTP date".to_owned()))?;
-    if skew > StdDuration::from_secs(300) {
-        return Ok(false);
-    }
-    let signature = parts
-        .headers
-        .get("signature")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| RoostyError::InvalidInput("missing HTTP signature".to_owned()))?;
-    let attributes = signature_attributes(signature);
-    if attributes.get("keyId") != Some(&actor.public_key_id) {
-        return Ok(false);
-    }
-    let headers = attributes
-        .get("headers")
-        .map(String::as_str)
-        .unwrap_or("(request-target)");
-    let required_headers = if body.is_some() {
-        &["(request-target)", "host", "date", "digest"][..]
-    } else {
-        &["(request-target)", "host", "date"][..]
-    };
-    for required in required_headers {
-        if !headers
-            .split_whitespace()
-            .any(|header| header.eq_ignore_ascii_case(required))
-        {
-            return Ok(false);
-        }
-    }
-    let mut signed = Vec::new();
-    for header_name in headers.split_whitespace() {
-        let value = if header_name.eq_ignore_ascii_case("(request-target)") {
-            format!(
-                "{} {}",
-                parts.method.as_str().to_ascii_lowercase(),
-                parts
-                    .uri
-                    .path_and_query()
-                    .map(|value| value.as_str())
-                    .unwrap_or("/")
-            )
-        } else {
-            parts
-                .headers
-                .get(header_name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_owned()
-        };
-        if value.is_empty() {
-            return Ok(false);
-        }
-        signed.push(format!("{}: {value}", header_name.to_ascii_lowercase()));
-    }
-    if let Some(body) = body {
-        let digest = parts
-            .headers
-            .get("digest")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        let expected_digest = format!("SHA-256={}", STANDARD.encode(Sha256::digest(body)));
-        if digest != expected_digest {
-            return Ok(false);
-        }
-    }
-    let signature_bytes = attributes
-        .get("signature")
-        .and_then(|value| STANDARD.decode(value).ok())
-        .ok_or_else(|| RoostyError::InvalidInput("invalid HTTP signature encoding".to_owned()))?;
-    let public_key = rsa::RsaPublicKey::from_public_key_pem(&actor.public_key_pem)
-        .map_err(|_| RoostyError::InvalidInput("invalid remote actor public key".to_owned()))?;
-    let signature = RsaSignature::try_from(signature_bytes.as_slice())
-        .map_err(|_| RoostyError::InvalidInput("invalid HTTP signature".to_owned()))?;
-    Ok(VerifyingKey::<Sha256>::new(public_key)
-        .verify(signed.join("\n").as_bytes(), &signature)
-        .is_ok())
-}
-
 async fn signed_outbox_requester(
     state: &AppState,
     database: &DatabaseContext,
     parts: &Parts,
 ) -> ApiResult<Option<RemoteActor>> {
-    let Some(signature) = parts
-        .headers
-        .get("signature")
-        .and_then(|value| value.to_str().ok())
+    let Some(identity) = signature::identity(parts)
+        .map_err(|_| ApiError::Unauthorized("HTTP signature is invalid".into()))?
     else {
         return Ok(None);
     };
-    let key_id = signature_attributes(signature)
-        .remove("keyId")
-        .ok_or_else(|| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
+    let signature_format = identity.format;
+    let key_id = identity.key_id;
     let txn = database.begin_read().await?;
     let cached = roosty_db::find_remote_actor_by_public_key_id(&txn, &key_id).await?;
     txn.commit().await?;
     if let Some(actor) = cached {
-        return if verify_legacy_get_signature(parts, &actor).unwrap_or(false) {
-            Ok(Some(actor))
-        } else {
-            Err(ApiError::Unauthorized("HTTP signature is invalid".into()))
-        };
+        signature::verify(
+            parts,
+            None,
+            &state.config.public_base_url,
+            &actor.public_key_id,
+            &actor.public_key_pem,
+        )
+        .map_err(|_| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
+        tracing::debug!(
+            signature_format = signature_format.as_str(),
+            "verified signed outbox requester"
+        );
+        return Ok(Some(actor));
     }
     let mut actor_url = Url::parse(&key_id)
         .map_err(|_| ApiError::Unauthorized("HTTP signature key is invalid".into()))?;
@@ -4828,21 +4739,19 @@ async fn signed_outbox_requester(
             "HTTP signature key does not match its owner".into(),
         ));
     }
-    if verify_legacy_get_signature(parts, &actor).unwrap_or(false) {
-        Ok(Some(actor))
-    } else {
-        Err(ApiError::Unauthorized("HTTP signature is invalid".into()))
-    }
-}
-
-fn signature_attributes(value: &str) -> BTreeMap<String, String> {
-    value
-        .split(',')
-        .filter_map(|part| {
-            let (key, value) = part.trim().split_once('=')?;
-            Some((key.to_owned(), value.trim_matches('"').to_owned()))
-        })
-        .collect()
+    signature::verify(
+        parts,
+        None,
+        &state.config.public_base_url,
+        &actor.public_key_id,
+        &actor.public_key_pem,
+    )
+    .map_err(|_| ApiError::Unauthorized("HTTP signature is invalid".into()))?;
+    tracing::debug!(
+        signature_format = signature_format.as_str(),
+        "verified signed outbox requester"
+    );
+    Ok(Some(actor))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -6721,65 +6630,94 @@ async fn signed_post(
 ) -> Result<(), RoostyError> {
     let url = Url::parse(inbox)
         .map_err(|_| RoostyError::InvalidInput("remote inbox URL is invalid".to_owned()))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| RoostyError::InvalidInput("remote inbox has no host".to_owned()))?
-        .to_owned();
+    url.host_str()
+        .ok_or_else(|| RoostyError::InvalidInput("remote inbox has no host".to_owned()))?;
+    let host = url[url::Position::BeforeHost..url::Position::AfterPort].to_owned();
     let body = serde_json::to_vec(activity)
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    let digest = format!("SHA-256={}", STANDARD.encode(Sha256::digest(&body)));
-    let date = httpdate::fmt_http_date(SystemTime::now());
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_owned(),
-    };
-    let signing =
-        format!("(request-target): post {path}\nhost: {host}\ndate: {date}\ndigest: {digest}");
-    let signature = SigningKey::<Sha256>::new(private_key.clone()).sign(signing.as_bytes());
-    let signature = format!(
-        "keyId=\"{key_id}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{}\"",
-        STANDARD.encode(signature.to_vec())
-    );
+    let legacy = signature::sign_post(
+        signature::SignatureFormat::Legacy,
+        &url,
+        &body,
+        private_key,
+        key_id,
+    )
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    let mut status = send_signed_post(state, db, &url, &host, &body, legacy).await?;
+    if should_retry_with_rfc9421(status) {
+        let rfc9421 = signature::sign_post(
+            signature::SignatureFormat::Rfc9421,
+            &url,
+            &body,
+            private_key,
+            key_id,
+        )
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        status = send_signed_post(state, db, &url, &host, &body, rfc9421).await?;
+    }
+    classify_delivery_status(status)
+}
+
+fn should_retry_with_rfc9421(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 401)
+}
+
+async fn send_signed_post(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    url: &Url,
+    host: &str,
+    body: &[u8],
+    signed: signature::SignedHeaders,
+) -> Result<StatusCode, RoostyError> {
+    tracing::debug!(signature_format = signed.format.as_str(), target = %url, "sending federated activity");
     #[cfg(test)]
-    if let Some(result) =
-        test_transport::deliver_if_registered(&url, &host, &date, &digest, &signature, body.clone())
-            .await
+    if let Some(result) = test_transport::deliver_if_registered(
+        url,
+        host,
+        signed.format,
+        &signed.headers,
+        body.to_vec(),
+    )
+    .await
     {
         return result;
     }
-    let address = discovery::validate_remote_url(state, db, &url).await?;
+    let address = discovery::validate_remote_url(state, db, url).await?;
+    let dns_host = url
+        .host_str()
+        .ok_or_else(|| RoostyError::InvalidInput("remote inbox has no host".to_owned()))?;
     let client = Client::builder()
         .redirect(Policy::none())
         .connect_timeout(StdDuration::from_secs(5))
         .timeout(StdDuration::from_secs(15))
-        .resolve(&host, address)
+        .resolve(dns_host, address)
         .build()
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     let response = client
-        .post(url)
+        .post(url.clone())
         .header("content-type", ACTIVITYSTREAMS_CONTENT_TYPE)
         .header("host", host)
-        .header("date", date)
-        .header("digest", digest)
-        .header("signature", signature)
-        .body(body)
+        .headers(signed.headers)
+        .body(body.to_vec())
         .send()
         .await
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-    if response.status().is_success() {
+    Ok(response.status())
+}
+
+fn classify_delivery_status(status: StatusCode) -> Result<(), RoostyError> {
+    if status.is_success() {
         Ok(())
-    } else if matches!(
-        response.status().as_u16(),
-        400 | 401 | 403 | 404 | 405 | 410
-    ) {
+    } else if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 405 | 410) {
         Err(RoostyError::InvalidInput(format!(
             "permanent federation delivery failure: remote inbox returned {}",
-            response.status()
+            status
         )))
     } else {
         Err(RoostyError::InvalidInput(format!(
             "remote inbox returned {}",
-            response.status()
+            status
         )))
     }
 }
@@ -7125,6 +7063,14 @@ fn internal_error(error: impl Display) -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
+fn signature_format_name(parts: &Parts) -> &'static str {
+    if parts.headers.contains_key("signature-input") {
+        "rfc9421"
+    } else {
+        "legacy"
+    }
+}
+
 /// Return the public key, generating and encrypting a fresh key only once.
 async fn ensure_actor_key(
     state: &AppState,
@@ -7243,6 +7189,24 @@ mod tests {
 
     /// Serializes scenarios which share the in-process recipient registry.
     static FEDERATION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Only authentication/profile-negotiation failures select RFC 9421 fallback.
+    #[test]
+    fn rfc9421_fallback_is_limited_to_bad_request_and_unauthorized() {
+        assert!(super::should_retry_with_rfc9421(StatusCode::BAD_REQUEST));
+        assert!(super::should_retry_with_rfc9421(StatusCode::UNAUTHORIZED));
+        for status in [
+            StatusCode::OK,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::GONE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!super::should_retry_with_rfc9421(status));
+        }
+    }
 
     /// Object key order is insignificant while array order remains part of replay identity.
     #[test]
@@ -7798,6 +7762,8 @@ mod tests {
             .unwrap();
         let alpha_remote = cache_test_actor(&context.beta, "author", "alpha.test", alpha_key).await;
         let beta_remote = cache_test_actor(&context.alpha, "follower", "beta.test", beta_key).await;
+        let request_count = test_transport::recorded_requests().len();
+        test_transport::reject_legacy_once("alpha.test");
 
         let follow_id = super::enqueue_remote_follow(
             &context.beta,
@@ -7818,6 +7784,39 @@ mod tests {
         .await
         .unwrap();
         deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
+        let requests = test_transport::recorded_requests();
+        let attempts = &requests[request_count..];
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0].format,
+            super::signature::SignatureFormat::Legacy
+        );
+        assert_eq!(
+            attempts[1].format,
+            super::signature::SignatureFormat::Rfc9421
+        );
+        assert_eq!(attempts[0].target, attempts[1].target);
+        assert_eq!(attempts[0].body, attempts[1].body);
+        let key_id = format!("{}#main-key", super::actor_url(&context.beta, "follower"));
+        assert!(
+            attempts[0].headers["signature"]
+                .to_str()
+                .unwrap()
+                .contains(&key_id)
+        );
+        assert!(
+            attempts[1].headers["signature-input"]
+                .to_str()
+                .unwrap()
+                .contains(&key_id)
+        );
+        assert!(attempts[1].headers.contains_key("content-digest"));
+        let activity_id =
+            serde_json::from_slice::<serde_json::Value>(&attempts[0].body).unwrap()["id"].clone();
+        assert_eq!(
+            activity_id,
+            serde_json::from_slice::<serde_json::Value>(&attempts[1].body).unwrap()["id"]
+        );
         assert!(
             roosty_db::remote_actor_follows_local_account(
                 &context.alpha.db,
@@ -8771,6 +8770,38 @@ mod tests {
                 .await
                 .unwrap()
         }
+
+        async fn signed_rfc_get(
+            &self,
+            uri: &str,
+            key_id: &str,
+            private_key: &RsaPrivateKey,
+        ) -> Response<Body> {
+            let created = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let signature_params =
+                format!("(\"@method\" \"@target-uri\");created={created};keyid=\"{key_id}\"");
+            let target = format!("https://alpha.test{uri}");
+            let base = format!(
+                "\"@method\": GET\n\"@target-uri\": {target}\n\"@signature-params\": {signature_params}"
+            );
+            let signed = SigningKey::<Sha256>::new(private_key.clone()).sign(base.as_bytes());
+            self.app()
+                .oneshot(
+                    Request::get(uri)
+                        .header("signature-input", format!("sig1={signature_params}"))
+                        .header(
+                            "signature",
+                            format!("sig1=:{}:", STANDARD.encode(signed.to_vec())),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
     }
 
     impl FederationTestContext {
@@ -8955,6 +8986,24 @@ mod tests {
             serde_json::from_slice(&to_bytes(signed.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(signed["totalItems"], 25);
+
+        let rfc_signed = context
+            .alpha
+            .signed_rfc_get(
+                "/users/alice/outbox",
+                &requester.public_key_id,
+                &private_key,
+            )
+            .await;
+        assert_eq!(rfc_signed.status(), StatusCode::OK);
+        assert_eq!(
+            rfc_signed.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        let rfc_signed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(rfc_signed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(rfc_signed["totalItems"], 25);
 
         let signed_page = context
             .alpha

@@ -61,6 +61,7 @@ serde_qs = "1.1.2"
 serde_urlencoded = "0.7.1"
 sha2 = { version = "0.10.9", features = ["oid"] }
 sha2-v11 = { package = "sha2", version = "0.11.0" }
+sfv = "0.15.0"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "macros"] }
 strum = { version = "0.27.2", features = ["derive"] }
 test-context = "0.5.8"
