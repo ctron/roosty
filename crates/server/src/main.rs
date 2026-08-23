@@ -11,7 +11,7 @@ use axum::Router;
 use clap::{Parser, Subcommand};
 use roosty_core::{AccountId, Result, RoostyError};
 #[cfg(test)]
-use roosty_db::NotificationPolicyUpdate;
+use roosty_db::{JobKind, NotificationPolicyUpdate};
 use roosty_migration::Migrator;
 use sea_orm::TransactionTrait;
 use sea_orm_migration::MigratorTrait;
@@ -785,7 +785,7 @@ mod tests {
 
     use postgresql_embedded::PostgreSQL;
     use roosty_migration::Migrator;
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Iterable, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
@@ -1057,11 +1057,57 @@ mod tests {
         postgresql.stop().await.unwrap();
     }
 
+    /// Given the migrated database enum, every Rust job kind is stored and claimable exactly once.
+    #[tokio::test]
+    async fn database_and_worker_support_every_known_job_kind() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let expected = JobKind::iter().collect::<HashSet<_>>();
+        for kind in &expected {
+            roosty_db::enqueue_job(
+                &db,
+                *kind,
+                serde_json::json!({}),
+                None,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        }
+        let diagnostic_kinds = roosty_db::admin_job_diagnostics(&db, 100, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| job.kind)
+            .collect::<HashSet<_>>();
+        assert_eq!(diagnostic_kinds, expected);
+
+        let mut claimed = HashSet::new();
+        while let Some(job) =
+            roosty_db::claim_due_job(&db, "all-kinds-worker", time::Duration::minutes(5))
+                .await
+                .unwrap()
+        {
+            assert!(claimed.insert(job.kind));
+            assert!(roosty_db::mark_job_completed(&db, &job).await.unwrap());
+        }
+
+        assert_eq!(claimed, expected);
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
     /// Given a job introduced by a newer deployment, an older worker leaves it available for a
     /// worker that understands its typed dispatch contract.
     #[tokio::test]
     async fn skips_unknown_future_job_kinds() {
         let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "ALTER TYPE job_kind ADD VALUE 'future_job'".to_owned(),
+        ))
+        .await
+        .unwrap();
         let job_id = uuid::Uuid::now_v7();
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,

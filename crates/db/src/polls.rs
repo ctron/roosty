@@ -720,7 +720,7 @@ pub async fn enqueue_poll_update(
     .await?;
     txn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "UPDATE job SET run_after = LEAST(run_after, $1) WHERE kind = $2 AND deduplication_key = $3 AND completed_at IS NULL",
+        "UPDATE job SET run_after = LEAST(run_after, $1) WHERE kind = $2::job_kind AND deduplication_key = $3 AND completed_at IS NULL",
         vec![
             run_after.into(),
             JobKind::PollUpdate.as_str().to_owned().into(),

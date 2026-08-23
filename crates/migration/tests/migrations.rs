@@ -900,6 +900,74 @@ async fn status_search_upgrade_backfills_and_rolls_back(database: &mut EmbeddedD
     assert!(!table_exists(database.connection(), "status_search_document").await);
 }
 
+/// Given existing durable work, migration 81 constrains its kind without changing stored values.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn job_kind_migration_preserves_rows_and_is_reversible(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(80)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO job (id, kind, payload, run_after)
+            VALUES (
+                '81000000-0000-0000-0000-000000000001',
+                'poll_expiration',
+                '{}'::jsonb,
+                now()
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+
+    let column = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT data_type, udt_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'job' AND column_name = 'kind'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        column.try_get::<String>("", "data_type").unwrap(),
+        "USER-DEFINED"
+    );
+    assert_eq!(
+        column.try_get::<String>("", "udt_name").unwrap(),
+        "job_kind"
+    );
+    assert!(
+        database
+            .connection()
+            .execute_unprepared(
+                "INSERT INTO job (id, kind, payload, run_after) VALUES ('81000000-0000-0000-0000-000000000002', 'unknown_job', '{}'::jsonb, now())",
+            )
+            .await
+            .is_err()
+    );
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    let row = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT kind FROM job WHERE id = '81000000-0000-0000-0000-000000000001'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "kind").unwrap(),
+        "poll_expiration"
+    );
+}
+
 struct EmbeddedDatabase {
     postgresql: PostgreSQL,
     connection: DatabaseConnection,

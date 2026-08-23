@@ -16,9 +16,9 @@ use scraper::{Html, Selector};
 use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveValueType, EntityTrait,
-    FromQueryResult, IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
-    sea_query::{Expr, Func, OnConflict, Query, SelectStatement, SimpleExpr},
+    EnumIter, FromQueryResult, IntoActiveModel, Iterable, ModelTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
+    sea_query::{Alias, Expr, Func, OnConflict, Query, SelectStatement, SimpleExpr},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -5759,7 +5759,17 @@ pub struct RemoteFollowResponseJob {
 
 /// Known durable job kinds dispatched by Roosty's worker.
 #[derive(
-    Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
+    Clone,
+    Copy,
+    Debug,
+    DeriveValueType,
+    Display,
+    EnumIter,
+    EnumString,
+    Eq,
+    Hash,
+    IntoStaticStr,
+    PartialEq,
 )]
 #[sea_orm(value_type = "String")]
 #[strum(serialize_all = "snake_case")]
@@ -5927,23 +5937,15 @@ async fn insert_response_job(
     txn: &sea_orm::DatabaseTransaction,
     response_job: RemoteFollowResponseJob,
 ) -> Result<()> {
-    let _ = job::Entity::insert(job::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        kind: Set(response_job.kind),
-        payload: Set(response_job.payload),
-        deduplication_key: Set(Some(response_job.deduplication_key)),
-        run_after: Set(OffsetDateTime::now_utc()),
-        attempts: Set(0),
-        locked_at: Set(None),
-        locked_by: Set(None),
-        claim_id: Set(None),
-        last_error: Set(None),
-        created_at: Set(OffsetDateTime::now_utc()),
-        completed_at: Set(None),
-        permanently_failed_at: Set(None),
-    })
-    .on_conflict_do_nothing()
-    .exec(txn)
+    enqueue_job_in_transaction(
+        txn,
+        NewJob {
+            kind: response_job.kind,
+            payload: response_job.payload,
+            deduplication_key: Some(response_job.deduplication_key),
+            run_after: OffsetDateTime::now_utc(),
+        },
+    )
     .await?;
     Ok(())
 }
@@ -11695,7 +11697,7 @@ pub async fn enqueue_due_trend_refresh(db: &DbConnection) -> Result<Option<JobId
              AND next_run_at <= now()
              AND NOT EXISTS (
                SELECT 1 FROM job
-               WHERE kind = $1 AND completed_at IS NULL
+               WHERE kind = $1::job_kind AND completed_at IS NULL
              )
            FOR UPDATE SKIP LOCKED"#,
         vec![JobKind::TrendMaintenance.as_str().to_owned().into()],
@@ -13577,7 +13579,7 @@ pub async fn reschedule_status(
     let updated = active.update(db).await?;
     db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "UPDATE job SET run_after = $1 WHERE kind = $2 AND deduplication_key = $3 AND completed_at IS NULL",
+        "UPDATE job SET run_after = $1 WHERE kind = $2::job_kind AND deduplication_key = $3 AND completed_at IS NULL",
         vec![
             scheduled_at.into(),
             JobKind::ScheduledStatusPublish.as_str().to_owned().into(),
@@ -13605,7 +13607,7 @@ pub async fn cancel_scheduled_status(
     model.into_active_model().delete(db).await?;
     db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "UPDATE job SET completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE kind = $1 AND deduplication_key = $2 AND completed_at IS NULL",
+        "UPDATE job SET completed_at = now(), locked_at = NULL, locked_by = NULL, claim_id = NULL WHERE kind = $1::job_kind AND deduplication_key = $2 AND completed_at IS NULL",
         vec![
             JobKind::ScheduledStatusPublish.as_str().to_owned().into(),
             id.to_string().into(),
@@ -19833,6 +19835,19 @@ pub struct AdminJobDiagnostic {
     pub permanently_failed_at: Option<OffsetDateTime>,
 }
 
+#[derive(FromQueryResult)]
+struct AdminJobDiagnosticRow {
+    id: Uuid,
+    kind: JobKind,
+    attempts: i32,
+    run_after: OffsetDateTime,
+    locked_at: Option<OffsetDateTime>,
+    last_error: Option<String>,
+    created_at: OffsetDateTime,
+    completed_at: Option<OffsetDateTime>,
+    permanently_failed_at: Option<OffsetDateTime>,
+}
+
 /// Origin of an administrator mutation.
 #[derive(
     Clone, Copy, Debug, DeriveValueType, Display, EnumString, Eq, IntoStaticStr, PartialEq,
@@ -20025,37 +20040,49 @@ pub async fn admin_job_diagnostics(
     limit: u64,
     max_id: Option<Uuid>,
 ) -> Result<Vec<AdminJobDiagnostic>> {
-    let mut query = entity::job::Entity::find()
+    let mut query = job::Entity::find()
+        .select_only()
+        .column(job::Column::Id)
+        .column_as(
+            Expr::col(job::Column::Kind).cast_as(Alias::new("text")),
+            job::Column::Kind,
+        )
+        .columns([
+            job::Column::Attempts,
+            job::Column::RunAfter,
+            job::Column::LockedAt,
+            job::Column::LastError,
+            job::Column::CreatedAt,
+            job::Column::CompletedAt,
+            job::Column::PermanentlyFailedAt,
+        ])
         .filter(
             Condition::any()
-                .add(entity::job::Column::CompletedAt.is_null())
-                .add(entity::job::Column::PermanentlyFailedAt.is_not_null()),
+                .add(job::Column::CompletedAt.is_null())
+                .add(job::Column::PermanentlyFailedAt.is_not_null()),
         )
-        .order_by_desc(entity::job::Column::Id)
+        .order_by_desc(job::Column::Id)
         .limit(limit.min(100));
     if let Some(max_id) = max_id {
-        query = query.filter(entity::job::Column::Id.lt(max_id));
+        query = query.filter(job::Column::Id.lt(max_id));
     }
-    let diagnostics = query
-        .all(db)
-        .await?
+    let rows = query.into_model::<AdminJobDiagnosticRow>().all(db).await?;
+    let diagnostics = rows
         .into_iter()
-        .map(|model| {
-            let attempts = u32::try_from(model.attempts).map_err(|_| {
+        .map(|row| {
+            let attempts = u32::try_from(row.attempts).map_err(|_| {
                 RoostyError::InvalidInput("stored job attempts must not be negative".to_owned())
             })?;
             Ok(AdminJobDiagnostic {
-                id: JobId(model.id),
-                kind: model.kind,
+                id: JobId(row.id),
+                kind: row.kind,
                 attempts,
-                run_after: model.run_after,
-                locked_at: model.locked_at,
-                last_error: model
-                    .last_error
-                    .map(|error| sanitize_admin_job_error(&error)),
-                created_at: model.created_at,
-                completed_at: model.completed_at,
-                permanently_failed_at: model.permanently_failed_at,
+                run_after: row.run_after,
+                locked_at: row.locked_at,
+                last_error: row.last_error.map(|error| sanitize_admin_job_error(&error)),
+                created_at: row.created_at,
+                completed_at: row.completed_at,
+                permanently_failed_at: row.permanently_failed_at,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -20119,7 +20146,7 @@ where
             DatabaseBackend::Postgres,
             r#"
             INSERT INTO job (id, kind, payload, deduplication_key, run_after)
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2::job_kind, $3, $4, $5)
             ON CONFLICT (kind, deduplication_key)
             WHERE deduplication_key IS NOT NULL AND completed_at IS NULL
             DO UPDATE SET deduplication_key = excluded.deduplication_key
@@ -20152,6 +20179,9 @@ pub async fn claim_due_job(
 ) -> Result<Option<ClaimedJob>> {
     let expired_before = OffsetDateTime::now_utc() - claim_ttl;
     let claim_id = JobClaimId(Uuid::now_v7());
+    let known_kinds = JobKind::iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect::<Vec<_>>();
     let row = db
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -20164,29 +20194,18 @@ pub async fn claim_due_job(
                 WHERE completed_at IS NULL
                   AND run_after <= now()
                   AND (locked_at IS NULL OR locked_at < $3)
-                  AND kind IN (
-                    'federation_follow_response', 'federation_status_delivery',
-                    'federation_quote_delivery', 'federation_follow_delivery',
-                    'federation_favourite_delivery', 'federation_reblog_delivery',
-                    'federation_actor_update_delivery', 'federation_moderation_delivery',
-                    'federation_remote_media_fetch', 'federation_featured_refresh',
-                    'federation_featured_tags_refresh', 'federation_thread_resolve',
-                    'federation_replies_fetch', 'federation_reply_fetch', 'web_push_delivery',
-                    'notification_request_merge', 'notification_request_cleanup',
-                    'scheduled_status_publish', 'trend_maintenance',
-                    'account_suggestion_maintenance',
-                    'preview_card_fetch', 'preview_card_backfill'
-                  )
+                  AND kind::text = ANY($4)
                 ORDER BY run_after, created_at
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, kind, payload, attempts, created_at, claim_id
+            RETURNING id, kind::text AS kind, payload, attempts, created_at, claim_id
             "#,
             vec![
                 worker_id.to_owned().into(),
                 claim_id.0.into(),
                 expired_before.into(),
+                known_kinds.into(),
             ],
         ))
         .await?;
