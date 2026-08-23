@@ -81,20 +81,27 @@ content. Outbound Notes include the locally selected preview URL as a `Link` whi
 
 |🟡
 |Inbox integrity
-|Transient ID-less activities are unsupported.
+|Transient ID-less activities are unsupported. Every POST remains HTTP-signed. A request signed
+by the declared activity actor is accepted through HTTP authentication; a distinct forwarding
+signer must carry a valid top-level FEP-8b32 `eddsa-jcs-2022` proof controlled by that actor.
+Proof sets, chains, and `mldsa44-jcs-2024` are not supported.
 
 |🟢
 |Signed HTTP requests
 |Legacy Cavage RSA signatures and Mastodon-compatible RFC 9421
 `rsa-v1_5-sha256` and `ed25519` signatures are accepted. Body-bearing RFC requests require a
 signed, verified RFC 9530 `Content-Digest`; signed GET requests do not require one. FEP-8b32
-integrity proofs remain pending.
+`eddsa-jcs-2022` proofs use the actor's FEP-521a Ed25519 assertion method.
 
 |🟢
 |Outbound delivery
 |ActivityPub POST delivery uses legacy Cavage RSA first and retries the identical target and body
 once with RFC 9421 RSA after HTTP 400 or 401. Other responses and network errors do not switch
-signature formats.
+signature formats. Newly queued local activities are proved once with the active Ed25519 key before
+durable fan-out, so recipients and retries receive identical JSON. Existing unsigned queued jobs
+remain deliverable. Proofs are also emitted for private and direct activities: recipients can
+transfer those proofs to third parties as evidence of authenticity, so audience addressing remains
+an access-control signal rather than cryptographic confidentiality.
 
 |🟡
 |Remote fetch/cache

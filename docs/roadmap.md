@@ -58,7 +58,8 @@
   legacy-first outbound retry on HTTP 400/401.
 - [x] Add FEP-521a RSA/Ed25519 key collections, inbound Ed25519 signatures, and automatic local
   key rotation with an overlap window.
-- [ ] Add FEP-8b32 `eddsa-jcs-2022` Object Integrity Proofs after FEP-521a/Ed25519 support; defer
+- [x] Add FEP-8b32 `eddsa-jcs-2022` Object Integrity Proof verification for forwarded activities
+  and durable proof emission for local activities; defer
   `mldsa44-jcs-2024` until deployment prerequisites and relay interoperability justify it.
 
 - [x] Refresh expired cached remote actors during exact-handle resolution, with bounded discovery observability and cross-process deduplication.

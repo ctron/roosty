@@ -11,6 +11,7 @@ use std::{
 };
 
 pub(crate) mod discovery;
+mod integrity;
 mod signature;
 #[cfg(test)]
 mod test_transport;
@@ -24,7 +25,10 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ed25519_dalek::{SigningKey as Ed25519SigningKey, pkcs8::EncodePrivateKey as _};
+use ed25519_dalek::{
+    SigningKey as Ed25519SigningKey,
+    pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
+};
 use multibase::Base;
 use rand_core::{OsRng, RngCore};
 use reqwest::{Client, redirect::Policy};
@@ -84,6 +88,12 @@ static ACTOR_KEYS_SEEDED: AtomicU64 = AtomicU64::new(0);
 static ACTOR_KEYS_ROTATED: AtomicU64 = AtomicU64::new(0);
 static ACTOR_KEYS_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static ACTOR_KEY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_DIRECT_HTTP: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_FORWARDED_VERIFIED: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_EMITTED: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_INVALID: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 const MAX_DISCOVERED_REPLIES: usize = 5;
 
@@ -2108,7 +2118,7 @@ async fn process_inbox(
         Ok(body) => body,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
-    let activity: JsonValue = match serde_json::from_slice(&body) {
+    let activity: JsonValue = match integrity::parse_unique_json(&body) {
         Ok(activity) => activity,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -2123,57 +2133,35 @@ async fn process_inbox(
             return StatusCode::FORBIDDEN.into_response();
         }
     };
-    let identity = match signature::identity(&parts) {
-        Ok(Some(identity)) => identity,
-        _ => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-    let mut remote_key = match roosty_db::find_remote_actor_key(db, &identity.key_id).await {
-        Ok(key) => key,
-        Err(error) => return internal_error(error),
-    };
-    if remote_key.is_none() && remote_actor.public_key_id == identity.key_id {
-        remote_key = legacy_remote_verification_key(&remote_actor).ok();
-    }
-    if remote_key
-        .as_ref()
-        .is_none_or(|key| key.remote_actor_id != remote_actor.id)
-    {
-        if discovery::refresh_remote_actor_by_id_in_transaction(
-            state.state,
-            &remote_actor.activitypub_id,
-            db,
-        )
-        .await
-        .is_err()
-        {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-        remote_key = roosty_db::find_remote_actor_key(db, &identity.key_id)
-            .await
-            .ok()
-            .flatten();
-    }
-    let Some(remote_key) = remote_key.filter(|key| key.remote_actor_id == remote_actor.id) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let signature_format = match signature::verify_actor_key(
-        &parts,
-        Some(&body),
-        &state.config.public_base_url,
-        &remote_key.key_id,
-        remote_key.algorithm,
-        &remote_key.public_key,
-    ) {
-        Ok(format) => format,
-        Err(error) => {
-            tracing::warn!(%error, signature_format = signature_format_name(&parts), "rejected remote inbox signature");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    };
+    let (http_actor, signature_format) =
+        match authenticate_inbox_http_signer(state, database, &parts, &body).await {
+            Ok(authenticated) => authenticated,
+            Err(response) => return response,
+        };
     tracing::debug!(
         signature_format = signature_format.as_str(),
         "verified remote inbox signature"
     );
+    if http_actor.id == remote_actor.id {
+        INTEGRITY_DIRECT_HTTP.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(authentication = "direct_http", actor = %remote_actor.activitypub_id, "authenticated inbox activity");
+    } else if let Err(outcome) =
+        authenticate_forwarded_activity(state, &activity, &remote_actor).await
+    {
+        match outcome {
+            integrity::VerificationOutcome::Unsupported => &INTEGRITY_UNSUPPORTED,
+            integrity::VerificationOutcome::Invalid
+            | integrity::VerificationOutcome::Expired
+            | integrity::VerificationOutcome::ControllerMismatch => &INTEGRITY_INVALID,
+            integrity::VerificationOutcome::Unresolved => &INTEGRITY_FAILURES,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(outcome = outcome.as_str(), actor = %remote_actor.activitypub_id, forwarder = %http_actor.activitypub_id, "rejected forwarded inbox activity");
+        return StatusCode::UNAUTHORIZED.into_response();
+    } else {
+        INTEGRITY_FORWARDED_VERIFIED.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(authentication = "forwarded_proof", actor = %remote_actor.activitypub_id, forwarder = %http_actor.activitypub_id, "authenticated inbox activity");
+    }
     let activity_type = inbound_activity_type(&activity);
     if activity_type.is_none_or(|kind| kind == InboundActivityType::Other) {
         return StatusCode::ACCEPTED.into_response();
@@ -3182,11 +3170,24 @@ async fn process_inbox(
         };
     }
     let persisted = if matches!(follow_state, InboundFollowState::Accepted) {
+        let response_activity = match follow_response_activity(
+            state.state,
+            &txn,
+            &local_account,
+            &activity,
+            FollowResponseType::Accept,
+        )
+        .await
+        {
+            Ok(activity) => activity,
+            Err(error) => return internal_error(error),
+        };
         let payload = match serde_json::to_value(FollowResponseDelivery {
             local_account_id: local_account.id,
             remote_actor_id: remote_actor.id,
             follow: activity.clone(),
             response_type: FollowResponseType::Accept,
+            activity: Some(response_activity),
         }) {
             Ok(payload) => payload,
             Err(error) => return internal_error(error),
@@ -3265,6 +3266,117 @@ async fn process_inbox(
         }
         false => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+/// Resolve and authenticate the HTTP signer independently of the activity actor.
+#[allow(clippy::result_large_err)]
+async fn authenticate_inbox_http_signer(
+    state: &TransactionContext<'_, DatabaseTransaction>,
+    database: &DatabaseContext,
+    parts: &Parts,
+    body: &[u8],
+) -> Result<(RemoteActor, signature::SignatureFormat), Response> {
+    let identity = signature::identity(parts)
+        .ok()
+        .flatten()
+        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
+    let mut key = roosty_db::find_remote_actor_key(state.db, &identity.key_id)
+        .await
+        .map_err(internal_error)?;
+    let mut actor = if let Some(key) = &key {
+        roosty_db::find_remote_actor_by_id(state.db, key.remote_actor_id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        roosty_db::find_remote_actor_by_public_key_id(state.db, &identity.key_id)
+            .await
+            .map_err(internal_error)?
+    };
+    if key.is_none()
+        && let Some(legacy_actor) = &actor
+    {
+        key = legacy_remote_verification_key(legacy_actor).ok();
+    }
+    if actor.is_none() || key.is_none() {
+        actor = discovery::resolve_remote_actor_by_key_id(state.state, database, &identity.key_id)
+            .await
+            .ok();
+        key = roosty_db::find_remote_actor_key(state.db, &identity.key_id)
+            .await
+            .map_err(internal_error)?;
+    }
+    let actor = actor.ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
+    if key
+        .as_ref()
+        .is_none_or(|key| key.remote_actor_id != actor.id)
+    {
+        discovery::refresh_remote_actor_by_id_in_transaction(
+            state.state,
+            &actor.activitypub_id,
+            state.db,
+        )
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED.into_response())?;
+        key = roosty_db::find_remote_actor_key(state.db, &identity.key_id)
+            .await
+            .map_err(internal_error)?;
+    }
+    let key = key
+        .filter(|key| key.remote_actor_id == actor.id)
+        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
+    let format = signature::verify_actor_key(
+        parts,
+        Some(body),
+        &state.config.public_base_url,
+        &key.key_id,
+        key.algorithm,
+        &key.public_key,
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, signature_format = signature_format_name(parts), "rejected remote inbox signature");
+        StatusCode::UNAUTHORIZED.into_response()
+    })?;
+    Ok((actor, format))
+}
+
+/// Authenticate a forwarded activity with the claimed actor's exact assertion method.
+async fn authenticate_forwarded_activity(
+    state: &TransactionContext<'_, DatabaseTransaction>,
+    activity: &JsonValue,
+    actor: &RemoteActor,
+) -> Result<(), integrity::VerificationOutcome> {
+    let prepared =
+        integrity::prepare(activity, OffsetDateTime::now_utc()).map_err(|error| error.outcome())?;
+    let mut key = roosty_db::find_remote_actor_key(state.db, &prepared.verification_method)
+        .await
+        .map_err(|_| integrity::VerificationOutcome::Unresolved)?;
+    if key
+        .as_ref()
+        .is_none_or(|key| key.remote_actor_id != actor.id)
+    {
+        discovery::refresh_remote_actor_by_id_in_transaction(
+            state.state,
+            &actor.activitypub_id,
+            state.db,
+        )
+        .await
+        .map_err(|_| integrity::VerificationOutcome::Unresolved)?;
+        key = roosty_db::find_remote_actor_key(state.db, &prepared.verification_method)
+            .await
+            .map_err(|_| integrity::VerificationOutcome::Unresolved)?;
+    }
+    let key = key.ok_or(integrity::VerificationOutcome::Unresolved)?;
+    if key.remote_actor_id != actor.id {
+        return Err(integrity::VerificationOutcome::ControllerMismatch);
+    }
+    if key.algorithm != ActorKeyAlgorithm::Ed25519
+        || key
+            .expires_at
+            .is_some_and(|expires| expires <= OffsetDateTime::now_utc())
+    {
+        return Err(integrity::VerificationOutcome::Expired);
+    }
+    integrity::verify(activity, &prepared, &key.public_key).map_err(|error| error.outcome())
 }
 
 /// Apply one verified Mastodon-style `Create(Note)` vote outside the large inbox future.
@@ -3377,26 +3489,15 @@ async fn process_and_publish_remote_status_activity(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// Hash compact canonical JSON with recursively sorted object keys.
+/// Hash semantic activity JSON after removing transferable authentication metadata.
 fn canonical_activity_digest(activity: &JsonValue) -> Result<[u8; 32], RoostyError> {
-    fn canonicalize(value: &JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(object) => {
-                let mut entries = object.iter().collect::<Vec<_>>();
-                entries.sort_by_key(|(key, _)| *key);
-                JsonValue::Object(
-                    entries
-                        .into_iter()
-                        .map(|(key, value)| (key.clone(), canonicalize(value)))
-                        .collect(),
-                )
-            }
-            JsonValue::Array(values) => JsonValue::Array(values.iter().map(canonicalize).collect()),
-            _ => value.clone(),
-        }
-    }
-
-    let bytes = serde_json::to_vec(&canonicalize(activity))
+    let mut semantic = activity.clone();
+    let object = semantic
+        .as_object_mut()
+        .ok_or_else(|| RoostyError::InvalidInput("inbox activity is not an object".to_owned()))?;
+    object.remove("proof");
+    object.remove("signature");
+    let bytes = serde_json_canonicalizer::to_vec(&semantic)
         .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
     Ok(Sha256::digest(bytes).into())
 }
@@ -4567,7 +4668,15 @@ pub(crate) fn metrics_text() -> String {
             "# TYPE roosty_federation_thread_fetch_total counter\n",
             "roosty_federation_thread_fetch_total{{outcome=\"parent_resolved\"}} {}\n",
             "roosty_federation_thread_fetch_total{{outcome=\"reply_discovered\"}} {}\n",
-            "roosty_federation_thread_fetch_total{{outcome=\"rejected\"}} {}\n"
+            "roosty_federation_thread_fetch_total{{outcome=\"rejected\"}} {}\n",
+            "# HELP roosty_federation_integrity_proof_total Bounded Object Integrity authentication and emission outcomes.\n",
+            "# TYPE roosty_federation_integrity_proof_total counter\n",
+            "roosty_federation_integrity_proof_total{{outcome=\"direct_http\"}} {}\n",
+            "roosty_federation_integrity_proof_total{{outcome=\"forwarded_verified\"}} {}\n",
+            "roosty_federation_integrity_proof_total{{outcome=\"emitted\"}} {}\n",
+            "roosty_federation_integrity_proof_total{{outcome=\"unsupported\"}} {}\n",
+            "roosty_federation_integrity_proof_total{{outcome=\"invalid\"}} {}\n",
+            "roosty_federation_integrity_proof_total{{outcome=\"failure\"}} {}\n"
         ),
         INBOX_ACCEPTED.load(Ordering::Relaxed),
         INBOX_DUPLICATE.load(Ordering::Relaxed),
@@ -4578,6 +4687,12 @@ pub(crate) fn metrics_text() -> String {
         THREAD_PARENT_RESOLVED.load(Ordering::Relaxed),
         THREAD_REPLIES_DISCOVERED.load(Ordering::Relaxed),
         THREAD_FETCH_REJECTED.load(Ordering::Relaxed),
+        INTEGRITY_DIRECT_HTTP.load(Ordering::Relaxed),
+        INTEGRITY_FORWARDED_VERIFIED.load(Ordering::Relaxed),
+        INTEGRITY_EMITTED.load(Ordering::Relaxed),
+        INTEGRITY_UNSUPPORTED.load(Ordering::Relaxed),
+        INTEGRITY_INVALID.load(Ordering::Relaxed),
+        INTEGRITY_FAILURES.load(Ordering::Relaxed),
     );
     metrics.push_str(&discovery::metrics_text());
     metrics
@@ -4890,13 +5005,35 @@ struct FollowResponseDelivery {
     remote_actor_id: AccountId,
     follow: JsonValue,
     response_type: FollowResponseType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity: Option<JsonValue>,
 }
 
 /// ActivityPub response types emitted for an inbound Follow request.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 enum FollowResponseType {
     Accept,
     Reject,
+}
+
+async fn follow_response_activity(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    local: &LocalAccount,
+    follow: &JsonValue,
+    response_type: FollowResponseType,
+) -> Result<JsonValue, RoostyError> {
+    let actor = actor_url(state, &local.username);
+    let response_type_name = response_type.as_str();
+    let mut activity = serde_json::json!({
+        "@context": ACTIVITYSTREAMS_CONTEXT,
+        "id": format!("{actor}#{}-{}", response_type_name.to_ascii_lowercase(), Uuid::now_v7()),
+        "type": response_type_name,
+        "actor": actor,
+        "object": follow,
+    });
+    prove_local_activity(state, db, local.id, &mut activity).await?;
+    Ok(activity)
 }
 
 /// Local state assigned to an inbound Follow before a manual approval decision.
@@ -5289,7 +5426,7 @@ pub(crate) async fn enqueue_pin_activity_in_transaction(
         if pinned { "add" } else { "remove" },
         Uuid::now_v7()
     );
-    let activity = serde_json::json!({
+    let mut activity = serde_json::json!({
         "@context": ACTIVITYSTREAMS_CONTEXT,
         "id": activity_id,
         "type": if pinned { "Add" } else { "Remove" },
@@ -5298,6 +5435,7 @@ pub(crate) async fn enqueue_pin_activity_in_transaction(
         "target": format!("{actor}/collections/featured"),
         "to": format!("{actor}/followers"),
     });
+    prove_local_activity(state, txn, status.account_id, &mut activity).await?;
     for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, status.account_id).await? {
         let payload = serde_json::to_value(StatusDelivery {
             local_account_id: status.account_id,
@@ -5337,7 +5475,7 @@ pub(crate) async fn enqueue_featured_tag_activity(
         if featured { "add" } else { "remove" },
         Uuid::now_v7()
     );
-    let activity = serde_json::json!({
+    let mut activity = serde_json::json!({
         "@context": ACTIVITYSTREAMS_CONTEXT,
         "id": activity_id,
         "type": if featured { "Add" } else { "Remove" },
@@ -5350,6 +5488,7 @@ pub(crate) async fn enqueue_featured_tag_activity(
         "target": format!("{actor}/collections/tags"),
         "to": format!("{actor}/followers"),
     });
+    prove_local_activity(state, txn, account.id, &mut activity).await?;
     for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, account.id).await? {
         let payload = serde_json::to_value(StatusDelivery {
             local_account_id: account.id,
@@ -5409,7 +5548,7 @@ pub(crate) async fn enqueue_quote_request_in_transaction(
         .quote_request_id
         .clone()
         .ok_or_else(|| RoostyError::InvalidInput("pending quote has no request ID".to_owned()))?;
-    let activity = serde_json::to_value(QuoteRequestActivity {
+    let mut activity = serde_json::to_value(QuoteRequestActivity {
         context: [ACTIVITYSTREAMS_CONTEXT, "https://w3id.org/fep/044f"],
         id: request_id.clone(),
         r#type: "https://w3id.org/fep/044f#QuoteRequest",
@@ -5418,6 +5557,7 @@ pub(crate) async fn enqueue_quote_request_in_transaction(
         instrument: status_url(state, &local.username, status.id),
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    prove_local_activity(state, txn, local.id, &mut activity).await?;
     let payload = serde_json::to_value(StatusDelivery {
         local_account_id: local.id,
         remote_actor_id: target.remote_actor_id,
@@ -5465,7 +5605,7 @@ pub(crate) async fn enqueue_quote_revocation_in_transaction(
             RoostyError::InvalidInput("quoted status author does not exist".to_owned())
         })?;
     let actor = actor_url(state, &local.username);
-    let activity = serde_json::to_value(Delete {
+    let mut activity = serde_json::to_value(Delete {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: format!("{authorization_id}#delete-{}", Uuid::now_v7()),
         r#type: DeleteType::Delete,
@@ -5475,6 +5615,7 @@ pub(crate) async fn enqueue_quote_revocation_in_transaction(
         object: authorization_id.clone(),
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    prove_local_activity(state, txn, local.id, &mut activity).await?;
     let payload = serde_json::to_value(StatusDelivery {
         local_account_id: local.id,
         remote_actor_id: quoting.remote_actor_id,
@@ -5607,7 +5748,8 @@ pub(crate) async fn prepare_remote_favourite(
         })?;
     let actor = actor_url(state, &local.username);
     let id = format!("{actor}#like-{}", Uuid::now_v7());
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Like", "actor": actor, "object": remote_status.activitypub_id});
+    let mut activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Like", "actor": actor, "object": remote_status.activitypub_id});
+    prove_local_activity(state, db, local_account_id, &mut activity).await?;
     Ok((
         id.clone(),
         favourite_delivery_job(local_account_id, remote.id, activity, &id)?,
@@ -5652,7 +5794,8 @@ pub(crate) async fn prepare_remote_unfavourite(
     let actor = actor_url(state, &local.username);
     let id = format!("{actor}#undo-like-{}", Uuid::now_v7());
     let like = serde_json::json!({"id": favourite.activity_id, "type": "Like", "actor": actor, "object": remote_status.activitypub_id});
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": like});
+    let mut activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": like});
+    prove_local_activity(state, db, favourite.local_account_id, &mut activity).await?;
     favourite_delivery_job(favourite.local_account_id, remote.id, activity, &id)
 }
 
@@ -5748,6 +5891,9 @@ pub(crate) async fn prepare_poll_vote(
             }
         }));
     }
+    for activity in &mut activities {
+        prove_local_activity(state, db, local_account_id, activity).await?;
+    }
     let payload = serde_json::to_value(PollVoteDelivery {
         local_account_id,
         remote_actor_id: remote.id,
@@ -5823,6 +5969,9 @@ pub(crate) async fn prepare_remote_reblog(
         actor,
         object: remote_status.activitypub_id.clone(),
     };
+    let mut activity = serde_json::to_value(activity)
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    prove_local_activity(state, db, local_account_id, &mut activity).await?;
     Ok((
         id.clone(),
         reblog_delivery_job(local_account_id, remote.id, activity, &id)?,
@@ -5876,6 +6025,9 @@ pub(crate) async fn prepare_remote_unreblog(
             object: remote_status.activitypub_id,
         },
     };
+    let mut activity = serde_json::to_value(activity)
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    prove_local_activity(state, db, reblog.local_account_id, &mut activity).await?;
     reblog_delivery_job(reblog.local_account_id, remote.id, activity, &id)
 }
 
@@ -5953,7 +6105,8 @@ pub(crate) async fn prepare_remote_follow(
         })?;
     let actor = actor_url(state, &local.username);
     let id = format!("{actor}#follow-{}", Uuid::now_v7());
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Follow", "actor": actor, "object": remote.activitypub_id});
+    let mut activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Follow", "actor": actor, "object": remote.activitypub_id});
+    prove_local_activity(state, db, local_account_id, &mut activity).await?;
     Ok((
         id.clone(),
         follow_delivery_job(local_account_id, remote_actor_id, activity, &id)?,
@@ -5991,7 +6144,8 @@ pub(crate) async fn prepare_remote_unfollow(
     let actor = actor_url(state, &local.username);
     let id = format!("{actor}#undo-follow-{}", Uuid::now_v7());
     let follow = serde_json::json!({"id": following.activity_id, "type": "Follow", "actor": actor, "object": remote.activitypub_id});
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": follow});
+    let mut activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": follow});
+    prove_local_activity(state, db, following.local_account_id, &mut activity).await?;
     follow_delivery_job(
         following.local_account_id,
         following.remote_actor_id,
@@ -6057,7 +6211,8 @@ pub(crate) async fn prepare_remote_block(
         })?;
     let actor = actor_url(state, &local.username);
     let id = format!("{actor}#block-{}", Uuid::now_v7());
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Block", "actor": actor, "object": remote.activitypub_id});
+    let mut activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Block", "actor": actor, "object": remote.activitypub_id});
+    prove_local_activity(state, db, local_account_id, &mut activity).await?;
     Ok((
         id.clone(),
         moderation_delivery_job(local_account_id, remote_actor_id, activity, &id)?,
@@ -6104,7 +6259,7 @@ pub(crate) async fn prepare_report_flag(
             }
         }
     }
-    let activity = serde_json::json!({
+    let mut activity = serde_json::json!({
         "@context": ACTIVITYSTREAMS_CONTEXT,
         "id": id,
         "type": "Flag",
@@ -6112,6 +6267,7 @@ pub(crate) async fn prepare_report_flag(
         "object": objects,
         "content": comment,
     });
+    prove_local_activity(state, db, local_account_id, &mut activity).await?;
     moderation_delivery_job(local_account_id, remote_actor_id, activity, &id)
 }
 
@@ -6132,7 +6288,8 @@ pub(crate) async fn prepare_remote_unblock(
     let actor = actor_url(state, &local.username);
     let id = format!("{actor}#undo-block-{}", Uuid::now_v7());
     let original = serde_json::json!({"id": block.activity_id, "type": "Block", "actor": actor, "object": remote.activitypub_id});
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": original});
+    let mut activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": id, "type": "Undo", "actor": actor, "object": original});
+    prove_local_activity(state, db, block.local_account_id, &mut activity).await?;
     moderation_delivery_job(block.local_account_id, block.remote_actor_id, activity, &id)
 }
 
@@ -6200,11 +6357,13 @@ pub(crate) async fn enqueue_status_activity(
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local status actor does not exist".to_owned()))?;
     let remote_audience = status_remote_audience(db, status).await?;
-    let activity =
+    let mut activity =
         status_activity(state, db, &local.username, status, kind, &remote_audience).await?;
+    prove_local_activity(state, db, local.id, &mut activity).await?;
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
+        .map(str::to_owned)
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
     let recipients =
         status_delivery_recipients(db, local.id, status, &remote_audience, &[]).await?;
@@ -6254,11 +6413,13 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
         .await?
         .ok_or_else(|| RoostyError::InvalidInput("local status actor does not exist".to_owned()))?;
     let remote_audience = status_remote_audience(txn, status).await?;
-    let activity =
+    let mut activity =
         status_activity(state, txn, &local.username, status, kind, &remote_audience).await?;
+    prove_local_activity(state, txn, local.id, &mut activity).await?;
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
+        .map(str::to_owned)
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
     let recipients = status_delivery_recipients(
         txn,
@@ -6357,7 +6518,7 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
     ensure_ed25519_actor_key(state, txn, &account).await?;
     let keys = roosty_db::publishable_local_actor_keys(txn, account.id).await?;
     let actor = actor_url(state, &account.username);
-    let activity = serde_json::to_value(ActorUpdate {
+    let mut activity = serde_json::to_value(ActorUpdate {
         context: ACTIVITYSTREAMS_CONTEXT,
         id: format!("{actor}#update-{}", Uuid::now_v7()),
         r#type: UpdateType::Update,
@@ -6366,9 +6527,11 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
         object: actor_document(state, account.clone(), public_key_pem, keys),
     })
     .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    prove_local_activity(state, txn, account.id, &mut activity).await?;
     let activity_id = activity
         .get("id")
         .and_then(JsonValue::as_str)
+        .map(str::to_owned)
         .ok_or_else(|| RoostyError::InvalidInput("actor update has no ID".to_owned()))?;
 
     for remote in roosty_db::accepted_remote_followers(txn, account.id).await? {
@@ -6404,7 +6567,7 @@ pub(crate) async fn enqueue_actor_delete_in_transaction(
     }
     let actor = actor_url(state, &account.username);
     let activity_id = format!("{actor}#delete-{}", Uuid::now_v7());
-    let activity = serde_json::json!({
+    let mut activity = serde_json::json!({
         "@context": ACTIVITYSTREAMS_CONTEXT,
         "id": activity_id,
         "type": "Delete",
@@ -6412,6 +6575,7 @@ pub(crate) async fn enqueue_actor_delete_in_transaction(
         "to": ["https://www.w3.org/ns/activitystreams#Public"],
         "object": actor,
     });
+    prove_local_activity(state, txn, account.id, &mut activity).await?;
     for remote in roosty_db::accepted_remote_followers(txn, account.id).await? {
         let payload = serde_json::to_value(ActorUpdateDelivery {
             local_account_id: account.id,
@@ -6471,6 +6635,7 @@ pub(crate) enum StatusActivityKind {
 
 /// Accept a pending remote Follow while atomically creating its durable Accept job.
 pub(crate) async fn accept_remote_follow_request(
+    state: &AppState,
     database: &DatabaseContext,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
@@ -6483,11 +6648,25 @@ pub(crate) async fn accept_remote_follow_request(
     let Some(follow) = follow else {
         return Ok(false);
     };
+    let local = roosty_db::find_local_account_by_id(&txn, local_account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local follow target does not exist".to_owned())
+        })?;
+    let activity = follow_response_activity(
+        state,
+        &txn,
+        &local,
+        &follow.activity,
+        FollowResponseType::Accept,
+    )
+    .await?;
     let payload = serde_json::to_value(FollowResponseDelivery {
         local_account_id,
         remote_actor_id,
         follow: follow.activity.clone(),
         response_type: FollowResponseType::Accept,
+        activity: Some(activity),
     })?;
     let accepted = roosty_db::accept_remote_follow_with_response_job(
         &txn,
@@ -6511,6 +6690,7 @@ pub(crate) async fn accept_remote_follow_request(
 
 /// Reject a pending remote Follow while atomically creating its durable Reject job.
 pub(crate) async fn reject_remote_follow_request(
+    state: &AppState,
     database: &DatabaseContext,
     local_account_id: AccountId,
     remote_actor_id: AccountId,
@@ -6523,11 +6703,25 @@ pub(crate) async fn reject_remote_follow_request(
     let Some(follow) = follow else {
         return Ok(false);
     };
+    let local = roosty_db::find_local_account_by_id(&txn, local_account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local follow target does not exist".to_owned())
+        })?;
+    let activity = follow_response_activity(
+        state,
+        &txn,
+        &local,
+        &follow.activity,
+        FollowResponseType::Reject,
+    )
+    .await?;
     let payload = serde_json::to_value(FollowResponseDelivery {
         local_account_id,
         remote_actor_id,
         follow: follow.activity.clone(),
         response_type: FollowResponseType::Reject,
+        activity: Some(activity),
     })?;
     let rejected = roosty_db::delete_remote_follow_with_response_job(
         &txn,
@@ -6575,9 +6769,22 @@ pub(crate) async fn deliver_follow_response(
             RoostyError::InvalidInput("local delivery actor has no signing key".to_owned())
         })?;
     let private_key = decrypt_private_key(state, &key)?;
-    let actor = actor_url(state, &local.username);
-    let response_type = payload.response_type.as_str();
-    let activity = serde_json::json!({"@context": ACTIVITYSTREAMS_CONTEXT, "id": format!("{actor}#{}-{}", response_type.to_ascii_lowercase(), Uuid::now_v7()), "type": response_type, "actor": actor, "object": payload.follow});
+    // Legacy queued jobs did not persist the activity. Keep them deliverable,
+    // while every newly queued response carries its stable enqueue-time proof.
+    let activity = match payload.activity {
+        Some(activity) => activity,
+        None => {
+            let actor = actor_url(state, &local.username);
+            let response_type = payload.response_type.as_str();
+            serde_json::json!({
+                "@context": ACTIVITYSTREAMS_CONTEXT,
+                "id": format!("{actor}#{}-{}", response_type.to_ascii_lowercase(), Uuid::now_v7()),
+                "type": response_type,
+                "actor": actor,
+                "object": payload.follow,
+            })
+        }
+    };
     let result = signed_post(
         state,
         &txn,
@@ -6718,6 +6925,17 @@ fn decrypt_private_key(
     state: &AppState,
     key: &LocalActorKey,
 ) -> Result<RsaPrivateKey, RoostyError> {
+    let plain = decrypt_actor_private_key_bytes(state, key)?;
+    let pem = from_utf8(&plain)
+        .map_err(|_| RoostyError::InvalidInput("stored actor key is invalid".to_owned()))?;
+    RsaPrivateKey::from_pkcs8_pem(pem)
+        .map_err(|_| RoostyError::InvalidInput("stored actor key is invalid".to_owned()))
+}
+
+fn decrypt_actor_private_key_bytes(
+    state: &AppState,
+    key: &LocalActorKey,
+) -> Result<Vec<u8>, RoostyError> {
     let secret = state
         .config
         .federation_key_encryption_secret
@@ -6746,10 +6964,61 @@ fn decrypt_private_key(
             &mut bytes,
         )
         .map_err(|_| RoostyError::InvalidInput("could not decrypt actor key".to_owned()))?;
-    let pem = from_utf8(plain)
-        .map_err(|_| RoostyError::InvalidInput("stored actor key is invalid".to_owned()))?;
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .map_err(|_| RoostyError::InvalidInput("stored actor key is invalid".to_owned()))
+    Ok(plain.to_vec())
+}
+
+/// Sign an activity once before its durable delivery payload is serialized.
+async fn prove_local_activity(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    activity: &mut JsonValue,
+) -> Result<(), RoostyError> {
+    // Federation-disabled administrative/test workflows can still construct
+    // durable jobs; keep those compatible without requiring signing secrets.
+    if !state.config.federation_enabled {
+        return Ok(());
+    }
+    let result = prove_local_activity_inner(state, db, account_id, activity).await;
+    match &result {
+        Ok(key_id) => {
+            INTEGRITY_EMITTED.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(verification_method = %key_id, "emitted activity integrity proof");
+        }
+        Err(error) => {
+            INTEGRITY_FAILURES.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, account_id = %account_id.0, "failed to emit activity integrity proof");
+        }
+    }
+    result.map(|_| ())
+}
+
+async fn prove_local_activity_inner(
+    state: &AppState,
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    activity: &mut JsonValue,
+) -> Result<String, RoostyError> {
+    let account = roosty_db::find_local_account_by_id(db, account_id)
+        .await?
+        .ok_or_else(|| RoostyError::InvalidInput("local proof actor does not exist".to_owned()))?;
+    ensure_ed25519_actor_key(state, db, &account).await?;
+    let key = roosty_db::find_active_local_actor_key(db, account_id, ActorKeyAlgorithm::Ed25519)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local proof actor has no Ed25519 key".to_owned())
+        })?;
+    let private_key = decrypt_actor_private_key_bytes(state, &key)?;
+    let signing_key = Ed25519SigningKey::from_pkcs8_der(&private_key)
+        .map_err(|_| RoostyError::InvalidInput("stored Ed25519 actor key is invalid".to_owned()))?;
+    integrity::sign(
+        activity,
+        &key.key_id,
+        OffsetDateTime::now_utc(),
+        &signing_key,
+    )
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    Ok(key.key_id)
 }
 
 async fn signed_post(
@@ -7625,6 +7894,17 @@ mod tests {
             canonical_activity_digest(&left).unwrap(),
             canonical_activity_digest(&array_changed).unwrap()
         );
+
+        let with_authentication = json!({
+            "a": true,
+            "z": [{"a": 1, "b": 2}, 3],
+            "signature": {"type": "Legacy"},
+            "proof": {"type": "DataIntegrityProof", "proofValue": "z1"},
+        });
+        assert_eq!(
+            canonical_activity_digest(&left).unwrap(),
+            canonical_activity_digest(&with_authentication).unwrap(),
+        );
     }
 
     /// A Mastodon Question maps oneOf tallies and closure metadata into typed poll state.
@@ -8497,6 +8777,7 @@ mod tests {
         );
         assert!(
             super::accept_remote_follow_request(
+                &context.alpha.state,
                 &context.alpha.database,
                 approved.id,
                 beta_remote.id
@@ -8518,6 +8799,7 @@ mod tests {
         deliver_test_job(&context.beta, roosty_db::JobKind::FederationFollowDelivery).await;
         assert!(
             super::reject_remote_follow_request(
+                &context.alpha.state,
                 &context.alpha.database,
                 rejected.id,
                 beta_remote.id
@@ -8653,6 +8935,24 @@ mod tests {
             "https://alpha.test/media_attachments/files/accounts/header.png"
         );
         assert_eq!(activity["object"]["image"]["mediaType"], "image/png");
+        assert!(
+            activity["@context"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|context| context == super::integrity::DATA_INTEGRITY_CONTEXT)
+        );
+        let proof = super::integrity::prepare(activity, time::OffsetDateTime::now_utc()).unwrap();
+        let ed25519 = roosty_db::find_active_local_actor_key(
+            &context.alpha.db,
+            author.id,
+            roosty_db::ActorKeyAlgorithm::Ed25519,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(proof.verification_method, ed25519.key_id);
+        super::integrity::verify(activity, &proof, &ed25519.public_key).unwrap();
         assert!(
             roosty_db::mark_job_completed(&context.alpha.db, &job)
                 .await

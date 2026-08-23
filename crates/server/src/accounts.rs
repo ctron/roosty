@@ -1212,9 +1212,13 @@ async fn authorize_follow_request(
     AuthenticatedAccount(account): AuthenticatedAccount,
     Path(path): Path<AccountPath>,
 ) -> ApiResult<Response> {
-    let accepted =
-        federation::accept_remote_follow_request(&database, account.id, AccountId(path.account_id))
-            .await?;
+    let accepted = federation::accept_remote_follow_request(
+        &state,
+        &database,
+        account.id,
+        AccountId(path.account_id),
+    )
+    .await?;
     if !accepted {
         return Err(ApiError::NotFound("Record not found".into()));
     }
@@ -1230,7 +1234,7 @@ async fn reject_follow_request(
 ) -> ApiResult<Response> {
     let remote_id = AccountId(path.account_id);
     let rejected =
-        federation::reject_remote_follow_request(&database, account.id, remote_id).await?;
+        federation::reject_remote_follow_request(&state, &database, account.id, remote_id).await?;
     if !rejected {
         return Err(ApiError::NotFound("Record not found".into()));
     }
