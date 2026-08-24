@@ -296,7 +296,7 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 
 |`ROOSTY_SEARCH_INDEXING_ENABLED`
 |`true`
-|Advertise eligible public profiles and statuses to search engines. `serve --search-indexing-enabled <true|false>` overrides the environment for that process.
+|Advertise eligible public profiles and statuses to search engines. `serve --search-indexing-enabled <true\|false>` overrides the environment for that process.
 
 |`ROOSTY_WEB_ROOT`
 |Build-dependent
