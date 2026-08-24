@@ -92,6 +92,7 @@ mod m20260701_000082_add_search_discovery_indexes;
 mod m20260701_000083_add_job_cleanup_indexes;
 mod m20260701_000084_add_remote_handle_validity;
 mod m20260823_000085_add_actor_multikeys;
+mod m20260824_000086_add_remote_actor_migration_job;
 
 pub struct Migrator;
 
@@ -184,6 +185,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000083_add_job_cleanup_indexes::Migration),
             Box::new(m20260701_000084_add_remote_handle_validity::Migration),
             Box::new(m20260823_000085_add_actor_multikeys::Migration),
+            Box::new(m20260824_000086_add_remote_actor_migration_job::Migration),
         ]
     }
 }

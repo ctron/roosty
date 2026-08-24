@@ -83,7 +83,8 @@
 - [x] Deliver and process public/unlisted boosts (`Announce`/`Undo`), including remote timeline entries, local counters, and notifications.
 - [x] Commit supported inbox side effects, idempotency markers, and durable follow/favourite/boost delivery jobs atomically; publish streams only after commit.
 - [x] Repair cached-status timelines, interactions, notifications, reply links, and direct-conversation projections atomically after signed remote status and actor Deletes.
-- [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle; moves expose a replacement account without automatically migrating follows.
+- [x] Process signed Actor `Update`, `Delete`, and `Move` activities for remote profile lifecycle;
+  verified moves expose the replacement and migrate accepted local followers through bounded durable jobs.
 - [x] Safely fetch, validate, cache, expire, and render remote image attachments, with preview metadata and stale-while-refresh proxying; video/audio remain passthrough-only.
 - [x] Federate the underlying Follow, addressed Create/Update/Delete, Like/Undo, and Announce/Undo activities that produce remote follow, mention, reply, favourite, and boost notifications. Replies always address and reach a cached remote parent author even when the text omits an explicit mention.
 - [x] Deliver and ingest ActivityStreams `Question` polls, tally `Update` activities, and
@@ -95,10 +96,11 @@
 - [x] Add recipient-scoped direct-message audiences, per-account last-status projection, local/remote deletion repair, and transactional notification creation.
 - [x] Finish transactional remote notifications for Follow and Announce flows, matching the existing transactional mention/reply and Like handling.
 - [x] Replace stringly persisted status visibility with the typed `StatusVisibility` model at persistence and wire boundaries.
-- [ ] Support remote account migration, redirects, and moved-account relationship updates.
+- [x] Support reciprocal-alias-verified remote account migration, redirects, and moved-account
+  relationship updates with transactional Follow/Undo delivery and list transfer.
 - [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
 - [x] Fetch and expose bounded remote featured profile tags with durable refresh and signed Add/Remove synchronization.
-- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, indexability, featured tags, and account migration metadata.
+- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, and indexability.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
 - [x] Coordinate cold remote avatar, header, attachment, and preview requests through durable job

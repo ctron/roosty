@@ -103,11 +103,12 @@ remain deliverable. Proofs are also emitted for private and direct activities: r
 transfer those proofs to third parties as evidence of authenticity, so audience addressing remains
 an access-control signal rather than cryptographic confidentiality.
 
-|🟡
+|🟢
 |Remote fetch/cache
 |Cold avatar, header, attachment, and attachment-preview proxy requests wait for one coordinated
 durable fetch and return usable media immediately when the origin succeeds. Stale cached media is
-served while refreshing. Account moves do not migrate follows.
+served while refreshing. Reciprocal-alias-verified account moves transfer accepted local followers
+and list memberships through bounded, retryable Follow/Undo jobs.
 
 |===
 
@@ -267,6 +268,10 @@ cursor pagination. `collection_ids[]`, warnings, and custom moderator roles are 
 |🔴
 |`POST /api/v1/accounts`
 |Public registration is missing; local users are operator-created with the admin CLI.
+
+|🔴
+|Local account migration
+|Roosty accounts cannot yet declare migration aliases or initiate an outbound `Move`.
 
 |🟢
 |`GET /api/v1/accounts/:id`
@@ -651,8 +656,8 @@ sitemaps. ActivityPub actor and Note endpoints remain JSON-only.
 |Featured content federation
 |
 
-|🟡
+|🟢
 |Remote conversations and moderation
-|Account migration is missing.
+|Mixed conversations, bilateral moderation, and verified inbound account migration are supported.
 
 |===

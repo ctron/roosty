@@ -2441,6 +2441,138 @@ pub async fn create_remote_following_with_job(
     Ok(remote_following_from_model(row))
 }
 
+/// Return one bounded batch of active accepted follows that still target a moved actor.
+pub async fn remote_actor_move_following_batch(
+    db: &impl ConnectionTrait,
+    remote_actor_id: AccountId,
+    limit: u64,
+) -> Result<Vec<RemoteFollowing>> {
+    Ok(remote_following::Entity::find()
+        .filter(remote_following::Column::RemoteActorId.eq(remote_actor_id.0))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .order_by_asc(remote_following::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(remote_following_from_model)
+        .collect())
+}
+
+/// Move one accepted local follow to a verified replacement actor transactionally.
+///
+/// The old relationship is retained as inactive so its original Follow identity remains
+/// auditable and can be referenced by the queued Undo. Existing target preferences win when the
+/// local account already follows the replacement.
+pub async fn migrate_remote_following_for_actor_move(
+    txn: &DatabaseTransaction,
+    following: &RemoteFollowing,
+    target_actor_id: AccountId,
+    allow_target: bool,
+    target_follow: Option<(String, NewJob)>,
+    undo_job: NewJob,
+) -> Result<bool> {
+    let mut actor_ids = [following.remote_actor_id, target_actor_id];
+    actor_ids.sort_unstable_by_key(|id| id.0);
+    for actor_id in actor_ids {
+        lock_local_remote_relation(txn, following.local_account_id, actor_id).await?;
+    }
+
+    let Some(source) = remote_following::Entity::find()
+        .filter(remote_following::Column::LocalAccountId.eq(following.local_account_id.0))
+        .filter(remote_following::Column::RemoteActorId.eq(following.remote_actor_id.0))
+        .filter(remote_following::Column::ActivityId.eq(&following.activity_id))
+        .filter(remote_following::Column::State.eq(RemoteFollowState::Accepted))
+        .filter(remote_following::Column::DeactivatedAt.is_null())
+        .one(txn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let source_actor = remote_actor::Entity::find_by_id(following.remote_actor_id.0)
+        .one(txn)
+        .await?;
+    if source_actor.and_then(|actor| actor.moved_to_remote_actor_id) != Some(target_actor_id.0) {
+        return Ok(false);
+    }
+
+    let target = if allow_target {
+        remote_following::Entity::find()
+            .filter(remote_following::Column::LocalAccountId.eq(following.local_account_id.0))
+            .filter(remote_following::Column::RemoteActorId.eq(target_actor_id.0))
+            .filter(remote_following::Column::DeactivatedAt.is_null())
+            .one(txn)
+            .await?
+    } else {
+        None
+    };
+    let target_exists = target.is_some();
+    if allow_target && !target_exists {
+        let (activity_id, job) = target_follow.ok_or_else(|| {
+            RoostyError::InvalidInput("remote actor migration Follow is missing".to_owned())
+        })?;
+        remote_following::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            local_account_id: Set(following.local_account_id.0),
+            remote_actor_id: Set(target_actor_id.0),
+            activity_id: Set(activity_id),
+            state: Set(RemoteFollowState::Pending),
+            show_reblogs: Set(following.show_reblogs),
+            notify: Set(following.notify),
+            ..Default::default()
+        }
+        .insert(txn)
+        .await?;
+        enqueue_job_in_transaction(txn, job).await?;
+    }
+
+    if allow_target {
+        let memberships = local_list_remote_member::Entity::find()
+            .filter(local_list_remote_member::Column::RemoteActorId.eq(following.remote_actor_id.0))
+            .filter(
+                local_list_remote_member::Column::ListId.in_subquery(
+                    Query::select()
+                        .column(local_list::Column::Id)
+                        .from(local_list::Entity)
+                        .and_where(local_list::Column::AccountId.eq(following.local_account_id.0))
+                        .to_owned(),
+                ),
+            )
+            .all(txn)
+            .await?;
+        for membership in memberships {
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"INSERT INTO local_list_remote_member
+                   (id, list_id, remote_actor_id, created_at)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (list_id, remote_actor_id) DO NOTHING"#,
+                vec![
+                    Uuid::now_v7().into(),
+                    membership.list_id.into(),
+                    target_actor_id.0.into(),
+                    membership.created_at.into(),
+                ],
+            ))
+            .await?;
+        }
+    }
+    remove_remote_account_from_owned_lists(
+        txn,
+        following.local_account_id,
+        following.remote_actor_id,
+    )
+    .await?;
+
+    let mut source = source.into_active_model();
+    source.deactivated_at = Set(Some(OffsetDateTime::now_utc()));
+    source.updated_at = Set(OffsetDateTime::now_utc());
+    source.update(txn).await?;
+    enqueue_job_in_transaction(txn, undo_job).await?;
+    Ok(true)
+}
+
 /// Find one local-to-remote follow relationship.
 pub async fn find_remote_following(
     db: &impl ConnectionTrait,
@@ -2844,6 +2976,7 @@ pub async fn process_remote_actor_move(
     txn: &DatabaseTransaction,
     remote_actor_id: AccountId,
     target_actor_id: AccountId,
+    job: NewJob,
 ) -> Result<bool> {
     let Some(actor) = remote_actor::Entity::find_by_id(remote_actor_id.0)
         .one(txn)
@@ -2855,6 +2988,7 @@ pub async fn process_remote_actor_move(
     actor.moved_to_remote_actor_id = Set(Some(target_actor_id.0));
     actor.updated_at = Set(OffsetDateTime::now_utc());
     actor.update(txn).await?;
+    enqueue_job_in_transaction(txn, job).await?;
     Ok(true)
 }
 
@@ -6026,6 +6160,7 @@ pub enum JobKind {
     PreviewCardFetch,
     PreviewCardBackfill,
     ActorKeyMaintenance,
+    RemoteActorMigration,
 }
 
 impl JobKind {

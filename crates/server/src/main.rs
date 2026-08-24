@@ -818,6 +818,15 @@ async fn worker_iteration(
         roosty_db::JobKind::ActorKeyMaintenance => {
             federation::maintain_actor_keys(state, &database).await
         }
+        roosty_db::JobKind::RemoteActorMigration => {
+            federation::migrate_remote_actor_relationships(
+                state,
+                &database,
+                job.payload.clone(),
+                job.id.0,
+            )
+            .await
+        }
     };
     match result {
         Ok(()) => {

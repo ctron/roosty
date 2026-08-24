@@ -96,6 +96,7 @@ static INTEGRITY_INVALID: AtomicU64 = AtomicU64::new(0);
 static INTEGRITY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 const MAX_DISCOVERED_REPLIES: usize = 5;
+const REMOTE_ACTOR_MIGRATION_BATCH_SIZE: u64 = if cfg!(test) { 2 } else { 100 };
 
 /// Mastodon visibility and explicit local recipients derived from a remote Note audience.
 #[derive(Debug, Eq, PartialEq)]
@@ -985,6 +986,13 @@ struct InboundMoveActivity {
     actor: String,
     object: InboundActorReference,
     target: InboundActorReference,
+}
+
+/// Durable cursor-free work item for draining active follows from a moved actor in batches.
+#[derive(Deserialize, Serialize)]
+struct RemoteActorMigrationJob {
+    source_actor_id: AccountId,
+    target_actor_id: AccountId,
 }
 
 #[derive(Deserialize)]
@@ -3708,7 +3716,15 @@ async fn process_remote_actor_lifecycle(
                 txn.commit().await?;
                 return Ok(None);
             }
-            roosty_db::process_remote_actor_move(&txn, remote_actor.id, target.id).await?;
+            let job = remote_actor_migration_job(
+                remote_actor.id,
+                target.id,
+                format!(
+                    "remote-actor-migration:{}:{}",
+                    remote_actor.id.0, target.id.0
+                ),
+            )?;
+            roosty_db::process_remote_actor_move(&txn, remote_actor.id, target.id, job).await?;
             txn.commit().await?;
             Ok(None)
         }
@@ -6154,6 +6170,106 @@ pub(crate) async fn prepare_remote_unfollow(
     )
 }
 
+fn remote_actor_migration_job(
+    source_actor_id: AccountId,
+    target_actor_id: AccountId,
+    deduplication_key: String,
+) -> Result<NewJob, RoostyError> {
+    let payload = serde_json::to_value(RemoteActorMigrationJob {
+        source_actor_id,
+        target_actor_id,
+    })
+    .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+    Ok(NewJob {
+        kind: JobKind::RemoteActorMigration,
+        payload,
+        deduplication_key: Some(deduplication_key),
+        run_after: OffsetDateTime::now_utc(),
+    })
+}
+
+/// Drain one bounded batch of local followers from a verified moved actor.
+pub(crate) async fn migrate_remote_actor_relationships(
+    state: &AppState,
+    database: &DatabaseContext,
+    payload: JsonValue,
+    current_job_id: Uuid,
+) -> Result<(), RoostyError> {
+    let payload: RemoteActorMigrationJob = serde_json::from_value(payload).map_err(|_| {
+        RoostyError::InvalidInput("invalid remote actor migration payload".to_owned())
+    })?;
+    let read = database.begin_read().await?;
+    let Some(source) = roosty_db::find_remote_actor_by_id(&read, payload.source_actor_id).await?
+    else {
+        read.commit().await?;
+        return Ok(());
+    };
+    let Some(target) = roosty_db::find_remote_actor_by_id(&read, payload.target_actor_id).await?
+    else {
+        read.commit().await?;
+        return Ok(());
+    };
+    if source.moved_to_remote_actor_id != Some(target.id) {
+        read.commit().await?;
+        return Ok(());
+    }
+    let followings = roosty_db::remote_actor_move_following_batch(
+        &read,
+        source.id,
+        REMOTE_ACTOR_MIGRATION_BATCH_SIZE,
+    )
+    .await?;
+    read.commit().await?;
+
+    for following in &followings {
+        let txn = database.begin_write().await?;
+        let target_allowed = state.config.federation_domain_is_allowed(&target.domain)
+            && target.deleted_at.is_none()
+            && target.suspended_at.is_none()
+            && !federation_domain_policy(&txn, &target.domain)
+                .await?
+                .is_suspended()
+            && !roosty_db::local_remote_accounts_are_blocked(
+                &txn,
+                following.local_account_id,
+                target.id,
+            )
+            .await?;
+        let target_follow = if target_allowed
+            && roosty_db::find_remote_following(&txn, following.local_account_id, target.id)
+                .await?
+                .is_none()
+        {
+            let (activity_id, job) =
+                prepare_remote_follow(state, &txn, following.local_account_id, target.id).await?;
+            Some((activity_id, job))
+        } else {
+            None
+        };
+        let undo_job = prepare_remote_unfollow(state, &txn, following.clone()).await?;
+        roosty_db::migrate_remote_following_for_actor_move(
+            &txn,
+            following,
+            target.id,
+            target_allowed,
+            target_follow,
+            undo_job,
+        )
+        .await?;
+        txn.commit().await?;
+    }
+
+    if followings.len() == REMOTE_ACTOR_MIGRATION_BATCH_SIZE as usize {
+        let continuation = remote_actor_migration_job(
+            source.id,
+            target.id,
+            format!("remote-actor-migration-continuation:{current_job_id}"),
+        )?;
+        roosty_db::enqueue_job_in_transaction(database.connection(), continuation).await?;
+    }
+    Ok(())
+}
+
 /// Serialize one Follow-family delivery for transactional outbox insertion.
 fn follow_delivery_job(
     local_account_id: AccountId,
@@ -7820,8 +7936,8 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_db::{
-        CollectionCursor, JobKind, LocalNotificationType, NewLocalStatus, NotificationFilter,
-        QuoteApprovalPolicy, StatusVisibility,
+        CollectionCursor, JobKind, ListRepliesPolicy, LocalNotificationType, NewLocalStatus,
+        NotificationFilter, QuoteApprovalPolicy, StatusVisibility,
     };
     use roosty_migration::Migrator;
     use rsa::{
@@ -7837,6 +7953,7 @@ mod tests {
     use tempfile::{Builder, TempDir};
     use tokio::{sync::Mutex, time::timeout};
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use super::{
         Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
@@ -8724,6 +8841,262 @@ mod tests {
         );
 
         test_transport::clear_inboxes();
+        context.teardown().await;
+    }
+
+    /// Given accepted local followers, when a verified remote actor moves, then bounded durable
+    /// batches preserve preferences and lists while deactivating the old relationships.
+    #[tokio::test]
+    async fn remote_actor_move_migrates_followers_in_idempotent_batches() {
+        let _guard = FEDERATION_TEST_LOCK.lock().await;
+        let context = FederationTestContext::setup().await;
+        let private_key = RsaPrivateKey::new(&mut super::OsRng, 2048).unwrap();
+        let public_key = private_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let source =
+            cache_test_actor(&context.alpha, "source", "remote.test", public_key.clone()).await;
+        let target = cache_test_actor(&context.alpha, "target", "remote.test", public_key).await;
+        let first = create_test_account(&context.alpha, "move_first").await;
+        let second = create_test_account(&context.alpha, "move_second").await;
+        let third = create_test_account(&context.alpha, "move_third").await;
+        let blocked = create_test_account(&context.alpha, "move_blocked").await;
+
+        for (account, reblogs, notify) in [
+            (&first, false, true),
+            (&second, true, false),
+            (&third, true, true),
+            (&blocked, true, false),
+        ] {
+            let activity_id = format!(
+                "https://alpha.test/users/{}#source-follow",
+                account.username
+            );
+            roosty_db::create_remote_following(
+                &context.alpha.db,
+                account.id,
+                source.id,
+                &activity_id,
+                reblogs,
+                notify,
+            )
+            .await
+            .unwrap();
+            assert!(
+                roosty_db::accept_remote_following(&context.alpha.db, source.id, &activity_id)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let existing_target_activity =
+            "https://alpha.test/users/move_second#existing-target-follow";
+        roosty_db::create_remote_following(
+            &context.alpha.db,
+            second.id,
+            target.id,
+            existing_target_activity,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            roosty_db::accept_remote_following(
+                &context.alpha.db,
+                target.id,
+                existing_target_activity,
+            )
+            .await
+            .unwrap()
+        );
+        let txn = context.alpha.db.begin().await.unwrap();
+        assert!(
+            roosty_db::block_remote_account(
+                &txn,
+                blocked.id,
+                target.id,
+                "https://alpha.test/users/move_blocked#block-target",
+                roosty_db::NewJob {
+                    kind: JobKind::FederationModerationDelivery,
+                    payload: json!({}),
+                    deduplication_key: Some("move-blocked-target".to_owned()),
+                    run_after: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .unwrap()
+        );
+        txn.commit().await.unwrap();
+
+        for account in [&first, &second] {
+            let txn = context.alpha.db.begin().await.unwrap();
+            let list = roosty_db::create_local_list(
+                &txn,
+                account.id,
+                "migrated",
+                ListRepliesPolicy::List,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                roosty_db::add_local_list_accounts(&txn, account.id, list.id, &[source.id])
+                    .await
+                    .unwrap(),
+                roosty_db::AddListAccountsResult::Added
+            );
+            txn.commit().await.unwrap();
+        }
+
+        let initial_key = format!("remote-actor-migration:{}:{}", source.id.0, target.id.0);
+        let migration_job =
+            super::remote_actor_migration_job(source.id, target.id, initial_key.clone()).unwrap();
+        let txn = context.alpha.db.begin().await.unwrap();
+        assert!(
+            roosty_db::process_remote_actor_move(&txn, source.id, target.id, migration_job)
+                .await
+                .unwrap()
+        );
+        txn.commit().await.unwrap();
+
+        let first_job = roosty_db::claim_due_job_by_key(
+            &context.alpha.db,
+            "move-test-first",
+            JobKind::RemoteActorMigration,
+            &initial_key,
+            time::Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        super::migrate_remote_actor_relationships(
+            &context.alpha,
+            &context.alpha.database,
+            first_job.payload.clone(),
+            first_job.id.0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            roosty_db::mark_job_completed(&context.alpha.db, &first_job)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            roosty_db::remote_actor_move_following_batch(&context.alpha.db, source.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let continuation_key = format!("remote-actor-migration-continuation:{}", first_job.id.0);
+        let continuation = roosty_db::claim_due_job_by_key(
+            &context.alpha.db,
+            "move-test-continuation",
+            JobKind::RemoteActorMigration,
+            &continuation_key,
+            time::Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        super::migrate_remote_actor_relationships(
+            &context.alpha,
+            &context.alpha.database,
+            continuation.payload.clone(),
+            continuation.id.0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            roosty_db::mark_job_completed(&context.alpha.db, &continuation)
+                .await
+                .unwrap()
+        );
+
+        for account in [&first, &second, &third, &blocked] {
+            assert!(
+                roosty_db::find_remote_following(&context.alpha.db, account.id, source.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for account in [&first, &second, &third] {
+            assert!(
+                roosty_db::find_remote_following(&context.alpha.db, account.id, target.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            roosty_db::find_remote_following(&context.alpha.db, blocked.id, target.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first_target = roosty_db::find_remote_following(&context.alpha.db, first.id, target.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!first_target.show_reblogs);
+        assert!(first_target.notify);
+        assert_eq!(first_target.state, roosty_db::RemoteFollowState::Pending);
+        let second_target =
+            roosty_db::find_remote_following(&context.alpha.db, second.id, target.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(second_target.activity_id, existing_target_activity);
+        assert!(!second_target.show_reblogs);
+        assert!(second_target.notify);
+        assert_eq!(second_target.state, roosty_db::RemoteFollowState::Accepted);
+        for account in [&first, &second] {
+            assert!(
+                roosty_db::local_lists_containing_account(
+                    &context.alpha.db,
+                    account.id,
+                    source.id,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+            assert_eq!(
+                roosty_db::local_lists_containing_account(
+                    &context.alpha.db,
+                    account.id,
+                    target.id,
+                )
+                .await
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+
+        let stable_activity = first_target.activity_id;
+        super::migrate_remote_actor_relationships(
+            &context.alpha,
+            &context.alpha.database,
+            first_job.payload,
+            Uuid::now_v7(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            roosty_db::find_remote_following(&context.alpha.db, first.id, target.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .activity_id,
+            stable_activity
+        );
+
         context.teardown().await;
     }
 
@@ -10089,6 +10462,16 @@ mod tests {
                     state,
                     &state.database,
                     job.payload.clone(),
+                ))
+                .await
+                .unwrap();
+            }
+            roosty_db::JobKind::RemoteActorMigration => {
+                Box::pin(super::migrate_remote_actor_relationships(
+                    state,
+                    &state.database,
+                    job.payload.clone(),
+                    job.id.0,
                 ))
                 .await
                 .unwrap();
