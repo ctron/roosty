@@ -21,6 +21,11 @@ Each active category refreshes its own JSON data every 15 seconds while the page
 The Refresh button performs the same in-place fetch; neither refresh mechanism reloads the document.
 The interface reads durable state from PostgreSQL, so it represents work across all Roosty server and worker processes using the database.
 
+The local and remote account tables show 25 accounts at a time with Previous and Next navigation.
+Select the Account, Email, Role, State, or Created column heading to sort it and select it again to
+reverse the direction. Email and Role apply only to local accounts. Search, sorting, and pagination
+are preserved in the page URL.
+
 == Create accounts
 
 Public registration is not currently available.

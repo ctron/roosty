@@ -166,6 +166,10 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(index_exists(database.connection(), "local_account_directory_new_idx").await);
     assert!(index_exists(database.connection(), "remote_actor_directory_active_idx").await);
     assert!(index_exists(database.connection(), "remote_actor_directory_new_idx").await);
+    assert!(index_exists(database.connection(), "local_account_admin_name_idx").await);
+    assert!(index_exists(database.connection(), "local_account_admin_state_idx").await);
+    assert!(index_exists(database.connection(), "remote_actor_admin_handle_idx").await);
+    assert!(index_exists(database.connection(), "remote_actor_admin_state_idx").await);
     assert!(
         column_exists(
             database.connection(),

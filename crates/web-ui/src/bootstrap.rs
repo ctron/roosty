@@ -48,6 +48,8 @@ pub struct UiAdminWorkQueue {
 pub struct UiAdminAccounts {
     pub csrf_token: String,
     pub accounts: Vec<UiAdminAccount>,
+    pub previous_cursor: Option<String>,
+    pub next_cursor: Option<String>,
 }
 
 /// Persisted federation moderation rules and mutation protection for the administrator UI.
@@ -113,6 +115,46 @@ impl UiAdminAccountOrigin {
     }
 }
 
+/// Sortable columns in the administrator account tables.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiAdminAccountSort {
+    Account,
+    Email,
+    Role,
+    State,
+    CreatedAt,
+}
+
+impl UiAdminAccountSort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Email => "email",
+            Self::Role => "role",
+            Self::State => "state",
+            Self::CreatedAt => "created_at",
+        }
+    }
+}
+
+/// Direction applied to an administrator account sort column.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiAdminAccountSortDirection {
+    Ascending,
+    Descending,
+}
+
+impl UiAdminAccountSortDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ascending => "ascending",
+            Self::Descending => "descending",
+        }
+    }
+}
+
 /// Recent administrator actions shown on the audit-log page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UiAdminAuditLog {
@@ -148,6 +190,7 @@ pub struct UiAdminAccount {
     pub is_admin: bool,
     pub limited: bool,
     pub suspended: bool,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +261,9 @@ pub trait UiBackend: Send + Sync {
         _cookie_header: Option<String>,
         _query: String,
         _origin: UiAdminAccountOrigin,
+        _sort: UiAdminAccountSort,
+        _direction: UiAdminAccountSortDirection,
+        _cursor: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAccounts, String>> + Send + 'static>> {
         Box::pin(async { Err("administrator accounts are unavailable".to_owned()) })
     }
@@ -265,12 +311,22 @@ pub async fn load_admin_work_queue() -> Result<UiAdminWorkQueue, ServerFnError> 
 pub async fn load_admin_accounts(
     query: String,
     origin: UiAdminAccountOrigin,
+    sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
+    cursor: Option<String>,
 ) -> Result<UiAdminAccounts, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         expect_context::<UiServerContext>()
             .0
-            .admin_accounts(request_cookie().await?, query, origin)
+            .admin_accounts(
+                request_cookie().await?,
+                query,
+                origin,
+                sort,
+                direction,
+                cursor,
+            )
             .await
             .map_err(ServerFnError::new)
     }

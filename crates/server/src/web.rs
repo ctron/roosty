@@ -21,7 +21,8 @@ use leptos::prelude::provide_context;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
 use roosty_core::{AccountId, Result as RoostyResult, RoostyError, StatusId};
 use roosty_db::{
-    AccountStatusTimelineOptions, AdminAccount, AdminAuditAction, AdminAuditEntry,
+    AccountStatusTimelineOptions, AdminAccount, AdminAccountOrigin, AdminAccountPageOptions,
+    AdminAccountSort, AdminAccountSortDirection, AdminAuditAction, AdminAuditEntry,
     AdminAuditSource, AdminAuditTargetKind, AdminJobDiagnostic, AdminJobSummary,
     FederationDomainBlock, FederationDomainBlockUpdate, InstanceRule, JobKind, LocalAccount,
     LocalStatus, NewFederationDomainBlock, NewJob, PollStatus, QuoteState, RemoteStatus,
@@ -29,13 +30,13 @@ use roosty_db::{
     StatusReference, StatusVisibility, TimelineCursor,
 };
 use roosty_web_ui::{
-    App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
-    UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
-    UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiFeaturedTag, UiInstanceRule,
-    UiMedia, UiMediaKind, UiModerationReport, UiPoll, UiPollOption, UiPreviewCard, UiProfileField,
-    UiProfileHeader, UiProfileTab, UiProfileTimeline, UiPublicAccount, UiPublicPageError,
-    UiServerContext, UiStatus, UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility,
-    shell,
+    App, UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccountSort,
+    UiAdminAccountSortDirection, UiAdminAccounts, UiAdminAuditEntry, UiAdminAuditLog,
+    UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary, UiAdminModeration,
+    UiAdminWorkQueue, UiBackend, UiBootstrap, UiFeaturedTag, UiInstanceRule, UiMedia, UiMediaKind,
+    UiModerationReport, UiPoll, UiPollOption, UiPreviewCard, UiProfileField, UiProfileHeader,
+    UiProfileTab, UiProfileTimeline, UiPublicAccount, UiPublicPageError, UiServerContext, UiStatus,
+    UiStatusAuthor, UiStatusPage, UiStatusThread, UiStatusVisibility, shell,
 };
 use sea_orm::{ConnectionTrait, DatabaseTransaction, DbErr};
 use serde::Deserialize;
@@ -494,6 +495,9 @@ impl UiBackend for RoostyUiBackend {
         cookie_header: Option<String>,
         query: String,
         origin: UiAdminAccountOrigin,
+        sort: UiAdminAccountSort,
+        direction: UiAdminAccountSortDirection,
+        cursor: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<UiAdminAccounts, String>> + Send + 'static>> {
         let state = self.state.clone();
         let database = self.database.clone();
@@ -506,21 +510,41 @@ impl UiBackend for RoostyUiBackend {
                 .begin_snapshot()
                 .await
                 .map_err(|error| error.to_string())?;
-            let accounts = roosty_db::list_admin_accounts(
+            let page = roosty_db::admin_account_page(
                 &txn,
-                &query,
-                Some(origin.as_str()),
-                None,
-                None,
-                100,
-                None,
+                AdminAccountPageOptions {
+                    query: &query,
+                    origin: match origin {
+                        UiAdminAccountOrigin::Local => AdminAccountOrigin::Local,
+                        UiAdminAccountOrigin::Remote => AdminAccountOrigin::Remote,
+                    },
+                    sort: match sort {
+                        UiAdminAccountSort::Account => AdminAccountSort::Account,
+                        UiAdminAccountSort::Email => AdminAccountSort::Email,
+                        UiAdminAccountSort::Role => AdminAccountSort::Role,
+                        UiAdminAccountSort::State => AdminAccountSort::State,
+                        UiAdminAccountSort::CreatedAt => AdminAccountSort::CreatedAt,
+                    },
+                    direction: match direction {
+                        UiAdminAccountSortDirection::Ascending => {
+                            AdminAccountSortDirection::Ascending
+                        }
+                        UiAdminAccountSortDirection::Descending => {
+                            AdminAccountSortDirection::Descending
+                        }
+                    },
+                    limit: 25,
+                    cursor: cursor.as_deref(),
+                },
             )
             .await
             .map_err(|error| error.to_string())?;
             txn.commit().await.map_err(|error| error.to_string())?;
             Ok(UiAdminAccounts {
                 csrf_token,
-                accounts: accounts.into_iter().map(ui_admin_account).collect(),
+                accounts: page.accounts.into_iter().map(ui_admin_account).collect(),
+                previous_cursor: page.previous_cursor,
+                next_cursor: page.next_cursor,
             })
         })
     }
@@ -1222,6 +1246,7 @@ fn ui_admin_account(account: AdminAccount) -> UiAdminAccount {
         is_admin: account.is_admin,
         limited: account.limited,
         suspended: account.suspended,
+        created_at: format_timestamp(account.created_at),
     }
 }
 

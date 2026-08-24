@@ -22,10 +22,10 @@ pub use authorization::{
     render_authorization_consent, render_out_of_band_authorization,
 };
 pub use bootstrap::{
-    UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditEntry,
-    UiAdminAuditLog, UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary,
-    UiAdminModeration, UiAdminWorkQueue, UiBackend, UiBootstrap, UiInstanceRule,
-    UiModerationReport, UiServerContext,
+    UiAccount, UiAdminAccount, UiAdminAccountOrigin, UiAdminAccountSort,
+    UiAdminAccountSortDirection, UiAdminAccounts, UiAdminAuditEntry, UiAdminAuditLog,
+    UiAdminDomainBlock, UiAdminDomainBlocks, UiAdminJob, UiAdminJobSummary, UiAdminModeration,
+    UiAdminWorkQueue, UiBackend, UiBootstrap, UiInstanceRule, UiModerationReport, UiServerContext,
 };
 pub use forms::{LoginError, PasswordChangeResult};
 pub use public_pages::{

@@ -10,14 +10,15 @@ use leptos_router::{
     hooks::{use_location, use_params_map, use_query_map},
     path,
 };
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
     bootstrap::{
-        UiAdminAccountOrigin, UiAdminAccounts, UiAdminAuditLog, UiAdminDomainBlocks,
-        UiAdminModeration, UiAdminWorkQueue, UiBootstrap, load_admin_accounts,
-        load_admin_audit_log, load_admin_domain_blocks, load_admin_moderation,
+        UiAdminAccountOrigin, UiAdminAccountSort, UiAdminAccountSortDirection, UiAdminAccounts,
+        UiAdminAuditLog, UiAdminDomainBlocks, UiAdminModeration, UiAdminWorkQueue, UiBootstrap,
+        load_admin_accounts, load_admin_audit_log, load_admin_domain_blocks, load_admin_moderation,
         load_admin_work_queue, load_bootstrap,
     },
     forms::{LoginError, PasswordChangeResult},
@@ -854,11 +855,17 @@ fn AdminRemoteAccountsPage() -> impl IntoView {
 #[component]
 fn AdminAccountsPage(origin: UiAdminAccountOrigin) -> impl IntoView {
     let bootstrap = expect_context::<BootstrapResource>();
-    let query = use_query_map().get().get("q").unwrap_or_default();
+    let query_map = use_query_map().get();
+    let query = query_map.get("q").unwrap_or_default();
+    let sort = parse_admin_account_sort(query_map.get("sort").as_deref(), origin);
+    let direction = parse_admin_account_sort_direction(query_map.get("order").as_deref());
+    let cursor = query_map.get("cursor");
     let search_value = query.clone();
     let accounts = Resource::new_blocking(
-        move || (query.clone(), origin),
-        |(query, origin)| load_admin_accounts(query, origin),
+        move || (query.clone(), origin, sort, direction, cursor.clone()),
+        |(query, origin, sort, direction, cursor)| {
+            load_admin_accounts(query, origin, sort, direction, cursor)
+        },
     );
     install_periodic_refresh(accounts);
     let (title, path, section) = match origin {
@@ -883,7 +890,14 @@ fn AdminAccountsPage(origin: UiAdminAccountOrigin) -> impl IntoView {
                     {Suspend::new(async move {
                         match accounts.await {
                             Ok(accounts) => {
-                                admin_accounts_content(accounts, search_value, origin, path)
+                                admin_accounts_content(
+                                    accounts,
+                                    search_value,
+                                    origin,
+                                    sort,
+                                    direction,
+                                    path,
+                                )
                             }
                             Err(_) => admin_load_error("accounts"),
                         }
@@ -1051,21 +1065,178 @@ fn admin_accounts_content(
     accounts: UiAdminAccounts,
     search_value: String,
     origin: UiAdminAccountOrigin,
+    sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
     path: &'static str,
 ) -> AnyView {
     match origin {
-        UiAdminAccountOrigin::Local => local_accounts_content(accounts, search_value, path),
-        UiAdminAccountOrigin::Remote => remote_accounts_content(accounts, search_value, path),
+        UiAdminAccountOrigin::Local => {
+            local_accounts_content(accounts, search_value, sort, direction, path)
+        }
+        UiAdminAccountOrigin::Remote => {
+            remote_accounts_content(accounts, search_value, sort, direction, path)
+        }
+    }
+}
+
+fn parse_admin_account_sort(
+    value: Option<&str>,
+    origin: UiAdminAccountOrigin,
+) -> UiAdminAccountSort {
+    match value {
+        Some("account") => UiAdminAccountSort::Account,
+        Some("email") if origin == UiAdminAccountOrigin::Local => UiAdminAccountSort::Email,
+        Some("role") if origin == UiAdminAccountOrigin::Local => UiAdminAccountSort::Role,
+        Some("state") => UiAdminAccountSort::State,
+        Some("created_at") | None => UiAdminAccountSort::CreatedAt,
+        Some(_) => UiAdminAccountSort::CreatedAt,
+    }
+}
+
+fn parse_admin_account_sort_direction(value: Option<&str>) -> UiAdminAccountSortDirection {
+    match value {
+        Some("ascending") => UiAdminAccountSortDirection::Ascending,
+        Some("descending") | None => UiAdminAccountSortDirection::Descending,
+        Some(_) => UiAdminAccountSortDirection::Descending,
+    }
+}
+
+fn admin_accounts_url(
+    path: &str,
+    query: &str,
+    sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
+    cursor: Option<&str>,
+) -> String {
+    let mut parameters = Vec::new();
+    if !query.is_empty() {
+        parameters.push(format!(
+            "q={}",
+            utf8_percent_encode(query, NON_ALPHANUMERIC)
+        ));
+    }
+    parameters.push(format!("sort={}", sort.as_str()));
+    parameters.push(format!("order={}", direction.as_str()));
+    if let Some(cursor) = cursor {
+        parameters.push(format!(
+            "cursor={}",
+            utf8_percent_encode(cursor, NON_ALPHANUMERIC)
+        ));
+    }
+    format!("{path}?{}", parameters.join("&"))
+}
+
+#[component]
+fn AdminAccountSortHeader(
+    label: &'static str,
+    column: UiAdminAccountSort,
+    active_sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
+    query: String,
+    path: &'static str,
+) -> impl IntoView {
+    let active = column == active_sort;
+    let next_direction = if active {
+        match direction {
+            UiAdminAccountSortDirection::Ascending => UiAdminAccountSortDirection::Descending,
+            UiAdminAccountSortDirection::Descending => UiAdminAccountSortDirection::Ascending,
+        }
+    } else if column == UiAdminAccountSort::CreatedAt {
+        UiAdminAccountSortDirection::Descending
+    } else {
+        UiAdminAccountSortDirection::Ascending
+    };
+    let aria_sort = if active { direction.as_str() } else { "none" };
+    let indicator = if active {
+        match direction {
+            UiAdminAccountSortDirection::Ascending => " ↑",
+            UiAdminAccountSortDirection::Descending => " ↓",
+        }
+    } else {
+        ""
+    };
+    let href = admin_accounts_url(path, &query, column, next_direction, None);
+    view! {
+        <th aria-sort=aria_sort>
+            <a class="link link-hover whitespace-nowrap" href=href>{label}{indicator}</a>
+        </th>
+    }
+}
+
+#[component]
+fn AdminAccountPagination(
+    previous_cursor: Option<String>,
+    next_cursor: Option<String>,
+    query: String,
+    sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
+    path: &'static str,
+) -> impl IntoView {
+    let previous_href = previous_cursor
+        .as_deref()
+        .map(|cursor| admin_accounts_url(path, &query, sort, direction, Some(cursor)));
+    let next_href = next_cursor
+        .as_deref()
+        .map(|cursor| admin_accounts_url(path, &query, sort, direction, Some(cursor)));
+    view! {
+        <nav class="flex items-center justify-between gap-4 pt-4" aria-label="Account pages">
+            {previous_href.map(|href| view! {
+                <a class="btn btn-outline" href=href rel="prev">"Previous"</a>
+            })}
+            <span class="grow"></span>
+            {next_href.map(|href| view! {
+                <a class="btn btn-outline" href=href rel="next">"Next"</a>
+            })}
+        </nav>
+    }
+}
+
+#[cfg(test)]
+mod admin_account_tests {
+    use super::{admin_accounts_url, parse_admin_account_sort};
+    use crate::bootstrap::{UiAdminAccountOrigin, UiAdminAccountSort, UiAdminAccountSortDirection};
+
+    #[test]
+    fn account_page_urls_preserve_and_encode_view_state() {
+        assert_eq!(
+            admin_accounts_url(
+                "/admin/accounts",
+                "alice & bob",
+                UiAdminAccountSort::Email,
+                UiAdminAccountSortDirection::Ascending,
+                Some("opaque_cursor"),
+            ),
+            "/admin/accounts?q=alice%20%26%20bob&sort=email&order=ascending&cursor=opaque%5Fcursor"
+        );
+    }
+
+    #[test]
+    fn remote_account_pages_reject_local_only_sort_columns() {
+        assert_eq!(
+            parse_admin_account_sort(Some("email"), UiAdminAccountOrigin::Remote),
+            UiAdminAccountSort::CreatedAt
+        );
+        assert_eq!(
+            parse_admin_account_sort(Some("role"), UiAdminAccountOrigin::Remote),
+            UiAdminAccountSort::CreatedAt
+        );
     }
 }
 
 fn local_accounts_content(
     accounts: UiAdminAccounts,
     search_value: String,
+    sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
     path: &'static str,
 ) -> AnyView {
     let csrf_create = accounts.csrf_token.clone();
     let csrf_actions = accounts.csrf_token;
+    let previous_cursor = accounts.previous_cursor;
+    let next_cursor = accounts.next_cursor;
+    let account_rows = accounts.accounts;
+    let accounts_empty = account_rows.is_empty();
+    let search_input_value = search_value.clone();
     view! {
         <section class="grid gap-6 pb-8">
             <AdminPanel title="Create local account">
@@ -1092,32 +1263,78 @@ fn local_accounts_content(
             </AdminPanel>
             <AdminPanel title="Local accounts">
                 <form class="fieldset max-w-xl gap-4" method="get" action=path>
+                    <input type="hidden" name="sort" value=sort.as_str()/>
+                    <input type="hidden" name="order" value=direction.as_str()/>
                     <FormField label="Search local accounts">
                         <input
                             class="input w-full"
                             name="q"
-                            value=search_value
+                            value=search_input_value
                             placeholder="Username, display name, or email"
                         />
                     </FormField>
                     <div class="card-actions">
                         <button class="btn btn-primary" type="submit">"Search"</button>
-                        <a class="btn btn-ghost" href=path>"Clear"</a>
+                        <a
+                            class="btn btn-ghost"
+                            href=admin_accounts_url(path, "", sort, direction, None)
+                        >
+                            "Clear"
+                        </a>
                     </div>
                 </form>
                 <div class="overflow-x-auto">
                     <table class="table table-zebra">
                         <thead>
                             <tr>
-                                <th>"Account"</th>
-                                <th>"Email"</th>
-                                <th>"Role"</th>
-                                <th>"State"</th>
+                                <AdminAccountSortHeader
+                                    label="Account"
+                                    column=UiAdminAccountSort::Account
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
+                                <AdminAccountSortHeader
+                                    label="Email"
+                                    column=UiAdminAccountSort::Email
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
+                                <AdminAccountSortHeader
+                                    label="Role"
+                                    column=UiAdminAccountSort::Role
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
+                                <AdminAccountSortHeader
+                                    label="State"
+                                    column=UiAdminAccountSort::State
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
+                                <AdminAccountSortHeader
+                                    label="Created"
+                                    column=UiAdminAccountSort::CreatedAt
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
                                 <th>"Actions"</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {accounts.accounts.into_iter().map(|account| {
+                            {accounts_empty.then(|| view! {
+                                <tr><td colspan="6">"No local accounts match this search."</td></tr>
+                            })}
+                            {account_rows.into_iter().map(|account| {
                                 let account_id = account.id.to_string();
                                 let reset_id = account_id.clone();
                                 let csrf_limit = csrf_actions.clone();
@@ -1144,6 +1361,7 @@ fn local_accounts_content(
                                         <td>{account.email.unwrap_or_default()}</td>
                                         <td>{if account.is_admin { "Admin" } else { "User" }}</td>
                                         <td>{if account.suspended { "Suspended" } else if account.limited { "Limited" } else { "Active" }}</td>
+                                        <td><time datetime=account.created_at.clone()>{account.created_at.clone()}</time></td>
                                         <td class="flex flex-wrap gap-2">
                                             <AdminActionModal
                                                 id=format!("limit-{account_id}")
@@ -1185,6 +1403,14 @@ fn local_accounts_content(
                         </tbody>
                     </table>
                 </div>
+                <AdminAccountPagination
+                    previous_cursor
+                    next_cursor
+                    query=search_value
+                    sort
+                    direction
+                    path
+                />
             </AdminPanel>
         </section>
     }
@@ -1194,37 +1420,76 @@ fn local_accounts_content(
 fn remote_accounts_content(
     accounts: UiAdminAccounts,
     search_value: String,
+    sort: UiAdminAccountSort,
+    direction: UiAdminAccountSortDirection,
     path: &'static str,
 ) -> AnyView {
     let csrf_actions = accounts.csrf_token;
+    let previous_cursor = accounts.previous_cursor;
+    let next_cursor = accounts.next_cursor;
+    let account_rows = accounts.accounts;
+    let accounts_empty = account_rows.is_empty();
+    let search_input_value = search_value.clone();
     view! {
         <section class="pb-8">
             <AdminPanel title="Remote accounts">
                 <form class="fieldset max-w-xl gap-4" method="get" action=path>
+                    <input type="hidden" name="sort" value=sort.as_str()/>
+                    <input type="hidden" name="order" value=direction.as_str()/>
                     <FormField label="Search remote accounts">
                         <input
                             class="input w-full"
                             name="q"
-                            value=search_value
+                            value=search_input_value
                             placeholder="Username, display name, or domain"
                         />
                     </FormField>
                     <div class="card-actions">
                         <button class="btn btn-primary" type="submit">"Search"</button>
-                        <a class="btn btn-ghost" href=path>"Clear"</a>
+                        <a
+                            class="btn btn-ghost"
+                            href=admin_accounts_url(path, "", sort, direction, None)
+                        >
+                            "Clear"
+                        </a>
                     </div>
                 </form>
                 <div class="overflow-x-auto">
                     <table class="table table-zebra">
                         <thead>
                             <tr>
-                                <th>"Account"</th>
-                                <th>"State"</th>
+                                <AdminAccountSortHeader
+                                    label="Account"
+                                    column=UiAdminAccountSort::Account
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
+                                <AdminAccountSortHeader
+                                    label="State"
+                                    column=UiAdminAccountSort::State
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
+                                <AdminAccountSortHeader
+                                    label="Created"
+                                    column=UiAdminAccountSort::CreatedAt
+                                    active_sort=sort
+                                    direction
+                                    query=search_value.clone()
+                                    path
+                                />
                                 <th>"Actions"</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {accounts.accounts.into_iter().map(|account| {
+                            {accounts_empty.then(|| view! {
+                                <tr><td colspan="4">"No remote accounts match this search."</td></tr>
+                            })}
+                            {account_rows.into_iter().map(|account| {
                                 let account_id = account.id.to_string();
                                 let csrf_limit = csrf_actions.clone();
                                 let csrf_suspend = csrf_actions.clone();
@@ -1250,6 +1515,7 @@ fn remote_accounts_content(
                                             <small>{account.display_name}</small>
                                         </td>
                                         <td>{if account.suspended { "Suspended" } else if account.limited { "Limited" } else { "Active" }}</td>
+                                        <td><time datetime=account.created_at.clone()>{account.created_at.clone()}</time></td>
                                         <td>
                                             <AdminActionModal
                                                 id=format!("limit-{account_id}")
@@ -1281,6 +1547,14 @@ fn remote_accounts_content(
                         </tbody>
                     </table>
                 </div>
+                <AdminAccountPagination
+                    previous_cursor
+                    next_cursor
+                    query=search_value
+                    sort
+                    direction
+                    path
+                />
             </AdminPanel>
         </section>
     }

@@ -17,8 +17,8 @@ use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveActiveEnum,
     DeriveValueType, EntityTrait, EnumIter, FromQueryResult, IntoActiveModel, Iterable, ModelTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement, TransactionTrait,
-    TryFromU64, TryInsertResult,
+    Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
+    TransactionTrait, TryFromU64, TryInsertResult,
     sea_query::{Alias, Expr, Func, OnConflict, Query, SelectStatement, SimpleExpr},
 };
 use serde::{Deserialize, Serialize};
@@ -1128,6 +1128,51 @@ pub struct AdminAccount {
     pub created_at: OffsetDateTime,
 }
 
+/// Account origin used by the first-party administrator account browser.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAccountOrigin {
+    Local,
+    Remote,
+}
+
+/// Stable database sort keys exposed by the administrator account browser.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAccountSort {
+    Account,
+    Email,
+    Role,
+    State,
+    CreatedAt,
+}
+
+/// Sort direction used by administrator account keyset pagination.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAccountSortDirection {
+    Ascending,
+    Descending,
+}
+
+/// Inputs for one bounded administrator account page.
+pub struct AdminAccountPageOptions<'a> {
+    pub query: &'a str,
+    pub origin: AdminAccountOrigin,
+    pub sort: AdminAccountSort,
+    pub direction: AdminAccountSortDirection,
+    pub limit: u64,
+    pub cursor: Option<&'a str>,
+}
+
+/// One administrator account page with opaque bidirectional keyset cursors.
+#[derive(Debug)]
+pub struct AdminAccountPage {
+    pub accounts: Vec<AdminAccount>,
+    pub previous_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+}
+
 /// Persisted Mastodon-compatible domain moderation rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FederationDomainBlock {
@@ -1492,6 +1537,339 @@ pub async fn list_admin_accounts(
     accounts.sort_unstable_by_key(|account| Reverse(account.id.0));
     accounts.truncate(fetch_limit as usize);
     Ok(accounts)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AdminAccountCursorNavigation {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+enum AdminAccountCursorKey {
+    Text(String),
+    Boolean(bool),
+    State(i16),
+    Timestamp(OffsetDateTime),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AdminAccountCursor {
+    version: u8,
+    origin: AdminAccountOrigin,
+    sort: AdminAccountSort,
+    direction: AdminAccountSortDirection,
+    navigation: AdminAccountCursorNavigation,
+    key: AdminAccountCursorKey,
+    id: Uuid,
+}
+
+/// List one keyset-paginated account page for the first-party administrator UI.
+pub async fn admin_account_page(
+    db: &impl ConnectionTrait,
+    options: AdminAccountPageOptions<'_>,
+) -> Result<AdminAccountPage> {
+    if options.origin == AdminAccountOrigin::Remote
+        && matches!(
+            options.sort,
+            AdminAccountSort::Email | AdminAccountSort::Role
+        )
+    {
+        return Err(RoostyError::InvalidInput(
+            "remote accounts cannot be sorted by email or role".to_owned(),
+        ));
+    }
+    let cursor = options
+        .cursor
+        .map(decode_admin_account_cursor)
+        .transpose()?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.version != 1
+            || cursor.origin != options.origin
+            || cursor.sort != options.sort
+            || cursor.direction != options.direction
+    }) {
+        return Err(RoostyError::InvalidInput(
+            "administrator account cursor does not match the requested view".to_owned(),
+        ));
+    }
+
+    let requested_limit = options.limit.clamp(1, 100);
+    let fetch_limit = requested_limit.saturating_add(1);
+    let backwards = cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.navigation == AdminAccountCursorNavigation::Previous);
+    let query_direction = if backwards {
+        reverse_admin_sort_direction(options.direction)
+    } else {
+        options.direction
+    };
+    let query = options.query.trim().to_lowercase();
+
+    let mut accounts = match options.origin {
+        AdminAccountOrigin::Local => {
+            let sort_expr = local_admin_account_sort_expr(options.sort);
+            let mut select = local_account::Entity::find();
+            if !query.is_empty() {
+                let pattern = format!("%{query}%");
+                select = select.filter(
+                    Condition::any()
+                        .add(lower_contains(local_account::Column::Username, &pattern))
+                        .add(lower_contains(local_account::Column::DisplayName, &pattern))
+                        .add(lower_contains(local_account::Column::Email, &pattern)),
+                );
+            }
+            if let Some(cursor) = &cursor {
+                select = select.filter(admin_account_cursor_condition(
+                    sort_expr.clone(),
+                    local_account::Column::Id.into_expr().into(),
+                    cursor,
+                    query_direction,
+                ));
+            }
+            select
+                .order_by(sort_expr, admin_sea_order(query_direction))
+                .order_by(local_account::Column::Id, admin_sea_order(query_direction))
+                .limit(fetch_limit)
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|account| AdminAccount {
+                    id: AccountId(account.id),
+                    username: account.username,
+                    domain: None,
+                    email: Some(account.email),
+                    display_name: account.display_name,
+                    is_admin: account.is_admin,
+                    limited: account.limited_at.is_some(),
+                    suspended: account.suspended_at.is_some(),
+                    data_purged_at: account.data_purged_at,
+                    created_at: account.created_at,
+                })
+                .collect::<Vec<_>>()
+        }
+        AdminAccountOrigin::Remote => {
+            let sort_expr = remote_admin_account_sort_expr(options.sort)?;
+            let mut select =
+                remote_actor::Entity::find().filter(remote_actor::Column::DeletedAt.is_null());
+            if !query.is_empty() {
+                let pattern = format!("%{query}%");
+                select = select.filter(
+                    Condition::any()
+                        .add(lower_contains(remote_actor::Column::Username, &pattern))
+                        .add(lower_contains(remote_actor::Column::DisplayName, &pattern))
+                        .add(lower_contains(remote_actor::Column::Domain, &pattern)),
+                );
+            }
+            if let Some(cursor) = &cursor {
+                select = select.filter(admin_account_cursor_condition(
+                    sort_expr.clone(),
+                    remote_actor::Column::Id.into_expr().into(),
+                    cursor,
+                    query_direction,
+                ));
+            }
+            select
+                .order_by(sort_expr, admin_sea_order(query_direction))
+                .order_by(remote_actor::Column::Id, admin_sea_order(query_direction))
+                .limit(fetch_limit)
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|actor| AdminAccount {
+                    id: AccountId(actor.id),
+                    username: actor.username,
+                    domain: Some(actor.domain),
+                    email: None,
+                    display_name: actor.display_name,
+                    is_admin: false,
+                    limited: actor.limited_at.is_some(),
+                    suspended: actor.suspended_at.is_some(),
+                    data_purged_at: actor.data_purged_at,
+                    created_at: actor.profile_created_at.unwrap_or(actor.created_at),
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let has_extra = accounts.len() > usize::try_from(requested_limit).unwrap_or(usize::MAX);
+    accounts.truncate(usize::try_from(requested_limit).unwrap_or(usize::MAX));
+    if backwards {
+        accounts.reverse();
+    }
+    let has_previous = if backwards {
+        has_extra
+    } else {
+        cursor.is_some()
+    };
+    let has_next = if backwards {
+        cursor.is_some()
+    } else {
+        has_extra
+    };
+    let previous_cursor = if has_previous {
+        accounts
+            .first()
+            .map(|account| {
+                encode_admin_account_cursor(
+                    account,
+                    &options,
+                    AdminAccountCursorNavigation::Previous,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let next_cursor = if has_next {
+        accounts
+            .last()
+            .map(|account| {
+                encode_admin_account_cursor(account, &options, AdminAccountCursorNavigation::Next)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(AdminAccountPage {
+        accounts,
+        previous_cursor,
+        next_cursor,
+    })
+}
+
+fn local_admin_account_sort_expr(sort: AdminAccountSort) -> SimpleExpr {
+    match sort {
+        AdminAccountSort::Account => Func::lower(Expr::col(local_account::Column::Username)).into(),
+        AdminAccountSort::Email => Func::lower(Expr::col(local_account::Column::Email)).into(),
+        AdminAccountSort::Role => local_account::Column::IsAdmin.into_expr().into(),
+        AdminAccountSort::State => Expr::cust(
+            "CASE WHEN suspended_at IS NOT NULL THEN 2 WHEN limited_at IS NOT NULL THEN 1 ELSE 0 END",
+        ),
+        AdminAccountSort::CreatedAt => local_account::Column::CreatedAt.into_expr().into(),
+    }
+}
+
+fn remote_admin_account_sort_expr(sort: AdminAccountSort) -> Result<SimpleExpr> {
+    match sort {
+        AdminAccountSort::Account => Ok(Expr::cust("lower(username || '@' || domain)")),
+        AdminAccountSort::State => Ok(Expr::cust(
+            "CASE WHEN suspended_at IS NOT NULL THEN 2 WHEN limited_at IS NOT NULL THEN 1 ELSE 0 END",
+        )),
+        AdminAccountSort::CreatedAt => Ok(Expr::cust("coalesce(profile_created_at, created_at)")),
+        AdminAccountSort::Email | AdminAccountSort::Role => Err(RoostyError::InvalidInput(
+            "remote accounts cannot be sorted by email or role".to_owned(),
+        )),
+    }
+}
+
+fn admin_account_cursor_condition(
+    sort_expr: SimpleExpr,
+    id_expr: SimpleExpr,
+    cursor: &AdminAccountCursor,
+    direction: AdminAccountSortDirection,
+) -> Condition {
+    let greater = direction == AdminAccountSortDirection::Ascending;
+    let key_comparison = admin_cursor_key_comparison(sort_expr.clone(), &cursor.key, greater);
+    let key_equality = match &cursor.key {
+        AdminAccountCursorKey::Text(value) => Expr::expr(sort_expr).eq(value.clone()),
+        AdminAccountCursorKey::Boolean(value) => Expr::expr(sort_expr).eq(*value),
+        AdminAccountCursorKey::State(value) => Expr::expr(sort_expr).eq(*value),
+        AdminAccountCursorKey::Timestamp(value) => Expr::expr(sort_expr).eq(*value),
+    };
+    let id_comparison = if greater {
+        Expr::expr(id_expr).gt(cursor.id)
+    } else {
+        Expr::expr(id_expr).lt(cursor.id)
+    };
+    let tie = Condition::all().add(key_equality).add(id_comparison);
+    Condition::any().add(key_comparison).add(tie)
+}
+
+fn admin_cursor_key_comparison(
+    expression: SimpleExpr,
+    key: &AdminAccountCursorKey,
+    greater: bool,
+) -> SimpleExpr {
+    match (key, greater) {
+        (AdminAccountCursorKey::Text(value), true) => Expr::expr(expression).gt(value.clone()),
+        (AdminAccountCursorKey::Text(value), false) => Expr::expr(expression).lt(value.clone()),
+        (AdminAccountCursorKey::Boolean(value), true) => Expr::expr(expression).gt(*value),
+        (AdminAccountCursorKey::Boolean(value), false) => Expr::expr(expression).lt(*value),
+        (AdminAccountCursorKey::State(value), true) => Expr::expr(expression).gt(*value),
+        (AdminAccountCursorKey::State(value), false) => Expr::expr(expression).lt(*value),
+        (AdminAccountCursorKey::Timestamp(value), true) => Expr::expr(expression).gt(*value),
+        (AdminAccountCursorKey::Timestamp(value), false) => Expr::expr(expression).lt(*value),
+    }
+}
+
+fn admin_account_cursor_key(
+    account: &AdminAccount,
+    sort: AdminAccountSort,
+) -> Result<AdminAccountCursorKey> {
+    match sort {
+        AdminAccountSort::Account => Ok(AdminAccountCursorKey::Text(
+            account.domain.as_ref().map_or_else(
+                || account.username.to_lowercase(),
+                |domain| format!("{}@{domain}", account.username).to_lowercase(),
+            ),
+        )),
+        AdminAccountSort::Email => account
+            .email
+            .as_ref()
+            .map(|email| AdminAccountCursorKey::Text(email.to_lowercase()))
+            .ok_or_else(|| RoostyError::InvalidInput("remote account has no email".to_owned())),
+        AdminAccountSort::Role => Ok(AdminAccountCursorKey::Boolean(account.is_admin)),
+        AdminAccountSort::State => Ok(AdminAccountCursorKey::State(if account.suspended {
+            2
+        } else if account.limited {
+            1
+        } else {
+            0
+        })),
+        AdminAccountSort::CreatedAt => Ok(AdminAccountCursorKey::Timestamp(account.created_at)),
+    }
+}
+
+fn encode_admin_account_cursor(
+    account: &AdminAccount,
+    options: &AdminAccountPageOptions<'_>,
+    navigation: AdminAccountCursorNavigation,
+) -> Result<String> {
+    let cursor = AdminAccountCursor {
+        version: 1,
+        origin: options.origin,
+        sort: options.sort,
+        direction: options.direction,
+        navigation,
+        key: admin_account_cursor_key(account, options.sort)?,
+        id: account.id.0,
+    };
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
+}
+
+fn decode_admin_account_cursor(value: &str) -> Result<AdminAccountCursor> {
+    let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+        RoostyError::InvalidInput("invalid administrator account cursor".to_owned())
+    })?;
+    serde_json::from_slice(&decoded)
+        .map_err(|_| RoostyError::InvalidInput("invalid administrator account cursor".to_owned()))
+}
+
+fn admin_sea_order(direction: AdminAccountSortDirection) -> Order {
+    match direction {
+        AdminAccountSortDirection::Ascending => Order::Asc,
+        AdminAccountSortDirection::Descending => Order::Desc,
+    }
+}
+
+fn reverse_admin_sort_direction(direction: AdminAccountSortDirection) -> AdminAccountSortDirection {
+    match direction {
+        AdminAccountSortDirection::Ascending => AdminAccountSortDirection::Descending,
+        AdminAccountSortDirection::Descending => AdminAccountSortDirection::Ascending,
+    }
 }
 
 fn lower_contains<C>(column: C, pattern: &str) -> SimpleExpr

@@ -1057,6 +1057,253 @@ mod tests {
         postgresql.stop().await.unwrap();
     }
 
+    /// Given a sorted administrator account view, forward and backward cursors return bounded,
+    /// stable pages without duplicates.
+    #[tokio::test]
+    async fn paginates_sorted_administrator_accounts_in_both_directions() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let password_hash = password::hash_password("password").unwrap();
+        roosty_db::create_bootstrap_admin(&db, "zed", "zed@example.com", &password_hash)
+            .await
+            .unwrap();
+        roosty_db::create_local_account(&db, "alice", "alice@example.com", &password_hash)
+            .await
+            .unwrap();
+        roosty_db::create_local_account(&db, "bob", "bob@example.com", &password_hash)
+            .await
+            .unwrap();
+
+        fn options(cursor: Option<&str>) -> roosty_db::AdminAccountPageOptions<'_> {
+            roosty_db::AdminAccountPageOptions {
+                query: "",
+                origin: roosty_db::AdminAccountOrigin::Local,
+                sort: roosty_db::AdminAccountSort::Account,
+                direction: roosty_db::AdminAccountSortDirection::Ascending,
+                limit: 2,
+                cursor,
+            }
+        }
+        let first = roosty_db::admin_account_page(&db, options(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .accounts
+                .iter()
+                .map(|account| account.username.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert!(first.previous_cursor.is_none());
+
+        let second = roosty_db::admin_account_page(&db, options(first.next_cursor.as_deref()))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .accounts
+                .iter()
+                .map(|account| account.username.as_str())
+                .collect::<Vec<_>>(),
+            ["zed"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        let previous =
+            roosty_db::admin_account_page(&db, options(second.previous_cursor.as_deref()))
+                .await
+                .unwrap();
+        assert_eq!(
+            previous
+                .accounts
+                .iter()
+                .map(|account| account.username.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+
+        db.execute_unprepared(
+            "UPDATE local_account SET limited_at = now() WHERE username = 'alice'; \
+             UPDATE local_account SET suspended_at = now() WHERE username = 'zed'; \
+             UPDATE local_account SET created_at = CASE username \
+                 WHEN 'alice' THEN now() - interval '3 days' \
+                 WHEN 'bob' THEN now() - interval '2 days' \
+                 ELSE now() - interval '1 day' END;",
+        )
+        .await
+        .unwrap();
+        for (sort, direction, expected) in [
+            (
+                roosty_db::AdminAccountSort::Email,
+                roosty_db::AdminAccountSortDirection::Descending,
+                vec!["zed", "bob", "alice"],
+            ),
+            (
+                roosty_db::AdminAccountSort::Role,
+                roosty_db::AdminAccountSortDirection::Ascending,
+                vec!["alice", "bob", "zed"],
+            ),
+            (
+                roosty_db::AdminAccountSort::State,
+                roosty_db::AdminAccountSortDirection::Ascending,
+                vec!["bob", "alice", "zed"],
+            ),
+            (
+                roosty_db::AdminAccountSort::CreatedAt,
+                roosty_db::AdminAccountSortDirection::Descending,
+                vec!["zed", "bob", "alice"],
+            ),
+        ] {
+            let page = roosty_db::admin_account_page(
+                &db,
+                roosty_db::AdminAccountPageOptions {
+                    query: "",
+                    origin: roosty_db::AdminAccountOrigin::Local,
+                    sort,
+                    direction,
+                    limit: 3,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.accounts
+                    .iter()
+                    .map(|account| account.username.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+        for (username, domain, age) in [("zed", "alpha.test", 1), ("alice", "zeta.test", 2)] {
+            roosty_db::upsert_remote_actor(
+                &db,
+                &roosty_db::RemoteActor {
+                    id: AccountId(uuid::Uuid::now_v7()),
+                    activitypub_id: format!("https://{domain}/users/{username}"),
+                    username: username.to_owned(),
+                    domain: domain.to_owned(),
+                    invalid_handle: false,
+                    display_name: username.to_owned(),
+                    summary: String::new(),
+                    emojis: serde_json::json!([]),
+                    inbox_url: format!("https://{domain}/inbox"),
+                    shared_inbox_url: None,
+                    followers_url: None,
+                    featured_url: None,
+                    featured_tags_url: None,
+                    public_key_id: format!("https://{domain}/users/{username}#main-key"),
+                    public_key_pem: "test-key".to_owned(),
+                    expires_at: now + time::Duration::hours(1),
+                    profile_created_at: Some(now - time::Duration::days(age)),
+                    first_seen_at: now,
+                    deleted_at: None,
+                    moved_to_remote_actor_id: None,
+                    limited_at: None,
+                    suspended_at: None,
+                    data_purged_at: None,
+                    discoverable: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        roosty_db::set_remote_actor_limited(&db, "zed", "alpha.test", true)
+            .await
+            .unwrap();
+        for (sort, direction, expected) in [
+            (
+                roosty_db::AdminAccountSort::Account,
+                roosty_db::AdminAccountSortDirection::Ascending,
+                vec!["alice", "zed"],
+            ),
+            (
+                roosty_db::AdminAccountSort::State,
+                roosty_db::AdminAccountSortDirection::Ascending,
+                vec!["alice", "zed"],
+            ),
+            (
+                roosty_db::AdminAccountSort::CreatedAt,
+                roosty_db::AdminAccountSortDirection::Descending,
+                vec!["zed", "alice"],
+            ),
+        ] {
+            let page = roosty_db::admin_account_page(
+                &db,
+                roosty_db::AdminAccountPageOptions {
+                    query: "",
+                    origin: roosty_db::AdminAccountOrigin::Remote,
+                    sort,
+                    direction,
+                    limit: 2,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.accounts
+                    .iter()
+                    .map(|account| account.username.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
+    /// A cursor is bound to its origin, column, and direction so it cannot silently page a
+    /// different administrator view.
+    #[tokio::test]
+    async fn rejects_mismatched_administrator_account_cursors() {
+        let (postgresql, db, _temp_dir) = migrated_test_database().await;
+        let password_hash = password::hash_password("password").unwrap();
+        for username in ["alice", "bob"] {
+            roosty_db::create_local_account(
+                &db,
+                username,
+                &format!("{username}@example.com"),
+                &password_hash,
+            )
+            .await
+            .unwrap();
+        }
+        let page = roosty_db::admin_account_page(
+            &db,
+            roosty_db::AdminAccountPageOptions {
+                query: "",
+                origin: roosty_db::AdminAccountOrigin::Local,
+                sort: roosty_db::AdminAccountSort::Account,
+                direction: roosty_db::AdminAccountSortDirection::Ascending,
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+        let error = roosty_db::admin_account_page(
+            &db,
+            roosty_db::AdminAccountPageOptions {
+                query: "",
+                origin: roosty_db::AdminAccountOrigin::Local,
+                sort: roosty_db::AdminAccountSort::Email,
+                direction: roosty_db::AdminAccountSortDirection::Ascending,
+                limit: 1,
+                cursor: page.next_cursor.as_deref(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, roosty_core::RoostyError::InvalidInput(_)));
+
+        db.close().await.unwrap();
+        postgresql.stop().await.unwrap();
+    }
+
     /// Given an existing account, replacing its hash makes only the new password valid.
     #[tokio::test]
     async fn resets_local_account_password_hash() {

@@ -4633,6 +4633,7 @@ dependencies = [
  "leptos_axum",
  "leptos_meta",
  "leptos_router",
+ "percent-encoding",
  "serde",
  "serde_json",
  "strum 0.27.2",
