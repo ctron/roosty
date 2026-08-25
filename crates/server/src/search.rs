@@ -246,7 +246,7 @@ async fn search_hashtags(
     Ok(responses)
 }
 
-/// Search only statuses related to the authenticated user, matching Mastodon's privacy scope.
+/// Search consented public posts plus statuses related to the authenticated user.
 async fn search_statuses(
     state: &AppState,
     database: &DatabaseContext,
@@ -366,8 +366,9 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_db::{
-        DomainBlockSeverity, LocalAccountSettingsUpdate, NewFederationDomainBlock, NewLocalStatus,
-        NewRemoteStatus, QuoteApprovalPolicy, RemoteActor, StatusVisibility,
+        ActivityPubActorType, DomainBlockSeverity, LocalAccountSettingsUpdate,
+        NewFederationDomainBlock, NewLocalStatus, NewRemoteStatus, QuoteApprovalPolicy,
+        RemoteActor, StatusVisibility,
     };
     use roosty_migration::Migrator;
     use sea_orm::TransactionTrait;
@@ -658,6 +659,123 @@ mod tests {
 
     #[test_context(SearchContext)]
     #[tokio::test]
+    /// Given explicit local and remote consent, only public posts become broadly searchable.
+    async fn search_respects_actor_indexability(context: &mut SearchContext) {
+        context.config.federation_enabled = true;
+        let token = context.access_token().await;
+        let author_id = context
+            .create_account("alice", "alice@example.com", "Alice Example")
+            .await;
+        roosty_db::update_local_account_settings(
+            &context.db,
+            author_id,
+            LocalAccountSettingsUpdate {
+                indexable: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let public = roosty_db::create_local_status(
+            &context.db,
+            NewLocalStatus {
+                id: None,
+                account_id: author_id,
+                content: "indexable capybara public".to_owned(),
+                visibility: StatusVisibility::Public,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+        roosty_db::create_local_status(
+            &context.db,
+            NewLocalStatus {
+                id: None,
+                account_id: author_id,
+                content: "indexable capybara unlisted".to_owned(),
+                visibility: StatusVisibility::Unlisted,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+        let opted_out_id = context
+            .create_account("carol", "carol@example.com", "Carol Example")
+            .await;
+        roosty_db::create_local_status(
+            &context.db,
+            NewLocalStatus {
+                id: None,
+                account_id: opted_out_id,
+                content: "non-indexable capybara public".to_owned(),
+                visibility: StatusVisibility::Public,
+                sensitive: false,
+                spoiler_text: String::new(),
+                language: None,
+                in_reply_to_id: None,
+                in_reply_to_remote_status_id: None,
+                quote_approval_policy: QuoteApprovalPolicy::Nobody,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut remote = context.cache_remote_actor("bob", "remote.test").await;
+        remote.indexable = true;
+        let remote = roosty_db::upsert_remote_actor(&context.db, &remote)
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let remote_public = roosty_db::upsert_remote_status(
+            &context.db,
+            NewRemoteStatus {
+                activitypub_id: "https://remote.test/statuses/capybara".to_owned(),
+                remote_actor_id: remote.id,
+                content: "indexable capybara remote".to_owned(),
+                visibility: StatusVisibility::Public,
+                published_at: now,
+                updated_at: now,
+                in_reply_to: None,
+                in_reply_to_local_status_id: None,
+                in_reply_to_remote_status_id: None,
+                object: serde_json::json!({}),
+                tag_names: Vec::new(),
+                quote_automatic_policy: Vec::new(),
+                quote_manual_policy: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = context
+            .authenticated_get("/api/v2/search?type=statuses&q=capybara", &token)
+            .await;
+        let body = json_body(response).await;
+        let ids = body["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|status| status["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&public.id.0.to_string()));
+        assert!(ids.contains(&remote_public.id.0.to_string()));
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
     /// Verifies that account search supports display names and requires auth.
     async fn account_search_matches_display_name(context: &mut SearchContext) {
         let token = context.access_token().await;
@@ -861,6 +979,7 @@ mod tests {
                 username: username.to_owned(),
                 domain: domain.to_owned(),
                 invalid_handle: false,
+                actor_type: ActivityPubActorType::Person,
                 display_name: "Remote Alice".to_owned(),
                 summary: String::new(),
                 emojis: serde_json::json!([]),
@@ -880,6 +999,7 @@ mod tests {
                 suspended_at: None,
                 data_purged_at: None,
                 discoverable: Some(true),
+                indexable: false,
             };
             roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

@@ -40,10 +40,13 @@
   `Announce` activities, with HTTP-signature-aware follower and mention visibility.
 - Local actors advertise the instance shared inbox, and identical broadly addressed activities
   enqueue one durable delivery per remote shared inbox instead of one per remote follower.
+- Mastodon-compatible actor extensions expose local and remote FEP-5feb indexability consent,
+  accept Person, Service, Application, and Group actors, and project bot/group account flags.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
-- Mastodon-compatible status search uses PostgreSQL trigram documents and exposes only a
-  viewer's own, mentioned, favourited, boosted, or bookmarked local and cached-remote posts.
+- Mastodon-compatible status search uses PostgreSQL trigram documents, broadly exposes public
+  posts from explicitly indexable actors, and otherwise limits results to a viewer's own,
+  mentioned, favourited, boosted, or bookmarked local and cached-remote posts.
 - Signed inbound remote-follow handling: `Follow` and `Undo(Follow)` update remote-follower state, with durable `Accept`/`Reject` responses for local actors.
 - Signed outbound delivery of local public, unlisted, and follower-only status lifecycle activities (`Create`, `Update`, and `Delete`) plus local actor profile `Update` activities to accepted remote followers and explicit mentions.
 
@@ -103,7 +106,7 @@
 - [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
 - [x] Fetch and expose bounded remote featured profile tags with durable refresh and signed Add/Remove synchronization.
 - [x] Advertise shared inboxes and deduplicate identical outbound activities by destination.
-- [ ] Complete deferred Mastodon actor extensions: group actors and indexability.
+- [x] Complete deferred Mastodon actor extensions: group actors and indexability.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
 - [x] Coordinate cold remote avatar, header, attachment, and preview requests through durable job

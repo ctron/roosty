@@ -17,6 +17,7 @@ pub struct Model {
     pub locked: bool,
     pub bot: bool,
     pub discoverable: bool,
+    pub indexable: bool,
     pub default_visibility: StatusVisibility,
     pub default_sensitive: bool,
     pub default_language: Option<String>,

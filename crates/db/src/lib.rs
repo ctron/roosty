@@ -905,6 +905,8 @@ pub struct LocalAccount {
     pub bot: bool,
     /// Whether this account can be discovered in profile directories.
     pub discoverable: bool,
+    /// Whether public authored statuses may be exposed through full-text search.
+    pub indexable: bool,
     /// Default visibility for authored statuses.
     pub default_visibility: StatusVisibility,
     /// Whether authored statuses are sensitive by default.
@@ -927,6 +929,36 @@ pub struct LocalAccount {
     pub data_purged_at: Option<OffsetDateTime>,
     /// Timestamp when the local account was created.
     pub created_at: OffsetDateTime,
+}
+
+/// Closed ActivityStreams actor kinds supported by Mastodon account projections.
+#[derive(Clone, Copy, Debug, DeriveActiveEnum, Deserialize, EnumIter, Eq, PartialEq, Serialize)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
+    enum_name = "activitypub_actor_type"
+)]
+pub enum ActivityPubActorType {
+    #[sea_orm(string_value = "person")]
+    Person,
+    #[sea_orm(string_value = "service")]
+    Service,
+    #[sea_orm(string_value = "application")]
+    Application,
+    #[sea_orm(string_value = "group")]
+    Group,
+}
+
+impl ActivityPubActorType {
+    /// Whether Mastodon projects this actor kind as an automated account.
+    pub const fn is_bot(self) -> bool {
+        matches!(self, Self::Service | Self::Application)
+    }
+
+    /// Whether Mastodon projects this actor kind as a group account.
+    pub const fn is_group(self) -> bool {
+        matches!(self, Self::Group)
+    }
 }
 
 /// Cryptographic algorithm attached to persisted ActivityPub actor keys.
@@ -993,6 +1025,8 @@ pub struct RemoteActor {
     pub domain: String,
     /// Whether the actor's current human-readable handle could not be verified.
     pub invalid_handle: bool,
+    /// Validated ActivityStreams actor kind.
+    pub actor_type: ActivityPubActorType,
     /// Display name from the actor document.
     pub display_name: String,
     /// Profile summary from the actor document.
@@ -1031,6 +1065,8 @@ pub struct RemoteActor {
     pub data_purged_at: Option<OffsetDateTime>,
     /// Whether the remote actor explicitly opted into profile discovery.
     pub discoverable: Option<bool>,
+    /// Whether the actor explicitly permits public-status search indexing.
+    pub indexable: bool,
 }
 
 /// One account returned by the unified Mastodon account search.
@@ -4582,7 +4618,9 @@ async fn upsert_remote_actor_with_identity(
         active.featured_tags_url = Set(actor.featured_tags_url.clone());
         active.public_key_id = Set(actor.public_key_id.clone());
         active.public_key_pem = Set(actor.public_key_pem.clone());
+        active.actor_type = Set(actor.actor_type);
         active.discoverable = Set(actor.discoverable);
+        active.indexable = Set(actor.indexable);
         active.fetched_at = Set(now);
         active.expires_at = Set(actor.expires_at);
         if let Some(profile_created_at) = actor.profile_created_at {
@@ -4609,6 +4647,7 @@ async fn upsert_remote_actor_with_identity(
             username: Set(stored_username),
             domain: Set(actor.domain.clone()),
             invalid_handle: Set(invalid_handle),
+            actor_type: Set(actor.actor_type),
             display_name: Set(actor.display_name.clone()),
             summary: Set(actor.summary.clone()),
             emojis: Set(actor.emojis.clone()),
@@ -4620,6 +4659,7 @@ async fn upsert_remote_actor_with_identity(
             public_key_id: Set(actor.public_key_id.clone()),
             public_key_pem: Set(actor.public_key_pem.clone()),
             discoverable: Set(actor.discoverable),
+            indexable: Set(actor.indexable),
             fetched_at: Set(now),
             expires_at: Set(actor.expires_at),
             profile_created_at: Set(actor.profile_created_at),
@@ -4901,6 +4941,8 @@ pub struct LocalAccountSettingsUpdate {
     pub bot: Option<bool>,
     /// Whether this account can be discovered in profile directories.
     pub discoverable: Option<bool>,
+    /// Whether public authored statuses may be exposed through full-text search.
+    pub indexable: Option<bool>,
     /// Default visibility for authored statuses.
     pub default_visibility: Option<StatusVisibility>,
     /// Whether authored statuses are sensitive by default.
@@ -8159,7 +8201,7 @@ pub async fn search_accounts(
     Ok(results)
 }
 
-/// Search status documents while enforcing Mastodon's viewer interaction scope.
+/// Search status documents while enforcing actor consent, visibility, and viewer interactions.
 pub async fn search_statuses(
     db: &impl ConnectionTrait,
     options: StatusSearchOptions<'_>,
@@ -8200,6 +8242,7 @@ pub async fn search_statuses(
               AND ($3::uuid IS NULL OR author.id = $3)
               AND (
                 author.id = $1
+                OR (author.indexable AND status.visibility = 'public')
                 OR EXISTS (
                     SELECT 1 FROM local_status_local_mention mention
                     WHERE mention.status_id = status.id
@@ -8284,6 +8327,8 @@ pub async fn search_statuses(
                    OR author.domain LIKE '%.' || blocked.domain
               )
               AND (
+                (author.indexable AND status.visibility = 'public')
+                OR
                 EXISTS (
                     SELECT 1 FROM remote_status_local_mention mention
                     WHERE mention.remote_status_id = status.id
@@ -10969,6 +11014,7 @@ where
     set_if_some(&mut active.locked, update.locked);
     set_if_some(&mut active.bot, update.bot);
     set_if_some(&mut active.discoverable, update.discoverable);
+    set_if_some(&mut active.indexable, update.indexable);
     if let Some(visibility) = update.default_visibility {
         active.default_visibility = Set(visibility);
     }
@@ -20197,6 +20243,7 @@ fn local_account_from_model(account: local_account::Model) -> Result<LocalAccoun
         locked: account.locked,
         bot: account.bot,
         discoverable: account.discoverable,
+        indexable: account.indexable,
         default_visibility: account.default_visibility,
         default_sensitive: account.default_sensitive,
         default_language: account.default_language,
@@ -20219,6 +20266,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         username: actor.username,
         domain: actor.domain,
         invalid_handle: actor.invalid_handle,
+        actor_type: actor.actor_type,
         display_name: actor.display_name,
         summary: actor.summary,
         emojis: actor.emojis,
@@ -20238,6 +20286,7 @@ fn remote_actor_from_model(actor: remote_actor::Model) -> RemoteActor {
         suspended_at: actor.suspended_at,
         data_purged_at: actor.data_purged_at,
         discoverable: actor.discoverable,
+        indexable: actor.indexable,
     }
 }
 

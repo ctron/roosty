@@ -37,7 +37,9 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 
 |🟢
 |Actor document
-|Local actors advertise the instance-wide shared inbox.
+|Local actors advertise the instance-wide shared inbox and explicit FEP-5feb search-indexing
+consent. Remote Person, Service, Application, and Group actors are accepted and projected through
+Mastodon-compatible `bot`, `group`, and `indexable` account fields.
 
 |🟡
 |Outbox
@@ -247,7 +249,7 @@ page is read.
 |Account metadata
 |Remote counts reflect only content cached by this instance. Verified handle refreshes retain the
 stable account ID; conflicting or temporarily unverifiable handles expose `invalid_handle: true`
-with a server-unique placeholder `acct`.
+with a server-unique placeholder `acct`. Remote actor kinds and FEP-5feb indexability are retained.
 
 |🟢
 |Admin accounts API
@@ -312,9 +314,10 @@ cursor pagination. `collection_ids[]`, warnings, and custom moderator roles are 
 
 |🟡
 |`GET /api/v2/search`
-|Accounts, hashtags, and authenticated interaction-scoped status search are supported.
-Status matching uses case-insensitive literal substrings of at least three characters;
-anonymous status results remain empty for Mastodon-compatible privacy.
+|Accounts, hashtags, and authenticated status search are supported. Explicitly indexable public
+posts are broadly searchable; opted-out posts remain limited to ownership, mentions, and known
+interactions. Status matching uses case-insensitive literal substrings of at least three characters;
+anonymous status results remain empty.
 
 |🟡
 |Remote account resolution

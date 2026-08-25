@@ -35,9 +35,9 @@ use reqwest::{Client, redirect::Policy};
 use ring::{aead, digest};
 use roosty_core::{AccountId, RoostyError, StatusId};
 use roosty_db::{
-    ActorKeyAlgorithm, CollectionCursor, DirectConversationRefresh, FeaturedTag,
-    FollowCollectionAccount, InboxActivityMetadata, InboxActivityOutcome, InboxActivityType,
-    InboxReplayResult, JobKind, LocalAccount, LocalActorKey, LocalNotification,
+    ActivityPubActorType, ActorKeyAlgorithm, CollectionCursor, DirectConversationRefresh,
+    FeaturedTag, FollowCollectionAccount, InboxActivityMetadata, InboxActivityOutcome,
+    InboxActivityType, InboxReplayResult, JobKind, LocalAccount, LocalActorKey, LocalNotification,
     LocalNotificationType, LocalOutboxItem, LocalOutboxPage, LocalRemoteAccountBlock,
     LocalRemoteStatusFavourite, LocalRemoteStatusReblog, LocalStatus, NewJob, NewModerationReport,
     NewRemoteCustomEmoji, NewRemoteMediaAttachment, NewRemoteStatus, PollStatus,
@@ -151,13 +151,6 @@ impl From<InboundAudienceError> for RoostyError {
             }
         }
     }
-}
-
-/// ActivityStreams actor types accepted and emitted by Roosty.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum ActorType {
-    Person,
-    Service,
 }
 
 /// ActivityStreams object types emitted for local statuses.
@@ -1111,7 +1104,7 @@ struct Actor {
     #[serde(rename = "@context")]
     context: ActorContext,
     id: String,
-    r#type: ActorType,
+    r#type: ActivityPubActorType,
     preferred_username: String,
     name: String,
     summary: String,
@@ -1125,6 +1118,7 @@ struct Actor {
     url: String,
     manually_approves_followers: bool,
     discoverable: bool,
+    indexable: bool,
     published: String,
     attachment: Vec<ActorProfileField>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1178,6 +1172,7 @@ struct ActorExtensionsContext {
     manually_approves_followers: &'static str,
     toot: &'static str,
     discoverable: &'static str,
+    indexable: &'static str,
     schema: &'static str,
     #[serde(rename = "PropertyValue")]
     property_value: &'static str,
@@ -1624,6 +1619,7 @@ fn actor_document(
         url: public_url(state, &format!("@{}", account.username)),
         manually_approves_followers: account.locked,
         discoverable: account.discoverable,
+        indexable: account.indexable,
         published: statuses::format_timestamp(account.created_at),
         attachment: actor_profile_fields(&account.profile_fields),
         icon: account.avatar_file_path.as_deref().map(|path| ActorImage {
@@ -1714,11 +1710,11 @@ async fn featured_tags(
 }
 
 /// Map Roosty's local bot setting to the ActivityPub actor type Mastodon uses for services.
-fn local_actor_type(bot: bool) -> ActorType {
+fn local_actor_type(bot: bool) -> ActivityPubActorType {
     if bot {
-        ActorType::Service
+        ActivityPubActorType::Service
     } else {
-        ActorType::Person
+        ActivityPubActorType::Person
     }
 }
 
@@ -1732,6 +1728,7 @@ fn actor_context() -> ActorContext {
             manually_approves_followers: "as:manuallyApprovesFollowers",
             toot: "http://joinmastodon.org/ns#",
             discoverable: "toot:discoverable",
+            indexable: "toot:indexable",
             schema: "http://schema.org#",
             property_value: "schema:PropertyValue",
             value: "schema:value",
@@ -3620,7 +3617,12 @@ fn is_remote_actor_lifecycle_activity(activity: &JsonValue, actor_id: &str) -> b
                         .get("id")
                         .and_then(JsonValue::as_str)
                         .is_some_and(|id| id == actor_id)
-                        && object.get("type").and_then(JsonValue::as_str) == Some("Person"),
+                        && object
+                            .get("type")
+                            .and_then(JsonValue::as_str)
+                            .is_some_and(|kind| {
+                                matches!(kind, "Person" | "Service" | "Application" | "Group")
+                            }),
                 ),
                 _ => None,
             })
@@ -8081,8 +8083,8 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
     use roosty_db::{
-        CollectionCursor, JobKind, ListRepliesPolicy, LocalNotificationType, NewLocalStatus,
-        NotificationFilter, QuoteApprovalPolicy, StatusVisibility,
+        ActivityPubActorType, CollectionCursor, JobKind, ListRepliesPolicy, LocalNotificationType,
+        NewLocalStatus, NotificationFilter, QuoteApprovalPolicy, StatusVisibility,
     };
     use roosty_migration::Migrator;
     use rsa::{
@@ -8101,15 +8103,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Actor, ActorEndpoints, ActorImage, ActorImageType, ActorType, CollectionType, Create,
-        CreateType, InboundAttachment, InboundFollowActivity, InboundInteractionPolicy,
-        InboundNote, InboundReplies, InboundTag, InboundUndoAnnounceActivity,
-        InboundUndoBlockActivity, InboundUndoFollowActivity, MAX_DISCOVERED_REPLIES, MentionTag,
-        MentionType, Note, NoteAttachment, NoteContext, NoteExtensionsContext, NoteType,
-        OutboxActivity, OutboxCollection, OutboxCollectionPage, PublicKey, actor_context,
-        actor_profile_fields, canonical_activity_digest, delivery_groups,
-        is_remote_actor_lifecycle_activity, local_actor_type, parse_acct, remote_hashtag_names,
-        remote_poll_from_note, same_url_origin,
+        Actor, ActorEndpoints, ActorImage, ActorImageType, CollectionType, Create, CreateType,
+        InboundAttachment, InboundFollowActivity, InboundInteractionPolicy, InboundNote,
+        InboundReplies, InboundTag, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
+        InboundUndoFollowActivity, MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note,
+        NoteAttachment, NoteContext, NoteExtensionsContext, NoteType, OutboxActivity,
+        OutboxCollection, OutboxCollectionPage, PublicKey, actor_context, actor_profile_fields,
+        canonical_activity_digest, delivery_groups, is_remote_actor_lifecycle_activity,
+        local_actor_type, parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
     };
     use crate::{
         config::{
@@ -9752,7 +9753,7 @@ mod tests {
         let actor = Actor {
             context: actor_context(),
             id: "https://example.test/users/alice".to_owned(),
-            r#type: ActorType::Person,
+            r#type: ActivityPubActorType::Person,
             preferred_username: "alice".to_owned(),
             name: "Alice".to_owned(),
             summary: String::new(),
@@ -9768,6 +9769,7 @@ mod tests {
             url: "https://example.test/@alice".to_owned(),
             manually_approves_followers: false,
             discoverable: true,
+            indexable: true,
             published: "2026-07-13T00:00:00.000Z".to_owned(),
             attachment: actor_profile_fields(&serde_json::json!([
                 { "name": "Website", "value": "https://example.test/?a=<b>" }
@@ -9878,6 +9880,7 @@ mod tests {
             "as:manuallyApprovesFollowers"
         );
         assert_eq!(actor["@context"][3]["discoverable"], "toot:discoverable");
+        assert_eq!(actor["@context"][3]["indexable"], "toot:indexable");
         assert_eq!(actor["@context"][3]["schema"], "http://schema.org#");
         assert_eq!(
             actor["@context"][3]["PropertyValue"],
@@ -9902,6 +9905,7 @@ mod tests {
             "https://example.test/users/alice/collections/tags"
         );
         assert!(actor["discoverable"].as_bool().unwrap());
+        assert!(actor["indexable"].as_bool().unwrap());
         assert_eq!(actor["published"], "2026-07-13T00:00:00.000Z");
         assert_eq!(actor["attachment"][0]["type"], "PropertyValue");
         assert_eq!(actor["attachment"][0]["name"], "Website");
@@ -9909,8 +9913,8 @@ mod tests {
             actor["attachment"][0]["value"],
             "https://example.test/?a=&lt;b&gt;"
         );
-        assert_eq!(local_actor_type(false), ActorType::Person);
-        assert_eq!(local_actor_type(true), ActorType::Service);
+        assert_eq!(local_actor_type(false), ActivityPubActorType::Person);
+        assert_eq!(local_actor_type(true), ActivityPubActorType::Service);
         assert!(actor.get("preferred_username").is_none());
         assert_eq!(actor["icon"]["type"], "Image");
         assert_eq!(
@@ -10439,6 +10443,7 @@ mod tests {
             username: username.to_owned(),
             domain: "remote.test".to_owned(),
             invalid_handle: false,
+            actor_type: ActivityPubActorType::Person,
             display_name: username.to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -10458,6 +10463,7 @@ mod tests {
             suspended_at: None,
             data_purged_at: None,
             discoverable: Some(true),
+            indexable: false,
         }
     }
 
@@ -10473,6 +10479,7 @@ mod tests {
             username: username.to_owned(),
             domain: domain.to_owned(),
             invalid_handle: false,
+            actor_type: ActivityPubActorType::Person,
             display_name: username.to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -10492,6 +10499,7 @@ mod tests {
             suspended_at: None,
             data_purged_at: None,
             discoverable: Some(true),
+            indexable: false,
         };
         roosty_db::upsert_remote_actor(&state.db, &actor)
             .await

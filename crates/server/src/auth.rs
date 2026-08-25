@@ -987,6 +987,7 @@ pub(crate) struct AccountResponse {
     locked: bool,
     bot: bool,
     discoverable: bool,
+    indexable: bool,
     limited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     suspended: Option<bool>,
@@ -1053,6 +1054,7 @@ struct UpdateCredentialsInput {
     locked: Option<bool>,
     bot: Option<bool>,
     discoverable: Option<bool>,
+    indexable: Option<bool>,
     default_visibility: Option<String>,
     default_sensitive: Option<bool>,
     default_language: Option<Option<String>>,
@@ -1078,6 +1080,7 @@ struct UpdateCredentialsParams {
     locked: Option<Value>,
     bot: Option<Value>,
     discoverable: Option<Value>,
+    indexable: Option<Value>,
     source: Option<UpdateCredentialsSourceParams>,
     #[serde(rename = "source[privacy]")]
     source_privacy: Option<String>,
@@ -1413,6 +1416,7 @@ pub(crate) fn account_response_with_stats(
         locked: account.locked,
         bot: account.bot,
         discoverable: account.discoverable,
+        indexable: account.indexable,
         limited: account.limited_at.is_some(),
         suspended: suspended.then_some(true),
         group: false,
@@ -1507,6 +1511,7 @@ fn settings_update_from_input(
         locked: input.locked,
         bot: input.bot,
         discoverable: input.discoverable,
+        indexable: input.indexable,
         default_visibility,
         default_sensitive: input.default_sensitive,
         default_language: input.default_language,
@@ -1535,6 +1540,7 @@ async fn update_credentials_input_from_params(
         locked: optional_bool(params.locked.as_ref())?,
         bot: optional_bool(params.bot.as_ref())?,
         discoverable: optional_bool(params.discoverable.as_ref())?,
+        indexable: optional_bool(params.indexable.as_ref())?,
         default_visibility: source.privacy.or(params.source_privacy),
         default_sensitive: match optional_bool(source.sensitive.as_ref())? {
             Some(value) => Some(value),
@@ -2878,6 +2884,7 @@ mod tests {
                 ("locked", "true"),
                 ("bot", "false"),
                 ("discoverable", "false"),
+                ("indexable", "true"),
                 ("source[privacy]", "unlisted"),
                 ("source[sensitive]", "true"),
                 ("source[language]", "de"),
@@ -2900,6 +2907,7 @@ mod tests {
 
         assert_eq!(update_response.status(), StatusCode::OK);
         let body = json_body(update_response).await;
+        assert_eq!(body["indexable"], true);
         assert_eq!(
             account_settings_snapshot(&body),
             json!({
@@ -2929,6 +2937,7 @@ mod tests {
             )
             .await;
         let body = json_body(credentials_response).await;
+        assert_eq!(body["indexable"], true);
         assert_eq!(
             body["fields"],
             profile_fields_json(&[("Website", "https://example.com")])

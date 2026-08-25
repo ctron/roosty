@@ -161,6 +161,9 @@ async fn migrations_run_up(database: &mut EmbeddedDatabase) {
     assert!(column_exists(database.connection(), "local_account", "last_status_at").await);
     assert!(column_exists(database.connection(), "remote_actor", "discoverable").await);
     assert!(column_exists(database.connection(), "remote_actor", "invalid_handle").await);
+    assert!(column_exists(database.connection(), "remote_actor", "actor_type").await);
+    assert!(column_exists(database.connection(), "remote_actor", "indexable").await);
+    assert!(column_exists(database.connection(), "local_account", "indexable").await);
     assert!(column_exists(database.connection(), "remote_actor", "last_status_at").await);
     assert!(index_exists(database.connection(), "local_account_directory_active_idx").await);
     assert!(index_exists(database.connection(), "local_account_directory_new_idx").await);
@@ -973,6 +976,69 @@ async fn job_kind_migration_preserves_rows_and_is_reversible(database: &mut Embe
         row.try_get::<String>("", "kind").unwrap(),
         "poll_expiration"
     );
+}
+
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+/// Existing accounts are conservatively opted out when actor extensions are introduced.
+async fn actor_extensions_backfill_safe_defaults(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(87)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO local_account (id, username, email, password_hash)
+            VALUES (
+                '10000000-0000-0000-0000-000000000088',
+                'actor_extensions', 'actor_extensions@example.test', 'hash'
+            );
+            INSERT INTO remote_actor (
+                id, activitypub_id, username, domain, inbox_url,
+                public_key_id, public_key_pem, expires_at
+            ) VALUES (
+                '30000000-0000-0000-0000-000000000088',
+                'https://remote.test/users/extensions', 'extensions', 'remote.test',
+                'https://remote.test/users/extensions/inbox',
+                'https://remote.test/users/extensions#main-key', 'key',
+                now() + interval '1 day'
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    let local = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT indexable FROM local_account WHERE username = 'actor_extensions'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let remote = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT actor_type::text AS actor_type, indexable FROM remote_actor WHERE username = 'extensions'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!local.try_get::<bool>("", "indexable").unwrap());
+    assert_eq!(
+        remote.try_get::<String>("", "actor_type").unwrap(),
+        "person"
+    );
+    assert!(!remote.try_get::<bool>("", "indexable").unwrap());
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    assert!(!column_exists(database.connection(), "local_account", "indexable").await);
+    assert!(!column_exists(database.connection(), "remote_actor", "actor_type").await);
+    assert!(!column_exists(database.connection(), "remote_actor", "indexable").await);
 }
 
 struct EmbeddedDatabase {

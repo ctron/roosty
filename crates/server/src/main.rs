@@ -11,7 +11,7 @@ use axum::Router;
 use clap::{Parser, Subcommand};
 use roosty_core::{AccountId, Result, RoostyError};
 #[cfg(test)]
-use roosty_db::{JobKind, NotificationPolicyUpdate};
+use roosty_db::{ActivityPubActorType, JobKind, NotificationPolicyUpdate};
 use roosty_migration::Migrator;
 use sea_orm::TransactionTrait;
 use sea_orm_migration::MigratorTrait;
@@ -1186,6 +1186,7 @@ mod tests {
                     username: username.to_owned(),
                     domain: domain.to_owned(),
                     invalid_handle: false,
+                    actor_type: ActivityPubActorType::Person,
                     display_name: username.to_owned(),
                     summary: String::new(),
                     emojis: serde_json::json!([]),
@@ -1205,6 +1206,7 @@ mod tests {
                     suspended_at: None,
                     data_purged_at: None,
                     discoverable: Some(true),
+                    indexable: false,
                 },
             )
             .await

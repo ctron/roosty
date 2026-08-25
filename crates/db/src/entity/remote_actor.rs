@@ -1,6 +1,8 @@
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 
+use crate::ActivityPubActorType;
+
 /// SeaORM model for a validated remote ActivityPub actor cache entry.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "remote_actor")]
@@ -11,6 +13,7 @@ pub struct Model {
     pub username: String,
     pub domain: String,
     pub invalid_handle: bool,
+    pub actor_type: ActivityPubActorType,
     pub display_name: String,
     pub summary: String,
     pub emojis: Json,
@@ -30,6 +33,7 @@ pub struct Model {
     pub suspended_at: Option<OffsetDateTime>,
     pub data_purged_at: Option<OffsetDateTime>,
     pub discoverable: Option<bool>,
+    pub indexable: bool,
     pub last_status_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,

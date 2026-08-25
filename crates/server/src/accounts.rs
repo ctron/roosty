@@ -171,6 +171,7 @@ pub(crate) struct RemoteAccountResponse {
     locked: bool,
     bot: bool,
     discoverable: Option<bool>,
+    indexable: bool,
     limited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     suspended: Option<bool>,
@@ -720,6 +721,7 @@ pub(crate) fn unresolved_remote_account_response(
         locked: false,
         bot: false,
         discoverable: None,
+        indexable: false,
         limited: false,
         suspended: None,
         group: false,
@@ -761,11 +763,12 @@ fn remote_account_response_from_media(
             actor.display_name
         },
         locked: false,
-        bot: false,
+        bot: actor.actor_type.is_bot(),
         discoverable: actor.discoverable,
+        indexable: actor.indexable,
         limited: actor.limited_at.is_some(),
         suspended: suspended.then_some(true),
-        group: false,
+        group: actor.actor_type.is_group(),
         created_at: format_timestamp(actor.profile_created_at.unwrap_or(actor.first_seen_at)),
         note: if suspended {
             String::new()
@@ -1666,6 +1669,7 @@ mod tests {
     };
     use postgresql_embedded::PostgreSQL;
     use roosty_core::AccountId;
+    use roosty_db::ActivityPubActorType;
     use roosty_migration::Migrator;
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
@@ -1696,6 +1700,7 @@ mod tests {
             username: "alice".to_owned(),
             domain: "remote.test".to_owned(),
             invalid_handle: false,
+            actor_type: ActivityPubActorType::Group,
             display_name: "Alice".to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -1715,6 +1720,7 @@ mod tests {
             suspended_at: None,
             data_purged_at: None,
             discoverable: Some(true),
+            indexable: true,
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1725,6 +1731,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(response["created_at"], format_timestamp(profile_created_at));
+        assert_eq!(response["group"], true);
+        assert_eq!(response["bot"], false);
+        assert_eq!(response["indexable"], true);
     }
 
     #[test]
@@ -1751,6 +1760,7 @@ mod tests {
             username: "alice".to_owned(),
             domain: "remote.test".to_owned(),
             invalid_handle: false,
+            actor_type: ActivityPubActorType::Person,
             display_name: "Alice".to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -1770,6 +1780,7 @@ mod tests {
             suspended_at: None,
             data_purged_at: None,
             discoverable: Some(true),
+            indexable: false,
         };
 
         let response = serde_json::to_value(remote_account_response_from_media(
@@ -1793,6 +1804,7 @@ mod tests {
             username: "alice".to_owned(),
             domain: "remote.test".to_owned(),
             invalid_handle: true,
+            actor_type: ActivityPubActorType::Person,
             display_name: "Alice".to_owned(),
             summary: String::new(),
             emojis: json!([]),
@@ -1812,6 +1824,7 @@ mod tests {
             suspended_at: None,
             data_purged_at: None,
             discoverable: None,
+            indexable: false,
         };
 
         let value = serde_json::to_value(remote_account_response_from_media(
@@ -3253,6 +3266,7 @@ mod tests {
                 username: username.to_owned(),
                 domain: domain.to_owned(),
                 invalid_handle: false,
+                actor_type: ActivityPubActorType::Person,
                 display_name: username.to_owned(),
                 summary: String::new(),
                 emojis: json!([]),
@@ -3272,6 +3286,7 @@ mod tests {
                 suspended_at: None,
                 data_purged_at: None,
                 discoverable: Some(true),
+                indexable: false,
             };
             let actor = roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await

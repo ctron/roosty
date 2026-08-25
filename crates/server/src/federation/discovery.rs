@@ -15,7 +15,8 @@ use reqwest::{
 };
 use roosty_core::{AccountId, FederationDiscoveryError, Result, RoostyError};
 use roosty_db::{
-    ActorKeyAlgorithm, NewRemoteCustomEmoji, NewRemoteProfileMedia, RemoteActor, RemoteActorKey,
+    ActivityPubActorType, ActorKeyAlgorithm, NewRemoteCustomEmoji, NewRemoteProfileMedia,
+    RemoteActor, RemoteActorKey,
 };
 use rsa::{
     RsaPublicKey,
@@ -32,7 +33,6 @@ use uuid::Uuid;
 
 use crate::{
     accounts::remote_custom_emojis,
-    federation::ActorType,
     http::{AppState, DatabaseContext},
     media::enqueue_remote_profile_media_fetches,
 };
@@ -60,7 +60,7 @@ struct WebFingerLink {
 #[serde(rename_all = "camelCase")]
 struct RemoteActorDocument {
     id: String,
-    r#type: ActorType,
+    r#type: ActivityPubActorType,
     #[serde(default)]
     preferred_username: String,
     #[serde(default)]
@@ -69,6 +69,8 @@ struct RemoteActorDocument {
     summary: String,
     #[serde(default)]
     discoverable: Option<bool>,
+    #[serde(default)]
+    indexable: bool,
     #[serde(default)]
     icon: Option<RemoteActorImage>,
     #[serde(default)]
@@ -363,6 +365,7 @@ pub async fn resolve_remote_actor(
         username: document.preferred_username,
         domain,
         invalid_handle: false,
+        actor_type: document.r#type,
         display_name: document.name,
         summary: document.summary,
         emojis: JsonValue::Array(document.tag),
@@ -382,6 +385,7 @@ pub async fn resolve_remote_actor(
         suspended_at: None,
         data_purged_at: None,
         discoverable: document.discoverable,
+        indexable: document.indexable,
     };
     let actor = store_remote_actor_on(
         &lock,
@@ -612,10 +616,7 @@ async fn fetch_remote_actor_by_id(
         .ok_or_else(|| invalid("remote actor ID has no host"))?
         .to_ascii_lowercase();
     let document: RemoteActorDocument = fetch_json(state, db, actor_url.clone(), None).await?;
-    if document.r#type != ActorType::Person
-        || document.id != activitypub_id
-        || document.preferred_username.is_empty()
-    {
+    if document.id != activitypub_id || document.preferred_username.is_empty() {
         return Err(invalid("remote actor document is invalid"));
     }
     let keys = actor_keys(state, db, &document).await?;
@@ -657,6 +658,7 @@ async fn fetch_remote_actor_by_id(
             username: document.preferred_username,
             domain: handle_domain,
             invalid_handle: !handle_valid,
+            actor_type: document.r#type,
             display_name: document.name,
             summary: document.summary,
             emojis: JsonValue::Array(document.tag),
@@ -676,6 +678,7 @@ async fn fetch_remote_actor_by_id(
             suspended_at: None,
             data_purged_at: None,
             discoverable: document.discoverable,
+            indexable: document.indexable,
         },
         document.icon,
         document.image,
@@ -723,7 +726,7 @@ pub async fn resolve_remote_move_target(
     let keys = actor_keys(state, &read_txn, &document).await?;
     let (public_key_id, public_key_pem) = legacy_projection(&keys)?;
     read_txn.commit().await?;
-    if document.r#type != ActorType::Person
+    if document.r#type != ActivityPubActorType::Person
         || document.id != target_id
         || document.preferred_username.is_empty()
         || !document.also_known_as.iter().any(|id| id == source_id)
@@ -752,6 +755,7 @@ pub async fn resolve_remote_move_target(
             username: document.preferred_username,
             domain,
             invalid_handle: false,
+            actor_type: document.r#type,
             display_name: document.name,
             summary: document.summary,
             emojis: JsonValue::Array(document.tag),
@@ -771,6 +775,7 @@ pub async fn resolve_remote_move_target(
             suspended_at: None,
             data_purged_at: None,
             discoverable: document.discoverable,
+            indexable: document.indexable,
         },
         document.icon,
         document.image,
@@ -1047,8 +1052,7 @@ fn validate_actor_document(
     requested_url: &Url,
     username: &str,
 ) -> Result<()> {
-    if document.r#type != ActorType::Person
-        || document.preferred_username.is_empty()
+    if document.preferred_username.is_empty()
         || !document.preferred_username.eq_ignore_ascii_case(username)
     {
         return Err(invalid(
@@ -1156,7 +1160,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use multibase::Base;
-    use roosty_db::ActorKeyAlgorithm;
+    use roosty_db::{ActivityPubActorType, ActorKeyAlgorithm};
 
     use super::{
         RemoteActorDocument, RemoteKeyType, RemoteMultikey, WebFingerResponse,
@@ -1219,9 +1223,10 @@ mod tests {
         let actor: RemoteActorDocument = serde_json::from_str(
             r#"{
                 "id": "https://social.example/users/alice",
-                "type": "Person",
+                "type": "Group",
                 "preferredUsername": "alice",
                 "discoverable": true,
+                "indexable": true,
                 "inbox": "https://social.example/users/alice/inbox",
                 "publicKey": {
                     "id": "https://social.example/users/alice#main-key",
@@ -1233,7 +1238,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(actor.preferred_username, "alice");
+        assert_eq!(actor.r#type, ActivityPubActorType::Group);
         assert_eq!(actor.discoverable, Some(true));
+        assert!(actor.indexable);
     }
 
     /// Reads both allowed ActivityStreams forms for remote profile images.

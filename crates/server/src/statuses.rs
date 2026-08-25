@@ -6401,8 +6401,8 @@ mod tests {
     use postgresql_embedded::PostgreSQL;
     use roosty_core::{AccountId, StatusId};
     use roosty_db::{
-        CollectionCursor, LocalNotificationType, NewRemoteMediaAttachment, NewRemoteStatus,
-        NotificationFilter, RemoteActor, RemoteStatus, RemoteStatusReblogTarget,
+        ActivityPubActorType, CollectionCursor, LocalNotificationType, NewRemoteMediaAttachment,
+        NewRemoteStatus, NotificationFilter, RemoteActor, RemoteStatus, RemoteStatusReblogTarget,
         RemoteStatusUpsertResult, StatusContextParent, StatusVisibility,
     };
     use roosty_migration::Migrator;
@@ -11304,6 +11304,7 @@ mod tests {
                 username: username.to_owned(),
                 domain: "remote.test".to_owned(),
                 invalid_handle: false,
+                actor_type: ActivityPubActorType::Person,
                 display_name: "Remote Alice".to_owned(),
                 summary: String::new(),
                 emojis: json!([]),
@@ -11323,6 +11324,7 @@ mod tests {
                 suspended_at: None,
                 data_purged_at: None,
                 discoverable: Some(true),
+                indexable: false,
             };
             roosty_db::upsert_remote_actor(&self.db, &actor)
                 .await
