@@ -1116,6 +1116,7 @@ struct Actor {
     name: String,
     summary: String,
     inbox: String,
+    endpoints: ActorEndpoints,
     outbox: String,
     followers: String,
     following: String,
@@ -1132,6 +1133,13 @@ struct Actor {
     image: Option<ActorImage>,
     public_key: PublicKey,
     assertion_method: Vec<Multikey>,
+}
+
+/// Instance-wide endpoints advertised by a local ActivityPub actor.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActorEndpoints {
+    shared_inbox: String,
 }
 
 /// FEP-521a verification method published in canonical base58-btc Multikey form.
@@ -1605,6 +1613,9 @@ fn actor_document(
         },
         summary: account.note,
         inbox: format!("{id}/inbox"),
+        endpoints: ActorEndpoints {
+            shared_inbox: public_url(state, "inbox"),
+        },
         outbox: format!("{id}/outbox"),
         followers: format!("{id}/followers"),
         following: format!("{id}/following"),
@@ -2552,6 +2563,8 @@ async fn process_inbox(
             let payload = match serde_json::to_value(StatusDelivery {
                 local_account_id: local.id,
                 remote_actor_id: remote_actor.id,
+                remote_actor_ids: Vec::new(),
+                inbox_url: None,
                 activity: response,
                 personal_inbox: true,
             }) {
@@ -5084,9 +5097,90 @@ impl FollowResponseType {
 struct StatusDelivery {
     local_account_id: AccountId,
     remote_actor_id: AccountId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remote_actor_ids: Vec<AccountId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inbox_url: Option<String>,
     activity: JsonValue,
     #[serde(default)]
     personal_inbox: bool,
+}
+
+struct DeliveryGroup {
+    inbox_url: String,
+    remote_actor_ids: Vec<AccountId>,
+}
+
+/// Group identical activities by their validated remote delivery endpoint.
+fn delivery_groups(recipients: Vec<RemoteActor>, personal_inbox: bool) -> Vec<DeliveryGroup> {
+    if personal_inbox {
+        let mut groups = recipients
+            .into_iter()
+            .map(|remote| DeliveryGroup {
+                inbox_url: remote.inbox_url,
+                remote_actor_ids: vec![remote.id],
+            })
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            left.inbox_url
+                .cmp(&right.inbox_url)
+                .then_with(|| left.remote_actor_ids[0].0.cmp(&right.remote_actor_ids[0].0))
+        });
+        return groups;
+    }
+    let mut groups = HashMap::<String, Vec<AccountId>>::new();
+    for remote in recipients {
+        let inbox_url = remote.shared_inbox_url.unwrap_or(remote.inbox_url);
+        groups.entry(inbox_url).or_default().push(remote.id);
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|(inbox_url, mut remote_actor_ids)| {
+            remote_actor_ids.sort_by_key(|id| id.0);
+            DeliveryGroup {
+                inbox_url,
+                remote_actor_ids,
+            }
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.inbox_url.cmp(&right.inbox_url));
+    groups
+}
+
+async fn enqueue_status_delivery_groups(
+    txn: &impl ConnectionTrait,
+    local_account_id: AccountId,
+    recipients: Vec<RemoteActor>,
+    activity: &JsonValue,
+    activity_id: &str,
+    personal_inbox: bool,
+) -> Result<(), RoostyError> {
+    for group in delivery_groups(recipients, personal_inbox) {
+        let Some(remote_actor_id) = group.remote_actor_ids.first().copied() else {
+            continue;
+        };
+        let deduplication_key = format!("{activity_id}:{}", group.inbox_url);
+        let payload = serde_json::to_value(StatusDelivery {
+            local_account_id,
+            remote_actor_id,
+            remote_actor_ids: group.remote_actor_ids,
+            inbox_url: Some(group.inbox_url),
+            activity: activity.clone(),
+            personal_inbox,
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            NewJob {
+                kind: JobKind::FederationStatusDelivery,
+                payload,
+                deduplication_key: Some(deduplication_key),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -5452,26 +5546,16 @@ pub(crate) async fn enqueue_pin_activity_in_transaction(
         "to": format!("{actor}/followers"),
     });
     prove_local_activity(state, txn, status.account_id, &mut activity).await?;
-    for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, status.account_id).await? {
-        let payload = serde_json::to_value(StatusDelivery {
-            local_account_id: status.account_id,
-            remote_actor_id,
-            activity: activity.clone(),
-            personal_inbox: false,
-        })
-        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job_in_transaction(
-            txn,
-            NewJob {
-                kind: JobKind::FederationStatusDelivery,
-                payload,
-                deduplication_key: Some(format!("{activity_id}:{}", remote_actor_id.0)),
-                run_after: OffsetDateTime::now_utc(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    let recipients = roosty_db::accepted_remote_followers(txn, status.account_id).await?;
+    enqueue_status_delivery_groups(
+        txn,
+        status.account_id,
+        recipients,
+        &activity,
+        &activity_id,
+        false,
+    )
+    .await
 }
 
 /// Atomically queue a featured hashtag Add or Remove for every accepted remote follower.
@@ -5505,26 +5589,9 @@ pub(crate) async fn enqueue_featured_tag_activity(
         "to": format!("{actor}/followers"),
     });
     prove_local_activity(state, txn, account.id, &mut activity).await?;
-    for remote_actor_id in roosty_db::accepted_remote_follower_ids(txn, account.id).await? {
-        let payload = serde_json::to_value(StatusDelivery {
-            local_account_id: account.id,
-            remote_actor_id,
-            activity: activity.clone(),
-            personal_inbox: false,
-        })
-        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job_in_transaction(
-            txn,
-            NewJob {
-                kind: JobKind::FederationStatusDelivery,
-                payload,
-                deduplication_key: Some(format!("{activity_id}:{}", remote_actor_id.0)),
-                run_after: OffsetDateTime::now_utc(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    let recipients = roosty_db::accepted_remote_followers(txn, account.id).await?;
+    enqueue_status_delivery_groups(txn, account.id, recipients, &activity, &activity_id, false)
+        .await
 }
 
 #[derive(Serialize)]
@@ -5577,6 +5644,8 @@ pub(crate) async fn enqueue_quote_request_in_transaction(
     let payload = serde_json::to_value(StatusDelivery {
         local_account_id: local.id,
         remote_actor_id: target.remote_actor_id,
+        remote_actor_ids: Vec::new(),
+        inbox_url: None,
         activity,
         personal_inbox: true,
     })
@@ -5635,6 +5704,8 @@ pub(crate) async fn enqueue_quote_revocation_in_transaction(
     let payload = serde_json::to_value(StatusDelivery {
         local_account_id: local.id,
         remote_actor_id: quoting.remote_actor_id,
+        remote_actor_ids: Vec::new(),
+        inbox_url: None,
         activity,
         personal_inbox: true,
     })
@@ -5657,7 +5728,45 @@ pub(crate) async fn enqueue_quote_revocation_in_transaction(
 struct ActorUpdateDelivery {
     local_account_id: AccountId,
     remote_actor_id: AccountId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remote_actor_ids: Vec<AccountId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inbox_url: Option<String>,
     activity: JsonValue,
+}
+
+async fn enqueue_actor_update_delivery_groups(
+    txn: &impl ConnectionTrait,
+    local_account_id: AccountId,
+    recipients: Vec<RemoteActor>,
+    activity: &JsonValue,
+    activity_id: &str,
+) -> Result<(), RoostyError> {
+    for group in delivery_groups(recipients, false) {
+        let Some(remote_actor_id) = group.remote_actor_ids.first().copied() else {
+            continue;
+        };
+        let deduplication_key = format!("{activity_id}:{}", group.inbox_url);
+        let payload = serde_json::to_value(ActorUpdateDelivery {
+            local_account_id,
+            remote_actor_id,
+            remote_actor_ids: group.remote_actor_ids,
+            inbox_url: Some(group.inbox_url),
+            activity: activity.clone(),
+        })
+        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
+        roosty_db::enqueue_job_in_transaction(
+            txn,
+            NewJob {
+                kind: JobKind::FederationActorUpdateDelivery,
+                payload,
+                deduplication_key: Some(deduplication_key),
+                run_after: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Durable payload for a local Follow or Undo(Follow) delivery.
@@ -6483,25 +6592,15 @@ pub(crate) async fn enqueue_status_activity(
         .ok_or_else(|| RoostyError::InvalidInput("status activity has no ID".to_owned()))?;
     let recipients =
         status_delivery_recipients(db, local.id, status, &remote_audience, &[]).await?;
-    for remote in recipients {
-        let payload = serde_json::to_value(StatusDelivery {
-            local_account_id: local.id,
-            remote_actor_id: remote.id,
-            activity: activity.clone(),
-            personal_inbox: status.visibility == StatusVisibility::Direct,
-        })
-        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job_in_transaction(
-            db,
-            NewJob {
-                kind: JobKind::FederationStatusDelivery,
-                payload,
-                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
-                run_after: OffsetDateTime::now_utc(),
-            },
-        )
-        .await?;
-    }
+    enqueue_status_delivery_groups(
+        db,
+        local.id,
+        recipients,
+        &activity,
+        &activity_id,
+        status.visibility == StatusVisibility::Direct,
+    )
+    .await?;
     txn.commit().await?;
     Ok(())
 }
@@ -6545,26 +6644,15 @@ pub(crate) async fn enqueue_status_activity_in_transaction(
         previous_remote_recipients,
     )
     .await?;
-    for remote in recipients {
-        let payload = serde_json::to_value(StatusDelivery {
-            local_account_id: local.id,
-            remote_actor_id: remote.id,
-            activity: activity.clone(),
-            personal_inbox: status.visibility == StatusVisibility::Direct,
-        })
-        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job_in_transaction(
-            txn,
-            NewJob {
-                kind: JobKind::FederationStatusDelivery,
-                payload,
-                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
-                run_after: OffsetDateTime::now_utc(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    enqueue_status_delivery_groups(
+        txn,
+        local.id,
+        recipients,
+        &activity,
+        &activity_id,
+        status.visibility == StatusVisibility::Direct,
+    )
+    .await
 }
 
 /// Remote actors that affect both Note addressing and activity delivery.
@@ -6650,26 +6738,8 @@ pub(crate) async fn enqueue_actor_update_in_transaction(
         .map(str::to_owned)
         .ok_or_else(|| RoostyError::InvalidInput("actor update has no ID".to_owned()))?;
 
-    for remote in roosty_db::accepted_remote_followers(txn, account.id).await? {
-        let payload = serde_json::to_value(ActorUpdateDelivery {
-            local_account_id: account.id,
-            remote_actor_id: remote.id,
-            activity: activity.clone(),
-        })
-        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job_in_transaction(
-            txn,
-            NewJob {
-                kind: JobKind::FederationActorUpdateDelivery,
-                payload,
-                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
-                run_after: OffsetDateTime::now_utc(),
-            },
-        )
-        .await?;
-    }
-
-    Ok(())
+    let recipients = roosty_db::accepted_remote_followers(txn, account.id).await?;
+    enqueue_actor_update_delivery_groups(txn, account.id, recipients, &activity, &activity_id).await
 }
 
 /// Queue a local actor `Delete` before suspension severs its remote followers.
@@ -6692,25 +6762,8 @@ pub(crate) async fn enqueue_actor_delete_in_transaction(
         "object": actor,
     });
     prove_local_activity(state, txn, account.id, &mut activity).await?;
-    for remote in roosty_db::accepted_remote_followers(txn, account.id).await? {
-        let payload = serde_json::to_value(ActorUpdateDelivery {
-            local_account_id: account.id,
-            remote_actor_id: remote.id,
-            activity: activity.clone(),
-        })
-        .map_err(|error| RoostyError::InvalidInput(error.to_string()))?;
-        roosty_db::enqueue_job_in_transaction(
-            txn,
-            NewJob {
-                kind: JobKind::FederationActorUpdateDelivery,
-                payload,
-                deduplication_key: Some(format!("{activity_id}:{}", remote.id.0)),
-                run_after: OffsetDateTime::now_utc(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    let recipients = roosty_db::accepted_remote_followers(txn, account.id).await?;
+    enqueue_actor_update_delivery_groups(txn, account.id, recipients, &activity, &activity_id).await
 }
 
 /// Resolve syntactically valid remote handles for a local status without making posting fail.
@@ -6922,6 +6975,18 @@ pub(crate) async fn deliver_status_activity(
 ) -> Result<(), RoostyError> {
     let payload: StatusDelivery = serde_json::from_value(payload)
         .map_err(|_| RoostyError::InvalidInput("invalid status delivery payload".to_owned()))?;
+    if let Some(inbox_url) = payload.inbox_url.as_deref() {
+        return deliver_grouped_activity(
+            state,
+            database,
+            payload.local_account_id,
+            &payload.remote_actor_ids,
+            inbox_url,
+            &payload.activity,
+            payload.personal_inbox,
+        )
+        .await;
+    }
     deliver_activity(
         state,
         database,
@@ -6960,6 +7025,18 @@ pub(crate) async fn deliver_actor_update(
     let payload: ActorUpdateDelivery = serde_json::from_value(payload).map_err(|_| {
         RoostyError::InvalidInput("invalid actor update delivery payload".to_owned())
     })?;
+    if let Some(inbox_url) = payload.inbox_url.as_deref() {
+        return deliver_grouped_activity(
+            state,
+            database,
+            payload.local_account_id,
+            &payload.remote_actor_ids,
+            inbox_url,
+            &payload.activity,
+            false,
+        )
+        .await;
+    }
     deliver_activity(
         state,
         database,
@@ -6969,6 +7046,74 @@ pub(crate) async fn deliver_actor_update(
         false,
     )
     .await
+}
+
+/// Deliver one identical activity once when at least one grouped recipient remains eligible.
+async fn deliver_grouped_activity(
+    state: &AppState,
+    database: &DatabaseContext,
+    local_account_id: AccountId,
+    remote_actor_ids: &[AccountId],
+    inbox_url: &str,
+    activity: &JsonValue,
+    personal_inbox: bool,
+) -> Result<(), RoostyError> {
+    let txn = database.begin_snapshot().await?;
+    let local = roosty_db::find_local_account_by_id(&txn, local_account_id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local delivery actor does not exist".to_owned())
+        })?;
+    let remote_actors = roosty_db::remote_actors_by_id(&txn, remote_actor_ids.to_vec()).await?;
+    let moderation_activity = inbound_activity_type(activity) == Some(InboundActivityType::Block)
+        || activity.get("object").and_then(inbound_activity_type)
+            == Some(InboundActivityType::Block);
+    let blocked = if moderation_activity {
+        HashSet::new()
+    } else {
+        roosty_db::blocked_remote_actor_ids_for_local_account(
+            &txn,
+            local_account_id,
+            remote_actor_ids,
+        )
+        .await?
+    };
+    let mut eligible = false;
+    for remote in remote_actors {
+        let effective_inbox = if personal_inbox {
+            remote.inbox_url.as_str()
+        } else {
+            remote
+                .shared_inbox_url
+                .as_deref()
+                .unwrap_or(&remote.inbox_url)
+        };
+        if effective_inbox != inbox_url
+            || !state.config.federation_domain_is_allowed(&remote.domain)
+            || remote.suspended_at.is_some()
+            || blocked.contains(&remote.id)
+            || roosty_db::federation_domain_policy(&txn, &remote.domain)
+                .await?
+                .is_suspended()
+        {
+            continue;
+        }
+        eligible = true;
+        break;
+    }
+    if !eligible {
+        txn.commit().await?;
+        return Ok(());
+    }
+    let key = roosty_db::find_local_actor_key(&txn, local.id)
+        .await?
+        .ok_or_else(|| {
+            RoostyError::InvalidInput("local delivery actor has no signing key".to_owned())
+        })?;
+    let private_key = decrypt_private_key(state, &key)?;
+    let result = signed_post(state, &txn, inbox_url, &private_key, &key.key_id, activity).await;
+    txn.commit().await?;
+    result
 }
 
 /// Sign and deliver one already-persisted activity to a remote actor's inbox.
@@ -7956,14 +8101,15 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Actor, ActorImage, ActorImageType, ActorType, CollectionType, Create, CreateType,
-        InboundAttachment, InboundFollowActivity, InboundInteractionPolicy, InboundNote,
-        InboundReplies, InboundTag, InboundUndoAnnounceActivity, InboundUndoBlockActivity,
-        InboundUndoFollowActivity, MAX_DISCOVERED_REPLIES, MentionTag, MentionType, Note,
-        NoteAttachment, NoteContext, NoteExtensionsContext, NoteType, OutboxActivity,
-        OutboxCollection, OutboxCollectionPage, PublicKey, actor_context, actor_profile_fields,
-        canonical_activity_digest, is_remote_actor_lifecycle_activity, local_actor_type,
-        parse_acct, remote_hashtag_names, remote_poll_from_note, same_url_origin,
+        Actor, ActorEndpoints, ActorImage, ActorImageType, ActorType, CollectionType, Create,
+        CreateType, InboundAttachment, InboundFollowActivity, InboundInteractionPolicy,
+        InboundNote, InboundReplies, InboundTag, InboundUndoAnnounceActivity,
+        InboundUndoBlockActivity, InboundUndoFollowActivity, MAX_DISCOVERED_REPLIES, MentionTag,
+        MentionType, Note, NoteAttachment, NoteContext, NoteExtensionsContext, NoteType,
+        OutboxActivity, OutboxCollection, OutboxCollectionPage, PublicKey, actor_context,
+        actor_profile_fields, canonical_activity_digest, delivery_groups,
+        is_remote_actor_lifecycle_activity, local_actor_type, parse_acct, remote_hashtag_names,
+        remote_poll_from_note, same_url_origin,
     };
     use crate::{
         config::{
@@ -9611,6 +9757,9 @@ mod tests {
             name: "Alice".to_owned(),
             summary: String::new(),
             inbox: "https://example.test/users/alice/inbox".to_owned(),
+            endpoints: ActorEndpoints {
+                shared_inbox: "https://example.test/inbox".to_owned(),
+            },
             outbox: "https://example.test/users/alice/outbox".to_owned(),
             followers: "https://example.test/users/alice/followers".to_owned(),
             following: "https://example.test/users/alice/following".to_owned(),
@@ -9741,6 +9890,10 @@ mod tests {
         );
         assert_eq!(actor["url"], "https://example.test/@alice");
         assert_eq!(
+            actor["endpoints"]["sharedInbox"],
+            "https://example.test/inbox"
+        );
+        assert_eq!(
             actor["featured"],
             "https://example.test/users/alice/collections/featured"
         );
@@ -9789,6 +9942,61 @@ mod tests {
                 .get("attributed_to")
                 .is_none()
         );
+    }
+
+    /// Given actors that share a delivery endpoint, when recipients are grouped, then one shared
+    /// delivery remains while personal-inbox delivery stays actor-specific.
+    #[test]
+    fn groups_broad_delivery_by_shared_inbox_only() {
+        let first = delivery_test_actor(
+            "alice",
+            "https://remote.test/users/alice/inbox",
+            Some("https://remote.test/inbox"),
+        );
+        let second = delivery_test_actor(
+            "bob",
+            "https://remote.test/personal-inbox",
+            Some("https://remote.test/inbox"),
+        );
+        let fourth = delivery_test_actor(
+            "dave",
+            "https://remote.test/personal-inbox",
+            Some("https://remote.test/inbox"),
+        );
+        let third = delivery_test_actor("carol", "https://other.test/users/carol/inbox", None);
+
+        let shared = delivery_groups(
+            vec![first.clone(), second.clone(), third.clone(), fourth.clone()],
+            false,
+        );
+        let personal = delivery_groups(vec![first, second, third, fourth], true);
+
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared[0].inbox_url, "https://other.test/users/carol/inbox");
+        assert_eq!(shared[0].remote_actor_ids.len(), 1);
+        assert_eq!(shared[1].inbox_url, "https://remote.test/inbox");
+        assert_eq!(shared[1].remote_actor_ids.len(), 3);
+        assert_eq!(personal.len(), 4);
+    }
+
+    /// Given a delivery queued before shared-inbox grouping, when decoded, then its original
+    /// actor-targeted delivery fields remain usable.
+    #[test]
+    fn accepts_legacy_status_delivery_payload() {
+        let local_account_id = AccountId(Uuid::now_v7());
+        let remote_actor_id = AccountId(Uuid::now_v7());
+        let payload = serde_json::json!({
+            "local_account_id": local_account_id,
+            "remote_actor_id": remote_actor_id,
+            "activity": {"type": "Create"},
+            "personal_inbox": false,
+        });
+
+        let delivery: super::StatusDelivery = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(delivery.remote_actor_id, remote_actor_id);
+        assert!(delivery.remote_actor_ids.is_empty());
+        assert!(delivery.inbox_url.is_none());
     }
 
     struct FederationTestContext {
@@ -10217,6 +10425,40 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn delivery_test_actor(
+        username: &str,
+        inbox_url: &str,
+        shared_inbox_url: Option<&str>,
+    ) -> roosty_db::RemoteActor {
+        let now = time::OffsetDateTime::now_utc();
+        roosty_db::RemoteActor {
+            id: AccountId(Uuid::now_v7()),
+            activitypub_id: format!("https://remote.test/users/{username}"),
+            username: username.to_owned(),
+            domain: "remote.test".to_owned(),
+            invalid_handle: false,
+            display_name: username.to_owned(),
+            summary: String::new(),
+            emojis: json!([]),
+            inbox_url: inbox_url.to_owned(),
+            shared_inbox_url: shared_inbox_url.map(str::to_owned),
+            followers_url: None,
+            featured_url: None,
+            featured_tags_url: None,
+            public_key_id: format!("https://remote.test/users/{username}#main-key"),
+            public_key_pem: String::new(),
+            expires_at: now + time::Duration::hours(1),
+            profile_created_at: None,
+            first_seen_at: now,
+            deleted_at: None,
+            moved_to_remote_actor_id: None,
+            limited_at: None,
+            suspended_at: None,
+            data_purged_at: None,
+            discoverable: Some(true),
+        }
     }
 
     async fn cache_test_actor(

@@ -37,7 +37,7 @@ Legend: 🟢 compatible, 🟡 compatible with gaps, 🔴 missing, ⚪ outside th
 
 |🟢
 |Actor document
-|
+|Local actors advertise the instance-wide shared inbox.
 
 |🟡
 |Outbox
@@ -101,7 +101,9 @@ signature formats. Newly queued local activities are proved once with the active
 durable fan-out, so recipients and retries receive identical JSON. Existing unsigned queued jobs
 remain deliverable. Proofs are also emitted for private and direct activities: recipients can
 transfer those proofs to third parties as evidence of authenticity, so audience addressing remains
-an access-control signal rather than cryptographic confidentiality.
+an access-control signal rather than cryptographic confidentiality. Identical broadly addressed
+activities are queued once per advertised shared inbox; direct and actor-specific activities keep
+using personal inboxes.
 
 |🟢
 |Remote fetch/cache

@@ -38,6 +38,8 @@
 - Opt-in local ActivityPub identity: WebFinger, actor documents with avatar/header URLs, encrypted actor keys, public Notes, outboxes, and follower/following collection metadata.
 - Mastodon-compatible local actor outboxes expose cursor-paginated status `Create` and boost
   `Announce` activities, with HTTP-signature-aware follower and mention visibility.
+- Local actors advertise the instance shared inbox, and identical broadly addressed activities
+  enqueue one durable delivery per remote shared inbox instead of one per remote follower.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
 - Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
 - Mastodon-compatible status search uses PostgreSQL trigram documents and exposes only a
@@ -100,7 +102,8 @@
   relationship updates with transactional Follow/Undo delivery and list transfer.
 - [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
 - [x] Fetch and expose bounded remote featured profile tags with durable refresh and signed Add/Remove synchronization.
-- [ ] Complete deferred Mastodon actor extensions: shared inboxes, group actors, and indexability.
+- [x] Advertise shared inboxes and deduplicate identical outbound activities by destination.
+- [ ] Complete deferred Mastodon actor extensions: group actors and indexability.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.
 - [x] Support multi-process streaming fan-out; federation workers already coordinate through durable database job claims.
 - [x] Coordinate cold remote avatar, header, attachment, and preview requests through durable job

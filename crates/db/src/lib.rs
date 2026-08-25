@@ -3321,7 +3321,7 @@ pub async fn process_remote_actor_delete(
         .await?;
     txn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "UPDATE job SET completed_at = $2, locked_at = NULL, locked_by = NULL, claim_id = NULL, last_error = 'remote actor deleted' WHERE completed_at IS NULL AND payload->>'remote_actor_id' = $1",
+        "UPDATE job SET completed_at = $2, locked_at = NULL, locked_by = NULL, claim_id = NULL, last_error = 'remote actor deleted' WHERE completed_at IS NULL AND payload->>'remote_actor_id' = $1 AND NOT (payload ? 'remote_actor_ids')",
         vec![remote_actor_id.0.to_string().into(), now.into()],
     ))
     .await?;
@@ -9168,6 +9168,40 @@ where
     )
 }
 
+/// Return the requested remote actors blocked in either direction for one local account.
+pub async fn blocked_remote_actor_ids_for_local_account<C>(
+    db: &C,
+    local_account_id: AccountId,
+    remote_actor_ids: &[AccountId],
+) -> Result<HashSet<AccountId>>
+where
+    C: ConnectionTrait,
+{
+    if remote_actor_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let actor_ids = remote_actor_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    let local_blocks = local_remote_account_block::Entity::find()
+        .filter(local_remote_account_block::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(local_remote_account_block::Column::RemoteActorId.is_in(actor_ids.clone()))
+        .all(db)
+        .await?;
+    let remote_blocks = remote_local_account_block::Entity::find()
+        .filter(remote_local_account_block::Column::LocalAccountId.eq(local_account_id.0))
+        .filter(remote_local_account_block::Column::RemoteActorId.is_in(actor_ids))
+        .all(db)
+        .await?;
+    Ok(local_blocks
+        .into_iter()
+        .map(|block| AccountId(block.remote_actor_id))
+        .chain(
+            remote_blocks
+                .into_iter()
+                .map(|block| AccountId(block.remote_actor_id)),
+        )
+        .collect())
+}
+
 /// Return whether a remote actor directly blocks a local account.
 pub async fn remote_actor_blocks_local_account<C>(
     db: &C,
@@ -9280,7 +9314,7 @@ where
         vec![actor_ids.clone().into(), now.into()])).await?;
     let actor_id_strings = actor_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
     db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-        "UPDATE job SET completed_at = $2, locked_at = NULL, locked_by = NULL, claim_id = NULL, last_error = 'remote domain suspended' WHERE completed_at IS NULL AND payload->>'remote_actor_id' = ANY($1)",
+        "UPDATE job SET completed_at = $2, locked_at = NULL, locked_by = NULL, claim_id = NULL, last_error = 'remote domain suspended' WHERE completed_at IS NULL AND (payload->>'remote_actor_id' = ANY($1) OR payload->'remote_actor_ids' ?| $1)",
         vec![actor_id_strings.into(), now.into()])).await?;
     Ok(actor_ids.len() as u64)
 }
