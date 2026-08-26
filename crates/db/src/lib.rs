@@ -11605,19 +11605,18 @@ pub async fn followed_local_tags(
     db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Vec<LocalTag>> {
-    let follows = local_tag_follow::Entity::find()
-        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
-        .all(db)
-        .await?;
-    let mut tags = Vec::with_capacity(follows.len());
-    for follow in follows {
-        if let Some(tag) = local_tag::Entity::find_by_id(follow.tag_id).one(db).await? {
-            tags.push(local_tag_from_model(tag));
-        }
-    }
-    tags.sort_by(|left, right| left.name.cmp(&right.name));
-
-    Ok(tags)
+    LocalTag::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT t.id, t.name, t.created_at, t.updated_at
+           FROM local_tag t
+           JOIN local_tag_follow f ON f.tag_id = t.id
+           WHERE f.account_id = $1
+           ORDER BY t.name ASC"#,
+        vec![account_id.0.into()],
+    ))
+    .all(db)
+    .await
+    .map_err(Into::into)
 }
 
 /// Return whether a local account follows the tag.
@@ -11632,6 +11631,66 @@ pub async fn is_local_tag_followed(
         .one(db)
         .await?
         .is_some())
+}
+
+/// Authentication-dependent relationship metadata for a Mastodon hashtag.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TagRelationship {
+    pub following: bool,
+    pub featuring: bool,
+}
+
+/// Return relationship metadata for a batch of tags in one database query.
+pub async fn local_tag_relationships(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    tag_ids: &[Uuid],
+) -> Result<HashMap<Uuid, TagRelationship>> {
+    if tag_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    #[derive(FromQueryResult)]
+    struct Row {
+        tag_id: Uuid,
+        following: bool,
+        featuring: bool,
+    }
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT t.id AS tag_id,
+                  EXISTS (SELECT 1 FROM local_tag_follow f
+                          WHERE f.account_id = $1 AND f.tag_id = t.id) AS following,
+                  EXISTS (SELECT 1 FROM local_featured_tag ft
+                          WHERE ft.account_id = $1 AND ft.tag_id = t.id) AS featuring
+           FROM local_tag t WHERE t.id = ANY($2)"#,
+        vec![account_id.0.into(), tag_ids.to_vec().into()],
+    ))
+    .all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.tag_id,
+                TagRelationship {
+                    following: row.following,
+                    featuring: row.featuring,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Return relationship metadata for one tag.
+pub async fn local_tag_relationship(
+    db: &impl ConnectionTrait,
+    account_id: AccountId,
+    tag_id: Uuid,
+) -> Result<TagRelationship> {
+    Ok(local_tag_relationships(db, account_id, &[tag_id])
+        .await?
+        .remove(&tag_id)
+        .unwrap_or_default())
 }
 
 /// Return public local and cached-remote usage during the latest seven UTC days.
@@ -13576,6 +13635,32 @@ pub async fn unfeature_local_tag(
     if featured.is_some() {
         local_featured_tag::Entity::delete_many()
             .filter(local_featured_tag::Column::Id.eq(featured_tag_id))
+            .filter(local_featured_tag::Column::AccountId.eq(account_id.0))
+            .exec(txn)
+            .await?;
+    }
+    Ok(featured)
+}
+
+/// Remove a featured tag by normalized name under the account aggregate lock.
+pub async fn unfeature_local_tag_by_name(
+    txn: &DatabaseTransaction,
+    account_id: AccountId,
+    name: &str,
+) -> Result<Option<FeaturedTag>> {
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("local-featured-tags:{}", account_id.0).into()],
+    ))
+    .await?;
+    let featured = local_featured_tags(txn, account_id)
+        .await?
+        .into_iter()
+        .find(|featured| featured.name == name);
+    if let Some(featured) = &featured {
+        local_featured_tag::Entity::delete_many()
+            .filter(local_featured_tag::Column::Id.eq(featured.id))
             .filter(local_featured_tag::Column::AccountId.eq(account_id.0))
             .exec(txn)
             .await?;

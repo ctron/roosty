@@ -50,10 +50,24 @@ async fn followed_tags(
 ) -> ApiResult<Json<Vec<TagResponse>>> {
     let txn = database.begin_snapshot().await?;
     let tags = roosty_db::followed_local_tags(&txn, account.id).await?;
+    let relationships = roosty_db::local_tag_relationships(
+        &txn,
+        account.id,
+        &tags.iter().map(|tag| tag.id).collect::<Vec<_>>(),
+    )
+    .await?;
     let context = StatusRenderContext::new(&state, &txn);
     let mut response = Vec::with_capacity(tags.len());
     for tag in tags {
-        response.push(tag_response_model(&context, &txn, tag, Some(true)).await?);
+        response.push(
+            tag_response_model(
+                &context,
+                &txn,
+                tag.clone(),
+                relationships.get(&tag.id).copied(),
+            )
+            .await?,
+        );
     }
     txn.commit().await?;
     Ok(Json(response))

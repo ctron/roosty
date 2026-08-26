@@ -103,7 +103,13 @@ async fn search(
         Vec::new()
     };
     let hashtags = if matches!(params.search_type, None | Some(SearchType::Hashtags)) {
-        search_hashtags(&state, &database, &params).await?
+        search_hashtags(
+            &state,
+            &database,
+            account.as_ref().map(|account| account.id),
+            &params,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -224,6 +230,7 @@ async fn search_accounts(
 async fn search_hashtags(
     state: &AppState,
     database: &DatabaseContext,
+    account_id: Option<AccountId>,
     params: &SearchParams,
 ) -> Result<Vec<TagResponse>> {
     let Some(query) = normalized_tag_query(params.q.as_deref()) else {
@@ -236,10 +243,24 @@ async fn search_hashtags(
     let offset = params.offset.unwrap_or(0);
     let txn = database.begin_snapshot().await?;
     let tags = roosty_db::search_local_tags(&txn, &query, limit, offset).await?;
+    let relationships = match account_id {
+        Some(account_id) => Some(
+            roosty_db::local_tag_relationships(
+                &txn,
+                account_id,
+                &tags.iter().map(|tag| tag.id).collect::<Vec<_>>(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let mut responses = Vec::with_capacity(tags.len());
     for tag in tags {
         let history = roosty_db::tag_history(&txn, tag.id).await?;
-        responses.push(TagResponse::new(state, tag, history, None));
+        let relationship = relationships
+            .as_ref()
+            .and_then(|relationships| relationships.get(&tag.id).copied());
+        responses.push(TagResponse::new(state, tag, history, relationship));
     }
 
     txn.commit().await?;
@@ -572,6 +593,8 @@ mod tests {
                 "id": body["hashtags"][0]["id"],
                 "name": "roosttag",
                 "url": "https://roosty.localhost:4000/tags/roosttag",
+                "following": false,
+                "featuring": false,
                 "history": [
                     {"day": history[0]["day"], "uses": "1", "accounts": "1"},
                     {"day": history[1]["day"], "uses": "0", "accounts": "0"},

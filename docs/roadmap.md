@@ -105,6 +105,7 @@
   relationship updates with transactional Follow/Undo delivery and list transfer.
 - [x] Index hashtags from cached remote Notes and expose mixed tag search, history, timelines, follows, home fan-out, and user streaming without remote outbox backfill.
 - [x] Fetch and expose bounded remote featured profile tags with durable refresh and signed Add/Remove synchronization.
+- [x] Expose authenticated hashtag relationship metadata and Mastodon 4.4 name-based feature/unfeature controls while retaining legacy featured-tag APIs.
 - [x] Advertise shared inboxes and deduplicate identical outbound activities by destination.
 - [x] Complete deferred Mastodon actor extensions: group actors and indexability.
 - [x] Enforce durable absolute-HTTPS activity IDs from the verified actor origin and reject payload/signer reuse through a canonical-JSON replay ledger.

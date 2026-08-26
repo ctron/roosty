@@ -181,6 +181,7 @@ struct TrendParams {
 async fn trending_tags(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
+    OptionalAuthenticatedAccount(account): OptionalAuthenticatedAccount,
     query: Result<Query<TrendParams>, QueryRejection>,
 ) -> ApiResult<Json<Vec<TagResponse>>> {
     let Query(params) =
@@ -196,11 +197,26 @@ async fn trending_tags(
 
     let txn = database.begin_snapshot().await?;
     let trends = roosty_db::trending_tags(&txn, limit, offset).await?;
+    let relationships = match account {
+        Some(account) => Some(
+            roosty_db::local_tag_relationships(
+                &txn,
+                account.id,
+                &trends.iter().map(|trend| trend.tag.id).collect::<Vec<_>>(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let response = trends
+        .into_iter()
+        .map(|trend| {
+            let relationship = relationships
+                .as_ref()
+                .and_then(|relationships| relationships.get(&trend.tag.id).copied());
+            TagResponse::new(&state, trend.tag, trend.history, relationship)
+        })
+        .collect();
     txn.commit().await?;
-    Ok(Json(
-        trends
-            .into_iter()
-            .map(|trend| TagResponse::new(&state, trend.tag, trend.history, None))
-            .collect(),
-    ))
+    Ok(Json(response))
 }

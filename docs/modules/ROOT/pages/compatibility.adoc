@@ -385,7 +385,7 @@ single-vote semantics, hidden totals, and `write:statuses` scope.
 
 |🟢
 |Hashtags
-|
+|Includes authenticated `following` and `featuring` metadata, tag follow controls, and Mastodon 4.4 name-based feature/unfeature controls. Legacy featured-tag management remains available.
 
 |🟡
 |Status links

@@ -480,6 +480,8 @@ pub(crate) struct TagResponse {
     history: Vec<TagHistoryResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     following: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    featuring: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -495,7 +497,7 @@ impl TagResponse {
         state: &AppState,
         tag: LocalTag,
         history: Vec<LocalTagHistory>,
-        following: Option<bool>,
+        relationship: Option<roosty_db::TagRelationship>,
     ) -> Self {
         Self {
             id: tag.id.to_string(),
@@ -509,7 +511,8 @@ impl TagResponse {
                     accounts: bucket.accounts.to_string(),
                 })
                 .collect(),
-            following,
+            following: relationship.map(|relationship| relationship.following),
+            featuring: relationship.map(|relationship| relationship.featuring),
         }
     }
 }
@@ -1874,6 +1877,7 @@ async fn local_status_history_response(
                 name,
                 history: Vec::new(),
                 following: None,
+                featuring: None,
             })
             .collect::<Vec<_>>();
         responses.push(StatusEditResponse {
@@ -3104,7 +3108,14 @@ async fn follow_tag(
     match roosty_db::follow_local_tag(&txn, account.id, &path.hashtag).await {
         Ok(tag) => {
             let context = StatusRenderContext::new(&state, &txn);
-            let response = match tag_response_model(&context, &txn, tag, Some(true)).await {
+            let relationship = roosty_db::local_tag_relationship(&txn, account.id, tag.id).await;
+            let response = match relationship {
+                Ok(relationship) => {
+                    tag_response_model(&context, &txn, tag, Some(relationship)).await
+                }
+                Err(error) => Err(error),
+            };
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => return server_error(error),
             };
@@ -3130,7 +3141,14 @@ async fn unfollow_tag(
     match roosty_db::unfollow_local_tag(&txn, account.id, &path.hashtag).await {
         Ok(Some(tag)) => {
             let context = StatusRenderContext::new(&state, &txn);
-            let response = match tag_response_model(&context, &txn, tag, Some(false)).await {
+            let relationship = roosty_db::local_tag_relationship(&txn, account.id, tag.id).await;
+            let response = match relationship {
+                Ok(relationship) => {
+                    tag_response_model(&context, &txn, tag, Some(relationship)).await
+                }
+                Err(error) => Err(error),
+            };
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => return server_error(error),
             };
@@ -3154,12 +3172,14 @@ async fn tag_response_by_name(
     let Some(tag) = roosty_db::find_local_tag_by_name(db, name).await? else {
         return Ok(None);
     };
-    let following = match viewer {
-        Some(account_id) => Some(roosty_db::is_local_tag_followed(db, account_id, tag.id).await?),
+    let relationship = match viewer {
+        Some(account_id) => Some(roosty_db::local_tag_relationship(db, account_id, tag.id).await?),
         None => None,
     };
 
-    Ok(Some(tag_response_model(state, db, tag, following).await?))
+    Ok(Some(
+        tag_response_model(state, db, tag, relationship).await?,
+    ))
 }
 
 /// Convert stored local tag metadata into a Mastodon tag response.
@@ -3167,10 +3187,10 @@ pub(crate) async fn tag_response_model(
     state: &StatusRenderContext<'_, impl ConnectionTrait>,
     db: &impl ConnectionTrait,
     tag: LocalTag,
-    following: Option<bool>,
+    relationship: Option<roosty_db::TagRelationship>,
 ) -> Result<TagResponse, RoostyError> {
     let history = roosty_db::tag_history(db, tag.id).await?;
-    Ok(TagResponse::new(state, tag, history, following))
+    Ok(TagResponse::new(state, tag, history, relationship))
 }
 
 fn tag_timeline_params(query: Option<&str>) -> Result<TagTimelineParams, ()> {
@@ -4643,6 +4663,7 @@ async fn remote_status_tags(
             url: public_url(state, &format!("tags/{}", tag.name)),
             history: Vec::new(),
             following: None,
+            featuring: None,
         })
         .collect())
 }
@@ -5237,6 +5258,7 @@ pub(crate) fn local_status_content_tag_links(
             name,
             history: Vec::new(),
             following: None,
+            featuring: None,
         })
         .collect()
 }
@@ -6403,7 +6425,7 @@ mod tests {
     use roosty_db::{
         ActivityPubActorType, CollectionCursor, LocalNotificationType, NewRemoteMediaAttachment,
         NewRemoteStatus, NotificationFilter, RemoteActor, RemoteStatus, RemoteStatusReblogTarget,
-        RemoteStatusUpsertResult, StatusContextParent, StatusVisibility,
+        RemoteStatusUpsertResult, StatusContextParent, StatusVisibility, TagRelationship,
     };
     use roosty_migration::Migrator;
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
@@ -6417,10 +6439,38 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        StatusContextLimits, StatusPermission, escape_html, has_status_scope, hashtag_names,
-        interaction_accounts_limit, mention_usernames, push_url_html, remote_mention_matches,
-        sanitize_remote_status_html, status_content_html, timeline_limit, url_matches,
+        StatusContextLimits, StatusPermission, TagResponse, escape_html, has_status_scope,
+        hashtag_names, interaction_accounts_limit, mention_usernames, push_url_html,
+        remote_mention_matches, sanitize_remote_status_html, status_content_html, timeline_limit,
+        url_matches,
     };
+
+    /// Tag relationship fields are absent anonymously and independently boolean when signed in.
+    #[test]
+    fn tag_relationship_serialization_matches_mastodon() {
+        let response = |relationship: Option<TagRelationship>| TagResponse {
+            id: Uuid::nil().to_string(),
+            name: "rust".to_owned(),
+            url: "https://example.test/tags/rust".to_owned(),
+            history: Vec::new(),
+            following: relationship.map(|value| value.following),
+            featuring: relationship.map(|value| value.featuring),
+        };
+        let anonymous = serde_json::to_value(response(None)).unwrap();
+        assert!(anonymous.get("following").is_none());
+        assert!(anonymous.get("featuring").is_none());
+        for following in [false, true] {
+            for featuring in [false, true] {
+                let value = serde_json::to_value(response(Some(TagRelationship {
+                    following,
+                    featuring,
+                })))
+                .unwrap();
+                assert_eq!(value["following"], following);
+                assert_eq!(value["featuring"], featuring);
+            }
+        }
+    }
     use crate::{
         config::{
             Config, ObjectStorageBackend, RegistrationMode, ScheduledStatusConfig, StreamingConfig,

@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Request, State},
     http::header,
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use roosty_core::AccountId;
 use roosty_db::{FeatureTagResult, FeaturedTag};
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    auth::AuthenticatedAccount,
+    auth::{AuthenticatedAccessToken, OAuthScope, OAuthScopeResource},
     federation::enqueue_featured_tag_activity,
     http::{ApiError, ApiResult, AppState, DatabaseContext},
     statuses::TagResponse,
@@ -29,6 +29,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/featured_tags", get(index).post(create))
         .route("/api/v1/featured_tags/{featured_tag_id}", delete(destroy))
         .route("/api/v1/featured_tags/suggestions", get(suggestions))
+        .route("/api/v1/tags/{name}/feature", post(feature_tag))
+        .route("/api/v1/tags/{name}/unfeature", post(unfeature_tag))
         .route(
             "/api/v1/accounts/{account_id}/featured_tags",
             get(account_featured_tags),
@@ -52,8 +54,10 @@ struct FeaturedTagResponse {
 async fn index(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
-    AuthenticatedAccount(account): AuthenticatedAccount,
+    token: AuthenticatedAccessToken,
 ) -> ApiResult<Json<Vec<FeaturedTagResponse>>> {
+    require_account_scope(&token, false)?;
+    let account = token.grant.account;
     let txn = database.begin_read().await?;
     let tags = roosty_db::local_featured_tags(&txn, account.id).await?;
     txn.commit().await?;
@@ -63,9 +67,11 @@ async fn index(
 async fn create(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
-    AuthenticatedAccount(account): AuthenticatedAccount,
+    token: AuthenticatedAccessToken,
     request: Request,
 ) -> ApiResult<Json<FeaturedTagResponse>> {
+    require_account_scope(&token, true)?;
+    let account = token.grant.account;
     let input = parse_input(request)
         .await
         .map_err(|error| ApiError::Unprocessable(error.into()))?;
@@ -94,9 +100,11 @@ async fn create(
 async fn destroy(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
-    AuthenticatedAccount(account): AuthenticatedAccount,
+    token: AuthenticatedAccessToken,
     Path(featured_tag_id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    require_account_scope(&token, true)?;
+    let account = token.grant.account;
     let txn = database.begin_write().await?;
     let removed = roosty_db::unfeature_local_tag(&txn, account.id, featured_tag_id)
         .await?
@@ -109,16 +117,114 @@ async fn destroy(
 async fn suggestions(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
-    AuthenticatedAccount(account): AuthenticatedAccount,
+    token: AuthenticatedAccessToken,
 ) -> ApiResult<Json<Vec<TagResponse>>> {
+    require_account_scope(&token, false)?;
+    let account = token.grant.account;
     let txn = database.begin_read().await?;
     let tags = roosty_db::suggested_featured_tags(&txn, account.id, MAX_SUGGESTIONS).await?;
-    txn.commit().await?;
+    let relationships = roosty_db::local_tag_relationships(
+        &txn,
+        account.id,
+        &tags.iter().map(|tag| tag.id).collect::<Vec<_>>(),
+    )
+    .await?;
     let responses = tags
         .into_iter()
-        .map(|tag| TagResponse::new(&state, tag, Vec::new(), None))
+        .map(|tag| {
+            let relationship = relationships.get(&tag.id).copied();
+            TagResponse::new(&state, tag, Vec::new(), relationship)
+        })
         .collect::<Vec<_>>();
+    txn.commit().await?;
     Ok(Json(responses))
+}
+
+async fn feature_tag(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    token: AuthenticatedAccessToken,
+    Path(name): Path<String>,
+) -> ApiResult<Json<TagResponse>> {
+    require_account_scope(&token, true)?;
+    let account = token.grant.account;
+    let name = valid_name(&name)?;
+    let txn = database.begin_write().await?;
+    let result = roosty_db::feature_local_tag(&txn, account.id, &name, MAX_FEATURED_TAGS).await?;
+    let (featured, created) = match result {
+        FeatureTagResult::Featured { tag, created } => (tag, created),
+        FeatureTagResult::LimitReached => return Err(limit_error()),
+    };
+    if created {
+        enqueue_featured_tag_activity(&state, &txn, &account, &featured, true).await?;
+    }
+    let tag = roosty_db::find_local_tag_by_name(&txn, &name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    let history = roosty_db::tag_history(&txn, tag.id).await?;
+    let relationship = roosty_db::local_tag_relationship(&txn, account.id, tag.id).await?;
+    let response = TagResponse::new(&state, tag, history, Some(relationship));
+    txn.commit().await?;
+    Ok(Json(response))
+}
+
+async fn unfeature_tag(
+    State(state): State<AppState>,
+    Extension(database): Extension<DatabaseContext>,
+    token: AuthenticatedAccessToken,
+    Path(name): Path<String>,
+) -> ApiResult<Json<TagResponse>> {
+    require_account_scope(&token, true)?;
+    let account = token.grant.account;
+    let name = valid_name(&name)?;
+    let txn = database.begin_write().await?;
+    let tag = roosty_db::find_local_tag_by_name(&txn, &name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Record not found".into()))?;
+    if let Some(removed) = roosty_db::unfeature_local_tag_by_name(&txn, account.id, &name).await? {
+        enqueue_featured_tag_activity(&state, &txn, &account, &removed, false).await?;
+    }
+    let history = roosty_db::tag_history(&txn, tag.id).await?;
+    let relationship = roosty_db::local_tag_relationship(&txn, account.id, tag.id).await?;
+    let response = TagResponse::new(&state, tag, history, Some(relationship));
+    txn.commit().await?;
+    Ok(Json(response))
+}
+
+fn valid_name(name: &str) -> ApiResult<String> {
+    roosty_db::normalize_featured_tag_name(name)
+        .ok_or_else(|| ApiError::Unprocessable("Featured tag name is invalid".into()))
+}
+
+fn limit_error() -> ApiError {
+    ApiError::Unprocessable("You have already featured the maximum number of hashtags".into())
+}
+
+fn require_account_scope(token: &AuthenticatedAccessToken, write: bool) -> ApiResult<()> {
+    let allowed = token
+        .grant
+        .scopes
+        .split_ascii_whitespace()
+        .map(OAuthScope::parse)
+        .any(|scope| {
+            matches!(
+                (write, scope),
+                (
+                    false,
+                    OAuthScope::Read(OAuthScopeResource::All | OAuthScopeResource::Accounts)
+                ) | (
+                    true,
+                    OAuthScope::Write(OAuthScopeResource::All | OAuthScopeResource::Accounts)
+                )
+            )
+        });
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "This action is outside the authorized scopes".into(),
+        ))
+    }
 }
 
 async fn account_featured_tags(
