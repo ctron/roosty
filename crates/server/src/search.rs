@@ -14,7 +14,9 @@ use crate::{
     auth::{
         AccountResponse, AuthenticatedAccount, OptionalAuthenticatedAccount, account_response_on,
     },
-    federation::discovery::{exact_remote_handle, resolve_remote_actor_for_search},
+    federation::discovery::{
+        exact_remote_handle, resolve_remote_actor_for_search, resolve_remote_actor_url_for_search,
+    },
     http::{ApiError, ApiResult, AppState, DatabaseContext},
     statuses::{StatusRenderContext, StatusResponse, TagResponse, search_status_models},
 };
@@ -90,6 +92,9 @@ async fn search(
             description: "This method requires an authenticated user".into(),
         });
     }
+    if params.resolve.unwrap_or(false) && params.q.as_deref().is_some_and(is_https_url_query) {
+        return resolved_url_search(&state, &database, account.as_ref(), &params).await;
+    }
     let accounts = if matches!(params.search_type, None | Some(SearchType::Accounts)) {
         search_accounts(
             &state,
@@ -138,6 +143,107 @@ async fn search(
         response.headers_mut().insert(header::LINK, link);
     }
     Ok(response)
+}
+
+/// Resolve an exact account URL without falling through to ordinary text search.
+async fn resolved_url_search(
+    state: &AppState,
+    database: &DatabaseContext,
+    account: Option<&roosty_db::LocalAccount>,
+    params: &SearchParams,
+) -> ApiResult<Response> {
+    let mut accounts = Vec::new();
+    let account_type = matches!(params.search_type, None | Some(SearchType::Accounts));
+    let has_page = params.offset.unwrap_or(0) == 0;
+    if account_type && has_page {
+        let query = params.q.as_deref().unwrap_or_default().trim();
+        let resolved = if let Some(username) = local_account_username_from_url(state, query) {
+            let txn = database.begin_snapshot().await?;
+            let local = roosty_db::find_local_account_by_username(&txn, &username).await?;
+            let local = match (local, params.following.unwrap_or(false), account) {
+                (Some(local), true, Some(viewer)) => {
+                    roosty_db::local_follow_relationship(&txn, viewer.id, local.id)
+                        .await?
+                        .map(|_| local)
+                }
+                (local, false, _) => local,
+                _ => None,
+            };
+            let response = match local {
+                Some(local) if local.suspended_at.is_none() && local.limited_at.is_none() => {
+                    Some(SearchAccountResponse::Local(Box::new(
+                        account_response_on(state, &txn, local).await?,
+                    )))
+                }
+                _ => None,
+            };
+            txn.commit().await?;
+            response
+        } else if state.config.federation_enabled {
+            match resolve_remote_actor_url_for_search(state, database, query).await {
+                Ok(actor) => {
+                    let txn = database.begin_snapshot().await?;
+                    let visible = actor.deleted_at.is_none()
+                        && actor.suspended_at.is_none()
+                        && actor.limited_at.is_none()
+                        && if params.following.unwrap_or(false) {
+                            match account {
+                                Some(viewer) => {
+                                    roosty_db::find_remote_following(&txn, viewer.id, actor.id)
+                                        .await?
+                                        .is_some_and(|follow| {
+                                            follow.state == roosty_db::RemoteFollowState::Accepted
+                                        })
+                                }
+                                None => false,
+                            }
+                        } else {
+                            true
+                        };
+                    let response = if visible {
+                        Some(SearchAccountResponse::Remote(Box::new(
+                            remote_account_response_on(state, &txn, actor).await?,
+                        )))
+                    } else {
+                        None
+                    };
+                    txn.commit().await?;
+                    response
+                }
+                Err(RoostyError::Database(error)) => return Err(error.into()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        accounts.extend(resolved);
+    }
+    Ok(Json(SearchResponse {
+        accounts,
+        statuses: Vec::new(),
+        hashtags: Vec::new(),
+    })
+    .into_response())
+}
+
+fn is_https_url_query(value: &str) -> bool {
+    url::Url::parse(value.trim()).is_ok_and(|url| url.scheme() == "https")
+}
+
+fn local_account_username_from_url(state: &AppState, value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if url.origin() != state.config.public_base_url.origin()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let base = state.config.public_base_url.path().trim_end_matches('/');
+    let path = url.path().strip_prefix(base)?.trim_start_matches('/');
+    let username = path
+        .strip_prefix('@')
+        .or_else(|| path.strip_prefix("users/"))?;
+    (!username.is_empty() && !username.contains('/')).then(|| username.to_owned())
 }
 
 async fn account_search(
@@ -399,6 +505,7 @@ mod tests {
     use test_context::{AsyncTestContext, test_context};
     use time::{Duration, OffsetDateTime};
     use tower::ServiceExt;
+    use url::form_urlencoded::byte_serialize;
     use uuid::Uuid;
 
     use crate::{
@@ -432,6 +539,87 @@ mod tests {
         assert_eq!(body["accounts"][0]["username"], "alice");
         assert_eq!(body["statuses"], serde_json::json!([]));
         assert_eq!(body["hashtags"], serde_json::json!([]));
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
+    /// Given local profile and actor URLs, authenticated resolving returns the exact account only.
+    async fn search_resolves_local_account_urls(context: &mut SearchContext) {
+        let token = context.access_token().await;
+        context
+            .create_account("alice", "alice@example.com", "Alice Example")
+            .await;
+
+        for query in [
+            "https%3A%2F%2Froosty.localhost%3A4000%2F%40alice",
+            "https%3A%2F%2Froosty.localhost%3A4000%2Fusers%2Falice",
+        ] {
+            let response = context
+                .authenticated_get(
+                    &format!("/api/v2/search?resolve=true&type=accounts&q={query}"),
+                    &token,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["accounts"].as_array().unwrap().len(), 1);
+            assert_eq!(body["accounts"][0]["username"], "alice");
+            assert_eq!(body["statuses"], serde_json::json!([]));
+            assert_eq!(body["hashtags"], serde_json::json!([]));
+        }
+    }
+
+    #[test_context(SearchContext)]
+    #[tokio::test]
+    /// Given a cached canonical actor URL, URL resolution returns it without a remote fetch.
+    async fn search_resolves_cached_remote_actor_url(context: &mut SearchContext) {
+        context.config.federation_enabled = true;
+        context.config.federation_allowed_domains = vec!["*".to_owned()];
+        let token = context.access_token().await;
+        let actor = context.cache_remote_actor("alice", "remote.test").await;
+        let query = byte_serialize(actor.activitypub_id.as_bytes()).collect::<String>();
+
+        let resolved = context
+            .authenticated_get(
+                &format!("/api/v2/search?resolve=true&type=accounts&q={query}"),
+                &token,
+            )
+            .await;
+        let unresolved = context
+            .authenticated_get(
+                &format!("/api/v2/search?resolve=false&type=accounts&q={query}"),
+                &token,
+            )
+            .await;
+        let wrong_type = context
+            .authenticated_get(
+                &format!("/api/v2/search?resolve=true&type=statuses&q={query}"),
+                &token,
+            )
+            .await;
+        let next_page = context
+            .authenticated_get(
+                &format!("/api/v2/search?resolve=true&type=accounts&offset=1&q={query}"),
+                &token,
+            )
+            .await;
+
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let body = json_body(resolved).await;
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(body["accounts"][0]["id"], actor.id.0.to_string());
+        assert_eq!(
+            json_body(unresolved).await["accounts"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            json_body(wrong_type).await["accounts"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            json_body(next_page).await["accounts"],
+            serde_json::json!([])
+        );
     }
 
     #[test_context(SearchContext)]

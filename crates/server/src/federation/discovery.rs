@@ -62,6 +62,8 @@ struct RemoteActorDocument {
     id: String,
     r#type: ActivityPubActorType,
     #[serde(default)]
+    url: Option<RemoteActorProfileUrl>,
+    #[serde(default)]
     preferred_username: String,
     #[serde(default)]
     name: String,
@@ -93,6 +95,26 @@ struct RemoteActorDocument {
     public_key: Option<RemoteKeyReference>,
     #[serde(default)]
     assertion_method: Vec<RemoteKeyReference>,
+}
+
+/// Human-facing profile links advertised by ActivityStreams actors.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RemoteActorProfileUrl {
+    Url(String),
+    Link { href: String },
+    Many(Vec<RemoteActorProfileUrl>),
+}
+
+impl RemoteActorProfileUrl {
+    fn contains(&self, expected: &Url) -> bool {
+        match self {
+            Self::Url(value) | Self::Link { href: value } => {
+                Url::parse(value).is_ok_and(|value| value == *expected)
+            }
+            Self::Many(values) => values.iter().any(|value| value.contains(expected)),
+        }
+    }
 }
 
 /// ActivityStreams allows image references as either URLs or Image objects.
@@ -451,6 +473,95 @@ pub async fn resolve_remote_actor_for_search(
             Err(error)
         }
     }
+}
+
+/// Resolve an HTTPS actor or advertised profile URL for authenticated account search.
+pub async fn resolve_remote_actor_url_for_search(
+    state: &AppState,
+    database: &DatabaseContext,
+    value: &str,
+) -> Result<RemoteActor> {
+    let requested_url = Url::parse(value).map_err(|_| invalid("remote account URL is invalid"))?;
+    if requested_url.scheme() != "https"
+        || !requested_url.username().is_empty()
+        || requested_url.password().is_some()
+        || requested_url.fragment().is_some()
+    {
+        DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
+        return Err(invalid(
+            "remote account URL must be an unauthenticated HTTPS URL without a fragment",
+        ));
+    }
+    let host = requested_url
+        .host_str()
+        .ok_or_else(|| invalid("remote account URL has no host"))?
+        .to_ascii_lowercase();
+    let txn = database.begin_snapshot().await?;
+    if !state.config.federation_domain_is_allowed(&host)
+        || roosty_db::federation_domain_policy(&txn, &host)
+            .await?
+            .is_suspended()
+    {
+        DISCOVERY_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(FederationDiscoveryError::PolicyRejected(host.into()).into());
+    }
+    if let Some(actor) = roosty_db::find_remote_actor_by_activitypub_id(&txn, value).await?
+        && actor.deleted_at.is_none()
+        && actor.expires_at > OffsetDateTime::now_utc()
+    {
+        txn.commit().await?;
+        DISCOVERY_CACHE_HIT.fetch_add(1, Ordering::Relaxed);
+        return Ok(actor);
+    }
+    txn.commit().await?;
+
+    let lock = database.begin_write().await?;
+    lock.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("remote-account-url:{requested_url}").into()],
+    ))
+    .await?;
+    let document: RemoteActorDocument =
+        match fetch_json(state, &lock, requested_url.clone(), None).await {
+            Ok(document) => document,
+            Err(error) => {
+                DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+    let actor_id = Url::parse(&document.id).map_err(|_| invalid("remote actor ID is invalid"))?;
+    let matches_requested = actor_id == requested_url
+        || document
+            .url
+            .as_ref()
+            .is_some_and(|url| url.contains(&requested_url));
+    if !matches_requested
+        || actor_id.scheme() != "https"
+        || actor_id.origin() != requested_url.origin()
+        || document.preferred_username.is_empty()
+    {
+        DISCOVERY_FAILED.fetch_add(1, Ordering::Relaxed);
+        return Err(invalid(
+            "remote actor does not advertise the requested profile URL",
+        ));
+    }
+    let actor_domain = actor_id
+        .host_str()
+        .ok_or_else(|| invalid("remote actor ID has no host"))?
+        .to_ascii_lowercase();
+    if !state.config.federation_domain_is_allowed(&actor_domain)
+        || roosty_db::federation_domain_policy(&lock, &actor_domain)
+            .await?
+            .is_suspended()
+    {
+        DISCOVERY_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return Err(FederationDiscoveryError::PolicyRejected(actor_domain.into()).into());
+    }
+    let handle = format!("{}@{actor_domain}", document.preferred_username);
+    lock.commit().await?;
+
+    resolve_remote_actor_for_search(state, database, &handle).await
 }
 
 /// Parse only account-address syntax; URLs and local shorthand are deliberately excluded.
@@ -1161,12 +1272,13 @@ mod tests {
 
     use multibase::Base;
     use roosty_db::{ActivityPubActorType, ActorKeyAlgorithm};
+    use url::Url;
 
     use super::{
-        RemoteActorDocument, RemoteKeyType, RemoteMultikey, WebFingerResponse,
-        activitypub_actor_href, is_activitypub_media_type, is_json_content_type, is_unsafe_address,
-        parse_multikey, parse_remote_handle, remote_profile_created_at, validate_actor_document,
-        validated_featured_url, validated_followers_url,
+        RemoteActorDocument, RemoteActorProfileUrl, RemoteKeyType, RemoteMultikey,
+        WebFingerResponse, activitypub_actor_href, is_activitypub_media_type, is_json_content_type,
+        is_unsafe_address, parse_multikey, parse_remote_handle, remote_profile_created_at,
+        validate_actor_document, validated_featured_url, validated_followers_url,
     };
 
     #[test]
@@ -1195,6 +1307,19 @@ mod tests {
         ));
         assert!(is_json_content_type("application/jrd+json"));
         assert!(!is_json_content_type("text/html"));
+    }
+
+    #[test]
+    fn actor_profile_urls_accept_strings_links_and_arrays() {
+        let expected = Url::parse("https://example.test/@alice").unwrap();
+        for value in [
+            serde_json::json!("https://example.test/@alice"),
+            serde_json::json!({"type": "Link", "href": "https://example.test/@alice"}),
+            serde_json::json!([{"href": "https://example.test/elsewhere"}, "https://example.test/@alice"]),
+        ] {
+            let profile: RemoteActorProfileUrl = serde_json::from_value(value).unwrap();
+            assert!(profile.contains(&expected));
+        }
     }
 
     /// FEP-521a Ed25519 methods accept the specified base58-btc and base64url encodings.

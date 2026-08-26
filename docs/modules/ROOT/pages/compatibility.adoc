@@ -321,7 +321,8 @@ anonymous status results remain empty.
 
 |🟡
 |Remote account resolution
-|Exact handles are resolved; URLs are not.
+|Exact handles and authenticated HTTPS actor/profile URL searches are resolved. Status and
+Collection URL resolution is not yet supported.
 
 |===
 
@@ -509,9 +510,9 @@ Bare domains without a URL scheme remain plain text.
 |Area
 |Notes
 
-|🟡
+|🟢
 |`GET /api/v1/tags/:name`
-|Featured-tag state is missing.
+|Authenticated responses include followed and featured-tag state.
 
 |🟢
 |`GET /api/v1/followed_tags`

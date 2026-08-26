@@ -43,7 +43,9 @@
 - Mastodon-compatible actor extensions expose local and remote FEP-5feb indexability consent,
   accept Person, Service, Application, and Group actors, and project bot/group account flags.
 - Safe operator-policy-controlled remote actor discovery through `resolve=true` account lookup, including WebFinger and validated actor caching. Policies can allow exact domains or all public domains with `*`, with explicit blocks taking precedence.
-- Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles, and links through remote profiles to the locally cached public/unlisted status subset.
+- Mastodon-compatible mixed account search exposes cached remote actors, resolves exact remote handles
+  and authenticated HTTPS actor/profile URL searches, and links through remote profiles to the
+  locally cached public/unlisted status subset.
 - Mastodon-compatible status search uses PostgreSQL trigram documents, broadly exposes public
   posts from explicitly indexable actors, and otherwise limits results to a viewer's own,
   mentioned, favourited, boosted, or bookmarked local and cached-remote posts.
@@ -69,6 +71,8 @@
 
 - [x] Refresh expired cached remote actors during exact-handle resolution, with bounded discovery observability and cross-process deduplication.
 - [x] Include cached and resolved remote accounts in Mastodon account search, with pagination and deterministic ranking.
+- [x] Resolve local and remote account actor/profile URLs through authenticated Mastodon v2 search
+  while retaining federation policy and SSRF protections.
 - [x] Add signed outbound `Follow` and `Undo(Follow)` delivery, including durable delivery jobs, destination deduplication, retries, and permanent-failure diagnostics.
 - [x] Process inbound `Accept` and `Reject` for locally initiated remote follows; signed inbound `Follow`/`Undo(Follow)` and locked-account requests are available.
 - [x] Persist local-to-remote follow/relationship state and expose accepted local and remote relationships through Mastodon and ActivityPub follower/following collections.
