@@ -172,7 +172,7 @@ where
     }
 }
 
-struct FormOrJson<T>(T);
+pub(crate) struct FormOrJson<T>(pub(crate) T);
 
 impl<S, T> FromRequest<S> for FormOrJson<T>
 where
@@ -571,6 +571,7 @@ impl OAuthResponseType {
 #[serde(rename_all = "snake_case")]
 enum OAuthGrantType {
     AuthorizationCode,
+    ClientCredentials,
     #[serde(other)]
     Other,
 }
@@ -833,15 +834,16 @@ fn authorization_page_context(
 #[derive(Deserialize)]
 struct TokenForm {
     grant_type: OAuthGrantType,
-    code: String,
+    code: Option<String>,
     client_id: String,
     client_secret: Option<String>,
-    redirect_uri: String,
+    redirect_uri: Option<String>,
     code_verifier: Option<String>,
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
-struct TokenResponse {
+pub(crate) struct TokenResponse {
     access_token: String,
     token_type: OAuthTokenType,
     scope: String,
@@ -853,14 +855,6 @@ async fn token(
     Extension(database): Extension<DatabaseContext>,
     FormOrJson(form): FormOrJson<TokenForm>,
 ) -> Response {
-    if form.grant_type != OAuthGrantType::AuthorizationCode {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_grant_type",
-            "only authorization_code is supported",
-        );
-    }
-
     let txn = match database.begin_write().await {
         Ok(txn) => txn,
         Err(error) => return server_error(error.into()),
@@ -871,13 +865,6 @@ async fn token(
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "unknown client");
         }
         Err(error) => return server_error(error),
-    };
-    let Some(redirect_uri) = matching_redirect_uri(&app.redirect_uri, &form.redirect_uri) else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "redirect_uri mismatch",
-        );
     };
     if let Some(secret) = form.client_secret.as_deref() {
         let supplied_hash = match roosty_db::secret_hash(&state.config.token_pepper, secret) {
@@ -891,13 +878,73 @@ async fn token(
                 "invalid client secret",
             );
         }
+    } else if form.grant_type == OAuthGrantType::ClientCredentials {
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client_secret is required",
+        );
     }
+
+    if form.grant_type == OAuthGrantType::ClientCredentials {
+        let scopes = match client_credentials_scopes(form.scope.as_deref(), &app.scopes) {
+            Ok(scopes) => scopes,
+            Err(description) => {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_scope", description);
+            }
+        };
+        let token = match roosty_db::create_application_access_token(
+            &txn,
+            &state.config.token_pepper,
+            app.id,
+            &scopes,
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(error) => return server_error(error),
+        };
+        if let Err(error) = txn.commit().await {
+            return server_error(error.into());
+        }
+        return Json(TokenResponse::from(token)).into_response();
+    }
+
+    if form.grant_type != OAuthGrantType::AuthorizationCode {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "unsupported grant_type",
+        );
+    }
+    let Some(code) = form.code.as_deref() else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code is required",
+        );
+    };
+    let Some(requested_redirect_uri) = form.redirect_uri.as_deref() else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "redirect_uri is required",
+        );
+    };
+    let Some(redirect_uri) = matching_redirect_uri(&app.redirect_uri, requested_redirect_uri)
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "redirect_uri mismatch",
+        );
+    };
 
     let Some((account_id, scopes, challenge, method)) =
         (match roosty_db::consume_authorization_code(
             &txn,
             &state.config.token_pepper,
-            &form.code,
+            code,
             app.id,
             redirect_uri,
         )
@@ -946,13 +993,46 @@ async fn token(
     if let Err(error) = txn.commit().await {
         return server_error(error.into());
     }
-    Json(TokenResponse {
-        access_token: token.token,
-        token_type: token.token_type,
-        scope: token.scope,
-        created_at: token.created_at,
-    })
-    .into_response()
+    Json(TokenResponse::from(token)).into_response()
+}
+
+impl From<roosty_db::OAuthAccessToken> for TokenResponse {
+    fn from(token: roosty_db::OAuthAccessToken) -> Self {
+        Self {
+            access_token: token.token,
+            token_type: token.token_type,
+            scope: token.scope,
+            created_at: token.created_at,
+        }
+    }
+}
+
+fn client_credentials_scopes(
+    requested: Option<&str>,
+    registered: &str,
+) -> Result<String, &'static str> {
+    let requested = requested.unwrap_or("read");
+    let requested = requested.split_whitespace().collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Err("scope must not be empty");
+    }
+    let registered = registered.split_whitespace().collect::<Vec<_>>();
+    if requested.iter().any(|requested| {
+        !registered
+            .iter()
+            .any(|scope| scope_covers(scope, requested))
+    }) {
+        return Err("requested scope exceeds the application's registered scopes");
+    }
+    Ok(requested.join(" "))
+}
+
+fn scope_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || matches!(granted, "read" | "write")
+            && requested
+                .strip_prefix(granted)
+                .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 #[derive(Deserialize)]
@@ -1806,7 +1886,7 @@ fn sign(secret: &str, payload: &str) -> Result<String, RoostyError> {
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1937,6 +2017,7 @@ mod tests {
     use image::{ImageBuffer, ImageFormat, Rgba};
     use postgresql_embedded::PostgreSQL;
     use roosty_migration::Migrator;
+    use sea_orm::TransactionTrait;
     use sea_orm_migration::MigratorTrait;
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -2023,6 +2104,158 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given registered parent scopes, client credentials issue an app-only token with a narrowed account scope.
+    async fn issues_client_credentials_token(context: &mut EndpointContext) {
+        let app = context.register_app().await;
+        let response = context
+            .form(
+                "POST",
+                "/oauth/token",
+                &[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", &app.client_id),
+                    ("client_secret", &app.client_secret),
+                    ("scope", "write:accounts"),
+                ],
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["scope"], "write:accounts");
+        let token = body["access_token"].as_str().unwrap();
+        let response = context
+            .request(
+                Request::builder()
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn client_credentials_rejects_unregistered_scope(context: &mut EndpointContext) {
+        let app = context.register_app().await;
+        let response = context
+            .form(
+                "POST",
+                "/oauth/token",
+                &[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", &app.client_id),
+                    ("client_secret", &app.client_secret),
+                    ("scope", "admin:write"),
+                ],
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"], "invalid_scope");
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given open registration and an app token, signup atomically returns a working user token.
+    async fn registers_account_with_application_token(context: &mut EndpointContext) {
+        context.config.registration_mode = RegistrationMode::Open;
+        let app_token = context.application_token().await;
+        let response = context
+            .json_with_bearer(
+                "POST",
+                "/api/v1/accounts",
+                json!({
+                    "username": "new_user",
+                    "email": "new@example.com",
+                    "password": "long-enough-password",
+                    "agreement": true,
+                    "locale": "en",
+                }),
+                &app_token,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["scope"], "read write");
+        let token = body["access_token"].as_str().unwrap().to_owned();
+        let response = context
+            .request(
+                Request::builder()
+                    .uri("/api/v1/accounts/verify_credentials")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["username"], "new_user");
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    async fn registration_fails_closed_and_returns_structured_validation(
+        context: &mut EndpointContext,
+    ) {
+        let app_token = context.application_token().await;
+        let input = json!({
+            "username": "!",
+            "email": "invalid",
+            "password": "short",
+            "agreement": false,
+            "locale": "",
+        });
+        let response = context
+            .json_with_bearer("POST", "/api/v1/accounts", input.clone(), &app_token)
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        context.config.registration_mode = RegistrationMode::Open;
+        let response = context
+            .json_with_bearer("POST", "/api/v1/accounts", input, &app_token)
+            .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await;
+        assert_eq!(body["details"]["username"][0]["error"], "ERR_INVALID");
+        assert_eq!(body["details"]["email"][0]["error"], "ERR_INVALID");
+        assert_eq!(body["details"]["password"][0]["error"], "ERR_TOO_SHORT");
+        assert_eq!(body["details"]["agreement"][0]["error"], "ERR_ACCEPTED");
+        assert_eq!(body["details"]["locale"][0]["error"], "ERR_BLANK");
+    }
+
+    #[test_context(EndpointContext)]
+    #[tokio::test]
+    /// Given simultaneous identical signups, exactly one account and user token are committed.
+    async fn concurrent_registration_reports_taken_account(context: &mut EndpointContext) {
+        context.config.registration_mode = RegistrationMode::Open;
+        let app_token = context.application_token().await;
+        let input = json!({
+            "username": "racer",
+            "email": "racer@example.com",
+            "password": "long-enough-password",
+            "agreement": true,
+            "locale": "en",
+        });
+        let first = context.json_with_bearer("POST", "/api/v1/accounts", input.clone(), &app_token);
+        let second = context.json_with_bearer("POST", "/api/v1/accounts", input, &app_token);
+        let (first, second) = tokio::join!(first, second);
+        let statuses = [first.status(), second.status()];
+
+        assert!(statuses.contains(&StatusCode::OK));
+        assert!(statuses.contains(&StatusCode::UNPROCESSABLE_ENTITY));
+        let txn = context.db.begin().await.unwrap();
+        let account = roosty_db::find_local_account_by_username(&txn, "racer")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(account.is_some());
     }
 
     #[test_context(EndpointContext)]
@@ -3499,6 +3732,25 @@ mod tests {
             .await
         }
 
+        async fn json_with_bearer(
+            &self,
+            method: &str,
+            uri: &str,
+            body: Value,
+            token: &str,
+        ) -> Response<Body> {
+            self.request(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+        }
+
         async fn register_app(&self) -> RegisteredApp {
             let response = self
                 .form(
@@ -3519,6 +3771,27 @@ mod tests {
                 client_id: body["client_id"].as_str().unwrap().to_owned(),
                 client_secret: body["client_secret"].as_str().unwrap().to_owned(),
             }
+        }
+
+        async fn application_token(&self) -> String {
+            let app = self.register_app().await;
+            let response = self
+                .form(
+                    "POST",
+                    "/oauth/token",
+                    &[
+                        ("grant_type", "client_credentials"),
+                        ("client_id", &app.client_id),
+                        ("client_secret", &app.client_secret),
+                        ("scope", "write:accounts"),
+                    ],
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await["access_token"]
+                .as_str()
+                .unwrap()
+                .to_owned()
         }
 
         async fn register_oob_app(&self) -> RegisteredApp {

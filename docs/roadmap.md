@@ -30,6 +30,9 @@
 - Mastodon-compatible public/unlisted status pins with a five-pin transactional limit, pinned account collections, ActivityPub featured collections, durable Add/Remove delivery, and bounded remote featured caching.
 - Mastodon-compatible notification policies and sender-scoped requests, with durable multi-process merges/cleanup, completion streaming, unread counts, and operator-managed local/remote account limits that leave ActivityPub ingestion intact.
 - Mastodon-compatible browser OAuth, including PKCE, forced reauthentication for multi-account clients, callback redirects, and out-of-band authorization codes for CLI clients such as toot.
+- Mastodon-compatible OAuth client-credentials application tokens and opt-in open account
+  registration, with atomic application-linked user token issuance. Confirmation email and manual
+  approval remain deferred, and the reserved approval mode fails closed.
 - A first-party Rust/WebAssembly frontend with server-rendered welcome, about, login, password,
   OAuth, local profile timelines, and bounded status-thread views; public pages hydrate with SEO
   metadata, cursor loading, deep-link support, and session-aware visibility served by the backend.
@@ -154,6 +157,8 @@
 - [x] Add public/unlisted remote replies and mentions, including addressing, object resolution, and local mention/reply notifications.
 - [x] Add remote profile lifecycle (`Update`, `Delete`, and `Move`) and safe remote profile-media caching.
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
+- [x] Add OAuth client-credentials tokens and Mastodon-compatible open account registration;
+  defer confirmation email and manual approval workflows.
 - [x] Add SEO-friendly first-party local profile tabs and status-thread pages with session-aware
   visibility, cursor hydration, metadata, microformats, and separate ActivityPub identifiers.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.

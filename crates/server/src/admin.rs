@@ -25,6 +25,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
+    account_validation,
     auth::AuthenticatedAccessToken,
     federation::enqueue_actor_delete_in_transaction,
     http::{AppState, DatabaseContext},
@@ -1274,26 +1275,13 @@ fn format_timestamp(timestamp: OffsetDateTime) -> String {
 }
 
 fn validate_username(username: &str) -> Result<(), RoostyError> {
-    if username.len() < 2
-        || username.len() > 30
-        || !username
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-    {
-        return Err(RoostyError::InvalidInput(
-            "username must be 2-30 ASCII letters, numbers, or underscores".to_owned(),
-        ));
-    }
-    Ok(())
+    account_validation::username(username)
+        .map_err(|reason| RoostyError::InvalidInput(format!("username {reason}")))
 }
 
 fn validate_email(email: &str) -> Result<(), RoostyError> {
-    if !email.contains('@') || email.trim() != email {
-        return Err(RoostyError::InvalidInput(
-            "email must contain @ and must not contain surrounding whitespace".to_owned(),
-        ));
-    }
-    Ok(())
+    account_validation::email(email)
+        .map_err(|reason| RoostyError::InvalidInput(format!("email {reason}")))
 }
 
 fn api_error(status: StatusCode, description: &str) -> Response {

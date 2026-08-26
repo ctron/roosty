@@ -26,7 +26,8 @@ use tracing::Level;
 use crate::{
     accounts, admin, auth, compat, config::Config, conversations, explore, featured_tags,
     federation, instance, lists, markers, media, notifications, polls, push, push::PushService,
-    reports, search, search_discovery, statuses, streaming::StreamingEvents, version, web,
+    registration, reports, search, search_discovery, statuses, streaming::StreamingEvents, version,
+    web,
 };
 use leptos::config::LeptosOptions;
 
@@ -317,6 +318,7 @@ pub fn app_router(
         .merge(polls::router())
         .merge(push::router())
         .merge(reports::router())
+        .merge(registration::router())
         .merge(search::router())
         .merge(search_discovery::router())
         .merge(statuses::router())

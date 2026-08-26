@@ -131,7 +131,8 @@ Parameters marked _Required_ have no role default and must be supplied by the in
 
 |`roosty_registration_mode`
 |Required
-|Advertised registration mode: `closed`, `open`, or `approval`. Public account registration is not yet implemented, so use `closed`.
+|Registration mode: `closed` or `open`. The reserved `approval` value currently fails closed and is
+advertised as disabled because approval workflows are not yet implemented.
 
 |`roosty_deploy_dir`
 |`/opt/roosty`
@@ -292,7 +293,8 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 
 |`ROOSTY_REGISTRATION_MODE`
 |`closed`
-|Advertised mode: `closed`, `open`, or `approval`. Public registration is not yet implemented.
+|Registration mode: `closed` or `open`. The reserved `approval` value currently behaves as
+`closed` until approval workflows are implemented.
 
 |`ROOSTY_SEARCH_INDEXING_ENABLED`
 |`true`

@@ -204,7 +204,7 @@ page is read.
 
 |🟢
 |`POST /oauth/token`
-|
+|Supports authorization-code/PKCE user tokens and client-credentials application tokens.
 
 |🟢
 |`POST /oauth/revoke`
@@ -269,9 +269,11 @@ Report-linked limit and suspension actions are available. Custom roles are missi
 |Client filing and administrator list/detail/update/assignment/resolution APIs are available with
 cursor pagination. `collection_ids[]`, warnings, and custom moderator roles are not yet supported.
 
-|🔴
+|🟡
 |`POST /api/v1/accounts`
-|Public registration is missing; local users are operator-created with the admin CLI.
+|App-token-authorized open registration creates immediately active accounts. Confirmation email,
+manual approval, age policy, CAPTCHA, and endpoint-specific rate limiting are not yet supported;
+the configured `approval` mode therefore fails closed.
 
 |🔴
 |Local account migration

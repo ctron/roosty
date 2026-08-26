@@ -95,6 +95,7 @@ mod m20260823_000085_add_actor_multikeys;
 mod m20260824_000086_add_remote_actor_migration_job;
 mod m20260824_000087_add_admin_account_sort_indexes;
 mod m20260825_000088_add_actor_extensions;
+mod m20260826_000089_allow_oauth_app_tokens;
 
 pub struct Migrator;
 
@@ -190,6 +191,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260824_000086_add_remote_actor_migration_job::Migration),
             Box::new(m20260824_000087_add_admin_account_sort_indexes::Migration),
             Box::new(m20260825_000088_add_actor_extensions::Migration),
+            Box::new(m20260826_000089_allow_oauth_app_tokens::Migration),
         ]
     }
 }

@@ -826,16 +826,23 @@ async fn insert_local_account(
     ensure_local_account_available(txn, username, email).await?;
 
     let account_id = Uuid::now_v7();
-    local_account::ActiveModel {
+    let insert = local_account::Entity::insert(local_account::ActiveModel {
         id: Set(account_id),
         username: Set(username.to_owned()),
         email: Set(email.to_owned()),
         password_hash: Set(password_hash.to_owned()),
         is_admin: Set(is_admin),
         ..Default::default()
-    }
-    .insert(txn)
+    })
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
+    .exec_without_returning(txn)
     .await?;
+    if insert == 0 {
+        ensure_local_account_available(txn, username, email).await?;
+        return Err(RoostyError::InvalidInput(
+            "account is already in use".to_owned(),
+        ));
+    }
     local_notification_policy::ActiveModel {
         account_id: Set(account_id),
         for_not_following: Set(NotificationPolicyAction::Accept),
@@ -7533,6 +7540,14 @@ pub enum OAuthTokenType {
 pub struct AccessTokenGrant {
     pub id: Uuid,
     pub account: LocalAccount,
+    pub scopes: String,
+}
+
+/// Validated application-only access token used before a user account exists.
+#[derive(Clone, Debug)]
+pub struct ApplicationAccessTokenGrant {
+    pub id: Uuid,
+    pub application: OAuthApplication,
     pub scopes: String,
 }
 
@@ -20024,6 +20039,27 @@ pub async fn create_access_token(
     application_id: Uuid,
     scopes: &str,
 ) -> Result<OAuthAccessToken> {
+    create_access_token_for_subject(db, token_pepper, Some(account_id), application_id, scopes)
+        .await
+}
+
+/// Create an application-only OAuth token through the client-credentials grant.
+pub async fn create_application_access_token(
+    db: &impl ConnectionTrait,
+    token_pepper: &str,
+    application_id: Uuid,
+    scopes: &str,
+) -> Result<OAuthAccessToken> {
+    create_access_token_for_subject(db, token_pepper, None, application_id, scopes).await
+}
+
+async fn create_access_token_for_subject(
+    db: &impl ConnectionTrait,
+    token_pepper: &str,
+    account_id: Option<AccountId>,
+    application_id: Uuid,
+    scopes: &str,
+) -> Result<OAuthAccessToken> {
     let token = random_token();
     let token_hash = secret_hash(token_pepper, &token)?;
     let issued_at = OffsetDateTime::now_utc();
@@ -20031,7 +20067,7 @@ pub async fn create_access_token(
     oauth_access_token::ActiveModel {
         id: Set(Uuid::now_v7()),
         token_hash: Set(token_hash),
-        account_id: Set(account_id.0),
+        account_id: Set(account_id.map(|account_id| account_id.0)),
         application_id: Set(application_id),
         scopes: Set(scopes.to_owned()),
         issued_at: Set(issued_at),
@@ -20070,7 +20106,10 @@ pub async fn find_account_by_access_token(
         return Ok(None);
     }
 
-    let account = local_account::Entity::find_by_id(token.account_id)
+    let Some(account_id) = token.account_id else {
+        return Ok(None);
+    };
+    let account = local_account::Entity::find_by_id(account_id)
         .filter(local_account::Column::SuspendedAt.is_null())
         .one(db)
         .await?;
@@ -20101,7 +20140,10 @@ pub async fn find_access_token_grant(
     {
         return Ok(None);
     }
-    let Some(account) = local_account::Entity::find_by_id(token.account_id)
+    let Some(account_id) = token.account_id else {
+        return Ok(None);
+    };
+    let Some(account) = local_account::Entity::find_by_id(account_id)
         .filter(local_account::Column::SuspendedAt.is_null())
         .one(db)
         .await?
@@ -20111,6 +20153,41 @@ pub async fn find_access_token_grant(
     Ok(Some(AccessTokenGrant {
         id: token.id,
         account: local_account_from_model(account)?,
+        scopes: token.scopes,
+    }))
+}
+
+/// Resolve an active application-only OAuth access token.
+pub async fn find_application_access_token_grant(
+    db: &impl ConnectionTrait,
+    token_pepper: &str,
+    raw_token: &str,
+) -> Result<Option<ApplicationAccessTokenGrant>> {
+    let token_hash = secret_hash(token_pepper, raw_token)?;
+    let Some(token) = oauth_access_token::Entity::find()
+        .filter(oauth_access_token::Column::TokenHash.eq(token_hash))
+        .filter(oauth_access_token::Column::AccountId.is_null())
+        .filter(oauth_access_token::Column::RevokedAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if token
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
+    {
+        return Ok(None);
+    }
+    let Some(application) = oauth_application::Entity::find_by_id(token.application_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ApplicationAccessTokenGrant {
+        id: token.id,
+        application: oauth_application_from_model(application),
         scopes: token.scopes,
     }))
 }

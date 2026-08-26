@@ -677,6 +677,69 @@ async fn migrations_run_up_and_down(database: &mut EmbeddedDatabase) {
     assert!(!materialized_view_exists(database.connection(), "account_suggestion_score").await);
 }
 
+/// Given existing user tokens, migration 89 adds reversible app-only token ownership.
+#[test_context(EmbeddedDatabase)]
+#[tokio::test]
+async fn oauth_app_token_migration_preserves_user_tokens(database: &mut EmbeddedDatabase) {
+    Migrator::up(database.connection(), Some(88)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO local_account (id, username, email, password_hash)
+            VALUES ('89000000-0000-0000-0000-000000000001', 'oauth_user', 'oauth@example.com', 'hash');
+            INSERT INTO oauth_application
+                (id, client_id, client_secret_hash, name, redirect_uri, scopes)
+            VALUES
+                ('89000000-0000-0000-0000-000000000002', 'client', 'secret', 'OAuth test', 'urn:ietf:wg:oauth:2.0:oob', 'read write');
+            INSERT INTO oauth_access_token
+                (id, token_hash, account_id, application_id, scopes)
+            VALUES
+                ('89000000-0000-0000-0000-000000000003', 'user-token', '89000000-0000-0000-0000-000000000001', '89000000-0000-0000-0000-000000000002', 'read');
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::up(database.connection(), Some(1)).await.unwrap();
+    database
+        .connection()
+        .execute_unprepared(
+            r#"
+            INSERT INTO oauth_access_token
+                (id, token_hash, account_id, application_id, scopes)
+            VALUES
+                ('89000000-0000-0000-0000-000000000004', 'app-token', NULL, '89000000-0000-0000-0000-000000000002', 'write:accounts');
+            "#,
+        )
+        .await
+        .unwrap();
+
+    Migrator::down(database.connection(), Some(1))
+        .await
+        .unwrap();
+    let row = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS count FROM oauth_access_token".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "count").unwrap(), 1);
+    let nullable = database
+        .connection()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns WHERE table_name = 'oauth_access_token' AND column_name = 'account_id'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(nullable.try_get::<String>("", "is_nullable").unwrap(), "NO");
+}
+
 /// A legacy ID-only replay marker survives the payload-aware ledger upgrade.
 #[test_context(EmbeddedDatabase)]
 #[tokio::test]

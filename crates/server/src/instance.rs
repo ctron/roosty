@@ -244,14 +244,12 @@ fn vapid_public_key(config: &Config) -> String {
 
 /// Return whether the configured registration mode allows user signups.
 fn registrations_enabled(config: &Config) -> bool {
-    matches!(
-        config.registration_mode,
-        RegistrationMode::Open | RegistrationMode::Approval
-    )
+    config.registration_mode == RegistrationMode::Open
 }
 
 fn registrations_approval_required(config: &Config) -> bool {
-    config.registration_mode == RegistrationMode::Approval
+    let _ = config;
+    false
 }
 
 /// Return the Roosty release version without build-specific metadata.
@@ -349,8 +347,8 @@ mod tests {
         assert_eq!(body["uri"], "roosty.localhost");
         assert_eq!(body["short_description"], "Endpoint test instance");
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(body["registrations"], true);
-        assert_eq!(body["approval_required"], true);
+        assert_eq!(body["registrations"], false);
+        assert_eq!(body["approval_required"], false);
         assert_eq!(body["stats"]["user_count"], 0);
     }
 

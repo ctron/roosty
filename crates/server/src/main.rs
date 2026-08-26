@@ -26,6 +26,7 @@ use tokio::{
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod account_validation;
 mod accounts;
 mod admin;
 mod auth;
@@ -45,6 +46,7 @@ mod password;
 mod polls;
 mod preview_cards;
 mod push;
+mod registration;
 mod reports;
 mod search;
 mod search_discovery;

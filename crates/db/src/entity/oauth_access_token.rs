@@ -8,7 +8,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub token_hash: String,
-    pub account_id: Uuid,
+    pub account_id: Option<Uuid>,
     pub application_id: Uuid,
     pub scopes: String,
     pub issued_at: OffsetDateTime,

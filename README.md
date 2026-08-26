@@ -15,8 +15,9 @@ Roosty is early-stage and under active development. Federation, timelines, follo
 notifications, moderation, OAuth, streaming, and Web Push are available across a growing Mastodon-compatible API
 surface.
 
-Compatibility is not complete. Public registration, video and audio uploads, local account migration, and parts of
-account management are still missing. The first-party frontend covers instance information, account flows, an
+Compatibility is not complete. Opt-in open registration is available, while confirmation email and
+approval-based registration, video and audio uploads, local account migration, and parts of account management are
+still missing. The first-party frontend covers instance information, account flows, an
 operations-first administrator dashboard, and server-rendered public profiles and status threads. APIs and deployment
 expectations may still change between releases.
 
