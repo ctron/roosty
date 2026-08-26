@@ -16,9 +16,9 @@ use scraper::{Html, Selector};
 use sea_orm::{
     AccessMode, ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, Database,
     DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, DeriveActiveEnum,
-    DeriveValueType, EntityTrait, EnumIter, FromQueryResult, IntoActiveModel, Iterable, ModelTrait,
-    Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
-    TransactionTrait, TryFromU64, TryInsertResult,
+    DeriveValueType, EntityTrait, EnumIter, FromQueryResult, IntoActiveModel, Iterable, JoinType,
+    ModelTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Select,
+    Set, Statement, TransactionTrait, TryFromU64, TryInsertResult,
     sea_query::{Alias, Expr, Func, OnConflict, Query, SelectStatement, SimpleExpr},
 };
 use serde::{Deserialize, Serialize};
@@ -11605,18 +11605,15 @@ pub async fn followed_local_tags(
     db: &impl ConnectionTrait,
     account_id: AccountId,
 ) -> Result<Vec<LocalTag>> {
-    LocalTag::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        r#"SELECT t.id, t.name, t.created_at, t.updated_at
-           FROM local_tag t
-           JOIN local_tag_follow f ON f.tag_id = t.id
-           WHERE f.account_id = $1
-           ORDER BY t.name ASC"#,
-        vec![account_id.0.into()],
-    ))
-    .all(db)
-    .await
-    .map_err(Into::into)
+    Ok(local_tag::Entity::find()
+        .join(JoinType::InnerJoin, local_tag::Relation::Follows.def())
+        .filter(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .order_by_asc(local_tag::Column::Name)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(local_tag_from_model)
+        .collect())
 }
 
 /// Return whether a local account follows the tag.
@@ -11655,18 +11652,36 @@ pub async fn local_tag_relationships(
         following: bool,
         featuring: bool,
     }
-    let rows = Row::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        r#"SELECT t.id AS tag_id,
-                  EXISTS (SELECT 1 FROM local_tag_follow f
-                          WHERE f.account_id = $1 AND f.tag_id = t.id) AS following,
-                  EXISTS (SELECT 1 FROM local_featured_tag ft
-                          WHERE ft.account_id = $1 AND ft.tag_id = t.id) AS featuring
-           FROM local_tag t WHERE t.id = ANY($2)"#,
-        vec![account_id.0.into(), tag_ids.to_vec().into()],
-    ))
-    .all(db)
-    .await?;
+    let following = Query::select()
+        .expr(Expr::val(1))
+        .from(local_tag_follow::Entity)
+        .and_where(local_tag_follow::Column::AccountId.eq(account_id.0))
+        .and_where(
+            Expr::col((local_tag_follow::Entity, local_tag_follow::Column::TagId))
+                .equals((local_tag::Entity, local_tag::Column::Id)),
+        )
+        .to_owned();
+    let featuring = Query::select()
+        .expr(Expr::val(1))
+        .from(local_featured_tag::Entity)
+        .and_where(local_featured_tag::Column::AccountId.eq(account_id.0))
+        .and_where(
+            Expr::col((
+                local_featured_tag::Entity,
+                local_featured_tag::Column::TagId,
+            ))
+            .equals((local_tag::Entity, local_tag::Column::Id)),
+        )
+        .to_owned();
+    let rows = local_tag::Entity::find()
+        .select_only()
+        .column_as(local_tag::Column::Id, "tag_id")
+        .column_as(Expr::exists(following), "following")
+        .column_as(Expr::exists(featuring), "featuring")
+        .filter(local_tag::Column::Id.is_in(tag_ids.iter().copied()))
+        .into_model::<Row>()
+        .all(db)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|row| {
