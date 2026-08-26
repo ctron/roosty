@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use ipnet::IpNet;
 use roosty_core::{Result, RoostyError};
 use strum::{Display, EnumString};
 use url::Url;
@@ -78,6 +79,78 @@ pub enum RegistrationMode {
     Closed,
     Open,
     Approval,
+}
+
+/// Durable registration-attempt limits and proxy-aware client addressing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistrationRateLimitConfig {
+    pub burst_limit: u64,
+    pub burst_window: Duration,
+    pub daily_limit: u64,
+    pub daily_window: Duration,
+    pub ipv6_prefix_length: u8,
+    pub trusted_proxy_cidrs: Vec<IpNet>,
+}
+
+impl Default for RegistrationRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            burst_limit: 5,
+            burst_window: Duration::from_secs(30 * 60),
+            daily_limit: 20,
+            daily_window: Duration::from_secs(24 * 60 * 60),
+            ipv6_prefix_length: 64,
+            trusted_proxy_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl RegistrationRateLimitConfig {
+    fn from_env() -> Result<Self> {
+        let value = Self {
+            burst_limit: parse_env("ROOSTY_REGISTRATION_BURST_LIMIT", "5")?,
+            burst_window: nonzero_duration_env("ROOSTY_REGISTRATION_BURST_WINDOW", "30m")?,
+            daily_limit: parse_env("ROOSTY_REGISTRATION_DAILY_LIMIT", "20")?,
+            daily_window: nonzero_duration_env("ROOSTY_REGISTRATION_DAILY_WINDOW", "24h")?,
+            ipv6_prefix_length: parse_env("ROOSTY_REGISTRATION_IPV6_PREFIX_LENGTH", "64")?,
+            trusted_proxy_cidrs: optional_env("ROOSTY_TRUSTED_PROXY_CIDRS")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(|cidr| {
+                            cidr.trim().parse().map_err(|error| {
+                                RoostyError::Configuration(format!(
+                                    "ROOSTY_TRUSTED_PROXY_CIDRS contains an invalid CIDR: {error}"
+                                ))
+                            })
+                        })
+                        .collect()
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        if value.burst_limit == 0 || value.daily_limit == 0 {
+            return Err(RoostyError::Configuration(
+                "registration rate limits must be positive".to_owned(),
+            ));
+        }
+        if value.daily_window <= value.burst_window {
+            return Err(RoostyError::Configuration("ROOSTY_REGISTRATION_DAILY_WINDOW must be greater than ROOSTY_REGISTRATION_BURST_WINDOW".to_owned()));
+        }
+        if value.daily_limit < value.burst_limit {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_REGISTRATION_DAILY_LIMIT must be at least ROOSTY_REGISTRATION_BURST_LIMIT"
+                    .to_owned(),
+            ));
+        }
+        if !(1..=128).contains(&value.ipv6_prefix_length) {
+            return Err(RoostyError::Configuration(
+                "ROOSTY_REGISTRATION_IPV6_PREFIX_LENGTH must be between 1 and 128".to_owned(),
+            ));
+        }
+        Ok(value)
+    }
 }
 
 /// Boolean configuration whose absent value enables the feature.
@@ -213,6 +286,7 @@ pub struct Config {
     pub object_storage_backend: ObjectStorageBackend,
     pub media_root: String,
     pub registration_mode: RegistrationMode,
+    pub registration_rate_limit: RegistrationRateLimitConfig,
     /// Whether public pages may be indexed and advertised to search crawlers.
     pub search_indexing_enabled: DefaultEnabled,
     pub federation_enabled: bool,
@@ -368,6 +442,7 @@ impl Config {
             media_root: optional_env("ROOSTY_MEDIA_ROOT")
                 .unwrap_or_else(|| DEFAULT_MEDIA_ROOT.to_owned()),
             registration_mode: parse_env("ROOSTY_REGISTRATION_MODE", DEFAULT_REGISTRATION_MODE)?,
+            registration_rate_limit: RegistrationRateLimitConfig::from_env()?,
             search_indexing_enabled: DefaultEnabled::resolve(search_indexing_override, || {
                 optional_parse_env("ROOSTY_SEARCH_INDEXING_ENABLED")
             })?,
@@ -609,6 +684,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode: RegistrationMode::Closed,
+            registration_rate_limit: RegistrationRateLimitConfig::default(),
             search_indexing_enabled: true.into(),
             federation_enabled: true,
             federation_key_encryption_secret: Some("test-federation-secret".to_owned()),

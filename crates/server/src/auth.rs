@@ -1998,6 +1998,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::config::RegistrationRateLimitConfig;
     use std::{
         fs,
         io::Cursor,
@@ -3655,6 +3656,7 @@ mod tests {
                 object_storage_backend: ObjectStorageBackend::Local,
                 media_root: temp_dir.path().join("media").to_string_lossy().to_string(),
                 registration_mode: RegistrationMode::Closed,
+                registration_rate_limit: RegistrationRateLimitConfig::default(),
                 search_indexing_enabled: true.into(),
                 federation_enabled: false,
                 federation_key_encryption_secret: None,

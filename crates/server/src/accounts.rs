@@ -1655,6 +1655,7 @@ fn non_empty(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::RegistrationRateLimitConfig;
     use std::{
         fs,
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -3081,6 +3082,7 @@ mod tests {
                 object_storage_backend: ObjectStorageBackend::Local,
                 media_root: "./media".to_owned(),
                 registration_mode: RegistrationMode::Closed,
+                registration_rate_limit: RegistrationRateLimitConfig::default(),
                 search_indexing_enabled: true.into(),
                 federation_enabled: false,
                 federation_key_encryption_secret: None,

@@ -12,6 +12,12 @@ roosty_worker_concurrency: 4
 roosty_successful_job_retention: 24h
 roosty_permanently_failed_job_retention: 30d
 roosty_search_indexing_enabled: true
+roosty_registration_burst_limit: 5
+roosty_registration_burst_window: 30m
+roosty_registration_daily_limit: 20
+roosty_registration_daily_window: 24h
+roosty_registration_ipv6_prefix_length: 64
+roosty_trusted_proxy_cidrs: []
 roosty_scheduled_status_minimum_offset: 5m
 roosty_scheduled_status_total_limit: 300
 roosty_scheduled_status_daily_limit: 25

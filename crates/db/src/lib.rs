@@ -20403,6 +20403,142 @@ pub fn secret_hash(pepper: &str, secret: &str) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
+/// Result of atomically checking and, when allowed, recording a registration attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegistrationRateLimitResult {
+    pub allowed: bool,
+    pub policy: RegistrationRateLimitPolicy,
+    pub limit: u64,
+    pub remaining: u64,
+    pub reset_at: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+pub enum RegistrationRateLimitPolicy {
+    #[strum(serialize = "burst_limited")]
+    Burst,
+    #[strum(serialize = "daily_limited")]
+    Daily,
+}
+
+/// Validated rolling-window policy supplied by the server configuration boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegistrationRateLimitSettings {
+    pub burst_limit: u64,
+    pub burst_window: Duration,
+    pub daily_limit: u64,
+    pub daily_window: Duration,
+}
+
+/// Serialize one privacy-preserving client key and enforce exact rolling windows.
+pub async fn check_registration_rate_limit(
+    txn: &DatabaseTransaction,
+    token_pepper: &str,
+    client_group: &str,
+    now: OffsetDateTime,
+    settings: RegistrationRateLimitSettings,
+) -> Result<RegistrationRateLimitResult> {
+    let RegistrationRateLimitSettings {
+        burst_limit,
+        burst_window,
+        daily_limit,
+        daily_window,
+    } = settings;
+    let client_id = secret_hash(
+        token_pepper,
+        &format!("registration-rate-limit\0{client_group}"),
+    )?;
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 917041))",
+        [client_id.clone().into()],
+    ))
+    .await?;
+
+    // Bound global cleanup work so ordinary requests cannot create latency spikes.
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM registration_attempt WHERE id IN (SELECT id FROM registration_attempt WHERE attempted_at <= $1 ORDER BY attempted_at, id LIMIT 100)",
+        [(now - daily_window).into()],
+    )).await?;
+
+    #[derive(FromQueryResult)]
+    struct AttemptTime {
+        attempted_at: OffsetDateTime,
+    }
+    let attempts = AttemptTime::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT attempted_at FROM registration_attempt WHERE client_id = $1 AND attempted_at > $2 ORDER BY attempted_at",
+        [client_id.clone().into(), (now - daily_window).into()],
+    )).all(txn).await?;
+    let burst_attempts = attempts
+        .iter()
+        .filter(|attempt| attempt.attempted_at > now - burst_window)
+        .count() as u64;
+    let daily_attempts = attempts.len() as u64;
+
+    let burst_reset = attempts
+        .iter()
+        .find(|attempt| attempt.attempted_at > now - burst_window)
+        .map_or(now + burst_window, |attempt| {
+            attempt.attempted_at + burst_window
+        });
+    let daily_reset = attempts.first().map_or(now + daily_window, |attempt| {
+        attempt.attempted_at + daily_window
+    });
+    let burst_blocked = burst_attempts >= burst_limit;
+    let daily_blocked = daily_attempts >= daily_limit;
+    if burst_blocked || daily_blocked {
+        let policy = if daily_blocked && (!burst_blocked || daily_reset >= burst_reset) {
+            RegistrationRateLimitPolicy::Daily
+        } else {
+            RegistrationRateLimitPolicy::Burst
+        };
+        let (limit, remaining, reset_at) = match policy {
+            RegistrationRateLimitPolicy::Burst => (burst_limit, 0, burst_reset),
+            RegistrationRateLimitPolicy::Daily => (daily_limit, 0, daily_reset),
+        };
+        return Ok(RegistrationRateLimitResult {
+            allowed: false,
+            policy,
+            limit,
+            remaining,
+            reset_at,
+        });
+    }
+
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO registration_attempt (id, client_id, attempted_at) VALUES ($1, $2, $3)",
+        [Uuid::now_v7().into(), client_id.into(), now.into()],
+    ))
+    .await?;
+    let burst_remaining = burst_limit - burst_attempts - 1;
+    let daily_remaining = daily_limit - daily_attempts - 1;
+    let (policy, limit, remaining, reset_at) = if daily_remaining < burst_remaining {
+        (
+            RegistrationRateLimitPolicy::Daily,
+            daily_limit,
+            daily_remaining,
+            daily_reset,
+        )
+    } else {
+        (
+            RegistrationRateLimitPolicy::Burst,
+            burst_limit,
+            burst_remaining,
+            burst_reset,
+        )
+    };
+    Ok(RegistrationRateLimitResult {
+        allowed: true,
+        policy,
+        limit,
+        remaining,
+        reset_at,
+    })
+}
+
 /// Compute the OAuth PKCE S256 challenge for a verifier.
 pub fn pkce_s256_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))

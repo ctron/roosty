@@ -30,6 +30,7 @@ mod account_validation;
 mod accounts;
 mod admin;
 mod auth;
+mod client_address;
 mod compat;
 mod config;
 mod conversations;
@@ -374,16 +375,19 @@ async fn serve_router(
 
     info!(%listen, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow_and_update() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        while !*shutdown_rx.borrow_and_update() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
             }
-        })
-        .await
-        .map_err(|error| RoostyError::Configuration(error.to_string()))
+        }
+    })
+    .await
+    .map_err(|error| RoostyError::Configuration(error.to_string()))
 }
 
 async fn wait_for_shutdown(shutdown_tx: watch::Sender<bool>) {
@@ -894,6 +898,7 @@ fn validate_email(email: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RegistrationRateLimitConfig;
 
     use std::{
         collections::HashSet,
@@ -2148,6 +2153,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode: RegistrationMode::Closed,
+            registration_rate_limit: RegistrationRateLimitConfig::default(),
             search_indexing_enabled: true.into(),
             federation_enabled: true,
             federation_key_encryption_secret: Some(

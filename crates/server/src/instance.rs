@@ -297,7 +297,9 @@ mod tests {
         sync::Arc,
     };
 
-    use crate::config::{ObjectStorageBackend, ScheduledStatusConfig, StreamingConfig};
+    use crate::config::{
+        ObjectStorageBackend, RegistrationRateLimitConfig, ScheduledStatusConfig, StreamingConfig,
+    };
 
     use super::*;
 
@@ -376,6 +378,7 @@ mod tests {
             object_storage_backend: ObjectStorageBackend::Local,
             media_root: "./media".to_owned(),
             registration_mode,
+            registration_rate_limit: RegistrationRateLimitConfig::default(),
             search_indexing_enabled: true.into(),
             federation_enabled: false,
             federation_key_encryption_secret: None,

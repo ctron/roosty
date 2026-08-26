@@ -26,6 +26,7 @@ hmac = { workspace = true }
 humantime = { workspace = true }
 httpdate = { workspace = true }
 image = { workspace = true }
+ipnet = { workspace = true }
 leptos = { workspace = true, features = ["ssr"] }
 leptos_axum = { workspace = true }
 linkify = { workspace = true }

@@ -159,6 +159,7 @@
 - [ ] Fill Mastodon client startup gaps found by Elk and browser logs.
 - [x] Add OAuth client-credentials tokens and Mastodon-compatible open account registration;
   defer confirmation email and manual approval workflows.
+- [x] Protect open registration with durable cross-process rolling limits and explicitly trusted proxy-aware client identification.
 - [x] Add SEO-friendly first-party local profile tabs and status-thread pages with session-aware
   visibility, cursor hydration, metadata, microformats, and separate ActivityPub identifiers.
 - [x] Add Mastodon-compatible scheduled statuses with durable storage, editing and cancellation, configurable per-account limits, and multi-process-safe publication.

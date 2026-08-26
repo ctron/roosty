@@ -296,6 +296,30 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 |Registration mode: `closed` or `open`. The reserved `approval` value currently behaves as
 `closed` until approval workflows are implemented.
 
+|`ROOSTY_REGISTRATION_BURST_LIMIT`
+|`5`
+|Maximum accepted signup attempts from one client during the burst window.
+
+|`ROOSTY_REGISTRATION_BURST_WINDOW`
+|`30m`
+|Short rolling signup-attempt window.
+
+|`ROOSTY_REGISTRATION_DAILY_LIMIT`
+|`20`
+|Maximum accepted signup attempts from one client during the longer window.
+
+|`ROOSTY_REGISTRATION_DAILY_WINDOW`
+|`24h`
+|Long rolling signup-attempt window; it must exceed the burst window.
+
+|`ROOSTY_REGISTRATION_IPV6_PREFIX_LENGTH`
+|`64`
+|IPv6 prefix length used to group signup clients, from 1 through 128. IPv4 addresses remain exact.
+
+|`ROOSTY_TRUSTED_PROXY_CIDRS`
+|Empty
+|Comma-separated proxy CIDRs permitted to supply `X-Forwarded-For`. Direct deployments should leave this empty.
+
 |`ROOSTY_SEARCH_INDEXING_ENABLED`
 |`true`
 |Advertise eligible public profiles and statuses to search engines. `serve --search-indexing-enabled <true\|false>` overrides the environment for that process.
@@ -304,6 +328,12 @@ Durations accept values such as `1500ms`, `10s`, `5m`, `1h`, or `30d`.
 |Build-dependent
 |Directory containing the packaged first-party web assets.
 |===
+
+Registration attempts are durably limited across all processes. Invalid signup fields and duplicate
+accounts consume capacity; closed registration and rejected app credentials or scopes do not. If open
+registration is served through a reverse proxy, including the Ansible Caddy deployment, explicitly set
+`ROOSTY_TRUSTED_PROXY_CIDRS` (or `roosty_trusted_proxy_cidrs`) to the actual container-network CIDR.
+Roosty never implicitly trusts private networks or forwarded headers.
 
 When search indexing is disabled, every public profile and status document emits
 `noindex, nofollow`, JSON-LD is omitted, sitemap routes return `404`, and `robots.txt` no longer

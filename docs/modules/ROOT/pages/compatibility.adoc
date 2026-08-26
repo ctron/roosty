@@ -272,7 +272,8 @@ cursor pagination. `collection_ids[]`, warnings, and custom moderator roles are 
 |🟡
 |`POST /api/v1/accounts`
 |App-token-authorized open registration creates immediately active accounts. Confirmation email,
-manual approval, age policy, CAPTCHA, and endpoint-specific rate limiting are not yet supported;
+manual approval, age policy, and CAPTCHA are not yet supported. Durable rolling signup limits are
+shared across processes and use proxy-safe client identification;
 the configured `approval` mode therefore fails closed.
 
 |🔴

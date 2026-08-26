@@ -5,7 +5,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 use axum::{
     Extension, Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::{
     account_validation,
     auth::{FormOrJson, TokenResponse, bearer_token},
+    client_address::{ClientSocket, group, resolve},
     config::RegistrationMode,
     http::{AppState, DatabaseContext},
     password,
@@ -45,6 +46,8 @@ enum RegistrationError {
     RegistrationsClosed,
     #[error("This action is outside the authorized scopes")]
     InsufficientScope,
+    #[error("Too many requests")]
+    RateLimited(roosty_db::RegistrationRateLimitResult),
     #[error("registration input is invalid")]
     Validation(ValidationDetails),
     #[error(transparent)]
@@ -83,6 +86,30 @@ impl IntoResponse for RegistrationError {
                 })),
             )
                 .into_response(),
+            Self::RateLimited(limit) => {
+                let now = time::OffsetDateTime::now_utc();
+                let retry_milliseconds = (limit.reset_at - now).whole_milliseconds();
+                let retry_after = ((retry_milliseconds + 999) / 1_000).max(1);
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({ "error": "Too many requests" })),
+                )
+                    .into_response();
+                for (name, value) in [
+                    (RETRY_AFTER.as_str(), retry_after.to_string()),
+                    ("x-ratelimit-limit", limit.limit.to_string()),
+                    ("x-ratelimit-remaining", limit.remaining.to_string()),
+                    (
+                        "x-ratelimit-reset",
+                        limit.reset_at.unix_timestamp().to_string(),
+                    ),
+                ] {
+                    if let Ok(value) = HeaderValue::from_str(&value) {
+                        response.headers_mut().insert(name, value);
+                    }
+                }
+                response
+            }
             Self::Validation(details) => {
                 let summary = details
                     .values()
@@ -122,6 +149,7 @@ struct RegistrationFieldError {
 async fn register_account(
     State(state): State<AppState>,
     Extension(database): Extension<DatabaseContext>,
+    peer: ClientSocket,
     headers: HeaderMap,
     FormOrJson(request): FormOrJson<RegistrationRequest>,
 ) -> Result<Response, RegistrationError> {
@@ -139,6 +167,39 @@ async fn register_account(
     if state.config.registration_mode != RegistrationMode::Open {
         return Err(RegistrationError::RegistrationsClosed);
     }
+
+    let client = resolve(
+        peer.0,
+        &headers,
+        &state.config.registration_rate_limit.trusted_proxy_cidrs,
+    );
+    let client_group = group(
+        client,
+        state.config.registration_rate_limit.ipv6_prefix_length,
+    );
+    let limits = &state.config.registration_rate_limit;
+    let txn = database.begin_write().await?;
+    let result = roosty_db::check_registration_rate_limit(
+        &txn,
+        &state.config.token_pepper,
+        &client_group,
+        time::OffsetDateTime::now_utc(),
+        roosty_db::RegistrationRateLimitSettings {
+            burst_limit: limits.burst_limit,
+            burst_window: time::Duration::try_from(limits.burst_window)
+                .map_err(|error| RoostyError::Configuration(error.to_string()))?,
+            daily_limit: limits.daily_limit,
+            daily_window: time::Duration::try_from(limits.daily_window)
+                .map_err(|error| RoostyError::Configuration(error.to_string()))?,
+        },
+    )
+    .await?;
+    txn.commit().await?;
+    if !result.allowed {
+        tracing::warn!(outcome = %result.policy, "registration attempt rate limited");
+        return Err(RegistrationError::RateLimited(result));
+    }
+    tracing::info!(outcome = "allowed", "registration attempt allowed");
 
     let details = validate(&request);
     if !details.is_empty() {
