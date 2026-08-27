@@ -146,6 +146,7 @@ pub(crate) fn AccountMenu(
     display_name: String,
     avatar_url: Option<String>,
 ) -> impl IntoView {
+    let profile_href = format!("/@{username}");
     let initial = display_name
         .chars()
         .find(|character| !character.is_whitespace())
@@ -172,6 +173,7 @@ pub(crate) fn AccountMenu(
             </summary>
             <form method="post" action="/logout">
                 <ul class="menu dropdown-content rounded-box border-base-300 bg-base-100 z-10 mt-2 w-52 border p-2 shadow">
+                    <li><a href=profile_href>"Profile"</a></li>
                     <li><a href="/auth/edit" rel="external">"Account"</a></li>
                     <li><button type="submit">"Log out"</button></li>
                 </ul>
@@ -412,6 +414,7 @@ mod tests {
         assert!(html.contains("class=\"btn btn-ghost\""));
         assert!(html.contains(">A</span>"));
         assert!(html.contains("class=\"menu dropdown-content rounded-box"));
+        assert!(html.contains("<li><a href=\"/@alice\">Profile</a></li>"));
         assert!(html.contains("<li><a href=\"/auth/edit\" rel=\"external\">Account</a></li>"));
         assert!(html.contains("<li><button type=\"submit\">Log out</button></li>"));
         assert!(html.contains("href=\"/auth/edit\" rel=\"external\""));

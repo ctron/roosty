@@ -2111,6 +2111,7 @@ mod tests {
         assert!(html.contains("<details class=\"dropdown dropdown-end\">"));
         assert!(html.contains("class=\"avatar"));
         assert!(html.contains("<ul class=\"menu dropdown-content rounded-box"));
+        assert!(html.contains("href=\"/@alice\">Profile</a>"));
         assert!(html.contains("href=\"/auth/edit\" rel=\"external\""));
         assert!(html.contains("method=\"post\" action=\"/logout\""));
         assert!(!html.contains("/login?next="));
