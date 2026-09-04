@@ -7,9 +7,9 @@
     "docs:serve": "npm run docs:build && miniserve build/site --port 8000"
   },
   "devDependencies": {
-    "@antora/cli": "3.1.15",
+    "@antora/cli": "3.2.0",
     "@antora/lunr-extension": "1.0.0-alpha.13",
-    "@antora/site-generator": "3.1.15"
+    "@antora/site-generator": "3.2.0"
   },
   "overrides": {
     "js-yaml": "4.3.0"
